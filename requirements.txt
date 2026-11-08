@@ -1,0 +1,14 @@
+discord.py[voice]>=2.3,<3
+discord-ext-voice-recv
+edge-tts
+SpeechRecognition
+ddgs
+aiohttp
+python-dotenv
+simpleeval
+openpyxl
+pypdf
+python-docx
+trafilatura
+youtube-transcript-api
+psutil
