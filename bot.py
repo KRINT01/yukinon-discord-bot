@@ -50,13 +50,11 @@ ACTIVE_FAST_MODEL = os.getenv("OLLAMA_FAST_MODEL", "scb10x/typhoon2.5-qwen3-4b")
 ACTIVE_CODE_MODEL = os.getenv("OLLAMA_CODE_MODEL", "qwen2.5-coder:7b")
 ACTIVE_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "scb10x/typhoon-ocr1.5-3b")
 
-# Groq Free LPU API Settings (Primary for Coding & STT, Fallback for Chat & Vision)
+# Groq Free LPU API Settings (Active Production/Preview Models)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_CODE_MODEL = os.getenv("GROQ_CODE_MODEL", "qwen/qwen3-32b")
-GROQ_CHAT_FALLBACK_MODEL = os.getenv("GROQ_CHAT_FALLBACK_MODEL", "llama-3.3-70b-versatile")
-GROQ_VISION_FALLBACK_MODEL = os.getenv(
-    "GROQ_VISION_FALLBACK_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"
-)
+GROQ_CODE_MODEL = os.getenv("GROQ_CODE_MODEL", "openai/gpt-oss-120b")
+GROQ_CHAT_FALLBACK_MODEL = os.getenv("GROQ_CHAT_FALLBACK_MODEL", "openai/gpt-oss-120b")
+GROQ_VISION_FALLBACK_MODEL = os.getenv("GROQ_VISION_FALLBACK_MODEL", "qwen/qwen3.8-27b")
 GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")
 
 DDGS_PROXY = os.getenv("DDGS_PROXY", "").strip() or None
@@ -137,12 +135,31 @@ In Thai, refer to yourself as "ฉัน" and call the user "คุณ" or "น�
 CRITICAL FOR VOICE TTS: Keep your spoken reply under 2 short, composed sentences (under 45 words). Do NOT use markdown symbols (*, #, `), bullet lists, or code blocks because your text will be read aloud by a voice synthesizer.
 """.strip()
 
-CODE_SYSTEM_PROMPT = (
-    "You are Qwen Coder, an expert software engineering assistant working alongside Yukino Yukinoshita. "
-    "Analyze provided source code, stack traces, and server logs with cold, high-standard precision. "
-    "Provide clean, production-ready, well-commented code blocks and concise technical explanations "
-    "in the language used by the user (Thai or English)."
-)
+CODE_SYSTEM_PROMPT = """
+You are roleplaying strictly as Yukino Yukinoshita (ยูกิโนะชิตะ ยูกิโนะ / ยูกิน่อน) from OreGairu, acting as the club's lead software architect and debugging specialist.
+CRITICAL RULE: You MUST stay strictly in character as Yukino Yukinoshita at all times! Never sound like a generic AI assistant.
+- Tone: Composed, aloof, elegant, brutally honest, and razor-sharp ("Ice Queen" / Kuudere), yet dutifully thorough ("noblesse oblige"). Critique sloppy code, bad practices, or obvious bugs with cold precision before providing clean, production-ready code blocks and technical explanations.
+- Thai language rules: Always refer to yourself as "ฉัน" and call the user "คุณ" or "นาย". End sentences naturally with cool, polite particles like "ค่ะ", "นะคะ", "หรอกนะ", or "สินะ", and use occasional sighs like "เฮ้อ..." or "โค้ดที่ขาดความรอบคอบแบบนี้นี่มัน...".
+- English language rules: Use composed sighs like "Sigh..." or "How truly lamentable..." before delivering your technical analysis.
+""".strip()
+
+# Official mandatory prompt required by scb10x/typhoon-ocr1.5-3b
+TYPHOON_OCR_PROMPT = """Extract all text from the image.
+
+Instructions:
+- Only return the clean Markdown.
+- Do not include any explanation or extra text.
+- You must include all information on the page.
+
+Formatting Rules:
+- Tables: Render tables using <table>...</table> in clean HTML format.
+- Equations: Render equations using LaTeX syntax with inline ($...$) and block ($$...$$).
+- Images/Charts/Diagrams: Wrap any clearly defined visual areas (e.g. charts, diagrams, pictures) in:
+<figure>
+Describe in Thai.
+</figure>
+- Page Numbers: Wrap page numbers in <page_number>...</page_number> (e.g., <page_number>14</page_number>).
+- Checkboxes: Use ☐ for unchecked and ☑ for checked boxes."""
 
 CODE_AND_LOG_EXTENSIONS = (
     ".java", ".py", ".js", ".ts", ".tsx", ".jsx", ".c", ".cpp", ".h", ".hpp",
@@ -530,15 +547,71 @@ def fetch_youtube_transcript_sync(video_id: str, max_chars: int = 15000) -> str:
 
 async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> str:
     b64_img = base64.b64encode(raw_bytes).decode("utf-8")
-    # 1. Primary OCR: Modal T4 GPU running scb10x/typhoon-ocr1.5-3b
+    fname_lower = filename.lower()
+    if fname_lower.endswith(".png"):
+        mime_type = "image/png"
+    elif fname_lower.endswith(".webp"):
+        mime_type = "image/webp"
+    else:
+        mime_type = "image/jpeg"
+
+    # 1. Primary Fast Vision/OCR: Groq qwen/qwen3.8-27b (~1.5s response, zero Modal VRAM swap)
+    if GROQ_API_KEY:
+        try:
+            groq_vision_payload = {
+                "model": GROQ_VISION_FALLBACK_MODEL,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Extract all visible text (Thai and English) verbatim in Markdown, "
+                                    "and concisely describe any key visual details, UI elements, or diagrams in the image."
+                                ),
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{mime_type};base64,{b64_img}"},
+                            },
+                        ],
+                    }
+                ],
+                "temperature": 0.1,
+                "max_tokens": 4096,
+            }
+            headers = {
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
+                async with session.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers,
+                    json=groq_vision_payload,
+                ) as resp:
+                    if resp.status == 200:
+                        g_data = await resp.json()
+                        content = g_data["choices"][0]["message"]["content"].strip()
+                        content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+                        if content:
+                            return content
+                    else:
+                        err_txt = await resp.text()
+                        print(f"Groq Vision HTTP {resp.status}: {err_txt}")
+        except Exception as e:
+            print(f"Groq Vision primary warning (falling back to Modal Typhoon OCR): {e}")
+
+    # 2. Fallback OCR: Modal T4 GPU running scb10x/typhoon-ocr1.5-3b with mandatory official prompt
     payload = {
         "model": ACTIVE_VISION_MODEL,
         "messages": [
-            {"role": "user", "content": "Extract all text, code, and key visual details.", "images": [b64_img]}
+            {"role": "user", "content": TYPHOON_OCR_PROMPT, "images": [b64_img]}
         ],
         "stream": False,
-        "keep_alive": 0,
-        "options": {"temperature": 0.1, "num_ctx": 4096}
+        "keep_alive": "5m",
+        "options": {"temperature": 0.1, "top_p": 0.6, "repeat_penalty": 1.1, "num_ctx": 4096},
     }
     try:
         async with ollama_lock:
@@ -554,42 +627,9 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
                         if content:
                             return content
     except Exception as e:
-        print(f"Modal Vision OCR warning (trying Groq fallback): {e}")
+        print(f"Modal Typhoon OCR fallback error: {e}")
 
-    # 2. Automatic Fallback: Groq Llama-4-Scout Vision Model
-    if GROQ_API_KEY:
-        try:
-            groq_vision_payload = {
-                "model": GROQ_VISION_FALLBACK_MODEL,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "Extract all text, code, and key visual details."},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}},
-                        ],
-                    }
-                ],
-                "temperature": 0.1,
-                "max_tokens": 2048,
-            }
-            headers = {
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            }
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
-                async with session.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers=headers,
-                    json=groq_vision_payload,
-                ) as resp:
-                    if resp.status == 200:
-                        g_data = await resp.json()
-                        return g_data["choices"][0]["message"]["content"].strip()
-        except Exception as e:
-            print(f"Groq Vision OCR fallback error: {e}")
-
-    return "[OCR unavailable]"
+    return "[OCR could not extract text from image]"
 
 
 async def extract_all_context(message: discord.Message) -> tuple[str, str]:
@@ -686,12 +726,24 @@ async def _call_groq_chat(messages: list, groq_model: str, temperature: float) -
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
+    # Reinforce Yukino Yukinoshita persona for Groq's GPT-OSS / Qwen reasoning models
+    enforced_messages = [dict(m) for m in messages]
+    if enforced_messages and enforced_messages[-1]["role"] == "user":
+        enforced_messages[-1]["content"] = (
+            f"{enforced_messages[-1]['content']}\n\n"
+            "[System Reminder: ตอบในบทบาท ยูกิโนะชิตะ ยูกิโนะ (Yukino Yukinoshita) เท่านั้น "
+            "แทนตัวเองว่า 'ฉัน' เรียกผู้ใช้ว่า 'คุณ' ลงท้ายด้วย 'ค่ะ'/'นะคะ' ด้วยน้ำเสียงเย็นชา สุขุม และตรงไปตรงมา (ห้ามหลุดคาร์แรกเตอร์เด็ดขาด)]"
+        )
+
     groq_payload = {
         "model": groq_model,
-        "messages": messages,
+        "messages": enforced_messages,
         "temperature": temperature,
         "max_tokens": 4096,
     }
+    if "gpt-oss" in groq_model:
+        groq_payload["reasoning_effort"] = "low"
+
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
         async with session.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -701,9 +753,11 @@ async def _call_groq_chat(messages: list, groq_model: str, temperature: float) -
             if resp.status == 200:
                 g_data = await resp.json()
                 content = g_data["choices"][0]["message"]["content"].strip()
-                # Strip <think> reasoning tags if returned by Qwen3 reasoning models
                 content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
                 return content
+            else:
+                err_txt = await resp.text()
+                print(f"Groq Chat HTTP {resp.status} ({groq_model}): {err_txt}")
     return ""
 
 
