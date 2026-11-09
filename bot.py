@@ -1152,7 +1152,7 @@ async def query_local_ollama_chat(
                 channel_memory[channel_id].append({"role": "user", "content": prompt})
                 channel_memory[channel_id].append({"role": "assistant", "content": instant_reply})
             return instant_reply, False
-            
+
     did_search = False
     working_prompt = prompt
 
@@ -1290,6 +1290,14 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
             self.user_buffers[user].extend(data.pcm)
             self.last_spoken[user] = time.monotonic()
 
+    def cleanup(self):
+        """Required abstract method for voice_recv.AudioSink; stops background monitor cleanly."""
+        self.running = False
+        if getattr(self, "monitor_task", None) and not self.monitor_task.done():
+            self.monitor_task.cancel()
+        self.user_buffers.clear()
+        self.last_spoken.clear()
+
     async def _silence_monitor_loop(self):
         while self.running:
             await asyncio.sleep(0.4)
@@ -1364,21 +1372,28 @@ async def join_voice(ctx):
     if not ctx.author.voice or not ctx.author.voice.channel:
         await ctx.send("คุณต้องเข้าไปอยู่ในห้องเสียงก่อนนะคะ ถึงจะเรียกฉันเข้าไปได้")
         return
+    target_channel = ctx.author.voice.channel
     try:
+        # If already connected in this server, disconnect cleanly first before reconnecting
+        if ctx.guild.voice_client:
+            await ctx.guild.voice_client.disconnect(force=True)
+            await asyncio.sleep(0.5)
+
         vc = (
-            await asyncio.wait_for(ctx.author.voice.channel.connect(cls=voice_recv.VoiceRecvClient), timeout=15.0)
+            await asyncio.wait_for(target_channel.connect(cls=voice_recv.VoiceRecvClient), timeout=15.0)
             if HAS_VOICE_RECV
-            else await asyncio.wait_for(ctx.author.voice.channel.connect(), timeout=15.0)
+            else await asyncio.wait_for(target_channel.connect(), timeout=15.0)
         )
         if HAS_VOICE_RECV and hasattr(vc, "listen"):
             vc.listen(SilenceGatedVoiceSink(ctx.guild, ctx.channel))
-        await ctx.send(f"เข้ามาในห้องเสียง `{ctx.author.voice.channel.name}` แล้วค่ะ 🎙️")
+
+        await ctx.send(f"เข้ามาในห้องเสียง `{target_channel.name}` แล้วค่ะ 🎙️")
         await speak_in_voice_channel(
             ctx.guild, "เข้ามาในห้องเสียงแล้วค่ะ มีเรื่องอะไรให้ช่วยก็พูดมาได้เลยนะคะ"
         )
     except Exception as e:
         await ctx.send(
-            f"เครือข่าย Container กั้นพอร์ต UDP สำหรับห้องเสียงค่ะ (`{e}`) "
+            f"เกิดข้อผิดพลาดขณะเชื่อมต่อห้องเสียงค่ะ (`{type(e).__name__}: {e}`) "
             "แต่คุณยังสามารถส่งไฟล์เสียงเข้าแชทเพื่อให้ฉันตอบกลับเป็นเสียงพูดได้ตามปกตินะคะ"
         )
 
