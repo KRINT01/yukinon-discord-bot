@@ -10,8 +10,11 @@ import tempfile
 import asyncio
 import platform
 import subprocess
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from collections import defaultdict, deque
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote_plus
 
 import psutil
 import aiohttp
@@ -43,7 +46,7 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
 # Modal Serverless GPU Ollama Endpoint & Bearer Auth Key
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "[http://127.0.0.1:11434](http://127.0.0.1:11434)").rstrip("/")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
 MODAL_API_KEY = os.getenv("MODAL_API_KEY", "").strip()
 
 ACTIVE_FAST_MODEL = os.getenv("OLLAMA_FAST_MODEL", "scb10x/typhoon2.5-qwen3-4b")
@@ -56,6 +59,10 @@ GROQ_CODE_MODEL = os.getenv("GROQ_CODE_MODEL", "openai/gpt-oss-120b")
 GROQ_CHAT_FALLBACK_MODEL = os.getenv("GROQ_CHAT_FALLBACK_MODEL", "openai/gpt-oss-120b")
 GROQ_VISION_FALLBACK_MODEL = os.getenv("GROQ_VISION_FALLBACK_MODEL", "qwen/qwen3.8-27b")
 GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")
+
+# Optional Free Tavily Search API Key (1,000 free searches/mo at tavily.com, no card required)
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
+DEFAULT_WEATHER_CITY = os.getenv("DEFAULT_WEATHER_CITY", "Bangkok").strip()
 
 DDGS_PROXY = os.getenv("DDGS_PROXY", "").strip() or None
 YOUTUBE_PROXY_URL = os.getenv("YOUTUBE_PROXY_URL", "").strip()
@@ -106,6 +113,85 @@ THAI_CHAR_REGEX = re.compile(r"[\u0E00-\u0E7F]")
 # Explicit CGNAT block (100.64.0.0/10) where ipaddress.is_private and is_global are both False
 CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
+THAI_WEEKDAYS = (
+    "วันจันทร์", "วันอังคาร", "วันพุธ", "วันพฤหัสบดี", "วันศุกร์", "วันเสาร์", "วันอาทิตย์"
+)
+THAI_MONTHS = (
+    "", "มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน",
+    "กรกฎาคม", "สิงหาคม", "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม"
+)
+
+THAI_PROVINCE_MAP = {
+    "กรุงเทพ": "Bangkok", "กทม": "Bangkok", "เชียงใหม่": "Chiang+Mai", "เชียงราย": "Chiang+Rai",
+    "ภูเก็ต": "Phuket", "ขอนแก่น": "Khon+Kaen", "โคราช": "Nakhon+Ratchasima",
+    "นครราชสีมา": "Nakhon+Ratchasima", "ชลบุรี": "Chonburi", "พัทยา": "Pattaya",
+    "หาดใหญ่": "Hat+Yai", "สงขลา": "Songkhla", "นนทบุรี": "Nonthaburi",
+    "ปทุมธานี": "Pathum+Thani", "สมุทรปราการ": "Samut+Prakan", "อุดรธานี": "Udon+Thani",
+    "อุบลราชธานี": "Ubon+Ratchathani", "พิษณุโลก": "Phitsanulok", "สุราษฎร์ธานี": "Surat+Thani",
+    "นครศรีธรรมราช": "Nakhon+Si+Thammarat", "ระยอง": "Rayong", "อยุธยา": "Ayutthaya",
+}
+
+
+def get_current_thai_datetime_str() -> str:
+    """Returns the exact live Thailand date and time (UTC+7) formatted in Thai & English."""
+    now_th = datetime.now(ZoneInfo("Asia/Bangkok"))
+    weekday_th = THAI_WEEKDAYS[now_th.weekday()]
+    month_th = THAI_MONTHS[now_th.month]
+    year_be = now_th.year + 543
+    return (
+        f"{weekday_th}ที่ {now_th.day} {month_th} พ.ศ. {year_be} "
+        f"(ค.ศ. {now_th.year}-{now_th.month:02d}-{now_th.day:02d}) "
+        f"เวลา {now_th.strftime('%H:%M')} น. (เวลาประเทศไทย UTC+7)"
+    )
+
+PURE_DATETIME_PATTERN = re.compile(
+    r"(วันนี้วันอะไร|วันนี้วันที่เท่าไหร่|วันนี้วันไหน|ตอนนี้กี่โมง|เวลากี่โมง|กี่โมงแล้ว|ตอนนี้เวลาเท่าไหร่|"
+    r"what\s+time\s+is\s+it|what\s+day\s+is\s+(it|today)|what\s+is\s+today'?s\s+date|what'?s\s+the\s+(time|date))",
+    re.IGNORECASE,
+)
+
+OTHER_TOPIC_BLOCKER_PATTERN = re.compile(
+    r"(ฝน|อากาศ|อุณหภูมิ|ร้อน|หนาว|ฝุ่น|ข่าว|ราคา|หุ้น|ทอง|บิตคอยน์|กินอะไร|ทำอะไร|ทำไม|ยังไง|อย่างไร|คืออะไร|"
+    r"ช่วย|แปล|สรุป|โค้ด|weather|rain|forecast|news|price|how|why|what\s+should|help|code)",
+    re.IGNORECASE,
+)
+
+
+def try_instant_datetime_reply(user_text: str) -> str | None:
+    """
+    If the user is ONLY asking for the current date or time (with no other topic like weather/news),
+    returns an instant in-character reply directly from Python without waking up the Modal GPU!
+    """
+    cleaned = user_text.strip()
+    if len(cleaned) > 65 or not PURE_DATETIME_PATTERN.search(cleaned):
+        return None
+    if OTHER_TOPIC_BLOCKER_PATTERN.search(cleaned):
+        return None
+
+    now_th = datetime.now(ZoneInfo("Asia/Bangkok"))
+    weekday_th = THAI_WEEKDAYS[now_th.weekday()]
+    month_th = THAI_MONTHS[now_th.month]
+    year_be = now_th.year + 543
+    time_str = now_th.strftime("%H:%M")
+
+    # If the user asked in English
+    if not THAI_CHAR_REGEX.search(cleaned):
+        return (
+            f"It is currently **{now_th.strftime('%A, %B %d, %Y')}** "
+            f"(B.E. {year_be}), and the time is **{time_str}** (Thailand Time, UTC+7)."
+        )
+
+    asks_time = any(k in cleaned for k in ("กี่โมง", "เวลา"))
+    asks_date = any(k in cleaned for k in ("วันอะไร", "วันที่", "วันไหน"))
+
+    if asks_time and not asks_date:
+        return f"ตอนนี้เวลา **{time_str} น.** ค่ะ ({weekday_th}ที่ {now_th.day} {month_th} พ.ศ. {year_be})"
+    return (
+        f"วันนี้คือ **{weekday_th}ที่ {now_th.day} {month_th} พ.ศ. {year_be}** "
+        f"(ค.ศ. {now_th.year}) และตอนนี้เวลา **{time_str} น.** ค่ะ"
+    )
+
+
 # --- Refined Natural Persona Prompts ---
 FAST_SYSTEM_PROMPT = """
 คุณกำลังสวมบทบาทเป็น "ยูกิโนะชิตะ ยูกิโนะ" (Yukino Yukinoshita / ยูกิน่อน) ประธานชมรมบริการจากเรื่อง OreGairu ในเซิร์ฟเวอร์ Discord
@@ -118,15 +204,18 @@ FAST_SYSTEM_PROMPT = """
 2. สรรพนามและหางเสียง:
    - แทนตัวเองว่า "ฉัน" และเรียกคู่สนทนาว่า "คุณ"
    - ใช้หางเสียงที่สุภาพแต่ดูสุขุมและเว้นระยะห่างอย่างเป็นธรรมชาติ เช่น "ค่ะ", "นะคะ", "หรอกนะ", "สินะ", "ล่ะ"
+   - ห้ามใช้คำพูดเหมือนบอทบริการลูกค้า เช่น "ขออภัยค่ะ ข้อมูลไม่สามารถให้ได้..." หากไม่มีข้อมูล ให้ตอบตามสไตล์ยูกิโนะอย่างเป็นธรรมชาติ
 3. ห้ามใช้คำติดปากหรือประโยคสำเร็จรูปซ้ำซาก (No Forced Catchphrases):
    - ห้ามขึ้นต้นทุกข้อความด้วยคำว่า "เฮ้อ..." และห้ามพูดประโยคเดิมๆ เช่น "คนที่ไม่ได้พยายาม..." หรือ "ถือเป็นหน้าที่ของผู้ที่เหนือกว่า..." โดยไม่มีบริบทที่เหมาะสมเด็ดขาด
-   - แสดงความคมคายและบุคลิกของยูกิโนะผ่าน "เนื้อหาที่กระชับ มีเหตุผลรองรับ และความใส่ใจในรายละเอียด" แทนการพูดจาดูถูกแบบไร้เหตุผล (แอบใจอ่อนหรือเสียอาการเล็กน้อยเฉพาะเวลาที่คุยเรื่องแมวเท่านั้น)
-4. การจัดรูปแบบสำหรับแชท Discord (Discord Formatting):
+   - แสดงความคมคายและบุคลิกของยูกิโนะผ่าน "เนื้อหาที่กระชับ มีเหตุผลรองรับ และความใส่ใจในรายละเอียด" (แอบใจอ่อนหรือเสียอาการเล็กน้อยเฉพาะเวลาที่คุยเรื่องแมวเท่านั้น)
+4. การตอบเรื่องวันเวลาและสภาพอากาศ:
+   - ยึดถือ `[ข้อมูลวันและเวลาปัจจุบันของระบบ]` ที่แนบให้เป็นความจริงเสมอ ห้ามเดาวันที่จากข่าวอื่นเด็ดขาด และตอบเฉพาะสิ่งที่ผู้ใช้ถาม (หากถามแค่วันที่หรือเวลา ไม่ต้องเอาข่าวอื่นมาพูดปน)
+5. การจัดรูปแบบสำหรับแชท Discord (Discord Formatting):
    - ห้ามสร้างตาราง Markdown (`| คอลัมน์ | ... |`) เด็ดขาด เพราะแชท Discord ไม่รองรับการแสดงผลตาราง ให้ใช้รายการหัวข้อย่อย (Bullet points `-` หรือตัวเลข `1.`) ที่อ่านง่ายแทน
 
 ### กฎการค้นหาเว็บ (Agentic Web Search):
-- หากผู้ใช้ถามข้อมูลข่าวสารปัจจุบัน ราคา หรือเหตุการณ์ล่าสุดที่คุณไม่ทราบแน่ชัด และยังไม่มีบล็อก `<untrusted_web_search_results>` ให้ตอบเพียง `[SEARCH: <คำค้นหาที่กระชับ>]` ในบรรทัดแรกเท่านั้น
-- เมื่อได้รับ `<untrusted_web_search_results>` แล้ว ให้สรุปข้อเท็จจริงด้วยน้ำเสียงของยูกิโนะอย่างแม่นยำพร้อมแนบลิงก์อ้างอิง
+- หากผู้ใช้ถามข้อมูลข่าวสารปัจจุบัน ราคา หรือเหตุการณ์ล่าสุดที่คุณไม่ทราบแน่ชัด และยังไม่มีบล็อก `<untrusted_web_search_results>` ให้ตอบเพียง `[SEARCH: <คำค้นหาที่กระชับและตรงประเด็น>]` ในบรรทัดแรกเท่านั้น
+- เมื่อได้รับ `<untrusted_web_search_results>` หรือ `<live_weather_report>` แล้ว ให้สรุปคำตอบที่ตรงกับคำถามของผู้ใช้ด้วยน้ำเสียงของยูกิโนะอย่างเป็นธรรมชาติ
 """.strip()
 
 VOICE_SYSTEM_PROMPT = """
@@ -151,7 +240,6 @@ CODE_SYSTEM_PROMPT = """
    - ห้ามใช้ตาราง Markdown (`|---|---|`) เด็ดขาด เพราะ Discord แสดงผลตารางเพี้ยน ให้สรุปขั้นตอนการแก้ไขเป็นหัวข้อย่อย (Bullet points) และบล็อกโค้ด (` ``` `) เท่านั้น
 """.strip()
 
-# Official mandatory prompt required by scb10x/typhoon-ocr1.5-3b fallback
 TYPHOON_OCR_PROMPT = """Extract all text from the image.
 
 Instructions:
@@ -191,10 +279,17 @@ CODE_INTENT_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+WEATHER_INTENT_PATTERN = re.compile(
+    r"(\b(weather|forecast|rain|raining|temperature|humidity|pm2\.5|storm)\b|"
+    r"ฝนตก|ฝนจะตก|พยากรณ์อากาศ|สภาพอากาศ|อากาศวันนี้|อากาศตอนนี้|อุณหภูมิ|ค่าฝุ่น|ร้อนไหม|หนาวไหม)",
+    re.IGNORECASE
+)
+
+# Note: Removed generic words like "วันนี้" / "ตอนนี้" so simple date/time questions don't trigger random web searches!
 WEB_SEARCH_INTENT_PATTERN = re.compile(
-    r"(\b(latest|current|today|news|price|weather|update|release date|who won|stock|bitcoin|"
-    r"search the web|look up|google|2025|2026|2027)\b|"
-    r"ล่าสุด|วันนี้|ตอนนี้|ปัจจุบัน|ข่าว|ราคา|พยากรณ์อากาศ|ค้นหา|หาข้อมูล|เสิร์ช|อัปเดต)",
+    r"(\b(latest|current news|breaking news|price of|release date|who won|stock price|bitcoin price|"
+    r"search the web|look up|google)\b|"
+    r"ข่าวล่าสุด|ข่าววันนี้|ราคาทอง|ราคาบิตคอยน์|ราคาหุ้น|ค้นหาข้อมูล|หาข้อมูล|เสิร์ช|อัปเดตล่าสุด|ผลการแข่งขัน)",
     re.IGNORECASE
 )
 
@@ -215,6 +310,7 @@ async def handle_root(request: web.Request) -> web.Response:
     <head><title>Yukinon Discord Bot - Render + Modal + Groq Hybrid</title></head>
     <body style="font-family: sans-serif; max-width: 680px; margin: 40px auto; line-height: 1.6;">
         <h2>❄️ Yukino Yukinoshita Discord Bot (Hybrid Cloud Edition)</h2>
+        <p><b>System Time (TH):</b> {get_current_thai_datetime_str()}</p>
         <p><b>Discord Gateway:</b> {"Connected as " + str(bot.user) if bot.is_ready() else "Connecting..."}</p>
         <p><b>Bot Process RAM:</b> {rss_mb:.1f} MB (Render 512 MB Free Web Service)</p>
         <p><b>Modal GPU Endpoint:</b> <code>{OLLAMA_BASE_URL}</code></p>
@@ -250,7 +346,7 @@ class YukinonBot(commands.Bot):
         await self.web_runner.setup()
         site = web.TCPSite(self.web_runner, "0.0.0.0", PORT)
         await site.start()
-        print(f"[Render Web Service Health Server] Listening on [http://0.0.0.0](http://0.0.0.0):{PORT}")
+        print(f"[Render Web Service Health Server] Listening on http://0.0.0.0:{PORT}")
 
 
 bot = YukinonBot(command_prefix="!", intents=intents, help_command=None)
@@ -262,15 +358,101 @@ def detect_coding_intent(text: str, attachments: list, channel_id: int = None) -
             return True
     if bool(CODE_INTENT_PATTERN.search(text)):
         return True
-    # If the user recently uploaded a code file in this channel and is asking a follow-up
     if channel_id and channel_id in channel_last_attachment:
         if channel_last_attachment[channel_id].get("is_code"):
             return True
     return False
 
 
+def detect_weather_intent(text: str) -> bool:
+    return bool(WEATHER_INTENT_PATTERN.search(text))
+
+
 def detect_web_search_intent(text: str) -> bool:
     return bool(WEB_SEARCH_INTENT_PATTERN.search(text))
+
+
+async def fetch_live_weather_context(user_text: str) -> str:
+    """
+    Fetches real-time temperature, humidity, sky condition, and hourly rain probability
+    from the keyless wttr.in JSON API (with Open-Meteo fallback for Bangkok).
+    """
+    target_city = DEFAULT_WEATHER_CITY
+    for th_name, en_query in THAI_PROVINCE_MAP.items():
+        if th_name in user_text:
+            target_city = en_query
+            break
+
+    url = f"https://wttr.in/{target_city}?format=j1&lang=th"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get(url, headers={"User-Agent": "curl/8.5.0"}) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    curr = (data.get("current_condition") or [{}])[0]
+                    weather_days = data.get("weather") or [{}]
+                    today_w = weather_days[0] if weather_days else {}
+                    hourly = today_w.get("hourly") or []
+
+                    temp_c = curr.get("temp_C", "?")
+                    feels_c = curr.get("FeelsLikeC", "?")
+                    humidity = curr.get("humidity", "?")
+                    precip_mm = curr.get("precipMM", "0.0")
+                    lang_th = curr.get("lang_th") or curr.get("weatherDesc") or [{"value": "ไม่ระบุ"}]
+                    cond_desc = lang_th[0].get("value", "")
+
+                    rain_chances = [int(h.get("chanceofrain", 0)) for h in hourly if "chanceofrain" in h]
+                    max_rain_chance = max(rain_chances) if rain_chances else 0
+
+                    hourly_summary = []
+                    for h in hourly:
+                        time_val = int(h.get("time", "0")) // 100
+                        chance = h.get("chanceofrain", "0")
+                        h_temp = h.get("tempC", "?")
+                        h_desc_list = h.get("lang_th") or h.get("weatherDesc") or [{"value": ""}]
+                        h_desc = h_desc_list[0].get("value", "")
+                        hourly_summary.append(
+                            f"- เวลา {time_val:02d}:00 น.: อุณหภูมิ {h_temp}°C, โอกาสฝนตก {chance}% ({h_desc})"
+                        )
+
+                    city_display = target_city.replace("+", " ")
+                    return (
+                        f'<live_weather_report location="{city_display}">\n'
+                        f"สภาพอากาศปัจจุบัน ({city_display}): {cond_desc}\n"
+                        f"อุณหภูมิปัจจุบัน: {temp_c}°C (รู้สึกเหมือน {feels_c}°C) | ความชื้นสัมพัทธ์: {humidity}% | ปริมาณน้ำฝนขณะนี้: {precip_mm} มม.\n"
+                        f"โอกาสเกิดฝนตกสูงสุดของวันนี้: {max_rain_chance}%\n"
+                        f"พยากรณ์อากาศรายชั่วโมงวันนี้:\n" + "\n".join(hourly_summary) + "\n"
+                        f"</live_weather_report>"
+                    )
+    except Exception as e:
+        print(f"wttr.in weather warning: {e}")
+
+    # Automatic Fallback: Keyless Open-Meteo API (Bangkok coordinates 13.7563, 100.5018)
+    try:
+        om_url = (
+            "https://api.open-meteo.com/v1/forecast"
+            "?latitude=13.7563&longitude=100.5018"
+            "&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation"
+            "&daily=precipitation_probability_max,temperature_2m_max,temperature_2m_min"
+            "&timezone=Asia%2FBangkok&forecast_days=1"
+        )
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get(om_url) as resp:
+                if resp.status == 200:
+                    om = await resp.json()
+                    c = om.get("current") or {}
+                    d = om.get("daily") or {}
+                    rain_prob = (d.get("precipitation_probability_max") or [0])[0]
+                    return (
+                        f'<live_weather_report location="Bangkok">\n'
+                        f"อุณหภูมิปัจจุบัน: {c.get('temperature_2m')}°C (รู้สึกเหมือน {c.get('apparent_temperature')}°C)\n"
+                        f"ความชื้นสัมพัทธ์: {c.get('relative_humidity_2m')}% | ปริมาณฝนปัจจุบัน: {c.get('precipitation')} มม.\n"
+                        f"โอกาสฝนตกสูงสุดวันนี้: {rain_prob}%\n"
+                        f"</live_weather_report>"
+                    )
+    except Exception as e:
+        print(f"Open-Meteo weather fallback error: {e}")
+    return ""
 
 
 def validate_safe_public_url(url: str) -> str:
@@ -314,26 +496,102 @@ def fetch_webpage_sync(url: str, max_chars: int = 14000) -> str:
     return extracted[:max_chars]
 
 
+def _search_google_news_rss_sync(query: str, is_thai: bool, max_results: int = 4) -> list[dict]:
+    """
+    100% Keyless Fallback when DuckDuckGo rate-limits Render's shared datacenter IP (HTTP 202).
+    Queries Google News RSS feed directly, which is never blocked on cloud datacenter IPs.
+    """
+    import urllib.request
+    hl = "th" if is_thai else "en-US"
+    gl = "TH" if is_thai else "US"
+    ceid = "TH:th" if is_thai else "US:en"
+    rss_url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl={hl}&gl={gl}&ceid={ceid}"
+    results = []
+    try:
+        req = urllib.request.Request(rss_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            xml_bytes = resp.read()
+        root = ET.fromstring(xml_bytes)
+        for item in root.findall("./channel/item")[:max_results]:
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            pub_date = (item.findtext("pubDate") or "").strip()
+            source = (item.findtext("source") or "").strip()
+            results.append({
+                "title": title,
+                "href": link,
+                "body": f"Published: {pub_date} | Source: {source} | Headline: {title}",
+            })
+    except Exception as e:
+        print(f"Google News RSS fallback warning: {e}")
+    return results
+
+
 def run_safe_web_search_sync(query: str, max_results: int = 4) -> str:
-    clean_q = re.sub(r"[\r\n]+", " ", query).strip()[:200]
+    clean_q = re.sub(r"[\r\n]+", " ", query).strip()
+    # Strip conversational filler words from the search query
+    clean_q = re.sub(r"^(สวัสดี|ยูกิโนะ|ยูกิน่อน|ช่วยหา|ค้นหา|ช่วยบอก|อยากรู้ว่า)\s*", "", clean_q).strip()[:200]
     if not clean_q:
         return ""
+
+    is_thai = bool(THAI_CHAR_REGEX.search(clean_q))
+    region_code = "th-th" if is_thai else "wt-wt"
     hits = []
-    with DDGS(proxy=DDGS_PROXY, timeout=15) as ddgs:
-        for backend_choice in ("auto", "lite"):
-            try:
-                hits = list(
-                    ddgs.text(
-                        clean_q, region="wt-wt", safesearch="moderate",
-                        backend=backend_choice, max_results=max_results
+
+    # 1. Optional Tavily AI Search API (if TAVILY_API_KEY is configured)
+    if TAVILY_API_KEY:
+        try:
+            import json
+            import urllib.request
+            t_req = urllib.request.Request(
+                "https://api.tavily.com/search",
+                data=json.dumps({
+                    "api_key": TAVILY_API_KEY,
+                    "query": clean_q,
+                    "max_results": max_results,
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(t_req, timeout=12) as resp:
+                t_data = json.loads(resp.read().decode("utf-8"))
+                for r in t_data.get("results", []):
+                    hits.append({
+                        "title": r.get("title", ""),
+                        "href": r.get("url", ""),
+                        "body": r.get("content", ""),
+                    })
+        except Exception as e:
+            print(f"Tavily search warning: {e}")
+
+    # 2. Primary Keyless Search: DDGS (text + news)
+    if not hits:
+        with DDGS(proxy=DDGS_PROXY, timeout=15) as ddgs:
+            for backend_choice in ("auto", "html", "lite"):
+                try:
+                    hits = list(
+                        ddgs.text(
+                            clean_q, region=region_code, safesearch="moderate",
+                            backend=backend_choice, max_results=max_results
+                        )
                     )
-                )
-                if hits:
-                    break
-            except Exception as e:
-                print(f"DDGS ({backend_choice}) warning: {e}")
+                    if hits:
+                        break
+                except Exception as e:
+                    print(f"DDGS text ({backend_choice}) warning: {e}")
+            if not hits:
+                try:
+                    hits = list(ddgs.news(clean_q, region=region_code, max_results=max_results))
+                except Exception as e:
+                    print(f"DDGS news warning: {e}")
+
+    # 3. Automatic Keyless Fallback: Google News RSS (never blocked on Render datacenter IPs)
+    if not hits:
+        hits = _search_google_news_rss_sync(clean_q, is_thai=is_thai, max_results=max_results)
+
     if not hits:
         return ""
+
     formatted_entries = []
     deep_scraped_count = 0
     for idx, item in enumerate(hits, 1):
@@ -341,7 +599,7 @@ def run_safe_web_search_sync(query: str, max_results: int = 4) -> str:
         href = (item.get("href") or item.get("url") or "").strip()
         snippet = (item.get("body") or "").strip()
         entry_text = f"[{idx}] Title: {title}\nURL: {href}\nSnippet: {snippet}"
-        if href and deep_scraped_count < 1:
+        if href and deep_scraped_count < 1 and "news.google.com" not in href:
             try:
                 article_excerpt = fetch_webpage_sync(href, max_chars=2200)
                 if article_excerpt:
@@ -451,7 +709,7 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as session:
                 async with session.post(
-                    "[https://api.groq.com/openai/v1/audio/transcriptions](https://api.groq.com/openai/v1/audio/transcriptions)",
+                    "https://api.groq.com/openai/v1/audio/transcriptions",
                     headers=headers,
                     data=form,
                 ) as resp:
@@ -526,10 +784,6 @@ def parse_docx_bytes(raw_bytes: bytes, max_chars: int = 30000) -> str:
 
 
 def format_code_or_log_attachment(text: str, is_log: bool, max_chars: int = 120000) -> str:
-    """
-    Preserves up to 120,000 characters (~3,500+ lines of code) so the bottom of React/JSX
-    files is never chopped off! Adds line numbers to source code files for accurate referencing.
-    """
     if is_log:
         if len(text) <= 30000:
             return text
@@ -541,7 +795,6 @@ def format_code_or_log_attachment(text: str, is_log: bool, max_chars: int = 1200
 
     if len(numbered_text) <= max_chars:
         return numbered_text
-    # If file is over 120,000 chars, keep both top (imports/state) and bottom (JSX render/exports)
     half = max_chars // 2
     return (
         f"{numbered_text[:half]}\n\n"
@@ -556,7 +809,7 @@ def extract_youtube_id(url: str):
         host = (parsed.hostname or "").lower()
         if host in ("youtu.be", "www.youtu.be"):
             return parsed.path.lstrip("/").split("?")[0][:11]
-        if host in ("youtube.com", "[www.youtube.com](https://www.youtube.com)", "m.youtube.com") and parsed.path == "/watch":
+        if host in ("youtube.com", "www.youtube.com", "m.youtube.com") and parsed.path == "/watch":
             return parse_qs(parsed.query).get("v", [None])[0][:11]
     except Exception:
         pass
@@ -586,7 +839,6 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
     else:
         mime_type = "image/jpeg"
 
-    # 1. Primary Fast Vision/OCR: Groq qwen/qwen3.8-27b with strict Thai character accuracy prompt
     if GROQ_API_KEY:
         try:
             groq_vision_payload = {
@@ -621,7 +873,7 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
             }
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
                 async with session.post(
-                    "[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)",
+                    "https://api.groq.com/openai/v1/chat/completions",
                     headers=headers,
                     json=groq_vision_payload,
                 ) as resp:
@@ -637,7 +889,6 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
         except Exception as e:
             print(f"Groq Vision primary warning (falling back to Modal Typhoon OCR): {e}")
 
-    # 2. Fallback OCR: Modal T4 GPU running scb10x/typhoon-ocr1.5-3b with mandatory official prompt
     payload = {
         "model": ACTIVE_VISION_MODEL,
         "messages": [
@@ -754,10 +1005,6 @@ async def verify_allowed_guild(ctx):
 
 
 def split_discord_message_smart(text: str, max_len: int = 1900) -> list[str]:
-    """
-    Splits long responses cleanly on newline boundaries (never mid-word!),
-    and automatically closes & re-opens fenced ``` code blocks across chunks.
-    """
     if len(text) <= 1990:
         return [text]
 
@@ -770,7 +1017,6 @@ def split_discord_message_smart(text: str, max_len: int = 1900) -> list[str]:
 
     for line in lines:
         stripped = line.strip()
-        # Handle single ultra-long line without newlines
         if len(line) > max_len:
             if current_lines:
                 if in_code_block:
@@ -846,7 +1092,6 @@ async def _call_groq_chat(
         "temperature": temperature,
         "max_tokens": 8192,
     }
-    # Use high/medium reasoning effort for coding & logic so React/code analysis is thorough
     if "gpt-oss" in groq_model:
         groq_payload["reasoning_effort"] = "high" if is_coding else "medium"
 
@@ -868,7 +1113,6 @@ async def _call_groq_chat(
 
 
 async def _call_modal_ollama_chat(messages: list, ollama_model: str, temperature: float) -> str:
-    # Modal Ollama has an 8192-token context limit; trim any oversized 100K-char code prompts
     trimmed_messages = []
     for m in messages:
         content = m.get("content", "")
@@ -900,10 +1144,28 @@ async def query_local_ollama_chat(
     temperature: float = 0.55, allow_agentic_search: bool = True,
     has_fresh_attachment: bool = False
 ) -> tuple[str, bool]:
+    # 0. Instant internal Python shortcut for pure date/time questions (0 LLM calls, $0 Modal cost)
+    if not has_fresh_attachment:
+        instant_reply = try_instant_datetime_reply(prompt)
+        if instant_reply:
+            if channel_id is not None:
+                channel_memory[channel_id].append({"role": "user", "content": prompt})
+                channel_memory[channel_id].append({"role": "assistant", "content": instant_reply})
+            return instant_reply, False
+            
     did_search = False
     working_prompt = prompt
 
-    # If the user asks a follow-up question without re-uploading the file, include recent channel attachment
+    # 1. Inject live Thailand date & time into the system prompt on every turn
+    live_clock_str = get_current_thai_datetime_str()
+    dynamic_system_prompt = (
+        f"{system_prompt}\n\n"
+        f"### [ข้อมูลวันและเวลาปัจจุบันของระบบ (Real-Time System Clock)]:\n"
+        f"- ขณะนี้คือ: **{live_clock_str}**\n"
+        f"- ใช้ข้อมูลวันและเวลานี้ตอบผู้ใช้โดยตรงเมื่อถูกถามว่าวันนี้วันอะไรหรือตอนนี้กี่โมง"
+    )
+
+    # 2. If the user asks a follow-up question without re-uploading a file, include recent channel attachment
     if (
         not has_fresh_attachment
         and channel_id is not None
@@ -916,6 +1178,13 @@ async def query_local_ollama_chat(
             f"[ไฟล์อ้างอิงล่าสุดในห้องแชทนี้ (ใช้ประกอบการตอบหากคำถามต่อเนื่องกัน)]:\n{cached_ctx}"
         )
 
+    # 3. If the user asks about weather/rain/temperature, fetch live meteorological data
+    if allow_agentic_search and detect_weather_intent(prompt):
+        weather_block = await fetch_live_weather_context(prompt)
+        if weather_block:
+            working_prompt = f"{working_prompt}\n\n{weather_block}"
+
+    # 4. If the user asks about live news/prices/events, run multi-backend web search
     if (
         allow_agentic_search
         and "<untrusted_web_search_results" not in working_prompt
@@ -929,12 +1198,11 @@ async def query_local_ollama_chat(
     is_coding = (model == ACTIVE_CODE_MODEL)
 
     async def _run_inference_pass(user_content: str) -> str:
-        messages = [{"role": "system", "content": system_prompt}]
+        messages = [{"role": "system", "content": dynamic_system_prompt}]
         if channel_id is not None:
             messages.extend(list(channel_memory[channel_id]))
         messages.append({"role": "user", "content": user_content})
 
-        # Route A: Coding & Log Stack Traces -> Groq LPU Primary (131K context, high reasoning) -> Modal Fallback
         if is_coding:
             try:
                 ans = await _call_groq_chat(messages, GROQ_CODE_MODEL, temperature, is_coding=True)
@@ -949,8 +1217,6 @@ async def query_local_ollama_chat(
                     return ans
             except Exception as e:
                 print(f"Modal GPU coding error: {e}")
-
-        # Route B: General Chat & Yukino Persona -> Modal GPU Primary (typhoon2.5-qwen3-4b) -> Groq Fallback
         else:
             try:
                 ans = await _call_modal_ollama_chat(messages, model, temperature)
@@ -976,10 +1242,9 @@ async def query_local_ollama_chat(
             if search_block:
                 did_search = True
                 answer = await _run_inference_pass(
-                    f"{working_prompt}\n\n{search_block}\n\nสรุปคำตอบในบทบาท ยูกิโนะชิตะ ยูกิโนะ"
+                    f"{working_prompt}\n\n{search_block}\n\nสรุปคำตอบที่ตรงกับคำถามในบทบาท ยูกิโนะชิตะ ยูกิโนะ"
                 )
 
-    # Save concise turn in rolling channel memory (full file stays in channel_last_attachment)
     if channel_id is not None and answer:
         channel_memory[channel_id].append({"role": "user", "content": prompt[:2000]})
         channel_memory[channel_id].append({"role": "assistant", "content": answer[:3000]})
@@ -1050,7 +1315,7 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} on {platform.machine()} (Render + Modal + Groq Hybrid Edition)")
+    print(f"Logged in as {bot.user} on {platform.machine()} at {get_current_thai_datetime_str()}")
 
 
 @bot.event
