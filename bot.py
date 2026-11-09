@@ -32,10 +32,23 @@ from youtube_transcript_api.proxies import GenericProxyConfig
 import edge_tts
 import speech_recognition as sr
 from ddgs import DDGS
+import audioop
 
-# Optional live voice receive extension (discord-ext-voice-recv)
+# Optional live voice receive extension (discord-ext-voice-recv) + Critical OpusError Patch
 try:
     from discord.ext import voice_recv
+    import discord.ext.voice_recv.opus as _vr_opus
+
+    _orig_decode_packet = _vr_opus.PacketDecoder._decode_packet
+
+    def _safe_decode_packet(self, packet):
+        try:
+            return _orig_decode_packet(self, packet)
+        except Exception:
+            # Return 20ms of 48kHz stereo 16-bit PCM silence (3840 bytes) instead of crashing PacketRouter
+            return packet, b"\x00" * 3840
+
+    _vr_opus.PacketDecoder._decode_packet = _safe_decode_packet
     HAS_VOICE_RECV = True
 except ImportError:
     voice_recv = None
@@ -105,9 +118,12 @@ channel_memory = defaultdict(lambda: deque(maxlen=12))
 # Stores the most recent file/code attachment per channel so follow-up questions still see the full code
 channel_last_attachment = {}
 
-# Per-guild wake-word requirement toggle for live voice chat (True = require wake word)
-voice_wake_word_enabled = defaultdict(lambda: True)
-VOICE_WAKE_WORDS = ("ยูกิโนะ", "ยูกิน่อน", "yukino", "yukinon", "บอท", "ไต้ฝุ่น", "typhoon", "bot")
+# False = reply to all speech in voice channel; True = require wake word ("ยูกิโนะ", etc.)
+voice_wake_word_enabled = defaultdict(lambda: False)
+VOICE_WAKE_WORDS = (
+    "ยูกิโนะ", "ยูคิโนะ", "ยูกิน่อน", "ยูคิน่อน", "ยูกิ", "ยูคิ",
+    "yukino", "yukinon", "yuki", "บอท", "ไต้ฝุ่น", "typhoon", "bot"
+)
 THAI_CHAR_REGEX = re.compile(r"[\u0E00-\u0E7F]")
 
 # Explicit CGNAT block (100.64.0.0/10) where ipaddress.is_private and is_global are both False
@@ -623,64 +639,145 @@ def select_tts_voice(text: str) -> str:
     return TTS_VOICE_TH if THAI_CHAR_REGEX.search(text) else TTS_VOICE_EN
 
 
+def _split_tts_chunks(text: str, max_len: int = 180) -> list[str]:
+    """Splits text into <=180-char chunks for Google Translate TTS fallback."""
+    words = text.split(" ")
+    chunks, cur = [], ""
+    for w in words:
+        if len(cur) + len(w) + 1 <= max_len:
+            cur = f"{cur} {w}".strip()
+        else:
+            if cur:
+                chunks.append(cur)
+            cur = w[:max_len]
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+async def _fallback_google_tts_with_yukino_pitch(spoken_text: str, lang_code: str) -> bytes:
+    """
+    100% Free, keyless fallback when Microsoft blocks Render's datacenter IP on edge-tts.
+    Fetches MP3 audio from translate.googleapis.com and uses ffmpeg to apply Yukino's
+    +14Hz (~8% higher timbre) and poised cadence.
+    """
+    raw_mp3_parts = bytearray()
+    headers = {"User-Agent": "Mozilla/5.0"}
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
+        for chunk in _split_tts_chunks(spoken_text, max_len=180):
+            tts_url = (
+                "https://translate.googleapis.com/translate_tts"
+                f"?ie=UTF-8&client=tw-ob&tl={lang_code}&q={quote_plus(chunk)}"
+            )
+            async with session.get(tts_url, headers=headers) as resp:
+                if resp.status == 200:
+                    raw_mp3_parts.extend(await resp.read())
+
+    if not raw_mp3_parts:
+        return b""
+
+    def _apply_ffmpeg_yukino_voice(mp3_bytes: bytes) -> bytes:
+        # Raise pitch by ~7% (asetrate) while keeping natural speaking speed (atempo)
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-i", "pipe:0",
+                "-af", "asetrate=24000*1.07,aresample=24000,atempo=0.98",
+                "-f", "mp3", "pipe:1", "-loglevel", "error"
+            ],
+            input=mp3_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        return proc.stdout
+
+    try:
+        return await asyncio.to_thread(_apply_ffmpeg_yukino_voice, bytes(raw_mp3_parts))
+    except Exception:
+        return bytes(raw_mp3_parts)
+
+
 async def synthesize_tts_mp3_bytes(text: str) -> bytes:
     spoken_text = clean_text_for_speech(text)
     if not spoken_text:
         return b""
-    voice_name = select_tts_voice(spoken_text)
+    is_thai = bool(THAI_CHAR_REGEX.search(spoken_text))
+    voice_name = TTS_VOICE_TH if is_thai else TTS_VOICE_EN
+
+    # 1. Try Microsoft Edge Neural TTS first (with 8s timeout so datacenter IP blocks never hang)
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
         mp3_path = tmp_mp3.name
     try:
         communicate = edge_tts.Communicate(
-            text=spoken_text, voice=voice_name, rate=TTS_RATE, pitch=TTS_PITCH
+            text=spoken_text,
+            voice=voice_name,
+            rate=TTS_RATE,
+            pitch=TTS_PITCH,
+            proxy=DDGS_PROXY,
         )
-        await communicate.save(mp3_path)
-        with open(mp3_path, "rb") as f:
-            return f.read()
+        await asyncio.wait_for(communicate.save(mp3_path), timeout=8.0)
+        if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 256:
+            with open(mp3_path, "rb") as f:
+                return f.read()
+    except Exception as e:
+        print(f"edge-tts blocked/failed ({e}); switching to Google TTS + FFmpeg Yukino filter...")
     finally:
         try:
             os.remove(mp3_path)
         except OSError:
             pass
 
+    # 2. Automatic Fallback: Google Translate TTS + FFmpeg Yukino Pitch/Timbre Filter
+    lang_code = "th" if is_thai else "en"
+    return await _fallback_google_tts_with_yukino_pitch(spoken_text, lang_code)
+
 
 async def speak_in_voice_channel(guild: discord.Guild, text: str, fallback_channel=None):
     spoken_text = clean_text_for_speech(text)
     if not spoken_text:
         return
+
+    mp3_bytes = await synthesize_tts_mp3_bytes(spoken_text)
+    if not mp3_bytes:
+        print("TTS synthesis returned empty audio bytes.")
+        return
+
     if not guild or not guild.voice_client or not guild.voice_client.is_connected():
         if fallback_channel:
-            mp3_bytes = await synthesize_tts_mp3_bytes(spoken_text)
-            if mp3_bytes:
-                await fallback_channel.send(
-                    file=discord.File(io.BytesIO(mp3_bytes), filename="yukinon_voice.mp3")
-                )
+            await fallback_channel.send(
+                file=discord.File(io.BytesIO(mp3_bytes), filename="yukinon_voice.mp3")
+            )
         return
-    voice_name = select_tts_voice(spoken_text)
+
     async with tts_lock:
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
+            tmp_mp3.write(mp3_bytes)
             mp3_path = tmp_mp3.name
         try:
-            communicate = edge_tts.Communicate(
-                text=spoken_text, voice=voice_name, rate=TTS_RATE, pitch=TTS_PITCH
-            )
-            await communicate.save(mp3_path)
             vc = guild.voice_client
-            while vc.is_playing():
+            while vc and vc.is_connected() and vc.is_playing():
                 await asyncio.sleep(0.2)
+            if not vc or not vc.is_connected():
+                return
             done_event = asyncio.Event()
 
             def _after_play(err):
+                if err:
+                    print(f"FFmpeg voice playback error: {err}")
                 try:
                     os.remove(mp3_path)
                 except OSError:
                     pass
                 bot.loop.call_soon_threadsafe(done_event.set)
 
-            vc.play(discord.FFmpegPCMAudio(mp3_path, options="-loglevel panic"), after=_after_play)
+            vc.play(discord.FFmpegPCMAudio(mp3_path, options="-loglevel warning"), after=_after_play)
             await asyncio.wait_for(done_event.wait(), timeout=60)
         except Exception as e:
-            print(f"TTS playback error: {e}")
+            print(f"TTS voice channel playback error: {e}")
+            try:
+                os.remove(mp3_path)
+            except OSError:
+                pass
 
 
 def transcribe_wav_bytes_google_sync(wav_bytes: bytes) -> str:
@@ -705,6 +802,11 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
             form = aiohttp.FormData()
             form.add_field("file", wav_bytes, filename="speech.wav", content_type="audio/wav")
             form.add_field("model", GROQ_STT_MODEL)
+            form.add_field("language", "th")
+            form.add_field(
+                "prompt",
+                "ยูกิโนะ, ยูกิน่อน, Yukino, Yukinon, บอท, ไต้ฝุ่น, สวัสดี, วันนี้, กี่โมง, โค้ด"
+            )
             form.add_field("response_format", "json")
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as session:
@@ -1251,21 +1353,31 @@ async def query_local_ollama_chat(
     return answer, did_search
 
 
+WHISPER_HALLUCINATIONS = {
+    "ขอบคุณครับ", "ขอบคุณค่ะ", "โปรดติดตามตอนต่อไป", "พากย์ไทยโดย", "ซับไทยโดย",
+    "thank you", "thanks for watching", "you", ".", ".."
+}
+
+
 async def handle_spoken_voice_command(guild: discord.Guild, text_channel, speaker_name: str, spoken_text: str):
     cleaned = spoken_text.strip()
-    if not cleaned:
+    if not cleaned or cleaned.lower() in WHISPER_HALLUCINATIONS:
         return
+    print(f"[Voice STT] {speaker_name} spoke: '{cleaned}' (wake_word_required={voice_wake_word_enabled[guild.id]})")
+
     lower_txt = cleaned.lower()
     if voice_wake_word_enabled[guild.id]:
-        if not any(lower_txt.startswith(w) or w in lower_txt[:18] for w in VOICE_WAKE_WORDS):
+        if not any(lower_txt.startswith(w) or w in lower_txt[:22] for w in VOICE_WAKE_WORDS):
+            print(f"[Voice STT] Ignored '{cleaned}' (no wake word detected; use !wakeword off to disable).")
             return
+
     answer, _ = await query_local_ollama_chat(
-        f"{speaker_name} พูดว่า: {cleaned}",
+        f"{speaker_name} พูดในห้องเสียงว่า: {cleaned}",
         model=ACTIVE_FAST_MODEL,
         system_prompt=VOICE_SYSTEM_PROMPT,
         channel_id=text_channel.id if text_channel else None,
         temperature=0.55,
-        allow_agentic_search=True
+        allow_agentic_search=True,
     )
     if text_channel:
         await text_channel.send(f"**[🎙️ `{speaker_name}`]:** {cleaned}\n**[🔊 Yukinon Voice]:** {answer}")
@@ -1291,7 +1403,6 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
             self.last_spoken[user] = time.monotonic()
 
     def cleanup(self):
-        """Required abstract method for voice_recv.AudioSink; stops background monitor cleanly."""
         self.running = False
         if getattr(self, "monitor_task", None) and not self.monitor_task.done():
             self.monitor_task.cancel()
@@ -1300,25 +1411,37 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
 
     async def _silence_monitor_loop(self):
         while self.running:
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.35)
             now = time.monotonic()
             for user, last_t in list(self.last_spoken.items()):
-                if now - last_t >= 1.2:
+                if now - last_t >= 1.1:
                     pcm_bytes = bytes(self.user_buffers.pop(user, b""))
                     self.last_spoken.pop(user, None)
-                    if len(pcm_bytes) > 115000:
+                    # Require at least ~0.35s of audio (64,000 bytes at 48kHz stereo 16-bit)
+                    if len(pcm_bytes) >= 64000:
+                        try:
+                            # Skip pure silence / background hiss (RMS < 180)
+                            if audioop.rms(pcm_bytes, 2) < 180:
+                                continue
+                        except Exception:
+                            pass
                         bot.loop.create_task(self._process_user_pcm(user, pcm_bytes))
 
     async def _process_user_pcm(self, user, pcm_bytes: bytes):
-        wav_io = io.BytesIO()
-        with wave.open(wav_io, "wb") as wf:
-            wf.setnchannels(2)
-            wf.setsampwidth(2)
-            wf.setframerate(48000)
-            wf.writeframes(pcm_bytes)
-        spoken_text = await transcribe_wav_bytes_hybrid(wav_io.getvalue())
-        if spoken_text:
-            await handle_spoken_voice_command(self.guild, self.text_channel, user.display_name, spoken_text)
+        try:
+            # Convert 48kHz stereo PCM to 16kHz mono WAV via ffmpeg so Whisper upload is 6x smaller & faster
+            raw_wav_io = io.BytesIO()
+            with wave.open(raw_wav_io, "wb") as wf:
+                wf.setnchannels(2)
+                wf.setsampwidth(2)
+                wf.setframerate(48000)
+                wf.writeframes(pcm_bytes)
+            compact_wav = await asyncio.to_thread(convert_audio_bytes_to_wav_sync, raw_wav_io.getvalue())
+            spoken_text = await transcribe_wav_bytes_hybrid(compact_wav)
+            if spoken_text:
+                await handle_spoken_voice_command(self.guild, self.text_channel, user.display_name, spoken_text)
+        except Exception as e:
+            print(f"Voice PCM processing error: {e}")
 
 
 @bot.event
@@ -1405,6 +1528,24 @@ async def leave_voice(ctx):
             ctx.guild, "ถ้าหมดธุระแล้ว ฉันขอตัวกลับไปอ่านหนังสือต่อนะคะ ลาก่อนค่ะ"
         )
         await ctx.guild.voice_client.disconnect(force=True)
+
+@bot.command(name="wakeword")
+async def toggle_wakeword(ctx, mode: str = ""):
+    gid = ctx.guild.id if ctx.guild else 0
+    m = mode.strip().lower()
+    if m in ("on", "true", "1", "เปิด"):
+        voice_wake_word_enabled[gid] = True
+    elif m in ("off", "false", "0", "ปิด"):
+        voice_wake_word_enabled[gid] = False
+    else:
+        voice_wake_word_enabled[gid] = not voice_wake_word_enabled[gid]
+
+    state_th = (
+        "เปิดใช้งาน (ต้องเรียกชื่อ 'ยูกิโนะ' หรือ 'ยูกิน่อน' ก่อนพูด)"
+        if voice_wake_word_enabled[gid]
+        else "ปิดใช้งาน (พูดคุยได้ทันทีโดยไม่ต้องเรียกชื่อนำหน้า)"
+    )
+    await ctx.send(f"🎙️ โหมดคำเรียกขานในห้องเสียงตอนนี้: **{state_th}** ค่ะ")
 
 
 @bot.command(name="ask")

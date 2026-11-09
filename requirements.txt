@@ -1,6 +1,6 @@
 discord.py[voice]>=2.3,<3
 discord-ext-voice-recv
-edge-tts
+edge-tts>=7.3.0
 SpeechRecognition
 ddgs
 aiohttp
