@@ -125,21 +125,22 @@ ACTIVE_FAST_MODEL = os.getenv("OLLAMA_FAST_MODEL", "scb10x/typhoon2.5-qwen3-4b")
 ACTIVE_CODE_MODEL = os.getenv("OLLAMA_CODE_MODEL", "qwen2.5-coder:7b")
 ACTIVE_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "scb10x/typhoon-ocr1.5-3b")
 
-# Groq Free LPU API Settings (Active Production/Preview Models)
+# Groq Free LPU API Settings (Active Production Models)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_CODE_MODEL = os.getenv("GROQ_CODE_MODEL", "openai/gpt-oss-120b")
 GROQ_CHAT_FALLBACK_MODEL = os.getenv("GROQ_CHAT_FALLBACK_MODEL", "openai/gpt-oss-120b")
-GROQ_VISION_FALLBACK_MODEL = os.getenv("GROQ_VISION_FALLBACK_MODEL", "qwen/qwen3.8-27b")
+GROQ_VISION_FALLBACK_MODEL = os.getenv("GROQ_VISION_FALLBACK_MODEL", "qwen/qwen3.6-27b")
 GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")
 
-# Cloudflare Workers AI Free Tier (10,000 Neurons/day)
+# Cloudflare Workers AI Free Tier (10,000 Neurons/day for FLUX Image Gen & Llama-4-Scout Vision)
 CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "").strip()
 CF_API_TOKEN = os.getenv("CF_API_TOKEN", "").strip()
 CF_IMAGE_MODEL = os.getenv("CF_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell").strip()
+CF_VISION_MODEL = os.getenv("CF_VISION_MODEL", "@cf/meta/llama-4-scout-17b-16e-instruct").strip()
 
-# Google AI Studio Free Tier (Auto-discovers newest Flash model if default is deprecated)
+# Google AI Studio Free Tier (Defaults directly to working gemini-3-flash-preview)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_SEARCH_MODEL = os.getenv("GEMINI_SEARCH_MODEL", "gemini-3.8-flash").strip()
+GEMINI_SEARCH_MODEL = os.getenv("GEMINI_SEARCH_MODEL", "gemini-3-flash-preview").strip()
 
 # Optional Free Tavily Search API Key
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
@@ -607,24 +608,24 @@ def fetch_webpage_sync(url: str, max_chars: int = 14000) -> str:
     return extracted[:max_chars]
 
 
-# Runtime cache for dynamically discovered active model IDs when a default model is deprecated
+# Runtime cache for dynamically discovered active model IDs
 _ACTIVE_GEMINI_MODEL_CACHE = GEMINI_SEARCH_MODEL
 _ACTIVE_GROQ_VISION_CACHE = GROQ_VISION_FALLBACK_MODEL
 
 GEMINI_MODEL_HINT_REGEX = re.compile(r"models/([a-zA-Z0-9._-]+)")
+# Exclude non-text/zero-quota sub-models (-image, -lite, -tts, -audio, -live, -embedding)
+GEMINI_EXCLUDED_SUBSTRINGS = ("image", "lite", "tts", "audio", "live", "embedding", "aqa", "bison", "gecko")
 
 
 async def _discover_active_gemini_flash_model() -> list[str]:
     """
-    Queries Google AI Studio's live GET /v1beta/models endpoint to find all active
-    Flash/Vision models supported by your API key, ordered newest-first.
+    Prioritizes 'gemini-3-flash-preview' first and filters out '-image' / '-lite' models
+    so Gemini never wastes time on 429/400 errors.
     """
     candidates = [
         _ACTIVE_GEMINI_MODEL_CACHE,
-        "gemini-3.8-flash",
-        "gemini-3.0-flash",
+        "gemini-3-flash-preview",
         "gemini-flash-latest",
-        "gemini-2.5-flash",
         "gemini-2.0-flash",
     ]
     if not GEMINI_API_KEY:
@@ -641,19 +642,17 @@ async def _discover_active_gemini_flash_model() -> list[str]:
                     api_models = []
                     for m in data.get("models") or []:
                         name = (m.get("name") or "").replace("models/", "")
+                        lower_name = name.lower()
                         methods = m.get("supportedGenerationMethods") or []
-                        if "generateContent" in methods and "flash" in name.lower():
-                            if "tts" not in name.lower() and "audio" not in name.lower():
+                        if "generateContent" in methods and "flash" in lower_name:
+                            if not any(bad in lower_name for bad in GEMINI_EXCLUDED_SUBSTRINGS):
                                 api_models.append(name)
-                    # Sort newest version numbers first
-                    api_models.sort(reverse=True)
                     for m_name in api_models:
                         if m_name not in candidates:
-                            candidates.insert(1, m_name)
+                            candidates.append(m_name)
     except Exception as e:
         print(f"Gemini model auto-discovery warning: {e}")
 
-    # Deduplicate while preserving priority order
     seen = set()
     return [x for x in candidates if x and not (x in seen or seen.add(x))]
 
@@ -661,12 +660,6 @@ async def _discover_active_gemini_flash_model() -> list[str]:
 async def call_gemini_generate_content_self_healing(
     payload: dict, timeout_sec: int = 45
 ) -> dict | None:
-    """
-    Calls Google AI Studio generateContent with automatic self-healing:
-    1) Tries the cached active Gemini model.
-    2) If HTTP 404/400 occurs, extracts any suggested replacement model from Google's error message.
-    3) Falls back to live model discovery via GET /v1beta/models and caches the first working model!
-    """
     global _ACTIVE_GEMINI_MODEL_CACHE
     if not GEMINI_API_KEY:
         return None
@@ -680,6 +673,8 @@ async def call_gemini_generate_content_self_healing(
             model_id = candidate_models[idx]
             idx += 1
             if not model_id or model_id in tried:
+                continue
+            if any(bad in model_id.lower() for bad in GEMINI_EXCLUDED_SUBSTRINGS):
                 continue
             tried.add(model_id)
 
@@ -696,57 +691,113 @@ async def call_gemini_generate_content_self_healing(
 
                 if status == 200:
                     if _ACTIVE_GEMINI_MODEL_CACHE != model_id:
-                        print(f"[Self-Healing Gemini] Switched active model to '{model_id}'")
+                        print(f"[Self-Healing Gemini] Active model locked to '{model_id}'")
                         _ACTIVE_GEMINI_MODEL_CACHE = model_id
                     return json.loads(body_text)
 
-                # If thinkingConfig is rejected by a specific model version, strip it and retry once
                 if status == 400 and "thinkingConfig" in body_text and attempt == 0:
                     work_payload.get("generationConfig", {}).pop("thinkingConfig", None)
                     continue
 
-                # If model is deprecated/404, check if Google's error message names the replacement model
                 if status in (404, 400):
                     hint_matches = GEMINI_MODEL_HINT_REGEX.findall(body_text)
                     for hinted_model in hint_matches:
-                        if hinted_model != model_id and hinted_model not in tried:
-                            print(f"[Self-Healing Gemini] 404 suggested '{hinted_model}', retrying...")
+                        if (
+                            hinted_model != model_id
+                            and hinted_model not in tried
+                            and not any(b in hinted_model.lower() for b in GEMINI_EXCLUDED_SUBSTRINGS)
+                        ):
                             candidate_models.insert(idx, hinted_model)
-                    print(f"Gemini model '{model_id}' unavailable (HTTP {status}); trying next model...")
+                    print(f"Gemini model '{model_id}' unavailable (HTTP {status}); trying next...")
                     break
                 else:
-                    print(f"Gemini HTTP {status} on '{model_id}': {body_text[:200]}")
+                    print(f"Gemini HTTP {status} on '{model_id}'; trying next...")
                     break
 
     return None
 
 
 async def _discover_active_groq_vision_models() -> list[str]:
-    """Queries Groq's live /openai/v1/models endpoint to find active vision-capable models."""
+    """Returns active Groq LPU Vision models ordered by accuracy and speed."""
     candidates = [
         _ACTIVE_GROQ_VISION_CACHE,
+        "qwen/qwen3.6-27b",
         "meta-llama/llama-4-scout-17b-16e-instruct",
-        "meta-llama/llama-4-maverick-17b-128e-instruct",
-        "qwen/qwen3.8-27b",
     ]
     if not GROQ_API_KEY:
         return candidates
     models_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/models")
     try:
         headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
             async with session.get(models_url, headers=headers) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     for m in data.get("data") or []:
                         mid = m.get("id") or ""
-                        if any(k in mid.lower() for k in ("vision", "llama-4", "qwen3", "pixtral")):
+                        if any(k in mid.lower() for k in ("qwen3.6", "llama-4-scout", "vision")):
                             if mid not in candidates:
                                 candidates.append(mid)
     except Exception:
         pass
     seen = set()
     return [x for x in candidates if x and not (x in seen or seen.add(x))]
+
+
+async def _call_cloudflare_vision_chat(
+    prompt_text: str, mime_type: str, b64_img: str, max_tokens: int = 3072
+) -> str:
+    """
+    Calls Cloudflare Workers AI Vision (@cf/meta/llama-4-scout-17b-16e-instruct)
+    via Cloudflare's OpenAI-compatible /ai/v1/chat/completions endpoint.
+    """
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+        return ""
+    cf_chat_url = clean_url(
+        f"{HTTPS}api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1/chat/completions"
+    )
+    headers = {
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    vision_models = [CF_VISION_MODEL, "@cf/meta/llama-4-scout-17b-16e-instruct", "@cf/google/gemma-4-26b-a4b-it"]
+    seen = set()
+
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40)) as session:
+        for cf_mod in vision_models:
+            if not cf_mod or cf_mod in seen:
+                continue
+            seen.add(cf_mod)
+            payload = {
+                "model": cf_mod,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt_text},
+                            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
+                        ],
+                    }
+                ],
+                "temperature": 0.1,
+                "max_tokens": max_tokens,
+            }
+            try:
+                async with session.post(cf_chat_url, headers=headers, json=payload) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        choices = data.get("choices") or []
+                        if choices:
+                            content = (choices[0].get("message") or {}).get("content") or ""
+                            content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+                            if content:
+                                return content
+                    else:
+                        err_txt = await resp.text()
+                        print(f"Cloudflare Vision ({cf_mod}) HTTP {resp.status}: {err_txt[:160]}")
+            except Exception as e:
+                print(f"Cloudflare Vision ({cf_mod}) warning: {e}")
+    return ""
 
 
 def _search_google_ai_studio_grounded_sync(query: str) -> str:
@@ -770,9 +821,9 @@ def _search_google_ai_studio_grounded_sync(query: str) -> str:
     }
     models_to_try = [
         _ACTIVE_GEMINI_MODEL_CACHE,
-        "gemini-3.8-flash",
+        "gemini-3-flash-preview",
         "gemini-flash-latest",
-        "gemini-2.5-flash",
+        "gemini-2.0-flash",
     ]
     seen = set()
     for model_id in models_to_try:
@@ -1247,6 +1298,7 @@ def fetch_youtube_transcript_sync(video_id: str, max_chars: int = 20000) -> str:
 
 
 async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> str:
+    global _ACTIVE_GROQ_VISION_CACHE
     b64_img = base64.b64encode(raw_bytes).decode("utf-8")
     fname_lower = filename.lower()
     if fname_lower.endswith(".png"):
@@ -1256,53 +1308,79 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
     else:
         mime_type = "image/jpeg"
 
-    if GROQ_API_KEY:
-        try:
-            groq_vision_payload = {
-                "model": GROQ_VISION_FALLBACK_MODEL,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    "You are a high-precision bilingual Thai and English OCR engine. "
-                                    "Transcribe ALL visible text in the image verbatim. "
-                                    "Pay careful attention to Thai tone marks (วรรณยุกต์), vowels (สระ), "
-                                    "and visually similar Thai consonants (ก/ภ/ถ, ข/ช, ค/ด/ต, พ/ผ/ฝ/ฟ, ร/ธ) "
-                                    "so every word is spelled accurately. Also briefly note key UI or visual elements."
-                                ),
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:{mime_type};base64,{b64_img}"},
-                            },
-                        ],
-                    }
-                ],
-                "temperature": 0.0,
-                "max_tokens": 4096,
-            }
-            headers = {
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            }
-            chat_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/chat/completions")
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
-                async with session.post(chat_url, headers=headers, json=groq_vision_payload) as resp:
-                    if resp.status == 200:
-                        g_data = await resp.json()
-                        content = g_data["choices"][0]["message"]["content"].strip()
-                        content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
-                        if content:
-                            return content
-                    else:
-                        err_txt = await resp.text()
-                        print(f"Groq Vision HTTP {resp.status}: {err_txt}")
-        except Exception as e:
-            print(f"Groq Vision primary warning (falling back to Modal Typhoon OCR): {e}")
+    ocr_prompt = (
+        "You are a high-precision multilingual (Thai, Japanese, English) OCR engine. "
+        "Transcribe ALL visible text in the image verbatim. "
+        "Pay careful attention to Thai tone marks (วรรณยุกต์), vowels (สระ), "
+        "and visually similar Thai consonants (ก/ภ/ถ, ข/ช, ค/ด/ต, พ/ผ/ฝ/ฟ, ร/ธ) "
+        "so every word is spelled accurately. Also briefly note key UI or visual elements."
+    )
 
+    # Tier 1: Groq LPU Vision (qwen/qwen3.6-27b -> llama-4-scout-17b-16e-instruct)
+    if GROQ_API_KEY:
+        groq_candidates = await _discover_active_groq_vision_models()
+        chat_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/chat/completions")
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=35)) as session:
+            for g_mod in groq_candidates:
+                try:
+                    groq_vision_payload = {
+                        "model": g_mod,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": ocr_prompt},
+                                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
+                                ],
+                            }
+                        ],
+                        "temperature": 0.0,
+                        "max_tokens": 4096,
+                    }
+                    async with session.post(chat_url, headers=headers, json=groq_vision_payload) as resp:
+                        if resp.status == 200:
+                            _ACTIVE_GROQ_VISION_CACHE = g_mod
+                            g_data = await resp.json()
+                            content = g_data["choices"][0]["message"]["content"].strip()
+                            content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+                            if content:
+                                return content
+                        else:
+                            err_txt = await resp.text()
+                            print(f"Groq Vision OCR ({g_mod}) HTTP {resp.status}: {err_txt[:150]}")
+                except Exception as e:
+                    print(f"Groq Vision OCR ({g_mod}) warning: {e}")
+
+    # Tier 2: Cloudflare Workers AI Vision (@cf/meta/llama-4-scout-17b-16e-instruct)
+    cf_ocr = await _call_cloudflare_vision_chat(ocr_prompt, mime_type, b64_img)
+    if cf_ocr:
+        return cf_ocr
+
+    # Tier 3: Google AI Studio Backup (gemini-3-flash-preview)
+    if GEMINI_API_KEY:
+        g_payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": ocr_prompt},
+                        {"inlineData": {"mimeType": mime_type, "data": b64_img}},
+                    ]
+                }
+            ],
+            "generationConfig": {"temperature": 0.0},
+        }
+        g_data = await call_gemini_generate_content_self_healing(g_payload, timeout_sec=30)
+        if g_data:
+            parts = ((g_data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+            g_text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+            if g_text:
+                return g_text
+
+    # Tier 4: Modal T4 GPU (scb10x/typhoon-ocr1.5-3b)
     payload = {
         "model": ACTIVE_VISION_MODEL,
         "messages": [
@@ -1805,6 +1883,18 @@ def _prepare_manga_image_for_vision(raw_bytes: bytes) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
+def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
+    """Extracts and validates the JSON {'summary': ..., 'bubbles': [...]} payload from any vision model."""
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", raw_text).strip()
+    cleaned = re.sub(r"^```(?:json)?|```$", "", cleaned).strip()
+    json_match = re.search(r"\{[\s\S]*\}", cleaned)
+    target = json_match.group(0) if json_match else cleaned
+    parsed = json.loads(target)
+    bubbles = parsed.get("bubbles") or []
+    summary = parsed.get("summary") or ""
+    return bubbles, summary
+
+
 async def extract_and_translate_manga_bubbles(
     raw_bytes: bytes, filename: str, target_lang_name: str
 ) -> tuple[list[dict], str]:
@@ -1823,7 +1913,7 @@ CRITICAL RULES:
 3. Speech Bubble Bounding Boxes (`box_2d`):
    - For each speech bubble, provide `box_2d` as `[ymin, xmin, ymax, xmax]` normalized from 0 to 1000.
    - `box_2d` must cover the white interior of the speech bubble where the Japanese text is written (if a bubble has two connected ovals for one sentence, cover both ovals).
-4. Return ONLY valid JSON matching this exact structure:
+4. Return ONLY valid JSON matching this exact structure (no markdown explanation outside JSON):
 {{
   "summary": "Brief 1-sentence scene context",
   "bubbles": [
@@ -1838,7 +1928,76 @@ CRITICAL RULES:
 }}
 """.strip()
 
-    # Tier 1: Self-Healing Google AI Studio (Automatically switches to gemini-3.8-flash or newest active Flash model)
+    fallback_bubbles_no_boxes = []
+    fallback_summary = ""
+
+    # Tier 1 (Primary - Ultra-Fast LPU): Groq Vision (qwen/qwen3.6-27b -> llama-4-scout-17b-16e-instruct)
+    if GROQ_API_KEY:
+        groq_vision_candidates = await _discover_active_groq_vision_models()
+        chat_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/chat/completions")
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40)) as session:
+            for g_model in groq_vision_candidates:
+                try:
+                    groq_payload = {
+                        "model": g_model,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": manga_system_instruction},
+                                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
+                                ],
+                            }
+                        ],
+                        "temperature": 0.1,
+                        "max_tokens": 4096,
+                    }
+                    async with session.post(chat_url, headers=headers, json=groq_payload) as resp:
+                        if resp.status == 200:
+                            _ACTIVE_GROQ_VISION_CACHE = g_model
+                            g_data = await resp.json()
+                            content = g_data["choices"][0]["message"]["content"].strip()
+                            bubbles, summary = _parse_manga_bubbles_json(content)
+                            if bubbles:
+                                has_boxes = any(
+                                    isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4
+                                    for b in bubbles
+                                )
+                                if has_boxes:
+                                    print(f"[Manga Vision] Completed via Tier 1 Groq ({g_model})")
+                                    return bubbles, summary
+                                fallback_bubbles_no_boxes = bubbles
+                                fallback_summary = summary
+                        else:
+                            err_txt = await resp.text()
+                            print(f"Groq Manga Vision ({g_model}) HTTP {resp.status}: {err_txt[:150]}")
+                except Exception as e:
+                    print(f"Groq Manga Vision ({g_model}) warning: {e}")
+
+    # Tier 2 (Secondary - Edge GPU): Cloudflare Workers AI Vision (@cf/meta/llama-4-scout-17b-16e-instruct)
+    try:
+        cf_content = await _call_cloudflare_vision_chat(manga_system_instruction, mime_type, b64_img)
+        if cf_content:
+            bubbles, summary = _parse_manga_bubbles_json(cf_content)
+            if bubbles:
+                has_boxes = any(
+                    isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4
+                    for b in bubbles
+                )
+                if has_boxes:
+                    print("[Manga Vision] Completed via Tier 2 Cloudflare Workers AI")
+                    return bubbles, summary
+                if not fallback_bubbles_no_boxes:
+                    fallback_bubbles_no_boxes = bubbles
+                    fallback_summary = summary
+    except Exception as e:
+        print(f"Cloudflare Manga Vision warning: {e}")
+
+    # Tier 3 (Backup - High-Precision Box_2D): Google AI Studio (gemini-3-flash-preview)
     if GEMINI_API_KEY:
         gemini_payload = {
             "contents": [
@@ -1862,62 +2021,17 @@ CRITICAL RULES:
                     ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
                 )
                 raw_json_str = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
-                raw_json_str = re.sub(r"^```(?:json)?|```$", "", raw_json_str).strip()
-                json_match = re.search(r"\{[\s\S]*\}", raw_json_str)
-                parsed = json.loads(json_match.group(0) if json_match else raw_json_str)
-                bubbles = parsed.get("bubbles") or []
-                summary = parsed.get("summary") or ""
+                bubbles, summary = _parse_manga_bubbles_json(raw_json_str)
                 if bubbles:
+                    print(f"[Manga Vision] Completed via Tier 3 Gemini ({_ACTIVE_GEMINI_MODEL_CACHE})")
                     return bubbles, summary
         except Exception as e:
-            print(f"Gemini Manga Translate parsing warning (falling back to Groq Vision): {e}")
+            print(f"Gemini Manga Vision backup warning: {e}")
 
-    # Tier 2: Self-Healing Groq Vision (Tries active vision models discovered on your Groq account)
-    if GROQ_API_KEY:
-        groq_vision_candidates = await _discover_active_groq_vision_models()
-        chat_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/chat/completions")
-        headers = {
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
-            for g_model in groq_vision_candidates:
-                try:
-                    groq_payload = {
-                        "model": g_model,
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": manga_system_instruction},
-                                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
-                                ],
-                            }
-                        ],
-                        "temperature": 0.1,
-                        "max_tokens": 4096,
-                    }
-                    async with session.post(chat_url, headers=headers, json=groq_payload) as resp:
-                        if resp.status == 200:
-                            _ACTIVE_GROQ_VISION_CACHE = g_model
-                            g_data = await resp.json()
-                            content = g_data["choices"][0]["message"]["content"].strip()
-                            content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
-                            json_match = re.search(r"\{[\s\S]*\}", content)
-                            if json_match:
-                                parsed = json.loads(json_match.group(0))
-                                bubbles = parsed.get("bubbles") or []
-                                if bubbles:
-                                    return bubbles, parsed.get("summary") or ""
-                            elif content:
-                                return [], content
-                        else:
-                            err_txt = await resp.text()
-                            print(f"Groq Manga Vision ({g_model}) HTTP {resp.status}: {err_txt[:160]}")
-                except Exception as e:
-                    print(f"Groq Manga Vision ({g_model}) warning: {e}")
+    if fallback_bubbles_no_boxes:
+        return fallback_bubbles_no_boxes, fallback_summary
 
-    # Tier 3: Guaranteed OCR + LLM Text Translation Fallback (Modal Typhoon OCR -> LLM Localizer)
+    # Tier 4 (Final Fallback): OCR + LLM Text Translation
     try:
         raw_ocr_text = await extract_image_via_transient_ocr(raw_bytes, filename)
         if raw_ocr_text and "[OCR could not" not in raw_ocr_text:
@@ -1938,7 +2052,7 @@ CRITICAL RULES:
             if tl_text:
                 return [], tl_text
     except Exception as e:
-        print(f"Manga Tier 3 OCR+LLM fallback error: {e}")
+        print(f"Manga Tier 4 OCR+LLM fallback error: {e}")
 
     return [], ""
 
