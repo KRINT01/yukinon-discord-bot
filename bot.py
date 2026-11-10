@@ -780,7 +780,7 @@ async def synthesize_tts_mp3_bytes(text: str) -> bytes:
     return await _fallback_google_tts_with_yukino_pitch(spoken_text, lang_code)
 
 
-aasync def speak_in_voice_channel(guild: discord.Guild, text: str, fallback_channel=None):
+async def speak_in_voice_channel(guild: discord.Guild, text: str, fallback_channel=None):
     spoken_text = clean_text_for_speech(text)
     if not spoken_text:
         return
