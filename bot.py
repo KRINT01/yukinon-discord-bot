@@ -1392,10 +1392,10 @@ async def _call_modal_ollama_chat(messages: list, ollama_model: str, temperature
 # CLOUDFLARE WORKERS AI IMAGE GENERATION (4-TIER GUARANTEED ENGLISH TRANSLATION)
 # ==============================================================================
 def _clean_conversational_image_prefix(raw_text: str) -> str:
-    """Strips conversational Thai/English prefixes ('ลองวาดรูป...ดูหน่อย') to isolate the subject."""
+    """Strips conversational Thai/English prefixes ('ลองวาดรูป...ดูหน่อย') to isolate the exact user prompt."""
     cleaned = raw_text.strip()
     cleaned = re.sub(
-        r"^(?:ยูกิโนะ|ยูกิน่อน|บอท)?\s*(?:ช่วย|ลอง|ช่วยลอง|อยากให้)?\s*"
+        r"^(?:ยูกิโนะ|ยูกิน่อน|บอท)?\s*(?:ช่วย|ลอง|ช่วยลอง|อยากให้|ไหนลอง)?\s*"
         r"(?:วาดรูป|สร้างรูป|เจนรูป|ขอรูป|วาดภาพ|สร้างภาพ|เจนภาพ|"
         r"draw\s+(?:an?\s+|me\s+an?\s+)?(?:image|picture|illustration)\s+(?:of\s+)?|"
         r"generate\s+(?:an?\s+)?(?:image|picture)\s+(?:of\s+)?)\s*",
@@ -1403,56 +1403,61 @@ def _clean_conversational_image_prefix(raw_text: str) -> str:
         cleaned,
         flags=re.IGNORECASE,
     ).strip()
-    cleaned = re.sub(r"\s*(?:ให้หน่อย|ดูหน่อย|ให้ดูหน่อย|ให้ที|หน่อยค่ะ|หน่อยครับ|หน่อยนะ)\s*$", "", cleaned).strip()
+    cleaned = re.sub(
+        r"\s*(?:ให้ดูหน่อย|ให้หน่อย|ดูหน่อย|ให้ที|ให้ดูที|ดูที|หน่อย)?\s*(?:นะคะ|นะครับ|ค่ะ|ครับ|นะ|จ้ะ|จ๊ะ|สิ)?\s*$",
+        "",
+        cleaned,
+    ).strip()
     return cleaned or raw_text.strip()
 
 
 async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: bool = False) -> str:
     """
-    4-Tier Guaranteed Thai->English Translator for FLUX models (since FLUX CLIP/T5 cannot read Thai script):
-    Tier 1: Groq LPU (openai/gpt-oss-120b)
-    Tier 2: Google AI Studio (gemini-2.5-flash)
-    Tier 3: Modal GPU Ollama (scb10x/typhoon2.5-qwen3-4b)
-    Tier 4: Keyless Google Translate API (translate.googleapis.com - 100% guaranteed fallback)
+    Translates Thai image prompts into English literally and faithfully WITHOUT adding
+    unrequested objects, lighting, or changing colors/subjects:
+    - Tier 1: Keyless Google Translate NMT (instant, literal translation, zero hallucinated words)
+    - Tier 2: Google AI Studio (gemini-2.5-flash) with strict literal translation rule
+    - Tier 3: Modal GPU Ollama (scb10x/typhoon2.5-qwen3-4b - native Thai LLM) with strict literal rule
+    - Tier 4: Groq LPU (openai/gpt-oss-120b) with strict literal rule
     """
-    style_instruction = (
-        "Format the output strictly as a 2D Japanese anime illustration prompt "
-        "(include tags: '2D anime key visual, cel-shaded anime art style, crisp lineart, "
-        "vibrant colors, high-detail anime background, not 3D, not photorealistic'). "
-        if is_anime_style
-        else "Include clear subject details, lighting, setting, and high-quality visual descriptors. "
-    )
-    sys_msg = (
-        "You are an expert English prompt engineer for the FLUX text-to-image model. "
-        "Translate the user's image description into a clear, vivid, accurate English image generation prompt. "
-        "Make sure the main subject (e.g., an orange tabby cat sitting at a desk using a computer) is described "
-        f"explicitly in the very first sentence. {style_instruction}"
-        "Output ONLY the English prompt in plain text, with no quotes or explanations."
+    prefix = "2D anime illustration, " if is_anime_style else ""
+
+    # Tier 1: Keyless Google Translate NMT (100% literal translation; never adds extra words or changes colors)
+    try:
+        gt_url = f"{GOOGLE_TRANSLATE_SINGLE_URL}?client=gtx&sl=th&tl=en&dt=t&q={quote_plus(raw_prompt)}"
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get(gt_url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                if resp.status == 200:
+                    gt_data = await resp.json(content_type=None)
+                    translated_segments = [seg[0] for seg in (gt_data[0] or []) if seg and seg[0]]
+                    en_literal = "".join(translated_segments).strip()
+                    if en_literal and not THAI_CHAR_REGEX.search(en_literal):
+                        return f"{prefix}{en_literal}"
+    except Exception as e:
+        print(f"FLUX Prompt Translate Tier 1 (Google Translate) warning: {e}")
+
+    # Strict literal instruction for LLM fallbacks (forbids adding extra words or changing colors/subjects)
+    strict_sys_msg = (
+        "You are a strict, literal Thai-to-English translator. "
+        "Translate the user's Thai text into English accurately and faithfully.\n"
+        "CRITICAL RULES:\n"
+        "1. Translate ONLY the words present in the original Thai text.\n"
+        "2. Do NOT add any extra words, adjectives, lighting, furniture, or background details.\n"
+        "3. Do NOT change colors or subjects (for example, 'แมวส้ม' means 'orange cat').\n"
+        "4. Output ONLY the direct English translation in plain text, with no quotes or explanations."
     )
     trans_messages = [
-        {"role": "system", "content": sys_msg},
+        {"role": "system", "content": strict_sys_msg},
         {"role": "user", "content": raw_prompt},
     ]
-
-    # Tier 1: Groq LPU
-    if GROQ_API_KEY:
-        try:
-            res = await _call_groq_chat(trans_messages, GROQ_CHAT_FALLBACK_MODEL, 0.3, is_coding=False)
-            if res and not THAI_CHAR_REGEX.search(res):
-                return res.strip(' "\'')
-        except Exception as e:
-            print(f"FLUX Prompt Translate Tier 1 (Groq) warning: {e}")
 
     # Tier 2: Google AI Studio (Gemini 2.5 Flash)
     if GEMINI_API_KEY:
         try:
-            g_url = (
-                f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{GEMINI_SEARCH_MODEL}:generateContent?key={GEMINI_API_KEY}"
-            )
+            g_url = f"{GEMINI_API_BASE_URL}/{GEMINI_SEARCH_MODEL}:generateContent?key={GEMINI_API_KEY}"
             g_payload = {
-                "contents": [{"parts": [{"text": f"{sys_msg}\n\nUser request: {raw_prompt}"}]}],
-                "generationConfig": {"temperature": 0.2},
+                "contents": [{"parts": [{"text": f"{strict_sys_msg}\n\nThai text: {raw_prompt}"}]}],
+                "generationConfig": {"temperature": 0.0},
             }
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
                 async with session.post(g_url, json=g_payload) as resp:
@@ -1461,28 +1466,26 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
                         parts = ((g_data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
                         g_txt = " ".join(p.get("text", "") for p in parts if p.get("text")).strip(' "\'')
                         if g_txt and not THAI_CHAR_REGEX.search(g_txt):
-                            return g_txt
+                            return f"{prefix}{g_txt}"
         except Exception as e:
             print(f"FLUX Prompt Translate Tier 2 (Gemini) warning: {e}")
 
-    # Tier 3: Keyless Google Translate API (Instant & guaranteed to remove all Thai characters)
+    # Tier 3: Modal GPU Ollama (scb10x/typhoon2.5-qwen3-4b - native Thai LLM)
     try:
-        gt_url = (
-            "https://translate.googleapis.com/translate_a/single"
-            f"?client=gtx&sl=auto&tl=en&dt=t&q={quote_plus(raw_prompt)}"
-        )
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-            async with session.get(gt_url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
-                if resp.status == 200:
-                    gt_data = await resp.json(content_type=None)
-                    translated_segments = [seg[0] for seg in (gt_data[0] or []) if seg and seg[0]]
-                    en_basic = "".join(translated_segments).strip()
-                    if en_basic:
-                        if is_anime_style:
-                            return f"2D anime key visual, cel-shaded anime illustration, crisp lineart, {en_basic}, high detail"
-                        return f"{en_basic}, highly detailed, warm lighting, sharp focus, 4k illustration"
+        res = await _call_modal_ollama_chat(trans_messages, ACTIVE_FAST_MODEL, 0.0)
+        if res and not THAI_CHAR_REGEX.search(res):
+            return f"{prefix}{res.strip(' \"\'')}"
     except Exception as e:
-        print(f"FLUX Prompt Translate Tier 3 (Google Translate) warning: {e}")
+        print(f"FLUX Prompt Translate Tier 3 (Modal Typhoon) warning: {e}")
+
+    # Tier 4: Groq LPU
+    if GROQ_API_KEY:
+        try:
+            res = await _call_groq_chat(trans_messages, GROQ_CHAT_FALLBACK_MODEL, 0.0, is_coding=False)
+            if res and not THAI_CHAR_REGEX.search(res):
+                return f"{prefix}{res.strip(' \"\'')}"
+        except Exception as e:
+            print(f"FLUX Prompt Translate Tier 4 (Groq) warning: {e}")
 
     return raw_prompt
 
@@ -1571,15 +1574,15 @@ async def generate_image_cloudflare_flux(user_prompt: str) -> tuple[bytes, str, 
 
 
 def build_yukino_image_caption(subject_text: str, formatted_en_prompt: str) -> str:
-    """Generates an in-character Yukino Yukinoshita caption (gets slightly flustered if it's a cat!)."""
+    """Generates an in-character Yukino Yukinoshita caption without truncating the prompt mid-word."""
     if CAT_TOPIC_REGEX.search(subject_text) or CAT_TOPIC_REGEX.search(formatted_en_prompt):
         return (
             f"ฉะ... ฉันไม่ได้ตั้งใจวาดเพราะชอบแมวเป็นพิเศษหรอกนะคะ แค่ทำตามคำขอของคุณตามหน้าที่เท่านั้นแหละค่ะ (`{subject_text}`)\n"
-            f"-# Prompt: *{formatted_en_prompt[:220]}*"
+            f"-# Prompt: *{formatted_en_prompt[:500]}*"
         )
     return (
-        f"ฉันร่างภาพ `{subject_text}` ออกมาให้ตามที่คุณต้องการแล้วค่ะ ลองตรวจสอบดูนะคะ\n"
-        f"-# Prompt: *{formatted_en_prompt[:220]}*"
+        f"ฉันวาดภาพ `{subject_text}` ออกมาให้ตามที่คุณต้องการแล้วค่ะ ลองตรวจสอบดูนะคะ\n"
+        f"-# Prompt: *{formatted_en_prompt[:500]}*"
     )
 
 
