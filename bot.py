@@ -32,23 +32,71 @@ from youtube_transcript_api.proxies import GenericProxyConfig
 import edge_tts
 import speech_recognition as sr
 from ddgs import DDGS
+import logging
 import audioop
 
-# Optional live voice receive extension (discord-ext-voice-recv) + Critical OpusError Patch
+try:
+    import davey
+except ImportError:
+    davey = None
+
+# Silence noisy RTCP SenderReport logs (type=200) from discord-ext-voice-recv
+logging.getLogger("discord.ext.voice_recv").setLevel(logging.WARNING)
+
+# Save discord.py 2.7's native Voice WebSocket handler BEFORE voice_recv overwrites it
+import discord.gateway as _dpy_gateway
+_NATIVE_DPY_VOICE_WS_RECEIVED = _dpy_gateway.DiscordVoiceWebSocket.received_message
+
 try:
     from discord.ext import voice_recv
     import discord.ext.voice_recv.opus as _vr_opus
 
-    _orig_decode_packet = _vr_opus.PacketDecoder._decode_packet
+    _VOICE_RECV_WS_RECEIVED = _dpy_gateway.DiscordVoiceWebSocket.received_message
 
-    def _safe_decode_packet(self, packet):
+    async def _dpy27_dave_compatible_received_message(self, msg):
+        """
+        1) Runs discord.py 2.7's native handler first so seq_ack and DAVE E2EE opcodes (21-31)
+           complete properly (allowing outgoing bot TTS audio to be heard!).
+        2) Forwards only SSRC/speaking events (op 5, 12, 13, 18, 20) to voice_recv.
+        """
+        await _NATIVE_DPY_VOICE_WS_RECEIVED(self, dict(msg) if isinstance(msg, dict) else msg)
+        if isinstance(msg, dict) and msg.get("op") in (5, 12, 13, 18, 20):
+            try:
+                vr_msg = dict(msg)
+                vr_msg.pop("seq", None)
+                await _VOICE_RECV_WS_RECEIVED(self, vr_msg)
+            except Exception:
+                pass
+
+    _dpy_gateway.DiscordVoiceWebSocket.received_message = _dpy27_dave_compatible_received_message
+
+    def _safe_dave_decode_packet(self, packet):
+        """
+        Decrypts incoming RTP packets through discord.py 2.7's active DAVE MLS session
+        before passing to libopus, and returns empty bytes b'' (never static/silence) on error.
+        """
+        if not packet or not getattr(packet, "decrypted_data", None):
+            return packet, b""
         try:
-            return _orig_decode_packet(self, packet)
-        except Exception:
-            # Return 20ms of 48kHz stereo 16-bit PCM silence (3840 bytes) instead of crashing PacketRouter
-            return packet, b"\x00" * 3840
+            vc = getattr(getattr(self, "sink", None), "voice_client", None)
+            conn = getattr(vc, "_connection", None)
+            dave_session = getattr(conn, "dave_session", None)
 
-    _vr_opus.PacketDecoder._decode_packet = _safe_decode_packet
+            if dave_session is not None and davey is not None:
+                user_id = vc._get_id_from_ssrc(packet.ssrc) if hasattr(vc, "_get_id_from_ssrc") else None
+                if user_id is None:
+                    return packet, b""
+                if not dave_session.can_passthrough(user_id):
+                    packet.decrypted_data = dave_session.decrypt(
+                        user_id, davey.MediaType.audio, packet.decrypted_data
+                    )
+
+            pcm = self._decoder.decode(packet.decrypted_data, fec=False)
+            return packet, pcm
+        except Exception:
+            return packet, b""
+
+    _vr_opus.PacketDecoder._decode_packet = _safe_dave_decode_packet
     HAS_VOICE_RECV = True
 except ImportError:
     voice_recv = None
@@ -732,7 +780,7 @@ async def synthesize_tts_mp3_bytes(text: str) -> bytes:
     return await _fallback_google_tts_with_yukino_pitch(spoken_text, lang_code)
 
 
-async def speak_in_voice_channel(guild: discord.Guild, text: str, fallback_channel=None):
+aasync def speak_in_voice_channel(guild: discord.Guild, text: str, fallback_channel=None):
     spoken_text = clean_text_for_speech(text)
     if not spoken_text:
         return
@@ -770,7 +818,12 @@ async def speak_in_voice_channel(guild: discord.Guild, text: str, fallback_chann
                     pass
                 bot.loop.call_soon_threadsafe(done_event.set)
 
-            vc.play(discord.FFmpegPCMAudio(mp3_path, options="-loglevel warning"), after=_after_play)
+            # Explicitly force 48kHz stereo PCM output for Discord Opus encoder compatibility
+            audio_source = discord.FFmpegPCMAudio(
+                mp3_path,
+                options="-vn -ar 48000 -ac 2 -f s16le -loglevel warning"
+            )
+            vc.play(audio_source, after=_after_play)
             await asyncio.wait_for(done_event.wait(), timeout=60)
         except Exception as e:
             print(f"TTS voice channel playback error: {e}")
@@ -803,11 +856,9 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
             form.add_field("file", wav_bytes, filename="speech.wav", content_type="audio/wav")
             form.add_field("model", GROQ_STT_MODEL)
             form.add_field("language", "th")
-            form.add_field(
-                "prompt",
-                "ยูกิโนะ, ยูกิน่อน, Yukino, Yukinon, บอท, ไต้ฝุ่น, สวัสดี, วันนี้, กี่โมง, โค้ด"
-            )
-            form.add_field("response_format", "json")
+            # CRITICAL: Lock temperature=0 and use verbose_json (NO prompt seed!) to prevent hallucinations
+            form.add_field("temperature", "0")
+            form.add_field("response_format", "verbose_json")
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as session:
                 async with session.post(
@@ -817,11 +868,29 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        txt = (data.get("text") or "").strip()
-                        if txt:
+                        segments = data.get("segments") or []
+                        valid_parts = []
+                        for seg in segments:
+                            no_speech = float(seg.get("no_speech_prob", 0.0))
+                            avg_logprob = float(seg.get("avg_logprob", 0.0))
+                            comp_ratio = float(seg.get("compression_ratio", 1.0))
+                            seg_text = (seg.get("text") or "").strip()
+                            # Reject segments that Whisper flags as non-speech, low confidence, or repetitive
+                            if no_speech > 0.40 or avg_logprob < -0.75 or comp_ratio > 2.1:
+                                print(
+                                    f"[Voice VAD Filter] Dropped noise segment '{seg_text}' "
+                                    f"(no_speech={no_speech:.2f}, logprob={avg_logprob:.2f}, comp={comp_ratio:.2f})"
+                                )
+                                continue
+                            if seg_text:
+                                valid_parts.append(seg_text)
+
+                        txt = " ".join(valid_parts).strip()
+                        if txt and not NOISE_HALLUCINATION_REGEX.search(txt):
                             return txt
+                        return ""
         except Exception as e:
-            print(f"Groq Whisper STT fallback to Google STT: {e}")
+            print(f"Groq Whisper STT error: {e}")
 
     return await asyncio.to_thread(transcribe_wav_bytes_google_sync, wav_bytes)
 
@@ -1353,15 +1422,21 @@ async def query_local_ollama_chat(
     return answer, did_search
 
 
+# Reject Nordic/Icelandic characters, special tokens, or 3x repeated character stutters from Whisper noise
+NOISE_HALLUCINATION_REGEX = re.compile(r"(<\|.*?\|>|[ðþæøåÐÞÆØÅ]|(.)\2\2)", re.IGNORECASE)
 WHISPER_HALLUCINATIONS = {
     "ขอบคุณครับ", "ขอบคุณค่ะ", "โปรดติดตามตอนต่อไป", "พากย์ไทยโดย", "ซับไทยโดย",
-    "thank you", "thanks for watching", "you", ".", ".."
+    "thank you", "thanks for watching", "you", "bye", ".", "..", "..."
 }
 
 
 async def handle_spoken_voice_command(guild: discord.Guild, text_channel, speaker_name: str, spoken_text: str):
     cleaned = spoken_text.strip()
-    if not cleaned or cleaned.lower() in WHISPER_HALLUCINATIONS:
+    if (
+        len(cleaned) < 2
+        or cleaned.lower() in WHISPER_HALLUCINATIONS
+        or NOISE_HALLUCINATION_REGEX.search(cleaned)
+    ):
         return
     print(f"[Voice STT] {speaker_name} spoke: '{cleaned}' (wake_word_required={voice_wake_word_enabled[guild.id]})")
 
@@ -1385,11 +1460,16 @@ async def handle_spoken_voice_command(guild: discord.Guild, text_channel, speake
 
 
 class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
+    # Frame RMS threshold (filters out PC fan hum / open-mic hiss; normal speech is 800-8000)
+    SPEECH_FRAME_RMS_THRESHOLD = 450
+    MIN_ACTIVE_SPEECH_FRAMES = 15  # At least 15 frames (300ms) of actual vocal energy
+
     def __init__(self, guild: discord.Guild, text_channel):
         super().__init__()
         self.guild = guild
         self.text_channel = text_channel
         self.user_buffers = defaultdict(bytearray)
+        self.speech_frame_counts = defaultdict(int)
         self.last_spoken = {}
         self.running = True
         self.monitor_task = bot.loop.create_task(self._silence_monitor_loop())
@@ -1398,15 +1478,33 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
         return False
 
     def write(self, user, data):
-        if user and not user.bot and hasattr(data, "pcm") and data.pcm:
+        # Ignore bot's own audio or empty/corrupted packets
+        if not user or user.bot or not hasattr(data, "pcm") or not data.pcm:
+            return
+        # Ignore incoming audio while the bot itself is speaking to prevent echo loops
+        if self.guild.voice_client and self.guild.voice_client.is_playing():
+            return
+
+        try:
+            frame_rms = audioop.rms(data.pcm, 2)
+        except Exception:
+            return
+
+        # Only start/extend recording when vocal energy exceeds the fan-noise floor
+        if frame_rms >= self.SPEECH_FRAME_RMS_THRESHOLD:
             self.user_buffers[user].extend(data.pcm)
+            self.speech_frame_counts[user] += 1
             self.last_spoken[user] = time.monotonic()
+        elif user in self.user_buffers and (time.monotonic() - self.last_spoken.get(user, 0) < 0.8):
+            # Keep natural trailing syllables/pauses inside an active utterance
+            self.user_buffers[user].extend(data.pcm)
 
     def cleanup(self):
         self.running = False
         if getattr(self, "monitor_task", None) and not self.monitor_task.done():
             self.monitor_task.cancel()
         self.user_buffers.clear()
+        self.speech_frame_counts.clear()
         self.last_spoken.clear()
 
     async def _silence_monitor_loop(self):
@@ -1416,20 +1514,14 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
             for user, last_t in list(self.last_spoken.items()):
                 if now - last_t >= 1.1:
                     pcm_bytes = bytes(self.user_buffers.pop(user, b""))
+                    active_frames = self.speech_frame_counts.pop(user, 0)
                     self.last_spoken.pop(user, None)
-                    # Require at least ~0.35s of audio (64,000 bytes at 48kHz stereo 16-bit)
-                    if len(pcm_bytes) >= 64000:
-                        try:
-                            # Skip pure silence / background hiss (RMS < 180)
-                            if audioop.rms(pcm_bytes, 2) < 180:
-                                continue
-                        except Exception:
-                            pass
+
+                    if active_frames >= self.MIN_ACTIVE_SPEECH_FRAMES and len(pcm_bytes) >= 57600:
                         bot.loop.create_task(self._process_user_pcm(user, pcm_bytes))
 
     async def _process_user_pcm(self, user, pcm_bytes: bytes):
         try:
-            # Convert 48kHz stereo PCM to 16kHz mono WAV via ffmpeg so Whisper upload is 6x smaller & faster
             raw_wav_io = io.BytesIO()
             with wave.open(raw_wav_io, "wb") as wf:
                 wf.setnchannels(2)
@@ -1497,16 +1589,24 @@ async def join_voice(ctx):
         return
     target_channel = ctx.author.voice.channel
     try:
-        # If already connected in this server, disconnect cleanly first before reconnecting
         if ctx.guild.voice_client:
             await ctx.guild.voice_client.disconnect(force=True)
             await asyncio.sleep(0.5)
 
         vc = (
-            await asyncio.wait_for(target_channel.connect(cls=voice_recv.VoiceRecvClient), timeout=15.0)
+            await asyncio.wait_for(
+                target_channel.connect(cls=voice_recv.VoiceRecvClient, self_deaf=False, self_mute=False),
+                timeout=15.0,
+            )
             if HAS_VOICE_RECV
-            else await asyncio.wait_for(target_channel.connect(), timeout=15.0)
+            else await asyncio.wait_for(
+                target_channel.connect(self_deaf=False, self_mute=False),
+                timeout=15.0,
+            )
         )
+        # Wait 1.0s for Discord's DAVE E2EE MLS handshake to finish before playing greeting audio
+        await asyncio.sleep(1.0)
+
         if HAS_VOICE_RECV and hasattr(vc, "listen"):
             vc.listen(SilenceGatedVoiceSink(ctx.guild, ctx.channel))
 
