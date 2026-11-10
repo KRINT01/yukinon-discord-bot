@@ -1346,7 +1346,7 @@ async def _call_groq_chat(
 
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as session:
         async with session.post(
-            "[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)",
+            "https://api.groq.com/openai/v1/chat/completions",
             headers=headers,
             json=groq_payload,
         ) as resp:
@@ -1447,7 +1447,7 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
     if GEMINI_API_KEY:
         try:
             g_url = (
-                f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/)"
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
                 f"{GEMINI_SEARCH_MODEL}:generateContent?key={GEMINI_API_KEY}"
             )
             g_payload = {
@@ -1468,7 +1468,7 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
     # Tier 3: Keyless Google Translate API (Instant & guaranteed to remove all Thai characters)
     try:
         gt_url = (
-            "[https://translate.googleapis.com/translate_a/single](https://translate.googleapis.com/translate_a/single)"
+            "https://translate.googleapis.com/translate_a/single"
             f"?client=gtx&sl=auto&tl=en&dt=t&q={quote_plus(raw_prompt)}"
         )
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
@@ -1528,7 +1528,7 @@ async def generate_image_cloudflare_flux(user_prompt: str) -> tuple[bytes, str, 
     if THAI_CHAR_REGEX.search(cleaned_subject) or is_anime_style:
         english_prompt = await translate_prompt_to_english_for_flux(cleaned_subject, is_anime_style=is_anime_style)
 
-    cf_url = f"[https://api.cloudflare.com/client/v4/accounts/](https://api.cloudflare.com/client/v4/accounts/){CF_ACCOUNT_ID}/ai/run/{selected_model}"
+    cf_url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{selected_model}"
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
 
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
@@ -1656,7 +1656,7 @@ CRITICAL RULES:
 
     if GEMINI_API_KEY:
         url = (
-            f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/)"
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{GEMINI_SEARCH_MODEL}:generateContent?key={GEMINI_API_KEY}"
         )
         payload = {
@@ -1716,7 +1716,7 @@ CRITICAL RULES:
             }
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
                 async with session.post(
-                    "[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)",
+                    "https://api.groq.com/openai/v1/chat/completions",
                     headers=headers,
                     json=groq_payload,
                 ) as resp:
