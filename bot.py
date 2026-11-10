@@ -43,6 +43,23 @@ try:
 except ImportError:
     davey = None
 
+# Constructed protocol prefixes so chat/markdown renderers NEVER auto-link URLs in code blocks
+HTTPS = "https" + "://"
+HTTP = "http" + "://"
+
+
+def clean_url(url: str) -> str:
+    """Safeguard: strips any accidental [url](url) or %5B...%5D Markdown formatting at runtime."""
+    if not url:
+        return ""
+    s = url.strip()
+    m = re.search(r"\]\((https?://[^)\s]+)\)", s)
+    if m:
+        return m.group(1).strip()
+    s = re.sub(r"^\[\vert{}\]$", "", s)
+    return s.strip()
+
+
 # Silence noisy RTCP SenderReport logs (type=200) from discord-ext-voice-recv
 logging.getLogger("discord.ext.voice_recv").setLevel(logging.WARNING)
 
@@ -101,7 +118,7 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
 # Modal Serverless GPU Ollama Endpoint & Bearer Auth Key
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+OLLAMA_BASE_URL = clean_url(os.getenv("OLLAMA_BASE_URL", f"{HTTP}127.0.0.1:11434")).rstrip("/")
 MODAL_API_KEY = os.getenv("MODAL_API_KEY", "").strip()
 
 ACTIVE_FAST_MODEL = os.getenv("OLLAMA_FAST_MODEL", "scb10x/typhoon2.5-qwen3-4b")
@@ -444,7 +461,7 @@ class YukinonBot(commands.Bot):
         await self.web_runner.setup()
         site = web.TCPSite(self.web_runner, "0.0.0.0", PORT)
         await site.start()
-        print(f"[Render Web Service Health Server] Listening on http://0.0.0.0:{PORT}")
+        print(f"[Render Web Service Health Server] Listening on 0.0.0.0:{PORT}")
 
 
 bot = YukinonBot(command_prefix="!", intents=intents, help_command=None)
@@ -477,7 +494,7 @@ async def fetch_live_weather_context(user_text: str) -> str:
             target_city = en_query
             break
 
-    url = f"https://wttr.in/{target_city}?format=j1&lang=th"
+    url = clean_url(f"{HTTPS}wttr.in/{target_city}?format=j1&lang=th")
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
             async with session.get(url, headers={"User-Agent": "curl/8.5.0"}) as resp:
@@ -522,8 +539,8 @@ async def fetch_live_weather_context(user_text: str) -> str:
         print(f"wttr.in weather warning: {e}")
 
     try:
-        om_url = (
-            "https://api.open-meteo.com/v1/forecast"
+        om_url = clean_url(
+            f"{HTTPS}api.open-meteo.com/v1/forecast"
             "?latitude=13.7563&longitude=100.5018"
             "&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation"
             "&daily=precipitation_probability_max,temperature_2m_max,temperature_2m_min"
@@ -549,7 +566,8 @@ async def fetch_live_weather_context(user_text: str) -> str:
 
 
 def validate_safe_public_url(url: str) -> str:
-    parsed = urlparse(url.strip())
+    cleaned = clean_url(url)
+    parsed = urlparse(cleaned)
     if parsed.scheme not in ("http", "https"):
         raise ValueError(f"Blocked unsafe URL scheme `{parsed.scheme}`.")
     hostname = parsed.hostname
@@ -573,7 +591,7 @@ def validate_safe_public_url(url: str) -> str:
             or (isinstance(ip_obj, ipaddress.IPv4Address) and ip_obj in CGNAT_NETWORK)
         ):
             raise ValueError(f"SSRF Protection: Blocked non-public IP `{ip_obj}`.")
-    return url.strip()
+    return cleaned
 
 
 def fetch_webpage_sync(url: str, max_chars: int = 14000) -> str:
@@ -592,8 +610,8 @@ def fetch_webpage_sync(url: str, max_chars: int = 14000) -> str:
 def _search_google_ai_studio_grounded_sync(query: str) -> str:
     if not GEMINI_API_KEY:
         return ""
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
+    url = clean_url(
+        f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
         f"{GEMINI_SEARCH_MODEL}:generateContent?key={GEMINI_API_KEY}"
     )
     payload = {
@@ -655,7 +673,7 @@ def _search_google_news_rss_sync(query: str, is_thai: bool, max_results: int = 4
     hl = "th" if is_thai else "en-US"
     gl = "TH" if is_thai else "US"
     ceid = "TH:th" if is_thai else "US:en"
-    rss_url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl={hl}&gl={gl}&ceid={ceid}"
+    rss_url = clean_url(f"{HTTPS}news.google.com/rss/search?q={quote_plus(query)}&hl={hl}&gl={gl}&ceid={ceid}")
     results = []
     try:
         req = urllib.request.Request(rss_url, headers={"User-Agent": "Mozilla/5.0"})
@@ -696,7 +714,7 @@ def run_safe_web_search_sync(query: str, max_results: int = 4) -> str:
     if TAVILY_API_KEY:
         try:
             t_req = urllib.request.Request(
-                "https://api.tavily.com/search",
+                clean_url(f"{HTTPS}api.tavily.com/search"),
                 data=json.dumps({
                     "api_key": TAVILY_API_KEY,
                     "query": clean_q,
@@ -794,8 +812,8 @@ async def _fallback_google_tts_with_yukino_pitch(spoken_text: str, lang_code: st
     headers = {"User-Agent": "Mozilla/5.0"}
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
         for chunk in _split_tts_chunks(spoken_text, max_len=180):
-            tts_url = (
-                "https://translate.googleapis.com/translate_tts"
+            tts_url = clean_url(
+                f"{HTTPS}translate.googleapis.com/translate_tts"
                 f"?ie=UTF-8&client=tw-ob&tl={lang_code}&q={quote_plus(chunk)}"
             )
             async with session.get(tts_url, headers=headers) as resp:
@@ -940,12 +958,9 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
             form.add_field("temperature", "0")
             form.add_field("response_format", "verbose_json")
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+            stt_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/audio/transcriptions")
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as session:
-                async with session.post(
-                    "https://api.groq.com/openai/v1/audio/transcriptions",
-                    headers=headers,
-                    data=form,
-                ) as resp:
+                async with session.post(stt_url, headers=headers, data=form) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         segments = data.get("segments") or []
@@ -1055,7 +1070,7 @@ def format_code_or_log_attachment(text: str, is_log: bool, max_chars: int = 1200
 
 def extract_youtube_id(url: str):
     try:
-        parsed = urlparse(url)
+        parsed = urlparse(clean_url(url))
         host = (parsed.hostname or "").lower()
         if host in ("youtu.be", "www.youtu.be"):
             return parsed.path.lstrip("/").split("?")[0][:11]
@@ -1121,12 +1136,9 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
                 "Authorization": f"Bearer {GROQ_API_KEY}",
                 "Content-Type": "application/json",
             }
+            chat_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/chat/completions")
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
-                async with session.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers=headers,
-                    json=groq_vision_payload,
-                ) as resp:
+                async with session.post(chat_url, headers=headers, json=groq_vision_payload) as resp:
                     if resp.status == 200:
                         g_data = await resp.json()
                         content = g_data["choices"][0]["message"]["content"].strip()
@@ -1152,7 +1164,7 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
         async with ollama_lock:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
                 async with session.post(
-                    f"{OLLAMA_BASE_URL}/api/chat",
+                    clean_url(f"{OLLAMA_BASE_URL}/api/chat"),
                     headers=get_modal_headers(),
                     json=payload,
                 ) as resp:
@@ -1345,12 +1357,9 @@ async def _call_groq_chat(
     if "gpt-oss" in groq_model:
         groq_payload["reasoning_effort"] = "high" if is_coding else "medium"
 
+    chat_url = clean_url(f"{HTTPS}[api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)")
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as session:
-        async with session.post(
-            "[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)",
-            headers=headers,
-            json=groq_payload,
-        ) as resp:
+        async with session.post(chat_url, headers=headers, json=groq_payload) as resp:
             if resp.status == 200:
                 g_data = await resp.json()
                 content = g_data["choices"][0]["message"]["content"].strip()
@@ -1379,7 +1388,7 @@ async def _call_modal_ollama_chat(messages: list, ollama_model: str, temperature
     async with ollama_lock:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as session:
             async with session.post(
-                f"{OLLAMA_BASE_URL}/api/chat",
+                clean_url(f"{OLLAMA_BASE_URL}/api/chat"),
                 headers=get_modal_headers(),
                 json=payload,
             ) as resp:
@@ -1425,8 +1434,8 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
 
     # Tier 1: Keyless Google Translate NMT (100% literal translation; never adds extra words or changes colors)
     try:
-        gt_url = (
-            "[https://translate.googleapis.com/translate_a/single](https://translate.googleapis.com/translate_a/single)"
+        gt_url = clean_url(
+            f"{HTTPS}[translate.googleapis.com/translate_a/single](https://translate.googleapis.com/translate_a/single)"
             f"?client=gtx&sl=th&tl=en&dt=t&q={quote_plus(raw_prompt)}"
         )
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
@@ -1458,8 +1467,8 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
     # Tier 2: Google AI Studio (Gemini 2.5 Flash)
     if GEMINI_API_KEY:
         try:
-            g_url = (
-                "[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/)"
+            g_url = clean_url(
+                f"{HTTPS}[generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/)"
                 f"{GEMINI_SEARCH_MODEL}:generateContent?key={GEMINI_API_KEY}"
             )
             g_payload = {
@@ -1541,7 +1550,7 @@ async def generate_image_cloudflare_flux(user_prompt: str) -> tuple[bytes, str, 
     if THAI_CHAR_REGEX.search(cleaned_subject) or is_anime_style:
         english_prompt = await translate_prompt_to_english_for_flux(cleaned_subject, is_anime_style=is_anime_style)
 
-    cf_url = f"[https://api.cloudflare.com/client/v4/accounts/](https://api.cloudflare.com/client/v4/accounts/){CF_ACCOUNT_ID}/ai/run/{selected_model}"
+    cf_url = clean_url(f"{HTTPS}[api.cloudflare.com/client/v4/accounts/](https://api.cloudflare.com/client/v4/accounts/){CF_ACCOUNT_ID}/ai/run/{selected_model}")
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
 
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
@@ -1609,7 +1618,7 @@ async def send_generated_image_to_channel(channel, prompt_text: str):
 
 
 # ==============================================================================
-# IN-CONTEXT MANGA / IMAGE TRANSLATION & PILLOW TYPESETTING ENGINE
+# IN-CONTEXT MANGA / IMAGE TRANSLATION & SMART SPEECH-BUBBLE TYPESETTING ENGINE
 # ==============================================================================
 def _load_manga_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     for path in FONT_CANDIDATES:
@@ -1632,26 +1641,38 @@ def _detect_target_translation_lang(user_prompt: str) -> tuple[str, str]:
     return "en", "English"
 
 
+def _normalize_image_to_1000x1000_jpeg(raw_bytes: bytes) -> str:
+    """
+    Resizes a copy of the manga page to exact 1000x1000 pixels before sending to Gemini/Groq Vision.
+    Because the input image is literally 1000x1000 pixels, pixel coordinates and normalized [0..1000]
+    coordinates are 100% identical, eliminating aspect-ratio coordinate shift!
+    """
+    img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    resized = img.resize((1000, 1000), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    resized.save(buf, format="JPEG", quality=92)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
 async def extract_and_translate_manga_bubbles(
     raw_bytes: bytes, filename: str, target_lang_name: str
 ) -> tuple[list[dict], str]:
-    b64_img = base64.b64encode(raw_bytes).decode("utf-8")
-    fname_lower = filename.lower()
-    mime_type = (
-        "image/png" if fname_lower.endswith(".png")
-        else "image/webp" if fname_lower.endswith(".webp")
-        else "image/jpeg"
-    )
+    # Pre-scale input image to 1000x1000 so [0..1000] coordinates never drift due to aspect ratio
+    b64_img_1000 = await asyncio.to_thread(_normalize_image_to_1000x1000_jpeg, raw_bytes)
+    mime_type = "image/jpeg"
 
     manga_system_instruction = f"""
 You are a professional Manga, Manhwa, and Comic Localizer.
+This input image has been normalized to exact 1000x1000 pixel dimensions (X from 0 to 1000, Y from 0 to 1000).
 Analyze the entire image visually (character expressions, action, speaker relationships, and panel layout)
-and translate all speech bubbles and important text into natural, idiomatic {target_lang_name}.
+and translate all speech bubbles into natural, idiomatic {target_lang_name}.
 
 CRITICAL RULES:
 1. Reading Order: Order the bubbles strictly in traditional Japanese Manga reading order (Top-to-Bottom, Right-to-Left across panels).
-2. In-Context Localization: Do NOT translate word-for-word statically. Adapt Japanese/Korean/Chinese idioms, pronouns, tone, and emotion so the dialogue sounds completely natural in {target_lang_name} while fitting inside a speech bubble. Ignore tiny background noise/watermarks.
-3. Bounding Boxes: For each text region inside a speech bubble, provide `box_2d` as `[ymin, xmin, ymax, xmax]` normalized from 0 to 1000 covering ONLY the text characters inside the bubble (stay inside the bubble border).
+2. In-Context Localization: Adapt Japanese/Korean/Chinese idioms, pronouns, tone, and emotion so the dialogue sounds completely natural in {target_lang_name} while fitting inside a speech bubble.
+3. Exact Speech Bubble Bounding Boxes (`box_2d`):
+   - For each speech bubble, provide `box_2d` as `[ymin, xmin, ymax, xmax]` (integers from 0 to 1000).
+   - IMPORTANT: `box_2d` MUST enclose the ENTIRE white interior of the speech bubble covering ALL columns of the original Japanese text from the leftmost column to the rightmost column (including furigana and punctuation), so that filling `box_2d` with white completely erases 100% of the original Japanese text!
 4. Return ONLY valid JSON matching this exact structure:
 {{
   "summary": "Brief 1-sentence scene context",
@@ -1668,27 +1689,33 @@ CRITICAL RULES:
 """.strip()
 
     if GEMINI_API_KEY:
-        url = (
-            f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/)"
+        url = clean_url(
+            f"{HTTPS}[generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/)"
             f"{GEMINI_SEARCH_MODEL}:generateContent?key={GEMINI_API_KEY}"
         )
+        # Note: thinkingBudget=0 is recommended by Google for accurate Gemini 2.5 Flash box_2d detection
         payload = {
             "contents": [
                 {
                     "parts": [
                         {"text": manga_system_instruction},
-                        {"inlineData": {"mimeType": mime_type, "data": b64_img}},
+                        {"inlineData": {"mimeType": mime_type, "data": b64_img_1000}},
                     ]
                 }
             ],
             "generationConfig": {
-                "temperature": 0.2,
+                "temperature": 0.1,
                 "responseMimeType": "application/json",
+                "thinkingConfig": {"thinkingBudget": 0},
             },
         }
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
                 async with session.post(url, json=payload) as resp:
+                    if resp.status != 200:
+                        # Retry without thinkingConfig in case a different Gemini model version is set
+                        payload["generationConfig"].pop("thinkingConfig", None)
+                        resp = await session.post(url, json=payload)
                     if resp.status == 200:
                         data = await resp.json()
                         parts = (
@@ -1716,23 +1743,20 @@ CRITICAL RULES:
                         "role": "user",
                         "content": [
                             {"type": "text", "text": manga_system_instruction},
-                            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
+                            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img_1000}"}},
                         ],
                     }
                 ],
-                "temperature": 0.2,
+                "temperature": 0.1,
                 "max_tokens": 4096,
             }
             headers = {
                 "Authorization": f"Bearer {GROQ_API_KEY}",
                 "Content-Type": "application/json",
             }
+            chat_url = clean_url(f"{HTTPS}[api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)")
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
-                async with session.post(
-                    "[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)",
-                    headers=headers,
-                    json=groq_payload,
-                ) as resp:
+                async with session.post(chat_url, headers=headers, json=groq_payload) as resp:
                     if resp.status == 200:
                         g_data = await resp.json()
                         content = g_data["choices"][0]["message"]["content"].strip()
@@ -1749,13 +1773,24 @@ CRITICAL RULES:
 
 
 def _wrap_text_to_pixel_width(
-    draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+    max_width: int,
+    allow_midword_split: bool = False,
 ) -> list[str]:
-    words = text.split(" ") if " " in text else [text]
+    """
+    Wraps English by whole words (never splitting 'Kaguya?' into 'Kaguy' + 'a?' during font scaling!)
+    and wraps unspaced Thai cleanly without breaking combining vowels/tone marks.
+    """
+    has_spaces = " " in text
+    words = text.split(" ") if has_spaces else [text]
     lines = []
     current = ""
 
     for word in words:
+        if not word:
+            continue
         test_line = f"{current} {word}".strip() if current else word
         bbox = draw.textbbox((0, 0), test_line, font=font)
         if (bbox[2] - bbox[0]) <= max_width:
@@ -1764,20 +1799,174 @@ def _wrap_text_to_pixel_width(
             if current:
                 lines.append(current)
                 current = ""
-            chunk = ""
-            for ch in word:
-                test_ch = chunk + ch
-                cbbox = draw.textbbox((0, 0), test_ch, font=font)
-                is_combining = "\u0E31" <= ch <= "\u0E3A" or "\u0E47" <= ch <= "\u0E4E"
-                if (cbbox[2] - cbbox[0]) > max_width and chunk and not is_combining:
-                    lines.append(chunk)
-                    chunk = ch
-                else:
-                    chunk = test_ch
-            current = chunk
+            wbbox = draw.textbbox((0, 0), word, font=font)
+            # If whole English word fits on its own line, OR if we are still searching for a smaller font size,
+            # keep the English word intact so the caller loop shrinks the font size!
+            if (wbbox[2] - wbbox[0]) <= max_width or (has_spaces and not allow_midword_split):
+                current = word
+            else:
+                chunk = ""
+                for ch in word:
+                    test_ch = chunk + ch
+                    cbbox = draw.textbbox((0, 0), test_ch, font=font)
+                    is_combining = "\u0E31" <= ch <= "\u0E3A" or "\u0E47" <= ch <= "\u0E4E"
+                    if (cbbox[2] - cbbox[0]) > max_width and chunk and not is_combining:
+                        lines.append(chunk)
+                        chunk = ch
+                    else:
+                        chunk = test_ch
+                current = chunk
     if current:
         lines.append(current)
     return lines
+
+
+def _clean_speech_bubble_and_get_text_box(
+    img: Image.Image, x1: int, y1: int, x2: int, y2: int
+) -> tuple[int, int, int, int, tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]:
+    """
+    Uses connected-component flood-fill + interior hole filling to erase 100% of the original
+    Japanese text inside a white speech bubble (even if the LLM's bounding box was slightly narrow
+    or offset), and returns the true interior bounds (tx1, ty1, tx2, ty2) for centering text!
+    """
+    width, height = img.size
+    box_w = x2 - x1
+    box_h = y2 - y1
+
+    # Define a search window around the predicted box (expanded more to the right/bottom to catch vertical kanji)
+    pad_left = max(18, int(box_w * 0.35))
+    pad_right = max(35, int(box_w * 0.85))
+    pad_top = max(18, int(box_h * 0.30))
+    pad_bot = max(30, int(box_h * 0.55))
+
+    wx1 = max(0, x1 - pad_left)
+    wy1 = max(0, y1 - pad_top)
+    wx2 = min(width, x2 + pad_right)
+    wy2 = min(height, y2 + pad_bot)
+    ww = wx2 - wx1
+    wh = wy2 - wy1
+
+    sub_gray = img.crop((wx1, wy1, wx2, wy2)).convert("L")
+    # Quantize to 3 levels: 255 = white bubble interior (>=205), 0 = dark border/text (<205)
+    bin_img = sub_gray.point(lambda p: 255 if p >= 205 else 0).convert("RGB")
+
+    # Search for a white speech-bubble seed containing dark text glyphs near the predicted box center
+    rel_cx = max(0, min(ww - 1, ((x1 + x2) // 2) - wx1))
+    rel_cy = max(0, min(wh - 1, ((y1 + y2) // 2) - wy1))
+
+    best_seed = None
+    # Search outward from box center (biasing slightly right/down where vertical Japanese columns sit)
+    for dy in range(0, max(wh // 2, 1), 6):
+        for dx in range(0, max(ww // 2, 1), 6):
+            for sx, sy in (
+                (rel_cx + dx, rel_cy + dy),
+                (rel_cx - dx, rel_cy + dy),
+                (rel_cx + dx, rel_cy - dy),
+                (rel_cx - dx, rel_cy - dy),
+            ):
+                if 4 <= sx < ww - 4 and 4 <= sy < wh - 4:
+                    if bin_img.getpixel((sx, sy)) == (255, 255, 255):
+                        best_seed = (sx, sy)
+                        break
+            if best_seed:
+                break
+        if best_seed:
+            break
+
+    if best_seed:
+        # Flood-fill the connected white speech bubble interior with green (0, 255, 0)
+        ImageDraw.floodfill(bin_img, best_seed, (0, 255, 0), thresh=10)
+
+        # Find the bounding box of the green flood-filled bubble region
+        r, g, b_ch = bin_img.split()
+        # In our quantized image, non-green pixels have R==B (0 or 255), whereas green has R=0, G=255
+        bubble_mask = Image.eval(r, lambda p: 0).paste(255, mask=Image.eval(g, lambda p: 255 if p > 0 else 0))
+        # Simpler mask extraction: pixel is part of floodfill iff R == 0 and G == 255
+        raw_rgb = bin_img.tobytes()
+        mask_bytes = bytearray(ww * wh)
+        min_bx, min_by = ww, wh
+        max_bx, max_by = 0, 0
+        count_green = 0
+        for idx in range(ww * wh):
+            off = idx * 3
+            if raw_rgb[off] == 0 and raw_rgb[off + 1] == 255:
+                mask_bytes[idx] = 255
+                count_green += 1
+                py, px = divmod(idx, ww)
+                if px < min_bx:
+                    min_bx = px
+                if px > max_bx:
+                    max_bx = px
+                if py < min_by:
+                    min_by = py
+                if py > max_by:
+                    max_by = py
+
+        # Check that the flood-filled region is a genuine bounded speech bubble (didn't leak to all 4 window edges)
+        touches_edges = (
+            (1 if min_bx <= 1 else 0)
+            + (1 if min_by <= 1 else 0)
+            + (1 if max_bx >= ww - 2 else 0)
+            + (1 if max_by >= wh - 2 else 0)
+        )
+        bw = max_bx - min_bx
+        bh = max_by - min_by
+
+        if count_green >= 200 and touches_edges <= 2 and bw >= 24 and bh >= 24:
+            # Fill all interior holes (the black Japanese characters inside the white speech bubble!)
+            # Any pixel not reachable from the boundary of the bubble's mask box without crossing green is text!
+            hole_canvas = Image.frombytes("L", (ww, wh), bytes(mask_bytes)).convert("RGB")
+            # Flood-fill the exterior from the edges of the window with red (255, 0, 0)
+            for ex in range(ww):
+                if hole_canvas.getpixel((ex, 0)) == (0, 0, 0):
+                    ImageDraw.floodfill(hole_canvas, (ex, 0), (255, 0, 0))
+                if hole_canvas.getpixel((ex, wh - 1)) == (0, 0, 0):
+                    ImageDraw.floodfill(hole_canvas, (ex, wh - 1), (255, 0, 0))
+            for ey in range(wh):
+                if hole_canvas.getpixel((0, ey)) == (0, 0, 0):
+                    ImageDraw.floodfill(hole_canvas, (0, ey), (255, 0, 0))
+                if hole_canvas.getpixel((ww - 1, ey)) == (0, 0, 0):
+                    ImageDraw.floodfill(hole_canvas, (ww - 1, ey), (255, 0, 0))
+
+            # Every pixel that is NOT exterior red (255, 0, 0) is strictly inside the speech bubble!
+            hc_bytes = hole_canvas.tobytes()
+            clean_mask_bytes = bytearray(ww * wh)
+            for idx in range(ww * wh):
+                off = idx * 3
+                if not (hc_bytes[off] == 255 and hc_bytes[off + 1] == 0):
+                    clean_mask_bytes[idx] = 255
+
+            clean_mask = Image.frombytes("L", (ww, wh), bytes(clean_mask_bytes))
+            white_patch = Image.new("RGB", (ww, wh), (255, 255, 255))
+            img.paste(white_patch, (wx1, wy1), mask=clean_mask)
+
+            # Inset by 12% so wrapped text stays comfortably inside the curved bubble border
+            inset_x = max(4, int(bw * 0.12))
+            inset_y = max(4, int(bh * 0.12))
+            tx1 = wx1 + min_bx + inset_x
+            ty1 = wy1 + min_by + inset_y
+            tx2 = wx1 + max_bx - inset_x
+            ty2 = wy1 + max_by - inset_y
+            if tx2 - tx1 >= 20 and ty2 - ty1 >= 16:
+                return tx1, ty1, tx2, ty2, (255, 255, 255), (15, 15, 15), (255, 255, 255)
+
+    # Fallback if bubble is borderless or dark: clean the predicted rectangle directly
+    crop_region = img.crop((x1, y1, x2, y2)).convert("L")
+    mean_luma = ImageStat.Stat(crop_region).mean[0]
+    is_light_bg = mean_luma >= 115
+    bg_fill = (255, 255, 255) if is_light_bg else (20, 20, 20)
+    fg_text = (15, 15, 15) if is_light_bg else (245, 245, 245)
+    stroke_col = (255, 255, 255) if is_light_bg else (0, 0, 0)
+
+    draw = ImageDraw.Draw(img)
+    pad_clean = 5
+    cx1 = max(0, x1 - pad_clean)
+    cy1 = max(0, y1 - pad_clean)
+    cx2 = min(width, x2 + pad_clean)
+    cy2 = min(height, y2 + pad_clean)
+    radius = min(12, min(box_w, box_h) // 4)
+    draw.rounded_rectangle([cx1, cy1, cx2, cy2], radius=radius, fill=bg_fill)
+    return x1, y1, x2, y2, bg_fill, fg_text, stroke_col
 
 
 def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) -> bytes | None:
@@ -1792,70 +1981,68 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
 
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     width, height = img.size
-    draw = ImageDraw.Draw(img)
 
+    # Pass 1: Clean all speech bubbles first and record their true interior text boxes
+    prepared_renders = []
     for b in valid_boxes:
         ymin, xmin, ymax, xmax = [float(v) for v in b["box_2d"]]
+        if ymin > ymax:
+            ymin, ymax = ymax, ymin
+        if xmin > xmax:
+            xmin, xmax = xmax, xmin
+
         x1 = max(0, int((xmin / 1000.0) * width))
         y1 = max(0, int((ymin / 1000.0) * height))
         x2 = min(width, int((xmax / 1000.0) * width))
         y2 = min(height, int((ymax / 1000.0) * height))
 
-        box_w = x2 - x1
-        box_h = y2 - y1
-        if box_w < 16 or box_h < 16:
+        if (x2 - x1) < 14 or (y2 - y1) < 14:
             continue
 
-        crop_region = img.crop((x1, y1, x2, y2)).convert("L")
-        mean_luma = ImageStat.Stat(crop_region).mean[0]
-        is_light_bg = mean_luma >= 115
-        bg_fill = (255, 255, 255) if is_light_bg else (20, 20, 20)
-        fg_text = (15, 15, 15) if is_light_bg else (245, 245, 245)
-        stroke_col = (255, 255, 255) if is_light_bg else (0, 0, 0)
+        tx1, ty1, tx2, ty2, bg_fill, fg_text, stroke_col = _clean_speech_bubble_and_get_text_box(
+            img, x1, y1, x2, y2
+        )
+        prepared_renders.append((tx1, ty1, tx2, ty2, fg_text, stroke_col, b["translated_text"].strip()))
 
-        pad_clean = 3
-        cx1 = max(0, x1 - pad_clean)
-        cy1 = max(0, y1 - pad_clean)
-        cx2 = min(width, x2 + pad_clean)
-        cy2 = min(height, y2 + pad_clean)
-        radius = min(12, min(box_w, box_h) // 4)
-        draw.rounded_rectangle([cx1, cy1, cx2, cy2], radius=radius, fill=bg_fill)
-
-        trans_text = b["translated_text"].strip()
+    # Pass 2: Typeset the translated dialogue centered inside each cleaned bubble
+    draw = ImageDraw.Draw(img)
+    for tx1, ty1, tx2, ty2, fg_text, stroke_col, trans_text in prepared_renders:
+        box_w = max(24, tx2 - tx1)
+        box_h = max(20, ty2 - ty1)
         usable_w = max(24, int(box_w * 0.94))
-        usable_h = max(20, int(box_h * 0.94))
+        usable_h = max(18, int(box_h * 0.94))
 
-        start_font_size = min(34, max(14, int(min(box_w, box_h) * 0.30)))
-        chosen_font = _load_manga_font(12)
+        start_font_size = min(32, max(13, int(min(box_w, box_h) * 0.28)))
+        chosen_font = _load_manga_font(10)
         chosen_lines = [trans_text]
-        line_height = 15
+        line_height = 13
 
-        for fsize in range(start_font_size, 10, -2):
+        for fsize in range(start_font_size, 8, -1):
             font = _load_manga_font(fsize)
-            wrapped = _wrap_text_to_pixel_width(draw, trans_text, font, usable_w)
+            # Only allow splitting a single long word if we've reached the minimum 9px font size
+            wrapped = _wrap_text_to_pixel_width(
+                draw, trans_text, font, usable_w, allow_midword_split=(fsize <= 9)
+            )
             sample_bbox = draw.textbbox((0, 0), "Agกข้ำ", font=font)
-            lh = int((sample_bbox[3] - sample_bbox[1]) * 1.18)
+            lh = int((sample_bbox[3] - sample_bbox[1]) * 1.15)
             total_h = lh * len(wrapped)
             max_line_w = max(
                 (draw.textbbox((0, 0), ln, font=font)[2] - draw.textbbox((0, 0), ln, font=font)[0])
                 for ln in wrapped
             )
-            if total_h <= usable_h and max_line_w <= usable_w:
-                chosen_font = font
-                chosen_lines = wrapped
-                line_height = lh
-                break
             chosen_font = font
             chosen_lines = wrapped
             line_height = lh
+            if total_h <= usable_h and max_line_w <= usable_w:
+                break
 
         total_text_h = line_height * len(chosen_lines)
-        curr_y = y1 + max(0, (box_h - total_text_h) // 2)
+        curr_y = ty1 + max(0, (box_h - total_text_h) // 2)
 
         for ln in chosen_lines:
             lbbox = draw.textbbox((0, 0), ln, font=chosen_font)
             lw = lbbox[2] - lbbox[0]
-            curr_x = x1 + max(0, (box_w - lw) // 2)
+            curr_x = tx1 + max(0, (box_w - lw) // 2)
             draw.text(
                 (curr_x, curr_y),
                 ln,
