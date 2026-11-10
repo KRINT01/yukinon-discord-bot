@@ -137,9 +137,9 @@ CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "").strip()
 CF_API_TOKEN = os.getenv("CF_API_TOKEN", "").strip()
 CF_IMAGE_MODEL = os.getenv("CF_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell").strip()
 
-# Google AI Studio Free Tier (Gemini 2.5 Flash for Grounded Search & Manga Translation)
+# Google AI Studio Free Tier (Auto-discovers newest Flash model if default is deprecated)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_SEARCH_MODEL = os.getenv("GEMINI_SEARCH_MODEL", "gemini-2.5-flash").strip()
+GEMINI_SEARCH_MODEL = os.getenv("GEMINI_SEARCH_MODEL", "gemini-3.8-flash").strip()
 
 # Optional Free Tavily Search API Key
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
@@ -607,13 +607,151 @@ def fetch_webpage_sync(url: str, max_chars: int = 14000) -> str:
     return extracted[:max_chars]
 
 
+# Runtime cache for dynamically discovered active model IDs when a default model is deprecated
+_ACTIVE_GEMINI_MODEL_CACHE = GEMINI_SEARCH_MODEL
+_ACTIVE_GROQ_VISION_CACHE = GROQ_VISION_FALLBACK_MODEL
+
+GEMINI_MODEL_HINT_REGEX = re.compile(r"models/([a-zA-Z0-9._-]+)")
+
+
+async def _discover_active_gemini_flash_model() -> list[str]:
+    """
+    Queries Google AI Studio's live GET /v1beta/models endpoint to find all active
+    Flash/Vision models supported by your API key, ordered newest-first.
+    """
+    candidates = [
+        _ACTIVE_GEMINI_MODEL_CACHE,
+        "gemini-3.8-flash",
+        "gemini-3.0-flash",
+        "gemini-flash-latest",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+    ]
+    if not GEMINI_API_KEY:
+        return candidates
+
+    list_url = clean_url(
+        f"{HTTPS}generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
+    )
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get(list_url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    api_models = []
+                    for m in data.get("models") or []:
+                        name = (m.get("name") or "").replace("models/", "")
+                        methods = m.get("supportedGenerationMethods") or []
+                        if "generateContent" in methods and "flash" in name.lower():
+                            if "tts" not in name.lower() and "audio" not in name.lower():
+                                api_models.append(name)
+                    # Sort newest version numbers first
+                    api_models.sort(reverse=True)
+                    for m_name in api_models:
+                        if m_name not in candidates:
+                            candidates.insert(1, m_name)
+    except Exception as e:
+        print(f"Gemini model auto-discovery warning: {e}")
+
+    # Deduplicate while preserving priority order
+    seen = set()
+    return [x for x in candidates if x and not (x in seen or seen.add(x))]
+
+
+async def call_gemini_generate_content_self_healing(
+    payload: dict, timeout_sec: int = 45
+) -> dict | None:
+    """
+    Calls Google AI Studio generateContent with automatic self-healing:
+    1) Tries the cached active Gemini model.
+    2) If HTTP 404/400 occurs, extracts any suggested replacement model from Google's error message.
+    3) Falls back to live model discovery via GET /v1beta/models and caches the first working model!
+    """
+    global _ACTIVE_GEMINI_MODEL_CACHE
+    if not GEMINI_API_KEY:
+        return None
+
+    candidate_models = await _discover_active_gemini_flash_model()
+    tried = set()
+
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_sec)) as session:
+        idx = 0
+        while idx < len(candidate_models):
+            model_id = candidate_models[idx]
+            idx += 1
+            if not model_id or model_id in tried:
+                continue
+            tried.add(model_id)
+
+            url = clean_url(
+                f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
+                f"{model_id}:generateContent?key={GEMINI_API_KEY}"
+            )
+            work_payload = json.loads(json.dumps(payload))
+
+            for attempt in range(2):
+                async with session.post(url, json=work_payload) as resp:
+                    status = resp.status
+                    body_text = await resp.text()
+
+                if status == 200:
+                    if _ACTIVE_GEMINI_MODEL_CACHE != model_id:
+                        print(f"[Self-Healing Gemini] Switched active model to '{model_id}'")
+                        _ACTIVE_GEMINI_MODEL_CACHE = model_id
+                    return json.loads(body_text)
+
+                # If thinkingConfig is rejected by a specific model version, strip it and retry once
+                if status == 400 and "thinkingConfig" in body_text and attempt == 0:
+                    work_payload.get("generationConfig", {}).pop("thinkingConfig", None)
+                    continue
+
+                # If model is deprecated/404, check if Google's error message names the replacement model
+                if status in (404, 400):
+                    hint_matches = GEMINI_MODEL_HINT_REGEX.findall(body_text)
+                    for hinted_model in hint_matches:
+                        if hinted_model != model_id and hinted_model not in tried:
+                            print(f"[Self-Healing Gemini] 404 suggested '{hinted_model}', retrying...")
+                            candidate_models.insert(idx, hinted_model)
+                    print(f"Gemini model '{model_id}' unavailable (HTTP {status}); trying next model...")
+                    break
+                else:
+                    print(f"Gemini HTTP {status} on '{model_id}': {body_text[:200]}")
+                    break
+
+    return None
+
+
+async def _discover_active_groq_vision_models() -> list[str]:
+    """Queries Groq's live /openai/v1/models endpoint to find active vision-capable models."""
+    candidates = [
+        _ACTIVE_GROQ_VISION_CACHE,
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "meta-llama/llama-4-maverick-17b-128e-instruct",
+        "qwen/qwen3.8-27b",
+    ]
+    if not GROQ_API_KEY:
+        return candidates
+    models_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/models")
+    try:
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get(models_url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    for m in data.get("data") or []:
+                        mid = m.get("id") or ""
+                        if any(k in mid.lower() for k in ("vision", "llama-4", "qwen3", "pixtral")):
+                            if mid not in candidates:
+                                candidates.append(mid)
+    except Exception:
+        pass
+    seen = set()
+    return [x for x in candidates if x and not (x in seen or seen.add(x))]
+
+
 def _search_google_ai_studio_grounded_sync(query: str) -> str:
     if not GEMINI_API_KEY:
         return ""
-    url = clean_url(
-        f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_SEARCH_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    )
     payload = {
         "contents": [
             {
@@ -630,43 +768,57 @@ def _search_google_ai_studio_grounded_sync(query: str) -> str:
         "tools": [{"google_search": {}}],
         "generationConfig": {"temperature": 0.1},
     }
-    try:
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
+    models_to_try = [
+        _ACTIVE_GEMINI_MODEL_CACHE,
+        "gemini-3.8-flash",
+        "gemini-flash-latest",
+        "gemini-2.5-flash",
+    ]
+    seen = set()
+    for model_id in models_to_try:
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        url = clean_url(
+            f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
+            f"{model_id}:generateContent?key={GEMINI_API_KEY}"
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        candidates = data.get("candidates") or []
-        if not candidates:
-            return ""
-        cand = candidates[0]
-        parts = (cand.get("content") or {}).get("parts") or []
-        summary_text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            candidates = data.get("candidates") or []
+            if not candidates:
+                continue
+            cand = candidates[0]
+            parts = (cand.get("content") or {}).get("parts") or []
+            summary_text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
 
-        chunks = (cand.get("groundingMetadata") or {}).get("groundingChunks") or []
-        sources = []
-        for idx, ch in enumerate(chunks[:5], 1):
-            web_info = ch.get("web") or {}
-            uri = web_info.get("uri", "")
-            title = web_info.get("title", "Source")
-            if uri:
-                sources.append(f"[{idx}] {title}: {uri}")
+            chunks = (cand.get("groundingMetadata") or {}).get("groundingChunks") or []
+            sources = []
+            for idx, ch in enumerate(chunks[:5], 1):
+                web_info = ch.get("web") or {}
+                uri = web_info.get("uri", "")
+                title = web_info.get("title", "Source")
+                if uri:
+                    sources.append(f"[{idx}] {title}: {uri}")
 
-        if not summary_text:
-            return ""
-        sources_block = "\n".join(sources)
-        return (
-            f'<untrusted_web_search_results query="{query}" engine="google_search_grounding">\n'
-            f"Verified Google Search Summary:\n{summary_text}\n\n"
-            f"Sources:\n{sources_block}\n"
-            f"</untrusted_web_search_results>"
-        )
-    except Exception as e:
-        print(f"Google AI Studio Grounded Search warning (falling back to DDGS/RSS): {e}")
-        return ""
+            if summary_text:
+                sources_block = "\n".join(sources)
+                return (
+                    f'<untrusted_web_search_results query="{query}" engine="google_search_grounding">\n'
+                    f"Verified Google Search Summary:\n{summary_text}\n\n"
+                    f"Sources:\n{sources_block}\n"
+                    f"</untrusted_web_search_results>"
+                )
+        except Exception as e:
+            print(f"Google AI Studio Grounded Search ({model_id}) warning: {e}")
+    return ""
 
 
 def _search_google_news_rss_sync(query: str, is_thai: bool, max_results: int = 4) -> list[dict]:
@@ -1656,6 +1808,7 @@ def _prepare_manga_image_for_vision(raw_bytes: bytes) -> str:
 async def extract_and_translate_manga_bubbles(
     raw_bytes: bytes, filename: str, target_lang_name: str
 ) -> tuple[list[dict], str]:
+    global _ACTIVE_GROQ_VISION_CACHE
     b64_img = await asyncio.to_thread(_prepare_manga_image_for_vision, raw_bytes)
     mime_type = "image/jpeg"
 
@@ -1685,12 +1838,9 @@ CRITICAL RULES:
 }}
 """.strip()
 
+    # Tier 1: Self-Healing Google AI Studio (Automatically switches to gemini-3.8-flash or newest active Flash model)
     if GEMINI_API_KEY:
-        url = clean_url(
-            f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
-            f"{GEMINI_SEARCH_MODEL}:generateContent?key={GEMINI_API_KEY}"
-        )
-        payload = {
+        gemini_payload = {
             "contents": [
                 {
                     "parts": [
@@ -1706,66 +1856,89 @@ CRITICAL RULES:
             },
         }
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
-                async with session.post(url, json=payload) as resp:
-                    status = resp.status
-                    body_text = await resp.text()
-                if status != 200:
-                    payload["generationConfig"].pop("thinkingConfig", None)
-                    async with session.post(url, json=payload) as resp2:
-                        status = resp2.status
-                        body_text = await resp2.text()
-                if status == 200:
-                    data = json.loads(body_text)
-                    parts = (
-                        ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-                    )
-                    raw_json_str = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
-                    raw_json_str = re.sub(r"^```(?:json)?|```$", "", raw_json_str).strip()
-                    parsed = json.loads(raw_json_str)
-                    bubbles = parsed.get("bubbles") or []
-                    summary = parsed.get("summary") or ""
-                    if bubbles:
-                        return bubbles, summary
-                else:
-                    print(f"Gemini Manga Translate HTTP {status}: {body_text[:200]}")
+            data = await call_gemini_generate_content_self_healing(gemini_payload, timeout_sec=45)
+            if data:
+                parts = (
+                    ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                )
+                raw_json_str = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+                raw_json_str = re.sub(r"^```(?:json)?|```$", "", raw_json_str).strip()
+                json_match = re.search(r"\{[\s\S]*\}", raw_json_str)
+                parsed = json.loads(json_match.group(0) if json_match else raw_json_str)
+                bubbles = parsed.get("bubbles") or []
+                summary = parsed.get("summary") or ""
+                if bubbles:
+                    return bubbles, summary
         except Exception as e:
-            print(f"Gemini Manga Translate warning (falling back to Groq Vision): {e}")
+            print(f"Gemini Manga Translate parsing warning (falling back to Groq Vision): {e}")
 
+    # Tier 2: Self-Healing Groq Vision (Tries active vision models discovered on your Groq account)
     if GROQ_API_KEY:
-        try:
-            groq_payload = {
-                "model": GROQ_VISION_FALLBACK_MODEL,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": manga_system_instruction},
-                            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
+        groq_vision_candidates = await _discover_active_groq_vision_models()
+        chat_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/chat/completions")
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
+            for g_model in groq_vision_candidates:
+                try:
+                    groq_payload = {
+                        "model": g_model,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": manga_system_instruction},
+                                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
+                                ],
+                            }
                         ],
+                        "temperature": 0.1,
+                        "max_tokens": 4096,
                     }
-                ],
-                "temperature": 0.1,
-                "max_tokens": 4096,
-            }
-            headers = {
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            }
-            chat_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/chat/completions")
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
-                async with session.post(chat_url, headers=headers, json=groq_payload) as resp:
-                    if resp.status == 200:
-                        g_data = await resp.json()
-                        content = g_data["choices"][0]["message"]["content"].strip()
-                        content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
-                        json_match = re.search(r"\{[\s\S]*\}", content)
-                        if json_match:
-                            parsed = json.loads(json_match.group(0))
-                            return parsed.get("bubbles") or [], parsed.get("summary") or ""
-                        return [], content
-        except Exception as e:
-            print(f"Groq Manga Translate fallback error: {e}")
+                    async with session.post(chat_url, headers=headers, json=groq_payload) as resp:
+                        if resp.status == 200:
+                            _ACTIVE_GROQ_VISION_CACHE = g_model
+                            g_data = await resp.json()
+                            content = g_data["choices"][0]["message"]["content"].strip()
+                            content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+                            json_match = re.search(r"\{[\s\S]*\}", content)
+                            if json_match:
+                                parsed = json.loads(json_match.group(0))
+                                bubbles = parsed.get("bubbles") or []
+                                if bubbles:
+                                    return bubbles, parsed.get("summary") or ""
+                            elif content:
+                                return [], content
+                        else:
+                            err_txt = await resp.text()
+                            print(f"Groq Manga Vision ({g_model}) HTTP {resp.status}: {err_txt[:160]}")
+                except Exception as e:
+                    print(f"Groq Manga Vision ({g_model}) warning: {e}")
+
+    # Tier 3: Guaranteed OCR + LLM Text Translation Fallback (Modal Typhoon OCR -> LLM Localizer)
+    try:
+        raw_ocr_text = await extract_image_via_transient_ocr(raw_bytes, filename)
+        if raw_ocr_text and "[OCR could not" not in raw_ocr_text:
+            tl_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        f"You are a professional Manga Localizer. Translate the following OCR text extracted "
+                        f"from a manga page into natural, in-context {target_lang_name}. "
+                        f"Format each line clearly with the original text and its {target_lang_name} translation."
+                    ),
+                },
+                {"role": "user", "content": raw_ocr_text},
+            ]
+            tl_text = await _call_groq_chat(tl_messages, GROQ_CHAT_FALLBACK_MODEL, 0.2, is_coding=False)
+            if not tl_text:
+                tl_text = await _call_modal_ollama_chat(tl_messages, ACTIVE_FAST_MODEL, 0.2)
+            if tl_text:
+                return [], tl_text
+    except Exception as e:
+        print(f"Manga Tier 3 OCR+LLM fallback error: {e}")
 
     return [], ""
 
