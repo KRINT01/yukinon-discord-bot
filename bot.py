@@ -350,6 +350,7 @@ Describe in Thai.
 - Page Numbers: Wrap page numbers in <page_number>...</page_number> (e.g., <page_number>14</page_number>).
 - Checkboxes: Use ☐ for unchecked and ☑ for checked boxes."""
 
+
 CODE_AND_LOG_EXTENSIONS = (
     ".java", ".py", ".js", ".ts", ".tsx", ".jsx", ".vue", ".svelte",
     ".c", ".cpp", ".h", ".hpp", ".cs", ".go", ".rs", ".php", ".rb",
@@ -1346,7 +1347,7 @@ async def _call_groq_chat(
 
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as session:
         async with session.post(
-            "https://api.groq.com/openai/v1/chat/completions",
+            "[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)",
             headers=headers,
             json=groq_payload,
         ) as resp:
@@ -1424,7 +1425,10 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
 
     # Tier 1: Keyless Google Translate NMT (100% literal translation; never adds extra words or changes colors)
     try:
-        gt_url = f"{GOOGLE_TRANSLATE_SINGLE_URL}?client=gtx&sl=th&tl=en&dt=t&q={quote_plus(raw_prompt)}"
+        gt_url = (
+            "[https://translate.googleapis.com/translate_a/single](https://translate.googleapis.com/translate_a/single)"
+            f"?client=gtx&sl=th&tl=en&dt=t&q={quote_plus(raw_prompt)}"
+        )
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
             async with session.get(gt_url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
                 if resp.status == 200:
@@ -1454,7 +1458,10 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
     # Tier 2: Google AI Studio (Gemini 2.5 Flash)
     if GEMINI_API_KEY:
         try:
-            g_url = f"{GEMINI_API_BASE_URL}/{GEMINI_SEARCH_MODEL}:generateContent?key={GEMINI_API_KEY}"
+            g_url = (
+                "[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/)"
+                f"{GEMINI_SEARCH_MODEL}:generateContent?key={GEMINI_API_KEY}"
+            )
             g_payload = {
                 "contents": [{"parts": [{"text": f"{strict_sys_msg}\n\nThai text: {raw_prompt}"}]}],
                 "generationConfig": {"temperature": 0.0},
@@ -1464,9 +1471,10 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
                     if resp.status == 200:
                         g_data = await resp.json()
                         parts = ((g_data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-                        g_txt = " ".join(p.get("text", "") for p in parts if p.get("text")).strip(' "\'')
-                        if g_txt and not THAI_CHAR_REGEX.search(g_txt):
-                            return f"{prefix}{g_txt}"
+                        raw_parts_text = " ".join(p.get("text", "") for p in parts if p.get("text")).strip()
+                        clean_txt = raw_parts_text.strip(' "\'\n\r\t')
+                        if clean_txt and not THAI_CHAR_REGEX.search(clean_txt):
+                            return f"{prefix}{clean_txt}"
         except Exception as e:
             print(f"FLUX Prompt Translate Tier 2 (Gemini) warning: {e}")
 
@@ -1474,7 +1482,8 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
     try:
         res = await _call_modal_ollama_chat(trans_messages, ACTIVE_FAST_MODEL, 0.0)
         if res and not THAI_CHAR_REGEX.search(res):
-            return f"{prefix}{res.strip(' \"\'')}"
+            clean_res = res.strip(' "\'\n\r\t')
+            return f"{prefix}{clean_res}"
     except Exception as e:
         print(f"FLUX Prompt Translate Tier 3 (Modal Typhoon) warning: {e}")
 
@@ -1483,7 +1492,8 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
         try:
             res = await _call_groq_chat(trans_messages, GROQ_CHAT_FALLBACK_MODEL, 0.0, is_coding=False)
             if res and not THAI_CHAR_REGEX.search(res):
-                return f"{prefix}{res.strip(' \"\'')}"
+                clean_res = res.strip(' "\'\n\r\t')
+                return f"{prefix}{clean_res}"
         except Exception as e:
             print(f"FLUX Prompt Translate Tier 4 (Groq) warning: {e}")
 
@@ -1531,7 +1541,7 @@ async def generate_image_cloudflare_flux(user_prompt: str) -> tuple[bytes, str, 
     if THAI_CHAR_REGEX.search(cleaned_subject) or is_anime_style:
         english_prompt = await translate_prompt_to_english_for_flux(cleaned_subject, is_anime_style=is_anime_style)
 
-    cf_url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{selected_model}"
+    cf_url = f"[https://api.cloudflare.com/client/v4/accounts/](https://api.cloudflare.com/client/v4/accounts/){CF_ACCOUNT_ID}/ai/run/{selected_model}"
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
 
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
@@ -1659,7 +1669,7 @@ CRITICAL RULES:
 
     if GEMINI_API_KEY:
         url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/)"
             f"{GEMINI_SEARCH_MODEL}:generateContent?key={GEMINI_API_KEY}"
         )
         payload = {
@@ -1719,7 +1729,7 @@ CRITICAL RULES:
             }
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
                 async with session.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
+                    "[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)",
                     headers=headers,
                     json=groq_payload,
                 ) as resp:
