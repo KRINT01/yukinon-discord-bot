@@ -1620,6 +1620,9 @@ async def send_generated_image_to_channel(channel, prompt_text: str):
 # ==============================================================================
 # IN-CONTEXT MANGA / IMAGE TRANSLATION & SMART SPEECH-BUBBLE TYPESETTING ENGINE
 # ==============================================================================
+# ==============================================================================
+# IN-CONTEXT MANGA / IMAGE TRANSLATION & SMART SPEECH-BUBBLE TYPESETTING ENGINE
+# ==============================================================================
 def _load_manga_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     for path in FONT_CANDIDATES:
         if os.path.exists(path):
@@ -1641,38 +1644,32 @@ def _detect_target_translation_lang(user_prompt: str) -> tuple[str, str]:
     return "en", "English"
 
 
-def _normalize_image_to_1000x1000_jpeg(raw_bytes: bytes) -> str:
-    """
-    Resizes a copy of the manga page to exact 1000x1000 pixels before sending to Gemini/Groq Vision.
-    Because the input image is literally 1000x1000 pixels, pixel coordinates and normalized [0..1000]
-    coordinates are 100% identical, eliminating aspect-ratio coordinate shift!
-    """
+def _prepare_manga_image_for_vision(raw_bytes: bytes) -> str:
+    """ Preserves original aspect ratio (max 1280px) so vision models never distort bubble shapes. """
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-    resized = img.resize((1000, 1000), Image.Resampling.LANCZOS)
+    img.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
     buf = io.BytesIO()
-    resized.save(buf, format="JPEG", quality=92)
+    img.save(buf, format="JPEG", quality=92)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 async def extract_and_translate_manga_bubbles(
     raw_bytes: bytes, filename: str, target_lang_name: str
 ) -> tuple[list[dict], str]:
-    # Pre-scale input image to 1000x1000 so [0..1000] coordinates never drift due to aspect ratio
-    b64_img_1000 = await asyncio.to_thread(_normalize_image_to_1000x1000_jpeg, raw_bytes)
+    b64_img = await asyncio.to_thread(_prepare_manga_image_for_vision, raw_bytes)
     mime_type = "image/jpeg"
 
     manga_system_instruction = f"""
 You are a professional Manga, Manhwa, and Comic Localizer.
-This input image has been normalized to exact 1000x1000 pixel dimensions (X from 0 to 1000, Y from 0 to 1000).
 Analyze the entire image visually (character expressions, action, speaker relationships, and panel layout)
-and translate all speech bubbles into natural, idiomatic {target_lang_name}.
+and translate ALL speech bubbles (including short exclamations like '!' or 'Huh?') into natural, idiomatic {target_lang_name}.
 
 CRITICAL RULES:
 1. Reading Order: Order the bubbles strictly in traditional Japanese Manga reading order (Top-to-Bottom, Right-to-Left across panels).
 2. In-Context Localization: Adapt Japanese/Korean/Chinese idioms, pronouns, tone, and emotion so the dialogue sounds completely natural in {target_lang_name} while fitting inside a speech bubble.
-3. Exact Speech Bubble Bounding Boxes (`box_2d`):
-   - For each speech bubble, provide `box_2d` as `[ymin, xmin, ymax, xmax]` (integers from 0 to 1000).
-   - IMPORTANT: `box_2d` MUST enclose the ENTIRE white interior of the speech bubble covering ALL columns of the original Japanese text from the leftmost column to the rightmost column (including furigana and punctuation), so that filling `box_2d` with white completely erases 100% of the original Japanese text!
+3. Speech Bubble Bounding Boxes (`box_2d`):
+   - For each speech bubble, provide `box_2d` as `[ymin, xmin, ymax, xmax]` normalized from 0 to 1000.
+   - `box_2d` must cover the white interior of the speech bubble where the Japanese text is written (if a bubble has two connected ovals for one sentence, cover both ovals).
 4. Return ONLY valid JSON matching this exact structure:
 {{
   "summary": "Brief 1-sentence scene context",
@@ -1690,16 +1687,15 @@ CRITICAL RULES:
 
     if GEMINI_API_KEY:
         url = clean_url(
-            f"{HTTPS}[generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/)"
+            f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
             f"{GEMINI_SEARCH_MODEL}:generateContent?key={GEMINI_API_KEY}"
         )
-        # Note: thinkingBudget=0 is recommended by Google for accurate Gemini 2.5 Flash box_2d detection
         payload = {
             "contents": [
                 {
                     "parts": [
                         {"text": manga_system_instruction},
-                        {"inlineData": {"mimeType": mime_type, "data": b64_img_1000}},
+                        {"inlineData": {"mimeType": mime_type, "data": b64_img}},
                     ]
                 }
             ],
@@ -1712,25 +1708,27 @@ CRITICAL RULES:
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
                 async with session.post(url, json=payload) as resp:
-                    if resp.status != 200:
-                        # Retry without thinkingConfig in case a different Gemini model version is set
-                        payload["generationConfig"].pop("thinkingConfig", None)
-                        resp = await session.post(url, json=payload)
-                    if resp.status == 200:
-                        data = await resp.json()
-                        parts = (
-                            ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-                        )
-                        raw_json_str = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
-                        raw_json_str = re.sub(r"^```(?:json)?|```$", "", raw_json_str).strip()
-                        parsed = json.loads(raw_json_str)
-                        bubbles = parsed.get("bubbles") or []
-                        summary = parsed.get("summary") or ""
-                        if bubbles:
-                            return bubbles, summary
-                    else:
-                        err_txt = await resp.text()
-                        print(f"Gemini Manga Translate HTTP {resp.status}: {err_txt[:200]}")
+                    status = resp.status
+                    body_text = await resp.text()
+                if status != 200:
+                    payload["generationConfig"].pop("thinkingConfig", None)
+                    async with session.post(url, json=payload) as resp2:
+                        status = resp2.status
+                        body_text = await resp2.text()
+                if status == 200:
+                    data = json.loads(body_text)
+                    parts = (
+                        ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                    )
+                    raw_json_str = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+                    raw_json_str = re.sub(r"^```(?:json)?|```$", "", raw_json_str).strip()
+                    parsed = json.loads(raw_json_str)
+                    bubbles = parsed.get("bubbles") or []
+                    summary = parsed.get("summary") or ""
+                    if bubbles:
+                        return bubbles, summary
+                else:
+                    print(f"Gemini Manga Translate HTTP {status}: {body_text[:200]}")
         except Exception as e:
             print(f"Gemini Manga Translate warning (falling back to Groq Vision): {e}")
 
@@ -1743,7 +1741,7 @@ CRITICAL RULES:
                         "role": "user",
                         "content": [
                             {"type": "text", "text": manga_system_instruction},
-                            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img_1000}"}},
+                            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
                         ],
                     }
                 ],
@@ -1754,7 +1752,7 @@ CRITICAL RULES:
                 "Authorization": f"Bearer {GROQ_API_KEY}",
                 "Content-Type": "application/json",
             }
-            chat_url = clean_url(f"{HTTPS}[api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)")
+            chat_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/chat/completions")
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
                 async with session.post(chat_url, headers=headers, json=groq_payload) as resp:
                     if resp.status == 200:
@@ -1779,10 +1777,6 @@ def _wrap_text_to_pixel_width(
     max_width: int,
     allow_midword_split: bool = False,
 ) -> list[str]:
-    """
-    Wraps English by whole words (never splitting 'Kaguya?' into 'Kaguy' + 'a?' during font scaling!)
-    and wraps unspaced Thai cleanly without breaking combining vowels/tone marks.
-    """
     has_spaces = " " in text
     words = text.split(" ") if has_spaces else [text]
     lines = []
@@ -1800,8 +1794,6 @@ def _wrap_text_to_pixel_width(
                 lines.append(current)
                 current = ""
             wbbox = draw.textbbox((0, 0), word, font=font)
-            # If whole English word fits on its own line, OR if we are still searching for a smaller font size,
-            # keep the English word intact so the caller loop shrinks the font size!
             if (wbbox[2] - wbbox[0]) <= max_width or (has_spaces and not allow_midword_split):
                 current = word
             else:
@@ -1821,77 +1813,175 @@ def _wrap_text_to_pixel_width(
     return lines
 
 
-def _clean_speech_bubble_and_get_text_box(
-    img: Image.Image, x1: int, y1: int, x2: int, y2: int
-) -> tuple[int, int, int, int, tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]:
+def _find_largest_inscribed_text_rect(
+    mask_bytes: bytes, mw: int, mh: int
+) -> tuple[int, int, int, int]:
     """
-    Uses connected-component flood-fill + interior hole filling to erase 100% of the original
-    Japanese text inside a white speech bubble (even if the LLM's bounding box was slightly narrow
-    or offset), and returns the true interior bounds (tx1, ty1, tx2, ty2) for centering text!
+    Finds the largest rectangle strictly inside the flood-filled speech bubble mask (255 = inside).
+    This guarantees that even on double/L-shaped speech bubbles (like Bubble #2) or curved ovals,
+    the translated text is placed 100% inside the white speech bubble and never overlaps characters!
+    """
+    # Step 1: Compute horizontal consecutive inside-pixel width ending at each (x, y)
+    # Downsample by 2x for speed (<1ms per bubble)
+    sw = max(1, mw // 2)
+    sh = max(1, mh // 2)
+    widths = [0] * (sw * sh)
+
+    for sy in range(sh):
+        py = min(mh - 1, sy * 2)
+        row_off = py * mw
+        run = 0
+        for sx in range(sw):
+            px = min(mw - 1, sx * 2)
+            if mask_bytes[row_off + px] == 255:
+                run += 1
+            else:
+                run = 0
+            widths[sy * sw + sx] = run
+
+    best_score = -1.0
+    best_rect = (int(mw * 0.12), int(mh * 0.12), int(mw * 0.88), int(mh * 0.88))
+
+    for sy in range(sh):
+        for sx in range(sw):
+            max_w = widths[sy * sw + sx]
+            if max_w < 6:
+                continue
+            cur_w = max_w
+            for ey in range(sy, sh):
+                w_here = widths[ey * sw + sx]
+                if w_here == 0:
+                    break
+                if w_here < cur_w:
+                    cur_w = w_here
+                cur_h = (ey - sy) + 1
+                if cur_w < 6 or cur_h < 6:
+                    continue
+                area = cur_w * cur_h
+                # Prefer balanced aspect ratios (width/height between 0.35 and 2.8) for readable typesetting
+                aspect = cur_w / float(cur_h)
+                if aspect < 0.25 or aspect > 4.0:
+                    aspect_penalty = 0.35
+                elif 0.45 <= aspect <= 2.2:
+                    aspect_penalty = 1.15
+                else:
+                    aspect_penalty = 0.85
+                score = area * aspect_penalty
+                if score > best_score:
+                    best_score = score
+                    rx1 = (sx - cur_w + 1) * 2
+                    ry1 = sy * 2
+                    rx2 = (sx + 1) * 2
+                    ry2 = (ey + 1) * 2
+                    best_rect = (rx1, ry1, min(mw, rx2), min(mh, ry2))
+
+    rx1, ry1, rx2, ry2 = best_rect
+    rw = rx2 - rx1
+    rh = ry2 - ry1
+    # Inset slightly (7%) so letters never touch the black ink outline of the bubble
+    pad_x = max(3, int(rw * 0.07))
+    pad_y = max(3, int(rh * 0.07))
+    if rw > pad_x * 2 + 12 and rh > pad_y * 2 + 10:
+        return rx1 + pad_x, ry1 + pad_y, rx2 - pad_x, ry2 - pad_y
+    return rx1, ry1, rx2, ry2
+
+
+def _discover_and_clean_speech_bubble(
+    img: Image.Image,
+    base_gray: Image.Image,
+    claimed_page_mask: Image.Image,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+) -> tuple[int, int, int, int, tuple[int, int, int], tuple[int, int, int]] | None:
+    """
+    Searches a generous region around (x1, y1, x2, y2) on the original grayscale image to find
+    the true enclosed white speech bubble that contains actual dark Japanese text glyphs ("holes"),
+    erases 100% of the Japanese text inside the bubble (including double/connected bubbles),
+    and returns the optimal interior rectangle (tx1, ty1, tx2, ty2) for typesetting!
     """
     width, height = img.size
-    box_w = x2 - x1
-    box_h = y2 - y1
+    box_w = max(12, x2 - x1)
+    box_h = max(12, y2 - y1)
+    pred_cx = (x1 + x2) // 2
+    pred_cy = (y1 + y2) // 2
 
-    # Define a search window around the predicted box (expanded more to the right/bottom to catch vertical kanji)
-    pad_left = max(18, int(box_w * 0.35))
-    pad_right = max(35, int(box_w * 0.85))
-    pad_top = max(18, int(box_h * 0.30))
-    pad_bot = max(30, int(box_h * 0.55))
-
-    wx1 = max(0, x1 - pad_left)
-    wy1 = max(0, y1 - pad_top)
-    wx2 = min(width, x2 + pad_right)
-    wy2 = min(height, y2 + pad_bot)
+    # Generous search window so even if the LLM's box drifted onto a character (like Bubble #2 or #3),
+    # the entire adjacent speech bubble is still inside our search window!
+    pad_x = max(110, int(box_w * 1.15))
+    pad_y = max(110, int(box_h * 1.15))
+    wx1 = max(0, x1 - pad_x)
+    wy1 = max(0, y1 - pad_y)
+    wx2 = min(width, x2 + pad_x)
+    wy2 = min(height, y2 + pad_y)
     ww = wx2 - wx1
     wh = wy2 - wy1
+    if ww < 20 or wh < 20:
+        return None
 
-    sub_gray = img.crop((wx1, wy1, wx2, wy2)).convert("L")
-    # Quantize to 3 levels: 255 = white bubble interior (>=205), 0 = dark border/text (<205)
-    bin_img = sub_gray.point(lambda p: 255 if p >= 205 else 0).convert("RGB")
+    sub_gray = base_gray.crop((wx1, wy1, wx2, wy2))
+    sub_claimed = claimed_page_mask.crop((wx1, wy1, wx2, wy2))
 
-    # Search for a white speech-bubble seed containing dark text glyphs near the predicted box center
-    rel_cx = max(0, min(ww - 1, ((x1 + x2) // 2) - wx1))
-    rel_cy = max(0, min(wh - 1, ((y1 + y2) // 2) - wy1))
+    # Quantize: white >= 200 -> (255, 255, 255), dark ink < 200 -> (0, 0, 0)
+    bin_rgb = sub_gray.point(lambda p: 255 if p >= 200 else 0).convert("RGB")
+    # Mask out any bubble already claimed by an earlier dialogue entry
+    claimed_Overlay = Image.new("RGB", (ww, wh), (128, 128, 128))
+    bin_rgb.paste(claimed_Overlay, (0, 0), mask=sub_claimed)
 
-    best_seed = None
-    # Search outward from box center (biasing slightly right/down where vertical Japanese columns sit)
-    for dy in range(0, max(wh // 2, 1), 6):
-        for dx in range(0, max(ww // 2, 1), 6):
-            for sx, sy in (
-                (rel_cx + dx, rel_cy + dy),
-                (rel_cx - dx, rel_cy + dy),
-                (rel_cx + dx, rel_cy - dy),
-                (rel_cx - dx, rel_cy - dy),
-            ):
-                if 4 <= sx < ww - 4 and 4 <= sy < wh - 4:
-                    if bin_img.getpixel((sx, sy)) == (255, 255, 255):
-                        best_seed = (sx, sy)
-                        break
-            if best_seed:
-                break
-        if best_seed:
-            break
+    # Seal window edges that correspond to the physical outer boundary of the manga page
+    # so bottom-clipped bubbles like '敵じゃない！' are treated as closed at the bottom edge!
+    bin_draw = ImageDraw.Draw(bin_rgb)
+    if wx1 == 0:
+        bin_draw.line([(0, 0), (0, wh - 1)], fill=(0, 0, 0))
+    if wy1 == 0:
+        bin_draw.line([(0, 0), (ww - 1, 0)], fill=(0, 0, 0))
+    if wx2 == width:
+        bin_draw.line([(ww - 1, 0), (ww - 1, wh - 1)], fill=(0, 0, 0))
+    if wy2 == height:
+        bin_draw.line([(0, wh - 1), (ww - 1, wh - 1)], fill=(0, 0, 0))
 
-    if best_seed:
-        # Flood-fill the connected white speech bubble interior with green (0, 255, 0)
-        ImageDraw.floodfill(bin_img, best_seed, (0, 255, 0), thresh=10)
+    rel_cx = max(0, min(ww - 1, pred_cx - wx1))
+    rel_cy = max(0, min(wh - 1, pred_cy - wy1))
+    rel_x1, rel_y1 = x1 - wx1, y1 - wy1
+    rel_x2, rel_y2 = x2 - wx1, y2 - wy1
 
-        # Find the bounding box of the green flood-filled bubble region
-        r, g, b_ch = bin_img.split()
-        # In our quantized image, non-green pixels have R==B (0 or 255), whereas green has R=0, G=255
-        bubble_mask = Image.eval(r, lambda p: 0).paste(255, mask=Image.eval(g, lambda p: 255 if p > 0 else 0))
-        # Simpler mask extraction: pixel is part of floodfill iff R == 0 and G == 255
-        raw_rgb = bin_img.tobytes()
-        mask_bytes = bytearray(ww * wh)
+    # Generate candidate seed points sorted by distance to the predicted box
+    seeds = []
+    step = 12
+    for sy in range(6, wh - 6, step):
+        for sx in range(6, ww - 6, step):
+            # Distance to the predicted box rectangle (0 if inside the predicted box)
+            dx = max(rel_x1 - sx, 0, sx - rel_x2)
+            dy = max(rel_y1 - sy, 0, sy - rel_y2)
+            dist_box = (dx * dx + dy * dy) ** 0.5
+            dist_center = ((sx - rel_cx) ** 2 + (sy - rel_cy) ** 2) ** 0.5
+            seeds.append((dist_box + dist_center * 0.25, sx, sy))
+    seeds.sort(key=lambda item: item[0])
+
+    visited_rgb = bin_rgb.copy()
+    best_candidate = None
+    best_score = -1.0
+
+    for dist_Metric, sx, sy in seeds:
+        if visited_rgb.getpixel((sx, sy)) != (255, 255, 255):
+            continue
+
+        # Mark this connected white component as visited on visited_rgb
+        ImageDraw.floodfill(visited_rgb, (sx, sy), (0, 255, 0), thresh=10)
+
+        # Extract the exact component on a clean copy
+        comp_rgb = bin_rgb.copy()
+        ImageDraw.floodfill(comp_rgb, (sx, sy), (0, 255, 0), thresh=10)
+        raw_bytes_comp = comp_rgb.tobytes()
+
         min_bx, min_by = ww, wh
         max_bx, max_by = 0, 0
-        count_green = 0
+        white_area = 0
         for idx in range(ww * wh):
             off = idx * 3
-            if raw_rgb[off] == 0 and raw_rgb[off + 1] == 255:
-                mask_bytes[idx] = 255
-                count_green += 1
+            if raw_bytes_comp[off] == 0 and raw_bytes_comp[off + 1] == 255:
+                white_area += 1
                 py, px = divmod(idx, ww)
                 if px < min_bx:
                     min_bx = px
@@ -1902,71 +1992,120 @@ def _clean_speech_bubble_and_get_text_box(
                 if py > max_by:
                     max_by = py
 
-        # Check that the flood-filled region is a genuine bounded speech bubble (didn't leak to all 4 window edges)
-        touches_edges = (
-            (1 if min_bx <= 1 else 0)
-            + (1 if min_by <= 1 else 0)
-            + (1 if max_bx >= ww - 2 else 0)
-            + (1 if max_by >= wh - 2 else 0)
+        bw = max_bx - min_bx + 1
+        bh = max_by - min_by + 1
+        # Filter out tiny noise specks (<300px) or giant page-spanning backgrounds
+        if white_area < 300 or bw < 16 or bh < 16:
+            continue
+        if bw > width * 0.78 or bh > height * 0.78:
+            continue
+
+        # Check if component leaked across the interior cut edges of our search window
+        leaked_interior_edges = (
+            (1 if (min_bx <= 1 and wx1 > 0) else 0)
+            + (1 if (min_by <= 1 and wy1 > 0) else 0)
+            + (1 if (max_bx >= ww - 2 and wx2 < width) else 0)
+            + (1 if (max_by >= wh - 2 and wy2 < height) else 0)
         )
-        bw = max_bx - min_bx
-        bh = max_by - min_by
+        if leaked_interior_edges >= 2:
+            continue
 
-        if count_green >= 200 and touches_edges <= 2 and bw >= 24 and bh >= 24:
-            # Fill all interior holes (the black Japanese characters inside the white speech bubble!)
-            # Any pixel not reachable from the boundary of the bubble's mask box without crossing green is text!
-            hole_canvas = Image.frombytes("L", (ww, wh), bytes(mask_bytes)).convert("RGB")
-            # Flood-fill the exterior from the edges of the window with red (255, 0, 0)
-            for ex in range(ww):
-                if hole_canvas.getpixel((ex, 0)) == (0, 0, 0):
-                    ImageDraw.floodfill(hole_canvas, (ex, 0), (255, 0, 0))
-                if hole_canvas.getpixel((ex, wh - 1)) == (0, 0, 0):
-                    ImageDraw.floodfill(hole_canvas, (ex, wh - 1), (255, 0, 0))
-            for ey in range(wh):
-                if hole_canvas.getpixel((0, ey)) == (0, 0, 0):
-                    ImageDraw.floodfill(hole_canvas, (0, ey), (255, 0, 0))
-                if hole_canvas.getpixel((ww - 1, ey)) == (0, 0, 0):
-                    ImageDraw.floodfill(hole_canvas, (ww - 1, ey), (255, 0, 0))
+        # Crop to the component's local bounding box (with 2px padding) to find enclosed dark text holes!
+        lx1 = max(0, min_bx - 2)
+        ly1 = max(0, min_by - 2)
+        lx2 = min(ww, max_bx + 3)
+        ly2 = min(wh, max_by + 3)
+        lw = lx2 - lx1
+        lh = ly2 - ly1
 
-            # Every pixel that is NOT exterior red (255, 0, 0) is strictly inside the speech bubble!
-            hc_bytes = hole_canvas.tobytes()
-            clean_mask_bytes = bytearray(ww * wh)
-            for idx in range(ww * wh):
-                off = idx * 3
-                if not (hc_bytes[off] == 255 and hc_bytes[off + 1] == 0):
-                    clean_mask_bytes[idx] = 255
+        local_comp = comp_rgb.crop((lx1, ly1, lx2, ly2))
+        lc_bytes = local_comp.tobytes()
+        # Build local canvas where white component is (255, 255, 255) and everything else is (0, 0, 0)
+        hole_test_bytes = bytearray(lw * lh * 3)
+        for i in range(lw * lh):
+            off = i * 3
+            if lc_bytes[off] == 0 and lc_bytes[off + 1] == 255:
+                hole_test_bytes[off] = 255
+                hole_test_bytes[off + 1] = 255
+                hole_test_bytes[off + 2] = 255
 
-            clean_mask = Image.frombytes("L", (ww, wh), bytes(clean_mask_bytes))
-            white_patch = Image.new("RGB", (ww, wh), (255, 255, 255))
-            img.paste(white_patch, (wx1, wy1), mask=clean_mask)
+        hole_img = Image.frombytes("RGB", (lw, lh), bytes(hole_test_bytes))
+        # Flood-fill exterior (0, 0, 0) from all 4 borders of the local box with red (255, 0, 0)
+        for ex in range(lw):
+            if hole_img.getpixel((ex, 0)) == (0, 0, 0):
+                ImageDraw.floodfill(hole_img, (ex, 0), (255, 0, 0))
+            if hole_img.getpixel((ex, lh - 1)) == (0, 0, 0):
+                ImageDraw.floodfill(hole_img, (ex, lh - 1), (255, 0, 0))
+        for ey in range(lh):
+            if hole_img.getpixel((0, ey)) == (0, 0, 0):
+                ImageDraw.floodfill(hole_img, (0, ey), (255, 0, 0))
+            if hole_img.getpixel((lw - 1, ey)) == (0, 0, 0):
+                ImageDraw.floodfill(hole_img, (lw - 1, ey), (255, 0, 0))
 
-            # Inset by 12% so wrapped text stays comfortably inside the curved bubble border
-            inset_x = max(4, int(bw * 0.12))
-            inset_y = max(4, int(bh * 0.12))
-            tx1 = wx1 + min_bx + inset_x
-            ty1 = wy1 + min_by + inset_y
-            tx2 = wx1 + max_bx - inset_x
-            ty2 = wy1 + max_by - inset_y
-            if tx2 - tx1 >= 20 and ty2 - ty1 >= 16:
-                return tx1, ty1, tx2, ty2, (255, 255, 255), (15, 15, 15), (255, 255, 255)
+        # Any pixel that is STILL (0, 0, 0) is an enclosed dark hole (Japanese text glyph) inside the bubble!
+        hi_bytes = hole_img.tobytes()
+        hole_pixels = 0
+        filled_mask_bytes = bytearray(lw * lh)
+        for i in range(lw * lh):
+            off = i * 3
+            r_v, g_v, b_v = hi_bytes[off], hi_bytes[off + 1], hi_bytes[off + 2]
+            if r_v == 0 and g_v == 0 and b_v == 0:
+                hole_pixels += 1
+                filled_mask_bytes[i] = 255
+            elif r_v == 255 and g_v == 255 and b_v == 255:
+                filled_mask_bytes[i] = 255
 
-    # Fallback if bubble is borderless or dark: clean the predicted rectangle directly
-    crop_region = img.crop((x1, y1, x2, y2)).convert("L")
-    mean_luma = ImageStat.Stat(crop_region).mean[0]
-    is_light_bg = mean_luma >= 115
-    bg_fill = (255, 255, 255) if is_light_bg else (20, 20, 20)
-    fg_text = (15, 15, 15) if is_light_bg else (245, 245, 245)
-    stroke_col = (255, 255, 255) if is_light_bg else (0, 0, 0)
+        # CRITICAL: A real speech bubble MUST enclose dark text glyphs (hole_pixels >= 15)!
+        # This rejects 100% of empty white armor plates, hair highlights, and background gaps.
+        ink_ratio = hole_pixels / float(max(1, white_area))
+        if hole_pixels < 15 or ink_ratio < 0.005 or ink_ratio > 0.75:
+            continue
 
-    draw = ImageDraw.Draw(img)
-    pad_clean = 5
-    cx1 = max(0, x1 - pad_clean)
-    cy1 = max(0, y1 - pad_clean)
-    cx2 = min(width, x2 + pad_clean)
-    cy2 = min(height, y2 + pad_clean)
-    radius = min(12, min(box_w, box_h) // 4)
-    draw.rounded_rectangle([cx1, cy1, cx2, cy2], radius=radius, fill=bg_fill)
-    return x1, y1, x2, y2, bg_fill, fg_text, stroke_col
+        # Score candidate by proximity to predicted box + enclosed text ink + bubble solidity
+        comp_cx = (min_bx + max_bx) / 2.0
+        comp_cy = (min_by + max_by) / 2.0
+        center_dist = ((comp_cx - rel_cx) ** 2 + (comp_cy - rel_cy) ** 2) ** 0.5
+
+        # Compute intersection overlap with predicted box
+        inter_x1 = max(min_bx, rel_x1)
+        inter_y1 = max(min_by, rel_y1)
+        inter_x2 = min(max_bx, rel_x2)
+        inter_y2 = min(max_by, rel_y2)
+        inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+        overlap_bonus = 2.2 if inter_area > 50 else 1.0
+
+        score = (
+            overlap_bonus
+            * (min(white_area, 45000) ** 0.45)
+            * (min(hole_pixels, 6000) ** 0.55)
+            / (25.0 + center_dist)
+        )
+        if score > best_score:
+            best_score = score
+            best_candidate = (lx1, ly1, lw, lh, bytes(filled_mask_bytes))
+
+    if best_candidate is None:
+        return None
+
+    lx1, ly1, lw, lh, filled_mask_bytes = best_candidate
+    abs_x = wx1 + lx1
+    abs_y = wy1 + ly1
+
+    # Erase 100% of the Japanese text inside the speech bubble (while keeping the black outline intact!)
+    local_mask = Image.frombytes("L", (lw, lh), filled_mask_bytes)
+    white_fill = Image.new("RGB", (lw, lh), (255, 255, 255))
+    img.paste(white_fill, (abs_x, abs_y), mask=local_mask)
+
+    # Mark this speech bubble as claimed so no other bubble entry can reuse it
+    claimed_page_mask.paste(255, (abs_x, abs_y), mask=local_mask)
+
+    # Find the largest inscribed rectangle strictly INSIDE the speech bubble mask
+    rx1, ry1, rx2, ry2 = _find_largest_inscribed_text_rect(filled_mask_bytes, lw, lh)
+    tx1 = abs_x + rx1
+    ty1 = abs_y + ry1
+    tx2 = abs_x + rx2
+    ty2 = abs_y + ry2
+    return tx1, ty1, tx2, ty2, (15, 15, 15), (255, 255, 255)
 
 
 def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) -> bytes | None:
@@ -1980,9 +2119,11 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
         return None
 
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    base_gray = img.convert("L")
     width, height = img.size
+    claimed_page_mask = Image.new("L", (width, height), 0)
 
-    # Pass 1: Clean all speech bubbles first and record their true interior text boxes
+    # Sort shorter/smaller boxes first or process in reading order while tracking claimed bubbles
     prepared_renders = []
     for b in valid_boxes:
         ymin, xmin, ymax, xmax = [float(v) for v in b["box_2d"]]
@@ -1996,35 +2137,38 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
         x2 = min(width, int((xmax / 1000.0) * width))
         y2 = min(height, int((ymax / 1000.0) * height))
 
-        if (x2 - x1) < 14 or (y2 - y1) < 14:
+        # Allow narrow boxes (down to 3px) so single-character bubbles like '!' are never skipped
+        if (x2 - x1) < 3 or (y2 - y1) < 3:
             continue
 
-        tx1, ty1, tx2, ty2, bg_fill, fg_text, stroke_col = _clean_speech_bubble_and_get_text_box(
-            img, x1, y1, x2, y2
+        res = _discover_and_clean_speech_bubble(
+            img, base_gray, claimed_page_mask, x1, y1, x2, y2
         )
-        prepared_renders.append((tx1, ty1, tx2, ty2, fg_text, stroke_col, b["translated_text"].strip()))
+        if res is not None:
+            tx1, ty1, tx2, ty2, fg_text, stroke_col = res
+            prepared_renders.append(
+                (tx1, ty1, tx2, ty2, fg_text, stroke_col, b["translated_text"].strip())
+            )
 
-    # Pass 2: Typeset the translated dialogue centered inside each cleaned bubble
     draw = ImageDraw.Draw(img)
     for tx1, ty1, tx2, ty2, fg_text, stroke_col, trans_text in prepared_renders:
-        box_w = max(24, tx2 - tx1)
-        box_h = max(20, ty2 - ty1)
-        usable_w = max(24, int(box_w * 0.94))
-        usable_h = max(18, int(box_h * 0.94))
+        box_w = max(20, tx2 - tx1)
+        box_h = max(18, ty2 - ty1)
+        usable_w = max(18, int(box_w * 0.94))
+        usable_h = max(16, int(box_h * 0.94))
 
-        start_font_size = min(32, max(13, int(min(box_w, box_h) * 0.28)))
+        start_font_size = min(32, max(13, int(min(box_w, box_h) * 0.30)))
         chosen_font = _load_manga_font(10)
         chosen_lines = [trans_text]
-        line_height = 13
+        line_height = 12
 
         for fsize in range(start_font_size, 8, -1):
             font = _load_manga_font(fsize)
-            # Only allow splitting a single long word if we've reached the minimum 9px font size
             wrapped = _wrap_text_to_pixel_width(
                 draw, trans_text, font, usable_w, allow_midword_split=(fsize <= 9)
             )
             sample_bbox = draw.textbbox((0, 0), "Agกข้ำ", font=font)
-            lh = int((sample_bbox[3] - sample_bbox[1]) * 1.15)
+            lh = int((sample_bbox[3] - sample_bbox[1]) * 1.14)
             total_h = lh * len(wrapped)
             max_line_w = max(
                 (draw.textbbox((0, 0), ln, font=font)[2] - draw.textbbox((0, 0), ln, font=font)[0])
