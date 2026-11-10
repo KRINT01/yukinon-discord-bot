@@ -129,14 +129,14 @@ ACTIVE_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "scb10x/typhoon-ocr1.5-3b
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_CODE_MODEL = os.getenv("GROQ_CODE_MODEL", "openai/gpt-oss-120b")
 GROQ_CHAT_FALLBACK_MODEL = os.getenv("GROQ_CHAT_FALLBACK_MODEL", "openai/gpt-oss-120b")
-GROQ_VISION_FALLBACK_MODEL = os.getenv("GROQ_VISION_FALLBACK_MODEL", "qwen/qwen3.6-27b")
+GROQ_VISION_FALLBACK_MODEL = os.getenv("GROQ_VISION_FALLBACK_MODEL", "qwen/qwen3.8-27b")
 GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")
 
-# Cloudflare Workers AI Free Tier (10,000 Neurons/day for FLUX Image Gen & Llama-4-Scout Vision)
+# Cloudflare Workers AI Free Tier (10,000 Neurons/day for FLUX Image Gen & Gemma 4 Vision)
 CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "").strip()
 CF_API_TOKEN = os.getenv("CF_API_TOKEN", "").strip()
 CF_IMAGE_MODEL = os.getenv("CF_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell").strip()
-CF_VISION_MODEL = os.getenv("CF_VISION_MODEL", "@cf/meta/llama-4-scout-17b-16e-instruct").strip()
+CF_VISION_MODEL = os.getenv("CF_VISION_MODEL", "@cf/google/gemma-4-26b-a4b-it").strip()
 
 # Google AI Studio Free Tier (Defaults directly to working gemini-3-flash-preview)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -718,38 +718,22 @@ async def call_gemini_generate_content_self_healing(
 
 
 async def _discover_active_groq_vision_models() -> list[str]:
-    """Returns active Groq LPU Vision models ordered by accuracy and speed."""
+    """Uses qwen/qwen3.8-27b directly without probing non-existent 404 model IDs."""
     candidates = [
         _ACTIVE_GROQ_VISION_CACHE,
-        "qwen/qwen3.6-27b",
-        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "qwen/qwen3.8-27b",
     ]
-    if not GROQ_API_KEY:
-        return candidates
-    models_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/models")
-    try:
-        headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
-            async with session.get(models_url, headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for m in data.get("data") or []:
-                        mid = m.get("id") or ""
-                        if any(k in mid.lower() for k in ("qwen3.6", "llama-4-scout", "vision")):
-                            if mid not in candidates:
-                                candidates.append(mid)
-    except Exception:
-        pass
     seen = set()
     return [x for x in candidates if x and not (x in seen or seen.add(x))]
 
 
 async def _call_cloudflare_vision_chat(
-    prompt_text: str, mime_type: str, b64_img: str, max_tokens: int = 3072
+    prompt_text: str, mime_type: str, b64_img: str, max_tokens: int = 4096
 ) -> str:
     """
-    Calls Cloudflare Workers AI Vision (@cf/meta/llama-4-scout-17b-16e-instruct)
-    via Cloudflare's OpenAI-compatible /ai/v1/chat/completions endpoint.
+    Calls Cloudflare Workers AI Vision using @cf/google/gemma-4-26b-a4b-it as primary
+    (~28-35 Neurons/call, built on Gemini 3 research), with @cf/moonshotai/kimi-k2.6
+    and @cf/mistralai/mistral-small-3.1-24b-instruct as automatic failovers.
     """
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
         return ""
@@ -760,10 +744,15 @@ async def _call_cloudflare_vision_chat(
         "Authorization": f"Bearer {CF_API_TOKEN}",
         "Content-Type": "application/json",
     }
-    vision_models = [CF_VISION_MODEL, "@cf/meta/llama-4-scout-17b-16e-instruct", "@cf/google/gemma-4-26b-a4b-it"]
+    vision_models = [
+        CF_VISION_MODEL,
+        "@cf/google/gemma-4-26b-a4b-it",
+        "@cf/moonshotai/kimi-k2.6",
+        "@cf/mistralai/mistral-small-3.1-24b-instruct",
+    ]
     seen = set()
 
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40)) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
         for cf_mod in vision_models:
             if not cf_mod or cf_mod in seen:
                 continue
@@ -788,9 +777,12 @@ async def _call_cloudflare_vision_chat(
                         data = await resp.json()
                         choices = data.get("choices") or []
                         if choices:
-                            content = (choices[0].get("message") or {}).get("content") or ""
+                            msg_obj = choices[0].get("message") or {}
+                            content = msg_obj.get("content") or ""
+                            # Strip any <think>...</think> reasoning blocks emitted by Gemma 4 or Kimi K2.6
                             content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
                             if content:
+                                print(f"[Cloudflare Vision] Succeeded with '{cf_mod}'")
                                 return content
                     else:
                         err_txt = await resp.text()
@@ -1883,16 +1875,145 @@ def _prepare_manga_image_for_vision(raw_bytes: bytes) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
+def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
+    """
+    Normalizes key names across different LLMs and filters out any bubble
+    whose translated_text is empty so an incomplete model response never short-circuits!
+    """
+    valid = []
+    for idx, item in enumerate(raw_bubbles, 1):
+        if not isinstance(item, dict):
+            continue
+        speaker = (
+            item.get("speaker_or_note")
+            or item.get("speaker")
+            or item.get("character")
+            or f"Bubble {idx}"
+        )
+        src_txt = (
+            item.get("source_text")
+            or item.get("original_text")
+            or item.get("japanese_text")
+            or item.get("source")
+            or ""
+        )
+        tr_txt = (
+            item.get("translated_text")
+            or item.get("translation")
+            or item.get("translated")
+            or item.get("english_text")
+            or item.get("target_text")
+            or item.get("text")
+            or ""
+        )
+        tr_txt = str(tr_txt).strip()
+        src_txt = str(src_txt).strip()
+        if not tr_txt:
+            continue
+
+        box = item.get("box_2d") or item.get("bbox") or item.get("box")
+        norm_box = None
+        if isinstance(box, (list, tuple)) and len(box) == 4:
+            try:
+                norm_box = [float(v) for v in box]
+            except Exception:
+                norm_box = None
+        elif isinstance(box, str):
+            nums = re.findall(r"-?\d+(?:\.\d+)?", box)
+            if len(nums) == 4:
+                norm_box = [float(v) for v in nums]
+
+        valid.append({
+            "id": item.get("id", idx),
+            "speaker_or_note": str(speaker).strip(),
+            "source_text": src_txt,
+            "translated_text": tr_txt,
+            "box_2d": norm_box,
+        })
+    return valid
+
+
 def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
-    """Extracts and validates the JSON {'summary': ..., 'bubbles': [...]} payload from any vision model."""
+    """
+    3-Stage Fault-Tolerant Parser for LLM Manga JSON outputs:
+    Stage 1: Standard json.loads()
+    Stage 2: Automatic JSON syntax repair (fixes missing commas on newlines, trailing commas, smart quotes)
+    Stage 3: Regex bubble-by-bubble extractor (recovers all bubbles even if unescaped quotes break json.loads)
+    """
+    if not raw_text:
+        return [], ""
     cleaned = re.sub(r"<think>[\s\S]*?</think>", "", raw_text).strip()
     cleaned = re.sub(r"^```(?:json)?|```$", "", cleaned).strip()
     json_match = re.search(r"\{[\s\S]*\}", cleaned)
     target = json_match.group(0) if json_match else cleaned
-    parsed = json.loads(target)
-    bubbles = parsed.get("bubbles") or []
-    summary = parsed.get("summary") or ""
-    return bubbles, summary
+
+    # Stage 1: Standard json.loads
+    try:
+        parsed = json.loads(target)
+        bubbles = _normalize_and_validate_bubbles(parsed.get("bubbles") or [])
+        summary = str(parsed.get("summary") or "").strip()
+        if bubbles:
+            return bubbles, summary
+    except Exception:
+        pass
+
+    # Stage 2: Repair common LLM JSON syntax errors (missing commas between lines, trailing commas)
+    try:
+        repaired = target
+        # Insert missing comma at end of line when next line starts a new JSON key or object
+        repaired = re.sub(r'(["\d\]}])\s*\n(\s*["{])', r"\1,\n\2", repaired)
+        # Remove trailing commas before } or ]
+        repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+        parsed = json.loads(repaired)
+        bubbles = _normalize_and_validate_bubbles(parsed.get("bubbles") or [])
+        summary = str(parsed.get("summary") or "").strip()
+        if bubbles:
+            return bubbles, summary
+    except Exception:
+        pass
+
+    # Stage 3: Regex fallback (extracts each bubble block even if dialogue had unescaped quotes)
+    summary_m = re.search(r'"summary"\s*:\s*"([^"\n]+)"', target)
+    summary = summary_m.group(1).strip() if summary_m else ""
+
+    extracted_bubbles = []
+    # Match each object inside the "bubbles" array
+    for idx, obj_m in enumerate(re.finditer(r"\{[^{}]*?\}", target), 1):
+        block = obj_m.group(0)
+        tr_m = re.search(
+            r'"(?:translated_text|translation|translated|text)"\s*:\s*"(.+?)"\s*(?:,\s*"|\n|\})',
+            block,
+            re.DOTALL,
+        )
+        if not tr_m:
+            continue
+        src_m = re.search(
+            r'"(?:source_text|original_text|source)"\s*:\s*"(.+?)"\s*(?:,\s*"|\n|\})',
+            block,
+            re.DOTALL,
+        )
+        spk_m = re.search(
+            r'"(?:speaker_or_note|speaker|character)"\s*:\s*"(.+?)"\s*(?:,\s*"|\n|\})',
+            block,
+            re.DOTALL,
+        )
+        box_m = re.search(r'"(?:box_2d|bbox|box)"\s*:\s*\[([^\]]+)\]', block)
+        norm_box = None
+        if box_m:
+            nums = re.findall(r"-?\d+(?:\.\d+)?", box_m.group(1))
+            if len(nums) == 4:
+                norm_box = [float(v) for v in nums]
+
+        extracted_bubbles.append({
+            "id": idx,
+            "speaker_or_note": spk_m.group(1).strip() if spk_m else f"Bubble {idx}",
+            "source_text": src_m.group(1).strip() if src_m else "",
+            "translated_text": tr_m.group(1).replace('\\"', '"').strip(),
+            "box_2d": norm_box,
+        })
+
+    valid_extracted = _normalize_and_validate_bubbles(extracted_bubbles)
+    return valid_extracted, summary
 
 
 async def extract_and_translate_manga_bubbles(
@@ -1909,18 +2030,18 @@ and translate ALL speech bubbles (including short exclamations like '!' or 'Huh?
 
 CRITICAL RULES:
 1. Reading Order: Order the bubbles strictly in traditional Japanese Manga reading order (Top-to-Bottom, Right-to-Left across panels).
-2. In-Context Localization: Adapt Japanese/Korean/Chinese idioms, pronouns, tone, and emotion so the dialogue sounds completely natural in {target_lang_name} while fitting inside a speech bubble.
+2. In-Context Localization: Adapt Japanese/Korean/Chinese idioms, pronouns, tone, and emotion so the dialogue sounds completely natural in {target_lang_name} while fitting inside a speech bubble. Do NOT use double quotes inside `translated_text` (use single quotes if needed).
 3. Speech Bubble Bounding Boxes (`box_2d`):
    - For each speech bubble, provide `box_2d` as `[ymin, xmin, ymax, xmax]` normalized from 0 to 1000.
    - `box_2d` must cover the white interior of the speech bubble where the Japanese text is written (if a bubble has two connected ovals for one sentence, cover both ovals).
-4. Return ONLY valid JSON matching this exact structure (no markdown explanation outside JSON):
+4. Return ONLY valid JSON matching this exact structure (every bubble MUST have a non-empty `translated_text`):
 {{
   "summary": "Brief 1-sentence scene context",
   "bubbles": [
     {{
       "id": 1,
       "speaker_or_note": "Character / SFX / Narration",
-      "source_text": "Original text",
+      "source_text": "Original Japanese text",
       "translated_text": "Natural {target_lang_name} translation",
       "box_2d": [ymin, xmin, ymax, xmax]
     }}
@@ -1931,7 +2052,7 @@ CRITICAL RULES:
     fallback_bubbles_no_boxes = []
     fallback_summary = ""
 
-    # Tier 1 (Primary - Ultra-Fast LPU): Groq Vision (qwen/qwen3.6-27b -> llama-4-scout-17b-16e-instruct)
+    # Tier 1 (Primary - Fast LPU): Groq Vision (qwen/qwen3.8-27b)
     if GROQ_API_KEY:
         groq_vision_candidates = await _discover_active_groq_vision_models()
         chat_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/chat/completions")
@@ -1963,12 +2084,14 @@ CRITICAL RULES:
                             content = g_data["choices"][0]["message"]["content"].strip()
                             bubbles, summary = _parse_manga_bubbles_json(content)
                             if bubbles:
-                                has_boxes = any(
-                                    isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4
+                                has_boxes_and_text = any(
+                                    isinstance(b.get("box_2d"), list)
+                                    and len(b["box_2d"]) == 4
+                                    and bool(b.get("translated_text"))
                                     for b in bubbles
                                 )
-                                if has_boxes:
-                                    print(f"[Manga Vision] Completed via Tier 1 Groq ({g_model})")
+                                if has_boxes_and_text:
+                                    print(f"[Manga Vision] Completed via Tier 1 Groq ({g_model}) - {len(bubbles)} bubbles")
                                     return bubbles, summary
                                 fallback_bubbles_no_boxes = bubbles
                                 fallback_summary = summary
@@ -1978,26 +2101,7 @@ CRITICAL RULES:
                 except Exception as e:
                     print(f"Groq Manga Vision ({g_model}) warning: {e}")
 
-    # Tier 2 (Secondary - Edge GPU): Cloudflare Workers AI Vision (@cf/meta/llama-4-scout-17b-16e-instruct)
-    try:
-        cf_content = await _call_cloudflare_vision_chat(manga_system_instruction, mime_type, b64_img)
-        if cf_content:
-            bubbles, summary = _parse_manga_bubbles_json(cf_content)
-            if bubbles:
-                has_boxes = any(
-                    isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4
-                    for b in bubbles
-                )
-                if has_boxes:
-                    print("[Manga Vision] Completed via Tier 2 Cloudflare Workers AI")
-                    return bubbles, summary
-                if not fallback_bubbles_no_boxes:
-                    fallback_bubbles_no_boxes = bubbles
-                    fallback_summary = summary
-    except Exception as e:
-        print(f"Cloudflare Manga Vision warning: {e}")
-
-    # Tier 3 (Backup - High-Precision Box_2D): Google AI Studio (gemini-3-flash-preview)
+    # Tier 2 (High-Precision Box_2D + Manga OCR): Google AI Studio (gemini-3-flash-preview)
     if GEMINI_API_KEY:
         gemini_payload = {
             "contents": [
@@ -2023,10 +2127,34 @@ CRITICAL RULES:
                 raw_json_str = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
                 bubbles, summary = _parse_manga_bubbles_json(raw_json_str)
                 if bubbles:
-                    print(f"[Manga Vision] Completed via Tier 3 Gemini ({_ACTIVE_GEMINI_MODEL_CACHE})")
+                    print(
+                        f"[Manga Vision] Completed via Tier 2 Gemini ({_ACTIVE_GEMINI_MODEL_CACHE}) "
+                        f"- {len(bubbles)} bubbles"
+                    )
                     return bubbles, summary
         except Exception as e:
-            print(f"Gemini Manga Vision backup warning: {e}")
+            print(f"Gemini Manga Vision warning: {e}")
+
+    # Tier 3 (Backup Edge GPU): Cloudflare Workers AI Vision (@cf/meta/llama-4-scout-17b-16e-instruct)
+    try:
+        cf_content = await _call_cloudflare_vision_chat(manga_system_instruction, mime_type, b64_img)
+        if cf_content:
+            bubbles, summary = _parse_manga_bubbles_json(cf_content)
+            if bubbles:
+                has_boxes_and_text = any(
+                    isinstance(b.get("box_2d"), list)
+                    and len(b["box_2d"]) == 4
+                    and bool(b.get("translated_text"))
+                    for b in bubbles
+                )
+                if has_boxes_and_text:
+                    print(f"[Manga Vision] Completed via Tier 3 Cloudflare Workers AI - {len(bubbles)} bubbles")
+                    return bubbles, summary
+                if not fallback_bubbles_no_boxes:
+                    fallback_bubbles_no_boxes = bubbles
+                    fallback_summary = summary
+    except Exception as e:
+        print(f"Cloudflare Manga Vision warning: {e}")
 
     if fallback_bubbles_no_boxes:
         return fallback_bubbles_no_boxes, fallback_summary
