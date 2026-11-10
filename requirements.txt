@@ -12,3 +12,4 @@ python-docx
 trafilatura
 youtube-transcript-api
 psutil
+Pillow

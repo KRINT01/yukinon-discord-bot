@@ -125,6 +125,20 @@ GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 DEFAULT_WEATHER_CITY = os.getenv("DEFAULT_WEATHER_CITY", "Bangkok").strip()
 
+# Cloudflare Workers AI Free Tier (10,000 Neurons/day = ~173 free FLUX.1-schnell images/day)
+CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "").strip()
+CF_API_TOKEN = os.getenv("CF_API_TOKEN", "").strip()
+CF_IMAGE_MODEL = os.getenv("CF_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell").strip()
+
+# Google AI Studio Free Tier (Gemini 2.5 Flash with Native Google Search Grounding)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_SEARCH_MODEL = os.getenv("GEMINI_SEARCH_MODEL", "gemini-2.5-flash").strip()
+
+IMAGE_GEN_INTENT_PATTERN = re.compile(
+    r"^(วาดรูป|สร้างรูป|เจนรูป|ขอรูป|ช่วยวาด|วาดภาพ|สร้างภาพ|draw\s+an?\s+image|generate\s+an?\s+image)\b",
+    re.IGNORECASE,
+)
+
 DDGS_PROXY = os.getenv("DDGS_PROXY", "").strip() or None
 YOUTUBE_PROXY_URL = os.getenv("YOUTUBE_PROXY_URL", "").strip()
 
@@ -590,6 +604,75 @@ def _search_google_news_rss_sync(query: str, is_thai: bool, max_results: int = 4
         print(f"Google News RSS fallback warning: {e}")
     return results
 
+def _search_google_ai_studio_grounded_sync(query: str) -> str:
+    """
+    Uses Google AI Studio (gemini-2.5-flash) with native Google Search Grounding
+    to retrieve real-time facts and citation URLs (1,500 RPD free tier, never blocked on Render IPs).
+    """
+    if not GEMINI_API_KEY:
+        return ""
+    import json
+    import urllib.request
+
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_SEARCH_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": (
+                            f"Search Google for the latest accurate information about: {query}\n"
+                            "Provide a concise factual summary with dates, numbers, and key facts."
+                        )
+                    }
+                ]
+            }
+        ],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": 0.1},
+    }
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        candidates = data.get("candidates") or []
+        if not candidates:
+            return ""
+        cand = candidates[0]
+        parts = (cand.get("content") or {}).get("parts") or []
+        summary_text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+
+        # Extract grounded source URLs from groundingMetadata
+        chunks = (cand.get("groundingMetadata") or {}).get("groundingChunks") or []
+        sources = []
+        for idx, ch in enumerate(chunks[:5], 1):
+            web_info = ch.get("web") or {}
+            uri = web_info.get("uri", "")
+            title = web_info.get("title", "Source")
+            if uri:
+                sources.append(f"[{idx}] {title}: {uri}")
+
+        if not summary_text:
+            return ""
+        sources_block = "\n".join(sources)
+        return (
+            f'<untrusted_web_search_results query="{query}" engine="google_search_grounding">\n'
+            f"Verified Google Search Summary:\n{summary_text}\n\n"
+            f"Sources:\n{sources_block}\n"
+            f"</untrusted_web_search_results>"
+        )
+    except Exception as e:
+        print(f"Google AI Studio Grounded Search warning (falling back to DDGS/RSS): {e}")
+        return ""
+
 
 def run_safe_web_search_sync(query: str, max_results: int = 4) -> str:
     clean_q = re.sub(r"[\r\n]+", " ", query).strip()
@@ -597,6 +680,12 @@ def run_safe_web_search_sync(query: str, max_results: int = 4) -> str:
     clean_q = re.sub(r"^(สวัสดี|ยูกิโนะ|ยูกิน่อน|ช่วยหา|ค้นหา|ช่วยบอก|อยากรู้ว่า)\s*", "", clean_q).strip()[:200]
     if not clean_q:
         return ""
+
+    # 0. Primary Tier: Google AI Studio Native Google Search Grounding (if GEMINI_API_KEY is set)
+    if GEMINI_API_KEY:
+        grounded_res = _search_google_ai_studio_grounded_sync(clean_q)
+        if grounded_res:
+            return grounded_res
 
     is_thai = bool(THAI_CHAR_REGEX.search(clean_q))
     region_code = "th-th" if is_thai else "wt-wt"
@@ -1561,6 +1650,11 @@ async def on_message(message: discord.Message):
         return
 
     clean_prompt = re.sub(rf"\<@\!?{bot.user.id}\>", "", message.content).strip()
+
+    if MANGA_TRANSLATE_INTENT_PATTERN.search(clean_prompt):
+        await process_manga_translation_request(message, clean_prompt)
+        return
+
     async with message.channel.typing():
         extracted_ctx, spoken_clip_text = await extract_all_context(message)
         user_request = clean_prompt or spoken_clip_text or "สรุปเนื้อหาของไฟล์ที่แนบมาให้หน่อย"
@@ -1676,6 +1770,519 @@ async def ask_code(ctx, *, prompt: str = "วิเคราะห์โค้�
             has_fresh_attachment=bool(ctx_text),
         )
         await send_chunked_response(ctx, answer)
+
+async def generate_image_cloudflare_flux(user_prompt: str) -> tuple[bytes, str]:
+    """
+    Future-proof Cloudflare Workers AI image generator (zero deprecated Stable Diffusion IDs):
+    - Default: @cf/black-forest-labs/flux-1-schnell (steps=8, ~104 free images/day)
+    - '--anime': @cf/black-forest-labs/flux-1-schnell (steps=8 + 2D anime key-visual prompt styling)
+    - '--fl2': @cf/black-forest-labs/flux-2-klein-4b (fast distilled FLUX.2 4B model)
+    - '--fl2hq': @cf/black-forest-labs/flux-2-klein-9b (Cloudflare's official SDXL replacement)
+    - '--hq' or '--phoenix': @cf/leonardo/phoenix-1.0 (25 steps, high prompt & text adherence)
+    """
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+        raise RuntimeError("ยังไม่ได้ตั้งค่า `CF_ACCOUNT_ID` และ `CF_API_TOKEN` ใน Render Environment ค่ะ")
+
+    raw_p = user_prompt.strip()
+    selected_model = CF_IMAGE_MODEL
+    mode_tag = "FLUX.1-schnell (8 steps)"
+    is_anime_style = False
+
+    lower_p = raw_p.lower()
+    if lower_p.startswith(("--hq ", "--phoenix ")):
+        selected_model = "@cf/leonardo/phoenix-1.0"
+        mode_tag = "Leonardo Phoenix 1.0 (HQ)"
+        raw_p = raw_p.split(" ", 1)[1].strip()
+    elif lower_p.startswith("--fl2hq "):
+        selected_model = "@cf/black-forest-labs/flux-2-klein-9b"
+        mode_tag = "FLUX.2 Klein 9B"
+        raw_p = raw_p.split(" ", 1)[1].strip()
+    elif lower_p.startswith(("--fl2 ", "--flux2 ")):
+        selected_model = "@cf/black-forest-labs/flux-2-klein-4b"
+        mode_tag = "FLUX.2 Klein 4B"
+        raw_p = raw_p.split(" ", 1)[1].strip()
+    elif lower_p.startswith("--anime "):
+        selected_model = "@cf/black-forest-labs/flux-1-schnell"
+        mode_tag = "FLUX.1-schnell (Anime Style)"
+        is_anime_style = True
+        raw_p = raw_p.split(" ", 1)[1].strip()
+
+    english_prompt = raw_p
+    if (THAI_CHAR_REGEX.search(english_prompt) or is_anime_style) and GROQ_API_KEY:
+        try:
+            style_instruction = (
+                "Format the output strictly as a 2D Japanese anime illustration prompt "
+                "(include tags: '2D anime key visual, cel-shaded anime art style, crisp lineart, "
+                "vibrant colors, high-detail anime background, not 3D, not photorealistic'). "
+                if is_anime_style
+                else "Include vivid lighting, composition, and high-quality visual descriptors. "
+            )
+            trans_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "Translate and expand the user's image request into a detailed English text-to-image prompt. "
+                        f"{style_instruction}"
+                        "Return ONLY the English prompt, nothing else."
+                    ),
+                },
+                {"role": "user", "content": english_prompt},
+            ]
+            translated = await _call_groq_chat(trans_messages, GROQ_CHAT_FALLBACK_MODEL, 0.3, is_coding=False)
+            if translated:
+                english_prompt = translated.strip(' "\'')
+        except Exception:
+            if is_anime_style:
+                english_prompt = f"2D anime key visual, cel-shaded anime illustration, crisp lineart, {english_prompt}"
+
+    cf_url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{selected_model}"
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
+
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
+        # Case 1: FLUX.2 models (flux-2-klein-4b / 9b / dev) require multipart/form-data
+        if "flux-2-" in selected_model:
+            form = aiohttp.FormData()
+            form.add_field("prompt", english_prompt)
+            form.add_field("width", "1024")
+            form.add_field("height", "1024")
+            req_ctx = session.post(cf_url, headers=headers, data=form)
+        # Case 2: Leonardo Phoenix 1.0 (25 steps + negative prompt)
+        elif "phoenix" in selected_model:
+            headers["Content-Type"] = "application/json"
+            payload = {
+                "prompt": english_prompt,
+                "negative_prompt": "blurry, low quality, deformed hands, extra fingers, watermark, bad anatomy",
+                "num_steps": 25,
+                "guidance": 3.5,
+                "width": 1024,
+                "height": 1024,
+            }
+            req_ctx = session.post(cf_url, headers=headers, json=payload)
+        # Case 3: Default FLUX.1-schnell with maximum steps=8
+        else:
+            headers["Content-Type"] = "application/json"
+            payload = {"prompt": english_prompt, "steps": 8}
+            req_ctx = session.post(cf_url, headers=headers, json=payload)
+
+        async with req_ctx as resp:
+            if resp.status != 200:
+                err_txt = await resp.text()
+                raise RuntimeError(f"Cloudflare Workers AI HTTP {resp.status}: {err_txt[:200]}")
+
+            content_type = (resp.headers.get("Content-Type") or "").lower()
+            if "image/" in content_type or "octet-stream" in content_type:
+                return await resp.read(), f"[{mode_tag}] {english_prompt}"
+
+            data = await resp.json()
+            b64_img = (data.get("result") or {}).get("image")
+            if not b64_img:
+                raise RuntimeError("Cloudflare Workers AI did not return an image payload.")
+            return base64.b64decode(b64_img), f"[{mode_tag}] {english_prompt}"
+
+
+@bot.command(name="imagine", aliases=["img", "draw"])
+async def imagine_command(ctx, *, prompt: str = ""):
+    if not prompt.strip():
+        await ctx.send("กรุณาระบุสิ่งที่ต้องการให้วาดด้วยนะคะ เช่น `!imagine แมวสีดำนั่งอ่านหนังสือในห้องชมรม` ค่ะ")
+        return
+    async with ctx.typing():
+        try:
+            img_bytes, en_prompt = await generate_image_cloudflare_flux(prompt)
+            await ctx.send(
+                content=(
+                    f"วาดภาพตามที่คุณขอเรียบร้อยแล้วค่ะ (`{prompt}`)\n"
+                    f"-# Prompt: *{en_prompt[:180]}*"
+                ),
+                file=discord.File(io.BytesIO(img_bytes), filename="yukinon_flux.png"),
+            )
+        except Exception as e:
+            await ctx.send(f"ไม่สามารถสร้างรูปภาพได้ในขณะนี้ค่ะ (`{e}`)")
+
+
+import json
+from PIL import Image, ImageDraw, ImageFont, ImageStat
+
+MANGA_TRANSLATE_INTENT_PATTERN = re.compile(
+    r"(แปลมังงะ|แปลรูป|แปลภาพ|แปลการ์ตูน|แปลข้อความในรูป|translate\s+(this\s+)?(manga|image|panel|comic|page))",
+    re.IGNORECASE,
+)
+
+# Font paths installed in the Debian container (supports both Thai and English)
+FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/tlwg/Garuda-Bold.ttf",
+    "/usr/share/fonts/truetype/tlwg/Garuda.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansThai-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+)
+
+
+def _load_manga_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    for path in FONT_CANDIDATES:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size=size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
+
+def _detect_target_translation_lang(user_prompt: str) -> tuple[str, str]:
+    """
+    Returns (language_code, language_name).
+    If the user mentions English / อังกฤษ / en -> translates to English.
+    If the user mentions Thai / ไทย / th (or writes in Thai without asking for English) -> translates to Thai.
+    Defaults to English for standard '!manga' or English prompts.
+    """
+    lower_p = user_prompt.lower()
+    if any(k in lower_p for k in ("english", "eng", "อังกฤษ", "เป็นอิ้ง", "แปลอิ้ง", " to en")):
+        return "en", "English"
+    if any(k in lower_p for k in ("thai", "ไทย", "เป็นไทย", "แปลไทย", " to th")):
+        return "th", "Thai"
+    if THAI_CHAR_REGEX.search(user_prompt):
+        return "th", "Thai"
+    return "en", "English"
+
+
+async def extract_and_translate_manga_bubbles(
+    raw_bytes: bytes, filename: str, target_lang_name: str
+) -> tuple[list[dict], str]:
+    """
+    Stage 1: Uses Gemini 2.5 Flash (Structured JSON + 2D Bounding Boxes) to detect all speech bubbles
+    in Right-to-Left manga reading order and perform in-context localization into English or Thai.
+    Falls back to Groq Vision (qwen/qwen3.8-27b) plain-text localization if Gemini is unavailable.
+    """
+    b64_img = base64.b64encode(raw_bytes).decode("utf-8")
+    fname_lower = filename.lower()
+    mime_type = (
+        "image/png" if fname_lower.endswith(".png")
+        else "image/webp" if fname_lower.endswith(".webp")
+        else "image/jpeg"
+    )
+
+    manga_system_instruction = f"""
+You are a professional Manga, Manhwa, and Comic Localizer.
+Analyze the entire image visually (character expressions, action, speaker relationships, and panel layout)
+and translate all speech bubbles and important text into natural, idiomatic {target_lang_name}.
+
+CRITICAL RULES:
+1. Reading Order: Order the bubbles strictly in traditional Japanese Manga reading order (Top-to-Bottom, Right-to-Left across panels).
+2. In-Context Localization: Do NOT translate word-for-word statically. Adapt Japanese/Korean/Chinese idioms, pronouns, tone, and emotion so the dialogue sounds completely natural in {target_lang_name} while fitting inside a speech bubble. Ignore tiny background noise/watermarks.
+3. Bounding Boxes: For each text region inside a speech bubble, provide `box_2d` as `[ymin, xmin, ymax, xmax]` normalized from 0 to 1000 covering ONLY the text characters inside the bubble (stay inside the bubble border).
+4. Return ONLY valid JSON matching this exact structure:
+{{
+  "summary": "Brief 1-sentence scene context",
+  "bubbles": [
+    {{
+      "id": 1,
+      "speaker_or_note": "Character / SFX / Narration",
+      "source_text": "Original text",
+      "translated_text": "Natural {target_lang_name} translation",
+      "box_2d": [ymin, xmin, ymax, xmax]
+    }}
+  ]
+}}
+""".strip()
+
+    # 1. Primary Engine: Google AI Studio (Gemini 2.5 Flash) with accurate 2D bounding boxes
+    if GEMINI_API_KEY:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{GEMINI_SEARCH_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        )
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": manga_system_instruction},
+                        {"inlineData": {"mimeType": mime_type, "data": b64_img}},
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.2,
+                "responseMimeType": "application/json",
+            },
+        }
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        parts = (
+                            ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                        )
+                        raw_json_str = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+                        raw_json_str = re.sub(r"^```(?:json)?|```$", "", raw_json_str).strip()
+                        parsed = json.loads(raw_json_str)
+                        bubbles = parsed.get("bubbles") or []
+                        summary = parsed.get("summary") or ""
+                        if bubbles:
+                            return bubbles, summary
+                    else:
+                        err_txt = await resp.text()
+                        print(f"Gemini Manga Translate HTTP {resp.status}: {err_txt[:200]}")
+        except Exception as e:
+            print(f"Gemini Manga Translate warning (falling back to Groq Vision): {e}")
+
+    # 2. Automatic Fallback: Groq Vision (qwen/qwen3.8-27b)
+    if GROQ_API_KEY:
+        try:
+            groq_payload = {
+                "model": GROQ_VISION_FALLBACK_MODEL,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": manga_system_instruction},
+                            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
+                        ],
+                    }
+                ],
+                "temperature": 0.2,
+                "max_tokens": 4096,
+            }
+            headers = {
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
+                async with session.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers,
+                    json=groq_payload,
+                ) as resp:
+                    if resp.status == 200:
+                        g_data = await resp.json()
+                        content = g_data["choices"][0]["message"]["content"].strip()
+                        content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+                        json_match = re.search(r"\{[\s\S]*\}", content)
+                        if json_match:
+                            parsed = json.loads(json_match.group(0))
+                            return parsed.get("bubbles") or [], parsed.get("summary") or ""
+                        return [], content
+        except Exception as e:
+            print(f"Groq Manga Translate fallback error: {e}")
+
+    return [], ""
+
+
+def _wrap_text_to_pixel_width(
+    draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int
+) -> list[str]:
+    """Wraps English (by words) or Thai (by words/characters without splitting combining vowels) to fit max_width."""
+    words = text.split(" ") if " " in text else [text]
+    lines = []
+    current = ""
+
+    for word in words:
+        test_line = f"{current} {word}".strip() if current else word
+        bbox = draw.textbbox((0, 0), test_line, font=font)
+        if (bbox[2] - bbox[0]) <= max_width:
+            current = test_line
+        else:
+            if current:
+                lines.append(current)
+                current = ""
+            # If a single word/phrase (like unspaced Thai) is wider than max_width, wrap cleanly by grapheme
+            chunk = ""
+            for ch in word:
+                test_ch = chunk + ch
+                cbbox = draw.textbbox((0, 0), test_ch, font=font)
+                # Never break immediately before a Thai combining vowel or tone mark (\u0E31-\u0E3A, \u0E47-\u0E4E)
+                is_combining = "\u0E31" <= ch <= "\u0E3A" or "\u0E47" <= ch <= "\u0E4E"
+                if (cbbox[2] - cbbox[0]) > max_width and chunk and not is_combining:
+                    lines.append(chunk)
+                    chunk = ch
+                else:
+                    chunk = test_ch
+            current = chunk
+    if current:
+        lines.append(current)
+    return lines
+
+
+def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) -> bytes | None:
+    """
+    Stage 2: Cleans the original Japanese text inside each bounding box and typesets the
+    localized English or Thai dialogue neatly centered inside each speech bubble.
+    """
+    valid_boxes = [
+        b for b in bubbles
+        if isinstance(b.get("box_2d"), list)
+        and len(b["box_2d"]) == 4
+        and (b.get("translated_text") or "").strip()
+    ]
+    if not valid_boxes:
+        return None
+
+    img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    width, height = img.size
+    draw = ImageDraw.Draw(img)
+
+    for b in valid_boxes:
+        ymin, xmin, ymax, xmax = [float(v) for v in b["box_2d"]]
+        x1 = max(0, int((xmin / 1000.0) * width))
+        y1 = max(0, int((ymin / 1000.0) * height))
+        x2 = min(width, int((xmax / 1000.0) * width))
+        y2 = min(height, int((ymax / 1000.0) * height))
+
+        box_w = x2 - x1
+        box_h = y2 - y1
+        if box_w < 16 or box_h < 16:
+            continue
+
+        # Determine whether the bubble background is light (standard white bubble) or dark
+        crop_region = img.crop((x1, y1, x2, y2)).convert("L")
+        mean_luma = ImageStat.Stat(crop_region).mean[0]
+        is_light_bg = mean_luma >= 115
+        bg_fill = (255, 255, 255) if is_light_bg else (20, 20, 20)
+        fg_text = (15, 15, 15) if is_light_bg else (245, 245, 245)
+        stroke_col = (255, 255, 255) if is_light_bg else (0, 0, 0)
+
+        # Slightly expand the cleaning rectangle by 3px to cover vertical kanji edges cleanly
+        pad_clean = 3
+        cx1 = max(0, x1 - pad_clean)
+        cy1 = max(0, y1 - pad_clean)
+        cx2 = min(width, x2 + pad_clean)
+        cy2 = min(height, y2 + pad_clean)
+        radius = min(12, min(box_w, box_h) // 4)
+        draw.rounded_rectangle([cx1, cy1, cx2, cy2], radius=radius, fill=bg_fill)
+
+        # Auto-scale font size from large down to 11px until wrapped lines fit inside (box_w, box_h)
+        trans_text = b["translated_text"].strip()
+        usable_w = max(24, int(box_w * 0.94))
+        usable_h = max(20, int(box_h * 0.94))
+
+        start_font_size = min(34, max(14, int(min(box_w, box_h) * 0.30)))
+        chosen_font = _load_manga_font(12)
+        chosen_lines = [trans_text]
+        line_height = 15
+
+        for fsize in range(start_font_size, 10, -2):
+            font = _load_manga_font(fsize)
+            wrapped = _wrap_text_to_pixel_width(draw, trans_text, font, usable_w)
+            sample_bbox = draw.textbbox((0, 0), "Agกข้ำ", font=font)
+            lh = int((sample_bbox[3] - sample_bbox[1]) * 1.18)
+            total_h = lh * len(wrapped)
+            max_line_w = max(
+                (draw.textbbox((0, 0), ln, font=font)[2] - draw.textbbox((0, 0), ln, font=font)[0])
+                for ln in wrapped
+            )
+            if total_h <= usable_h and max_line_w <= usable_w:
+                chosen_font = font
+                chosen_lines = wrapped
+                line_height = lh
+                break
+            chosen_font = font
+            chosen_lines = wrapped
+            line_height = lh
+
+        # Vertically and horizontally center the wrapped text inside the speech bubble
+        total_text_h = line_height * len(chosen_lines)
+        curr_y = y1 + max(0, (box_h - total_text_h) // 2)
+
+        for ln in chosen_lines:
+            lbbox = draw.textbbox((0, 0), ln, font=chosen_font)
+            lw = lbbox[2] - lbbox[0]
+            curr_x = x1 + max(0, (box_w - lw) // 2)
+            draw.text(
+                (curr_x, curr_y),
+                ln,
+                font=chosen_font,
+                fill=fg_text,
+                stroke_width=2,
+                stroke_fill=stroke_col,
+            )
+            curr_y += line_height
+
+    out_io = io.BytesIO()
+    img.save(out_io, format="PNG", optimize=True)
+    return out_io.getvalue()
+
+
+async def process_manga_translation_request(ctx_or_message, user_prompt: str):
+    """Handles !manga / !translate or natural manga translation requests with image + text fallback."""
+    msg = ctx_or_message.message if hasattr(ctx_or_message, "message") else ctx_or_message
+    channel = ctx_or_message.channel
+
+    # Find attached image on current message or on a replied-to message
+    image_attachments = [
+        a for a in msg.attachments if a.filename.lower().endswith(IMAGE_EXTENSIONS)
+    ]
+    if not image_attachments and msg.reference and isinstance(msg.reference.resolved, discord.Message):
+        image_attachments = [
+            a for a in msg.reference.resolved.attachments
+            if a.filename.lower().endswith(IMAGE_EXTENSIONS)
+        ]
+
+    if not image_attachments:
+        await channel.send(
+            "กรุณาแนบรูปภาพหน้ามังงะหรือข้อความที่ต้องการให้แปลมาด้วยนะคะ "
+            "(เช่น แนบรูปพร้อมพิมพ์ `!manga en` เพื่อแปลเป็นภาษาอังกฤษ หรือ `!manga th` เพื่อแปลเป็นภาษาไทยค่ะ)"
+        )
+        return
+
+    _, target_lang_name = _detect_target_translation_lang(user_prompt)
+    att = image_attachments[0]
+
+    async with channel.typing():
+        raw_bytes = await att.read()
+        bubbles, scene_summary = await extract_and_translate_manga_bubbles(
+            raw_bytes, att.filename, target_lang_name
+        )
+
+        # Fallback Case: Model returned plain translated text without JSON bubbles
+        if not bubbles and scene_summary:
+            await send_chunked_response(
+                channel,
+                f"**📖 คำแปลข้อความจากภาพ ({target_lang_name}):**\n\n{scene_summary}",
+            )
+            return
+
+        if not bubbles:
+            await channel.send("ไม่สามารถตรวจจับข้อความในภาพนี้ได้ค่ะ กรุณาตรวจสอบว่าภาพมีความคมชัดนะคะ")
+            return
+
+        # Format the Right-to-Left in-context transcript as a clean bulleted guide
+        transcript_lines = [
+            f"**📖 คำแปลมังงะตามลำดับช่องอ่าน ขวาไปซ้าย ({target_lang_name}):**"
+        ]
+        if scene_summary:
+            transcript_lines.append(f"-# *บริบทของฉาก: {scene_summary}*")
+
+        for idx, b in enumerate(bubbles, 1):
+            speaker = (b.get("speaker_or_note") or f"ช่องคำพูด {idx}").strip()
+            src_txt = (b.get("source_text") or "").strip()
+            tr_txt = (b.get("translated_text") or "").strip()
+            if tr_txt:
+                transcript_lines.append(f"**{idx}. [{speaker}]** `{src_txt}`\n   ↳ **{tr_txt}**")
+
+        transcript_text = "\n".join(transcript_lines)
+
+        # Try rendering the translated text directly onto the manga speech bubbles
+        rendered_png = None
+        try:
+            rendered_png = await asyncio.to_thread(
+                render_translated_manga_image_sync, raw_bytes, bubbles
+            )
+        except Exception as e:
+            print(f"Manga image rendering fallback to text-only: {e}")
+
+        if rendered_png:
+            await channel.send(
+                content=transcript_text[:1950],
+                file=discord.File(io.BytesIO(rendered_png), filename=f"translated_{att.filename}.png"),
+            )
+        else:
+            # Automatic fallback if bounding boxes were unavailable
+            await send_chunked_response(channel, transcript_text)
+
+
+@bot.command(name="manga", aliases=["translate", "tl"])
+async def manga_command(ctx, *, args: str = "English"):
+    await process_manga_translation_request(ctx, args)
 
 
 @bot.command(name="clear")

@@ -4,13 +4,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DEBIAN_FRONTEND=noninteractive
 
-# Install audio codecs required for Discord voice channels, edge-tts, and STT conversion
+# Install audio codecs required for Discord voice channels, edge-tts, STT conversion, and fonts
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libopus0 \
     libopus-dev \
     libsodium-dev \
     flac \
+    fonts-noto-core \
+    fonts-tlwg-garuda-ttf \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
