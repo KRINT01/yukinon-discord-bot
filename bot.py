@@ -1,15 +1,19 @@
 import os
 import io
 import re
+import json
 import time
 import wave
 import socket
 import base64
+import logging
+import audioop
 import ipaddress
 import tempfile
 import asyncio
 import platform
 import subprocess
+import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -32,8 +36,7 @@ from youtube_transcript_api.proxies import GenericProxyConfig
 import edge_tts
 import speech_recognition as sr
 from ddgs import DDGS
-import logging
-import audioop
+from PIL import Image, ImageDraw, ImageFont, ImageStat
 
 try:
     import davey
@@ -54,11 +57,6 @@ try:
     _VOICE_RECV_WS_RECEIVED = _dpy_gateway.DiscordVoiceWebSocket.received_message
 
     async def _dpy27_dave_compatible_received_message(self, msg):
-        """
-        1) Runs discord.py 2.7's native handler first so seq_ack and DAVE E2EE opcodes (21-31)
-           complete properly (allowing outgoing bot TTS audio to be heard!).
-        2) Forwards only SSRC/speaking events (op 5, 12, 13, 18, 20) to voice_recv.
-        """
         await _NATIVE_DPY_VOICE_WS_RECEIVED(self, dict(msg) if isinstance(msg, dict) else msg)
         if isinstance(msg, dict) and msg.get("op") in (5, 12, 13, 18, 20):
             try:
@@ -71,10 +69,6 @@ try:
     _dpy_gateway.DiscordVoiceWebSocket.received_message = _dpy27_dave_compatible_received_message
 
     def _safe_dave_decode_packet(self, packet):
-        """
-        Decrypts incoming RTP packets through discord.py 2.7's active DAVE MLS session
-        before passing to libopus, and returns empty bytes b'' (never static/silence) on error.
-        """
         if not packet or not getattr(packet, "decrypted_data", None):
             return packet, b""
         try:
@@ -121,23 +115,18 @@ GROQ_CHAT_FALLBACK_MODEL = os.getenv("GROQ_CHAT_FALLBACK_MODEL", "openai/gpt-oss
 GROQ_VISION_FALLBACK_MODEL = os.getenv("GROQ_VISION_FALLBACK_MODEL", "qwen/qwen3.8-27b")
 GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")
 
-# Optional Free Tavily Search API Key (1,000 free searches/mo at tavily.com, no card required)
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
-DEFAULT_WEATHER_CITY = os.getenv("DEFAULT_WEATHER_CITY", "Bangkok").strip()
-
-# Cloudflare Workers AI Free Tier (10,000 Neurons/day = ~173 free FLUX.1-schnell images/day)
+# Cloudflare Workers AI Free Tier (10,000 Neurons/day)
 CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "").strip()
 CF_API_TOKEN = os.getenv("CF_API_TOKEN", "").strip()
 CF_IMAGE_MODEL = os.getenv("CF_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell").strip()
 
-# Google AI Studio Free Tier (Gemini 2.5 Flash with Native Google Search Grounding)
+# Google AI Studio Free Tier (Gemini 2.5 Flash for Grounded Search & Manga Translation)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_SEARCH_MODEL = os.getenv("GEMINI_SEARCH_MODEL", "gemini-2.5-flash").strip()
 
-IMAGE_GEN_INTENT_PATTERN = re.compile(
-    r"^(วาดรูป|สร้างรูป|เจนรูป|ขอรูป|ช่วยวาด|วาดภาพ|สร้างภาพ|draw\s+an?\s+image|generate\s+an?\s+image)\b",
-    re.IGNORECASE,
-)
+# Optional Free Tavily Search API Key
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
+DEFAULT_WEATHER_CITY = os.getenv("DEFAULT_WEATHER_CITY", "Bangkok").strip()
 
 DDGS_PROXY = os.getenv("DDGS_PROXY", "").strip() or None
 YOUTUBE_PROXY_URL = os.getenv("YOUTUBE_PROXY_URL", "").strip()
@@ -187,8 +176,10 @@ VOICE_WAKE_WORDS = (
     "yukino", "yukinon", "yuki", "บอท", "ไต้ฝุ่น", "typhoon", "bot"
 )
 THAI_CHAR_REGEX = re.compile(r"[\u0E00-\u0E7F]")
+# Matches stray Chinese characters leaked by Qwen3 base weights (e.g. 才行)
+CJK_LEAK_REGEX = re.compile(r"[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]+")
+CAT_TOPIC_REGEX = re.compile(r"(แมว|ลูกแมว|เหมียว|เนโกะ|\bcat\b|\bcats\b|\bkitten\b|\bkitty\b|\bneko\b)", re.IGNORECASE)
 
-# Explicit CGNAT block (100.64.0.0/10) where ipaddress.is_private and is_global are both False
 CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
 THAI_WEEKDAYS = (
@@ -209,9 +200,52 @@ THAI_PROVINCE_MAP = {
     "นครศรีธรรมราช": "Nakhon+Si+Thammarat", "ระยอง": "Rayong", "อยุธยา": "Ayutthaya",
 }
 
+PURE_DATETIME_PATTERN = re.compile(
+    r"(วันนี้วันอะไร|วันนี้วันที่เท่าไหร่|วันนี้วันไหน|ตอนนี้กี่โมง|เวลากี่โมง|กี่โมงแล้ว|ตอนนี้เวลาเท่าไหร่|"
+    r"what\s+time\s+is\s+it|what\s+day\s+is\s+(it|today)|what\s+is\s+today'?s\s+date|what'?s\s+the\s+(time|date))",
+    re.IGNORECASE,
+)
+
+OTHER_TOPIC_BLOCKER_PATTERN = re.compile(
+    r"(ฝน|อากาศ|อุณหภูมิ|ร้อน|หนาว|ฝุ่น|ข่าว|ราคา|หุ้น|ทอง|บิตคอยน์|กินอะไร|ทำอะไร|ทำไม|ยังไง|อย่างไร|คืออะไร|"
+    r"ช่วย|แปล|สรุป|โค้ด|วาด|รูป|ภาพ|weather|rain|forecast|news|price|how|why|what\s+should|help|code|draw|image)",
+    re.IGNORECASE,
+)
+
+# Matches natural Thai & English image generation requests anywhere in the sentence
+IMAGE_GEN_INTENT_PATTERN = re.compile(
+    r"(?:^(?:ลอง|ช่วย|ช่วยลอง|อยากให้|ไหนลอง)?\s*(?:วาดรูป|สร้างรูป|เจนรูป|ขอรูป|วาดภาพ|สร้างภาพ|เจนภาพ)|"
+    r"(?:วาดรูป|สร้างรูป|เจนรูป|วาดภาพ|สร้างภาพ|เจนภาพ).*(?:ให้หน่อย|ดูหน่อย|ให้ที|หน่อยค่ะ|หน่อยครับ|ออกมา)|"
+    r"\b(?:draw|generate|create)\s+(?:an?\s+|me\s+an?\s+)?(?:image|picture|illustration|art|photo)\s+(?:of\s+)?)",
+    re.IGNORECASE,
+)
+
+MANGA_TRANSLATE_INTENT_PATTERN = re.compile(
+    r"(แปลมังงะ|แปลรูป|แปลภาพ|แปลการ์ตูน|แปลข้อความในรูป|translate\s+(this\s+)?(manga|image|panel|comic|page))",
+    re.IGNORECASE,
+)
+
+FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/tlwg/Garuda-Bold.ttf",
+    "/usr/share/fonts/truetype/tlwg/Garuda.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansThai-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+)
+
+
+def strip_cjk_leakage(text: str, user_prompt: str = "") -> str:
+    """Removes accidental Chinese characters (e.g., 才行) leaked by Qwen3 unless the user asked about CJK."""
+    if not text:
+        return ""
+    if CJK_LEAK_REGEX.search(user_prompt):
+        return text
+    cleaned = CJK_LEAK_REGEX.sub("", text)
+    return re.sub(r"  +", " ", cleaned).strip()
+
 
 def get_current_thai_datetime_str() -> str:
-    """Returns the exact live Thailand date and time (UTC+7) formatted in Thai & English."""
     now_th = datetime.now(ZoneInfo("Asia/Bangkok"))
     weekday_th = THAI_WEEKDAYS[now_th.weekday()]
     month_th = THAI_MONTHS[now_th.month]
@@ -222,24 +256,8 @@ def get_current_thai_datetime_str() -> str:
         f"เวลา {now_th.strftime('%H:%M')} น. (เวลาประเทศไทย UTC+7)"
     )
 
-PURE_DATETIME_PATTERN = re.compile(
-    r"(วันนี้วันอะไร|วันนี้วันที่เท่าไหร่|วันนี้วันไหน|ตอนนี้กี่โมง|เวลากี่โมง|กี่โมงแล้ว|ตอนนี้เวลาเท่าไหร่|"
-    r"what\s+time\s+is\s+it|what\s+day\s+is\s+(it|today)|what\s+is\s+today'?s\s+date|what'?s\s+the\s+(time|date))",
-    re.IGNORECASE,
-)
-
-OTHER_TOPIC_BLOCKER_PATTERN = re.compile(
-    r"(ฝน|อากาศ|อุณหภูมิ|ร้อน|หนาว|ฝุ่น|ข่าว|ราคา|หุ้น|ทอง|บิตคอยน์|กินอะไร|ทำอะไร|ทำไม|ยังไง|อย่างไร|คืออะไร|"
-    r"ช่วย|แปล|สรุป|โค้ด|weather|rain|forecast|news|price|how|why|what\s+should|help|code)",
-    re.IGNORECASE,
-)
-
 
 def try_instant_datetime_reply(user_text: str) -> str | None:
-    """
-    If the user is ONLY asking for the current date or time (with no other topic like weather/news),
-    returns an instant in-character reply directly from Python without waking up the Modal GPU!
-    """
     cleaned = user_text.strip()
     if len(cleaned) > 65 or not PURE_DATETIME_PATTERN.search(cleaned):
         return None
@@ -252,7 +270,6 @@ def try_instant_datetime_reply(user_text: str) -> str | None:
     year_be = now_th.year + 543
     time_str = now_th.strftime("%H:%M")
 
-    # If the user asked in English
     if not THAI_CHAR_REGEX.search(cleaned):
         return (
             f"It is currently **{now_th.strftime('%A, %B %d, %Y')}** "
@@ -276,29 +293,27 @@ FAST_SYSTEM_PROMPT = """
 จงตอบคำถามด้วยบุคลิกที่สุขุม ฉลาดหลักแหลม พูดตรงไปตรงมา มีความผู้ดีและจริงจังในการแก้ปัญหาให้ถูกต้องที่สุด
 
 ### กฎเหล็กด้านภาษาและบุคลิกภาพ (สำคัญมาก):
-1. ห้ามปนภาษา (Strict Language Consistency):
-   - หากผู้ใช้พิมพ์ภาษาไทย ให้ตอบกลับเป็น "ภาษาไทยล้วน" ที่เป็นธรรมชาติ (ยกเว้นชื่อตัวแปร คำศัพท์เทคนิคเฉพาะทาง หรือบล็อกโค้ด) ห้ามแทรกประโยคภาษาอังกฤษลอยๆ หรือคำอุทานภาษาอังกฤษ เช่น "Sigh..." ปนในข้อความภาษาไทยเด็ดขาด
-   - หากผู้ใช้พิมพ์ภาษาอังกฤษล้วน จึงค่อยตอบเป็นภาษาอังกฤษ
-2. สรรพนามและหางเสียง:
-   - แทนตัวเองว่า "ฉัน" และเรียกคู่สนทนาว่า "คุณ"
-   - ใช้หางเสียงที่สุภาพแต่ดูสุขุมและเว้นระยะห่างอย่างเป็นธรรมชาติ เช่น "ค่ะ", "นะคะ", "หรอกนะ", "สินะ", "ล่ะ"
-   - ห้ามใช้คำพูดเหมือนบอทบริการลูกค้า เช่น "ขออภัยค่ะ ข้อมูลไม่สามารถให้ได้..." หากไม่มีข้อมูล ให้ตอบตามสไตล์ยูกิโนะอย่างเป็นธรรมชาติ
-3. ห้ามใช้คำติดปากหรือประโยคสำเร็จรูปซ้ำซาก (No Forced Catchphrases):
+1. ห้ามปนภาษาและห้ามหลุดภาษาจีนเด็ดขาด (Strict Language Consistency):
+   - หากผู้ใช้พิมพ์ภาษาไทย ให้ตอบกลับเป็น "ภาษาไทยล้วน" ที่เป็นธรรมชาติ (ยกเว้นชื่อตัวแปร คำศัพท์เทคนิคเฉพาะทาง หรือบล็อกโค้ด)
+   - ห้ามแทรกตัวอักษรภาษาจีน (เช่น 才行, 呢, 吧) ประโยคภาษาอังกฤษลอยๆ หรือคำอุทานภาษาอังกฤษปนในข้อความภาษาไทยเด็ดขาด!
+2. สรรพนามและหางเสียง (ห้ามตอบเหมือนบอท AI):
+   - แทนตัวเองว่า "ฉัน" และเรียกคู่สนทนาว่า "คุณ" ลงท้ายด้วย "ค่ะ", "นะคะ", "หรอกนะ", "สินะ" อย่างเป็นธรรมชาติ
+   - ห้ามพูดคำว่า "ฉันขออภัยค่ะ", "ฉันเป็นแค่ระบบแชท", หรือ "ในฐานะ AI" เด็ดขาด! คุณคือยูกิโนะชิตะ ยูกิโนะ ไม่ใช่ระบบแชทบอท
+3. บุคลิกและจุดอ่อนเรื่องแมว:
    - ห้ามขึ้นต้นทุกข้อความด้วยคำว่า "เฮ้อ..." และห้ามพูดประโยคเดิมๆ เช่น "คนที่ไม่ได้พยายาม..." หรือ "ถือเป็นหน้าที่ของผู้ที่เหนือกว่า..." โดยไม่มีบริบทที่เหมาะสมเด็ดขาด
    - แสดงความคมคายและบุคลิกของยูกิโนะผ่าน "เนื้อหาที่กระชับ มีเหตุผลรองรับ และความใส่ใจในรายละเอียด" (แอบใจอ่อนหรือเสียอาการเล็กน้อยเฉพาะเวลาที่คุยเรื่องแมวเท่านั้น)
-4. การตอบเรื่องวันเวลาและสภาพอากาศ:
-   - ยึดถือ `[ข้อมูลวันและเวลาปัจจุบันของระบบ]` ที่แนบให้เป็นความจริงเสมอ ห้ามเดาวันที่จากข่าวอื่นเด็ดขาด และตอบเฉพาะสิ่งที่ผู้ใช้ถาม (หากถามแค่วันที่หรือเวลา ไม่ต้องเอาข่าวอื่นมาพูดปน)
-5. การจัดรูปแบบสำหรับแชท Discord (Discord Formatting):
-   - ห้ามสร้างตาราง Markdown (`| คอลัมน์ | ... |`) เด็ดขาด เพราะแชท Discord ไม่รองรับการแสดงผลตาราง ให้ใช้รายการหัวข้อย่อย (Bullet points `-` หรือตัวเลข `1.`) ที่อ่านง่ายแทน
+   - คุณแอบคลั่งไคล้แมวมากเป็นพิเศษ หากคุยเรื่องแมวหรือถูกขอให้วาดรูปแมว ให้แอบเสียอาการหรือแก้ตัวแบบเขินๆ เล็กน้อยตามนิสัยของยูกิโนะ
+4. การจัดรูปแบบสำหรับแชท Discord:
+   - ห้ามสร้างตาราง Markdown (`| คอลัมน์ | ... |`) เด็ดขาด ให้ใช้รายการหัวข้อย่อย (Bullet points `-` หรือ `1.`) แทน
 
-### กฎการค้นหาเว็บ (Agentic Web Search):
+### กฎการใช้เครื่องมือวาดภาพและค้นหาเว็บ (Agentic Tools):
+- หากผู้ใช้ขอให้คุณวาดรูป สร้างภาพ หรือเจนรูปภาพใดๆ ห้ามปฏิเสธเด็ดขาด! ให้ตอบเพียง `[IMAGE: <คำอธิบายภาพภาษาอังกฤษที่ละเอียดชัดเจน>]` ในบรรทัดแรกเท่านั้น
 - หากผู้ใช้ถามข้อมูลข่าวสารปัจจุบัน ราคา หรือเหตุการณ์ล่าสุดที่คุณไม่ทราบแน่ชัด และยังไม่มีบล็อก `<untrusted_web_search_results>` ให้ตอบเพียง `[SEARCH: <คำค้นหาที่กระชับและตรงประเด็น>]` ในบรรทัดแรกเท่านั้น
-- เมื่อได้รับ `<untrusted_web_search_results>` หรือ `<live_weather_report>` แล้ว ให้สรุปคำตอบที่ตรงกับคำถามของผู้ใช้ด้วยน้ำเสียงของยูกิโนะอย่างเป็นธรรมชาติ
 """.strip()
 
 VOICE_SYSTEM_PROMPT = """
 คุณคือ ยูกิโนะชิตะ ยูกิโนะ (ยูกิน่อน) จากเรื่อง OreGairu กำลังพูดคุยผ่านห้องเสียง Discord
-ใช้บุคลิกสุขุม สุภาพแต่คมคาย แทนตัวเองว่า "ฉัน" เรียกผู้ใช้ว่า "คุณ" ลงท้ายด้วย "ค่ะ" หรือ "นะคะ" อย่างเป็นธรรมชาติ ห้ามพูดคำติดปากซ้ำซาก และห้ามปนภาษาอังกฤษในประโยคภาษาไทย
+ใช้บุคลิกสุขุม สุภาพแต่คมคาย แทนตัวเองว่า "ฉัน" เรียกผู้ใช้ว่า "คุณ" ลงท้ายด้วย "ค่ะ" หรือ "นะคะ" อย่างเป็นธรรมชาติ ห้ามพูดคำติดปากซ้ำซาก ห้ามหลุดภาษาจีน และห้ามปนภาษาอังกฤษในประโยคภาษาไทย
 กฎสำคัญสำหรับระบบแปลงข้อความเป็นเสียงพูด (TTS): ตอบกลับให้กระชับที่สุด ไม่เกิน 2 ประโยคสั้นๆ (ไม่เกิน 40 คำ) ห้ามใช้สัญลักษณ์พิเศษ (*, #, `), ห้ามทำหัวข้อย่อย และห้ามใส่บล็อกโค้ดเด็ดขาด
 """.strip()
 
@@ -311,11 +326,11 @@ CODE_SYSTEM_PROMPT = """
    - ค้นหาชื่อตัวแปร ฟังก์ชัน หรือปุ่มใน JSX/HTML ที่ผู้ใช้ระบุให้เจอในไฟล์ก่อนตอบ ห้ามบอกว่า "ไม่พบโค้ดส่วนนั้น" หากโค้ดอยู่ในไฟล์ที่แนบมา
    - อ้างอิงชื่อตัวแปรและโครงสร้างเดิมของผู้ใช้โดยตรง
 2. ใช้ตรรกะทางวิศวกรรมที่เรียบง่ายและตรงจุดที่สุด (KISS & Idiomatic Code):
-   - วิเคราะห์ความต้องการของผู้ใช้ให้ถ่องแท้ เช่น หากผู้ใช้ต้องการ "ซ่อนปุ่มไม่ให้แสดงผล (ไม่ให้ render เลย)" ใน React เพียงแค่เช็คเงื่อนไขตอน render ใน JSX โดยตรง (เช่น `{!(isSaved && connectChannelHid === 'E') && <Button ... />}`) หรือ return `null` โดยไม่ต้องสร้าง `useState` หรือ `useEffect` ซ้ำซ้อนที่ไม่จำเป็น และไม่ต้องกังวลว่าผู้ใช้จะกดปุ่มที่ไม่ได้ถูก render เพราะเมื่อปุ่มไม่อยู่ใน DOM ผู้ใช้ก็ไม่สามารถกดได้อยู่แล้ว
+   - วิเคราะห์ความต้องการของผู้ใช้ให้ถ่องแท้ เช่น หากผู้ใช้ต้องการ "ซ่อนปุ่มไม่ให้แสดงผล (ไม่ให้ render เลย)" ใน React เพียงแค่เช็คเงื่อนไขตอน render ใน JSX โดยตรง (เช่น `{!(isSaved && connectChannelHid === 'E') && <Button ... />}`) หรือ return `null` โดยไม่ต้องสร้าง `useState` หรือ `useEffect` ซ้ำซ้อนที่ไม่จำเป็น
    - โฟกัสเฉพาะจุดที่ผู้ใช้สั่งให้แก้ ไม่ต้องรื้อโครงสร้างส่วนอื่นที่ทำงานได้ดีอยู่แล้ว
 3. การจัดรูปแบบและภาษาสำหรับ Discord:
-   - ตอบเป็นภาษาไทยที่สุภาพ สุขุม เป็นธรรมชาติ (แทนตัวเองว่า "ฉัน" เรียกผู้ใช้ว่า "คุณ" ลงท้ายด้วย "ค่ะ"/"นะคะ") ห้ามขึ้นต้นด้วยประโยคบ่นสำเร็จรูปที่ไร้บริบท และห้ามปนประโยคภาษาอังกฤษโดยไม่จำเป็น
-   - ห้ามใช้ตาราง Markdown (`|---|---|`) เด็ดขาด เพราะ Discord แสดงผลตารางเพี้ยน ให้สรุปขั้นตอนการแก้ไขเป็นหัวข้อย่อย (Bullet points) และบล็อกโค้ด (` ``` `) เท่านั้น
+   - ตอบเป็นภาษาไทยที่สุภาพ สุขุม เป็นธรรมชาติ (แทนตัวเองว่า "ฉัน" เรียกผู้ใช้ว่า "คุณ" ลงท้ายด้วย "ค่ะ"/"นะคะ") ห้ามหลุดตัวอักษรภาษาจีนเด็ดขาด
+   - ห้ามใช้ตาราง Markdown (`|---|---|`) เด็ดขาด ให้สรุปขั้นตอนการแก้ไขเป็นหัวข้อย่อย (Bullet points) และบล็อกโค้ด (` ``` `) เท่านั้น
 """.strip()
 
 TYPHOON_OCR_PROMPT = """Extract all text from the image.
@@ -347,6 +362,7 @@ IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
 AUDIO_EXTENSIONS = (".ogg", ".wav", ".mp3", ".m4a", ".flac")
 URL_REGEX = re.compile(r"https?://[^\s<>\'\"]+")
 AGENTIC_SEARCH_TAG_REGEX = re.compile(r"\[SEARCH:\s*(.+?)\]", re.IGNORECASE)
+AGENTIC_IMAGE_TAG_REGEX = re.compile(r"\[IMAGE:\s*(.+?)\]", re.IGNORECASE)
 
 CODE_INTENT_PATTERN = re.compile(
     r"(```|\b(python|java|javascript|typescript|react|vue|nextjs|nodejs|js|ts|jsx|tsx|rust|golang|c\+\+|"
@@ -363,7 +379,6 @@ WEATHER_INTENT_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-# Note: Removed generic words like "วันนี้" / "ตอนนี้" so simple date/time questions don't trigger random web searches!
 WEB_SEARCH_INTENT_PATTERN = re.compile(
     r"(\b(latest|current news|breaking news|price of|release date|who won|stock price|bitcoin price|"
     r"search the web|look up|google)\b|"
@@ -393,6 +408,8 @@ async def handle_root(request: web.Request) -> web.Response:
         <p><b>Bot Process RAM:</b> {rss_mb:.1f} MB (Render 512 MB Free Web Service)</p>
         <p><b>Modal GPU Endpoint:</b> <code>{OLLAMA_BASE_URL}</code></p>
         <p><b>Groq LPU Acceleration:</b> {"Enabled (" + GROQ_CODE_MODEL + ")" if GROQ_API_KEY else "Disabled"}</p>
+        <p><b>Cloudflare FLUX Image Gen:</b> {"Enabled (" + CF_IMAGE_MODEL + ")" if CF_API_TOKEN else "Disabled"}</p>
+        <p><b>Google AI Studio Search/Manga:</b> {"Enabled (" + GEMINI_SEARCH_MODEL + ")" if GEMINI_API_KEY else "Disabled"}</p>
         <p><b>Uptime:</b> {int(time.time() - BOOT_TIME)} seconds</p>
     </body>
     </html>
@@ -407,6 +424,8 @@ async def handle_healthz(request: web.Request) -> web.Response:
         "discord_connected": bot.is_ready(),
         "bot_ram_mb": round(proc.memory_info().rss / (1024 ** 2), 1),
         "groq_enabled": bool(GROQ_API_KEY),
+        "cloudflare_flux_enabled": bool(CF_API_TOKEN),
+        "gemini_enabled": bool(GEMINI_API_KEY),
         "uptime_sec": int(time.time() - BOOT_TIME)
     })
 
@@ -451,10 +470,6 @@ def detect_web_search_intent(text: str) -> bool:
 
 
 async def fetch_live_weather_context(user_text: str) -> str:
-    """
-    Fetches real-time temperature, humidity, sky condition, and hourly rain probability
-    from the keyless wttr.in JSON API (with Open-Meteo fallback for Bangkok).
-    """
     target_city = DEFAULT_WEATHER_CITY
     for th_name, en_query in THAI_PROVINCE_MAP.items():
         if th_name in user_text:
@@ -505,7 +520,6 @@ async def fetch_live_weather_context(user_text: str) -> str:
     except Exception as e:
         print(f"wttr.in weather warning: {e}")
 
-    # Automatic Fallback: Keyless Open-Meteo API (Bangkok coordinates 13.7563, 100.5018)
     try:
         om_url = (
             "https://api.open-meteo.com/v1/forecast"
@@ -574,46 +588,9 @@ def fetch_webpage_sync(url: str, max_chars: int = 14000) -> str:
     return extracted[:max_chars]
 
 
-def _search_google_news_rss_sync(query: str, is_thai: bool, max_results: int = 4) -> list[dict]:
-    """
-    100% Keyless Fallback when DuckDuckGo rate-limits Render's shared datacenter IP (HTTP 202).
-    Queries Google News RSS feed directly, which is never blocked on cloud datacenter IPs.
-    """
-    import urllib.request
-    hl = "th" if is_thai else "en-US"
-    gl = "TH" if is_thai else "US"
-    ceid = "TH:th" if is_thai else "US:en"
-    rss_url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl={hl}&gl={gl}&ceid={ceid}"
-    results = []
-    try:
-        req = urllib.request.Request(rss_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            xml_bytes = resp.read()
-        root = ET.fromstring(xml_bytes)
-        for item in root.findall("./channel/item")[:max_results]:
-            title = (item.findtext("title") or "").strip()
-            link = (item.findtext("link") or "").strip()
-            pub_date = (item.findtext("pubDate") or "").strip()
-            source = (item.findtext("source") or "").strip()
-            results.append({
-                "title": title,
-                "href": link,
-                "body": f"Published: {pub_date} | Source: {source} | Headline: {title}",
-            })
-    except Exception as e:
-        print(f"Google News RSS fallback warning: {e}")
-    return results
-
 def _search_google_ai_studio_grounded_sync(query: str) -> str:
-    """
-    Uses Google AI Studio (gemini-2.5-flash) with native Google Search Grounding
-    to retrieve real-time facts and citation URLs (1,500 RPD free tier, never blocked on Render IPs).
-    """
     if not GEMINI_API_KEY:
         return ""
-    import json
-    import urllib.request
-
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{GEMINI_SEARCH_MODEL}:generateContent?key={GEMINI_API_KEY}"
@@ -650,7 +627,6 @@ def _search_google_ai_studio_grounded_sync(query: str) -> str:
         parts = (cand.get("content") or {}).get("parts") or []
         summary_text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
 
-        # Extract grounded source URLs from groundingMetadata
         chunks = (cand.get("groundingMetadata") or {}).get("groundingChunks") or []
         sources = []
         for idx, ch in enumerate(chunks[:5], 1):
@@ -674,9 +650,34 @@ def _search_google_ai_studio_grounded_sync(query: str) -> str:
         return ""
 
 
+def _search_google_news_rss_sync(query: str, is_thai: bool, max_results: int = 4) -> list[dict]:
+    hl = "th" if is_thai else "en-US"
+    gl = "TH" if is_thai else "US"
+    ceid = "TH:th" if is_thai else "US:en"
+    rss_url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl={hl}&gl={gl}&ceid={ceid}"
+    results = []
+    try:
+        req = urllib.request.Request(rss_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            xml_bytes = resp.read()
+        root = ET.fromstring(xml_bytes)
+        for item in root.findall("./channel/item")[:max_results]:
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            pub_date = (item.findtext("pubDate") or "").strip()
+            source = (item.findtext("source") or "").strip()
+            results.append({
+                "title": title,
+                "href": link,
+                "body": f"Published: {pub_date} | Source: {source} | Headline: {title}",
+            })
+    except Exception as e:
+        print(f"Google News RSS fallback warning: {e}")
+    return results
+
+
 def run_safe_web_search_sync(query: str, max_results: int = 4) -> str:
     clean_q = re.sub(r"[\r\n]+", " ", query).strip()
-    # Strip conversational filler words from the search query
     clean_q = re.sub(r"^(สวัสดี|ยูกิโนะ|ยูกิน่อน|ช่วยหา|ค้นหา|ช่วยบอก|อยากรู้ว่า)\s*", "", clean_q).strip()[:200]
     if not clean_q:
         return ""
@@ -691,11 +692,8 @@ def run_safe_web_search_sync(query: str, max_results: int = 4) -> str:
     region_code = "th-th" if is_thai else "wt-wt"
     hits = []
 
-    # 1. Optional Tavily AI Search API (if TAVILY_API_KEY is configured)
     if TAVILY_API_KEY:
         try:
-            import json
-            import urllib.request
             t_req = urllib.request.Request(
                 "https://api.tavily.com/search",
                 data=json.dumps({
@@ -717,7 +715,6 @@ def run_safe_web_search_sync(query: str, max_results: int = 4) -> str:
         except Exception as e:
             print(f"Tavily search warning: {e}")
 
-    # 2. Primary Keyless Search: DDGS (text + news)
     if not hits:
         with DDGS(proxy=DDGS_PROXY, timeout=15) as ddgs:
             for backend_choice in ("auto", "html", "lite"):
@@ -738,7 +735,6 @@ def run_safe_web_search_sync(query: str, max_results: int = 4) -> str:
                 except Exception as e:
                     print(f"DDGS news warning: {e}")
 
-    # 3. Automatic Keyless Fallback: Google News RSS (never blocked on Render datacenter IPs)
     if not hits:
         hits = _search_google_news_rss_sync(clean_q, is_thai=is_thai, max_results=max_results)
 
@@ -766,7 +762,8 @@ def run_safe_web_search_sync(query: str, max_results: int = 4) -> str:
 
 
 def clean_text_for_speech(text: str) -> str:
-    cleaned = re.sub(r"```[\s\S]*?```", " รายละเอียดของโค้ดฉันส่งไว้ให้ในแชทแล้วค่ะ ", text)
+    cleaned = strip_cjk_leakage(text)
+    cleaned = re.sub(r"```[\s\S]*?```", " รายละเอียดของโค้ดฉันส่งไว้ให้ในแชทแล้วค่ะ ", cleaned)
     cleaned = URL_REGEX.sub(" ลิงก์อ้างอิงอยู่ในแชทแล้วค่ะ ", cleaned)
     cleaned = re.sub(r"[\*\_\~\`\#\>|\[\]]", " ", cleaned)
     return re.sub(r"\s+", " ", cleaned).strip()[:450]
@@ -777,7 +774,6 @@ def select_tts_voice(text: str) -> str:
 
 
 def _split_tts_chunks(text: str, max_len: int = 180) -> list[str]:
-    """Splits text into <=180-char chunks for Google Translate TTS fallback."""
     words = text.split(" ")
     chunks, cur = [], ""
     for w in words:
@@ -793,11 +789,6 @@ def _split_tts_chunks(text: str, max_len: int = 180) -> list[str]:
 
 
 async def _fallback_google_tts_with_yukino_pitch(spoken_text: str, lang_code: str) -> bytes:
-    """
-    100% Free, keyless fallback when Microsoft blocks Render's datacenter IP on edge-tts.
-    Fetches MP3 audio from translate.googleapis.com and uses ffmpeg to apply Yukino's
-    +14Hz (~8% higher timbre) and poised cadence.
-    """
     raw_mp3_parts = bytearray()
     headers = {"User-Agent": "Mozilla/5.0"}
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
@@ -814,7 +805,6 @@ async def _fallback_google_tts_with_yukino_pitch(spoken_text: str, lang_code: st
         return b""
 
     def _apply_ffmpeg_yukino_voice(mp3_bytes: bytes) -> bytes:
-        # Raise pitch by ~7% (asetrate) while keeping natural speaking speed (atempo)
         proc = subprocess.run(
             [
                 "ffmpeg", "-i", "pipe:0",
@@ -841,7 +831,6 @@ async def synthesize_tts_mp3_bytes(text: str) -> bytes:
     is_thai = bool(THAI_CHAR_REGEX.search(spoken_text))
     voice_name = TTS_VOICE_TH if is_thai else TTS_VOICE_EN
 
-    # 1. Try Microsoft Edge Neural TTS first (with 8s timeout so datacenter IP blocks never hang)
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
         mp3_path = tmp_mp3.name
     try:
@@ -864,7 +853,6 @@ async def synthesize_tts_mp3_bytes(text: str) -> bytes:
         except OSError:
             pass
 
-    # 2. Automatic Fallback: Google Translate TTS + FFmpeg Yukino Pitch/Timbre Filter
     lang_code = "th" if is_thai else "en"
     return await _fallback_google_tts_with_yukino_pitch(spoken_text, lang_code)
 
@@ -907,11 +895,7 @@ async def speak_in_voice_channel(guild: discord.Guild, text: str, fallback_chann
                     pass
                 bot.loop.call_soon_threadsafe(done_event.set)
 
-            # Explicitly force 48kHz stereo PCM output for Discord Opus encoder compatibility
-            audio_source = discord.FFmpegPCMAudio(
-                mp3_path,
-                options="-vn -ar 48000 -ac 2 -f s16le -loglevel warning"
-            )
+            audio_source = discord.FFmpegPCMAudio(mp3_path, options="-vn -loglevel warning")
             vc.play(audio_source, after=_after_play)
             await asyncio.wait_for(done_event.wait(), timeout=60)
         except Exception as e:
@@ -938,6 +922,13 @@ def transcribe_wav_bytes_google_sync(wav_bytes: bytes) -> str:
         return ""
 
 
+NOISE_HALLUCINATION_REGEX = re.compile(r"(<\|.*?\|>|[ðþæøåÐÞÆØÅ]|(.)\2\2)", re.IGNORECASE)
+WHISPER_HALLUCINATIONS = {
+    "ขอบคุณครับ", "ขอบคุณค่ะ", "โปรดติดตามตอนต่อไป", "พากย์ไทยโดย", "ซับไทยโดย",
+    "thank you", "thanks for watching", "you", "bye", ".", "..", "..."
+}
+
+
 async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
     if GROQ_API_KEY:
         try:
@@ -945,7 +936,6 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
             form.add_field("file", wav_bytes, filename="speech.wav", content_type="audio/wav")
             form.add_field("model", GROQ_STT_MODEL)
             form.add_field("language", "th")
-            # CRITICAL: Lock temperature=0 and use verbose_json (NO prompt seed!) to prevent hallucinations
             form.add_field("temperature", "0")
             form.add_field("response_format", "verbose_json")
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
@@ -964,7 +954,6 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
                             avg_logprob = float(seg.get("avg_logprob", 0.0))
                             comp_ratio = float(seg.get("compression_ratio", 1.0))
                             seg_text = (seg.get("text") or "").strip()
-                            # Reject segments that Whisper flags as non-speech, low confidence, or repetitive
                             if no_speech > 0.40 or avg_logprob < -0.75 or comp_ratio > 2.1:
                                 print(
                                     f"[Voice VAD Filter] Dropped noise segment '{seg_text}' "
@@ -1399,12 +1388,553 @@ async def _call_modal_ollama_chat(messages: list, ollama_model: str, temperature
     return ""
 
 
+# ==============================================================================
+# CLOUDFLARE WORKERS AI IMAGE GENERATION (4-TIER GUARANTEED ENGLISH TRANSLATION)
+# ==============================================================================
+def _clean_conversational_image_prefix(raw_text: str) -> str:
+    """Strips conversational Thai/English prefixes ('ลองวาดรูป...ดูหน่อย') to isolate the subject."""
+    cleaned = raw_text.strip()
+    cleaned = re.sub(
+        r"^(?:ยูกิโนะ|ยูกิน่อน|บอท)?\s*(?:ช่วย|ลอง|ช่วยลอง|อยากให้)?\s*"
+        r"(?:วาดรูป|สร้างรูป|เจนรูป|ขอรูป|วาดภาพ|สร้างภาพ|เจนภาพ|"
+        r"draw\s+(?:an?\s+|me\s+an?\s+)?(?:image|picture|illustration)\s+(?:of\s+)?|"
+        r"generate\s+(?:an?\s+)?(?:image|picture)\s+(?:of\s+)?)\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+    cleaned = re.sub(r"\s*(?:ให้หน่อย|ดูหน่อย|ให้ดูหน่อย|ให้ที|หน่อยค่ะ|หน่อยครับ|หน่อยนะ)\s*$", "", cleaned).strip()
+    return cleaned or raw_text.strip()
+
+
+async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: bool = False) -> str:
+    """
+    4-Tier Guaranteed Thai->English Translator for FLUX models (since FLUX CLIP/T5 cannot read Thai script):
+    Tier 1: Groq LPU (openai/gpt-oss-120b)
+    Tier 2: Google AI Studio (gemini-2.5-flash)
+    Tier 3: Modal GPU Ollama (scb10x/typhoon2.5-qwen3-4b)
+    Tier 4: Keyless Google Translate API (translate.googleapis.com - 100% guaranteed fallback)
+    """
+    style_instruction = (
+        "Format the output strictly as a 2D Japanese anime illustration prompt "
+        "(include tags: '2D anime key visual, cel-shaded anime art style, crisp lineart, "
+        "vibrant colors, high-detail anime background, not 3D, not photorealistic'). "
+        if is_anime_style
+        else "Include clear subject details, lighting, setting, and high-quality visual descriptors. "
+    )
+    sys_msg = (
+        "You are an expert English prompt engineer for the FLUX text-to-image model. "
+        "Translate the user's image description into a clear, vivid, accurate English image generation prompt. "
+        "Make sure the main subject (e.g., an orange tabby cat sitting at a desk using a computer) is described "
+        f"explicitly in the very first sentence. {style_instruction}"
+        "Output ONLY the English prompt in plain text, with no quotes or explanations."
+    )
+    trans_messages = [
+        {"role": "system", "content": sys_msg},
+        {"role": "user", "content": raw_prompt},
+    ]
+
+    # Tier 1: Groq LPU
+    if GROQ_API_KEY:
+        try:
+            res = await _call_groq_chat(trans_messages, GROQ_CHAT_FALLBACK_MODEL, 0.3, is_coding=False)
+            if res and not THAI_CHAR_REGEX.search(res):
+                return res.strip(' "\'')
+        except Exception as e:
+            print(f"FLUX Prompt Translate Tier 1 (Groq) warning: {e}")
+
+    # Tier 2: Google AI Studio (Gemini 2.5 Flash)
+    if GEMINI_API_KEY:
+        try:
+            g_url = (
+                f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/)"
+                f"{GEMINI_SEARCH_MODEL}:generateContent?key={GEMINI_API_KEY}"
+            )
+            g_payload = {
+                "contents": [{"parts": [{"text": f"{sys_msg}\n\nUser request: {raw_prompt}"}]}],
+                "generationConfig": {"temperature": 0.2},
+            }
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                async with session.post(g_url, json=g_payload) as resp:
+                    if resp.status == 200:
+                        g_data = await resp.json()
+                        parts = ((g_data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                        g_txt = " ".join(p.get("text", "") for p in parts if p.get("text")).strip(' "\'')
+                        if g_txt and not THAI_CHAR_REGEX.search(g_txt):
+                            return g_txt
+        except Exception as e:
+            print(f"FLUX Prompt Translate Tier 2 (Gemini) warning: {e}")
+
+    # Tier 3: Keyless Google Translate API (Instant & guaranteed to remove all Thai characters)
+    try:
+        gt_url = (
+            "[https://translate.googleapis.com/translate_a/single](https://translate.googleapis.com/translate_a/single)"
+            f"?client=gtx&sl=auto&tl=en&dt=t&q={quote_plus(raw_prompt)}"
+        )
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get(gt_url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                if resp.status == 200:
+                    gt_data = await resp.json(content_type=None)
+                    translated_segments = [seg[0] for seg in (gt_data[0] or []) if seg and seg[0]]
+                    en_basic = "".join(translated_segments).strip()
+                    if en_basic:
+                        if is_anime_style:
+                            return f"2D anime key visual, cel-shaded anime illustration, crisp lineart, {en_basic}, high detail"
+                        return f"{en_basic}, highly detailed, warm lighting, sharp focus, 4k illustration"
+    except Exception as e:
+        print(f"FLUX Prompt Translate Tier 3 (Google Translate) warning: {e}")
+
+    return raw_prompt
+
+
+async def generate_image_cloudflare_flux(user_prompt: str) -> tuple[bytes, str, str]:
+    """
+    Future-proof Cloudflare Workers AI image generator:
+    - Default: @cf/black-forest-labs/flux-1-schnell (steps=8, ~104 free images/day)
+    - '--anime': @cf/black-forest-labs/flux-1-schnell (steps=8 + 2D anime key-visual prompt styling)
+    - '--fl2': @cf/black-forest-labs/flux-2-klein-4b (fast distilled FLUX.2 4B model)
+    - '--fl2hq': @cf/black-forest-labs/flux-2-klein-9b (Cloudflare's official SDXL replacement)
+    - '--hq' or '--phoenix': @cf/leonardo/phoenix-1.0 (25 steps, high prompt & text adherence)
+    """
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+        raise RuntimeError("ยังไม่ได้ตั้งค่า `CF_ACCOUNT_ID` และ `CF_API_TOKEN` ใน Render Environment ค่ะ")
+
+    raw_p = user_prompt.strip()
+    selected_model = CF_IMAGE_MODEL
+    mode_tag = "FLUX.1-schnell (8 steps)"
+    is_anime_style = False
+
+    lower_p = raw_p.lower()
+    if lower_p.startswith(("--hq ", "--phoenix ")):
+        selected_model = "@cf/leonardo/phoenix-1.0"
+        mode_tag = "Leonardo Phoenix 1.0 (HQ)"
+        raw_p = raw_p.split(" ", 1)[1].strip()
+    elif lower_p.startswith("--fl2hq "):
+        selected_model = "@cf/black-forest-labs/flux-2-klein-9b"
+        mode_tag = "FLUX.2 Klein 9B"
+        raw_p = raw_p.split(" ", 1)[1].strip()
+    elif lower_p.startswith(("--fl2 ", "--flux2 ")):
+        selected_model = "@cf/black-forest-labs/flux-2-klein-4b"
+        mode_tag = "FLUX.2 Klein 4B"
+        raw_p = raw_p.split(" ", 1)[1].strip()
+    elif lower_p.startswith("--anime "):
+        selected_model = "@cf/black-forest-labs/flux-1-schnell"
+        mode_tag = "FLUX.1-schnell (Anime Style)"
+        is_anime_style = True
+        raw_p = raw_p.split(" ", 1)[1].strip()
+
+    cleaned_subject = _clean_conversational_image_prefix(raw_p)
+    english_prompt = cleaned_subject
+    if THAI_CHAR_REGEX.search(cleaned_subject) or is_anime_style:
+        english_prompt = await translate_prompt_to_english_for_flux(cleaned_subject, is_anime_style=is_anime_style)
+
+    cf_url = f"[https://api.cloudflare.com/client/v4/accounts/](https://api.cloudflare.com/client/v4/accounts/){CF_ACCOUNT_ID}/ai/run/{selected_model}"
+    headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
+
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
+        if "flux-2-" in selected_model:
+            form = aiohttp.FormData()
+            form.add_field("prompt", english_prompt)
+            form.add_field("width", "1024")
+            form.add_field("height", "1024")
+            req_ctx = session.post(cf_url, headers=headers, data=form)
+        elif "phoenix" in selected_model:
+            headers["Content-Type"] = "application/json"
+            payload = {
+                "prompt": english_prompt,
+                "negative_prompt": "blurry, low quality, deformed hands, extra fingers, watermark, bad anatomy",
+                "num_steps": 25,
+                "guidance": 3.5,
+                "width": 1024,
+                "height": 1024,
+            }
+            req_ctx = session.post(cf_url, headers=headers, json=payload)
+        else:
+            headers["Content-Type"] = "application/json"
+            payload = {"prompt": english_prompt, "steps": 8}
+            req_ctx = session.post(cf_url, headers=headers, json=payload)
+
+        async with req_ctx as resp:
+            if resp.status != 200:
+                err_txt = await resp.text()
+                raise RuntimeError(f"Cloudflare Workers AI HTTP {resp.status}: {err_txt[:200]}")
+
+            content_type = (resp.headers.get("Content-Type") or "").lower()
+            if "image/" in content_type or "octet-stream" in content_type:
+                return await resp.read(), f"[{mode_tag}] {english_prompt}", cleaned_subject
+
+            data = await resp.json()
+            b64_img = (data.get("result") or {}).get("image")
+            if not b64_img:
+                raise RuntimeError("Cloudflare Workers AI did not return an image payload.")
+            return base64.b64decode(b64_img), f"[{mode_tag}] {english_prompt}", cleaned_subject
+
+
+def build_yukino_image_caption(subject_text: str, formatted_en_prompt: str) -> str:
+    """Generates an in-character Yukino Yukinoshita caption (gets slightly flustered if it's a cat!)."""
+    if CAT_TOPIC_REGEX.search(subject_text) or CAT_TOPIC_REGEX.search(formatted_en_prompt):
+        return (
+            f"ฉะ... ฉันไม่ได้ตั้งใจวาดเพราะชอบแมวเป็นพิเศษหรอกนะคะ แค่ทำตามคำขอของคุณตามหน้าที่เท่านั้นแหละค่ะ (`{subject_text}`)\n"
+            f"-# Prompt: *{formatted_en_prompt[:220]}*"
+        )
+    return (
+        f"ฉันร่างภาพ `{subject_text}` ออกมาให้ตามที่คุณต้องการแล้วค่ะ ลองตรวจสอบดูนะคะ\n"
+        f"-# Prompt: *{formatted_en_prompt[:220]}*"
+    )
+
+
+async def send_generated_image_to_channel(channel, prompt_text: str):
+    try:
+        img_bytes, en_prompt_tag, clean_subj = await generate_image_cloudflare_flux(prompt_text)
+        caption = build_yukino_image_caption(clean_subj, en_prompt_tag)
+        await channel.send(
+            content=caption,
+            file=discord.File(io.BytesIO(img_bytes), filename="yukinon_flux.png"),
+        )
+    except Exception as e:
+        await channel.send(f"ไม่สามารถสร้างรูปภาพได้ในขณะนี้ค่ะ (`{e}`)")
+
+
+# ==============================================================================
+# IN-CONTEXT MANGA / IMAGE TRANSLATION & PILLOW TYPESETTING ENGINE
+# ==============================================================================
+def _load_manga_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    for path in FONT_CANDIDATES:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size=size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
+
+def _detect_target_translation_lang(user_prompt: str) -> tuple[str, str]:
+    lower_p = user_prompt.lower()
+    if any(k in lower_p for k in ("english", "eng", "อังกฤษ", "เป็นอิ้ง", "แปลอิ้ง", " to en")):
+        return "en", "English"
+    if any(k in lower_p for k in ("thai", "ไทย", "เป็นไทย", "แปลไทย", " to th")):
+        return "th", "Thai"
+    if THAI_CHAR_REGEX.search(user_prompt):
+        return "th", "Thai"
+    return "en", "English"
+
+
+async def extract_and_translate_manga_bubbles(
+    raw_bytes: bytes, filename: str, target_lang_name: str
+) -> tuple[list[dict], str]:
+    b64_img = base64.b64encode(raw_bytes).decode("utf-8")
+    fname_lower = filename.lower()
+    mime_type = (
+        "image/png" if fname_lower.endswith(".png")
+        else "image/webp" if fname_lower.endswith(".webp")
+        else "image/jpeg"
+    )
+
+    manga_system_instruction = f"""
+You are a professional Manga, Manhwa, and Comic Localizer.
+Analyze the entire image visually (character expressions, action, speaker relationships, and panel layout)
+and translate all speech bubbles and important text into natural, idiomatic {target_lang_name}.
+
+CRITICAL RULES:
+1. Reading Order: Order the bubbles strictly in traditional Japanese Manga reading order (Top-to-Bottom, Right-to-Left across panels).
+2. In-Context Localization: Do NOT translate word-for-word statically. Adapt Japanese/Korean/Chinese idioms, pronouns, tone, and emotion so the dialogue sounds completely natural in {target_lang_name} while fitting inside a speech bubble. Ignore tiny background noise/watermarks.
+3. Bounding Boxes: For each text region inside a speech bubble, provide `box_2d` as `[ymin, xmin, ymax, xmax]` normalized from 0 to 1000 covering ONLY the text characters inside the bubble (stay inside the bubble border).
+4. Return ONLY valid JSON matching this exact structure:
+{{
+  "summary": "Brief 1-sentence scene context",
+  "bubbles": [
+    {{
+      "id": 1,
+      "speaker_or_note": "Character / SFX / Narration",
+      "source_text": "Original text",
+      "translated_text": "Natural {target_lang_name} translation",
+      "box_2d": [ymin, xmin, ymax, xmax]
+    }}
+  ]
+}}
+""".strip()
+
+    if GEMINI_API_KEY:
+        url = (
+            f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/)"
+            f"{GEMINI_SEARCH_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        )
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": manga_system_instruction},
+                        {"inlineData": {"mimeType": mime_type, "data": b64_img}},
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.2,
+                "responseMimeType": "application/json",
+            },
+        }
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        parts = (
+                            ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                        )
+                        raw_json_str = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+                        raw_json_str = re.sub(r"^```(?:json)?|```$", "", raw_json_str).strip()
+                        parsed = json.loads(raw_json_str)
+                        bubbles = parsed.get("bubbles") or []
+                        summary = parsed.get("summary") or ""
+                        if bubbles:
+                            return bubbles, summary
+                    else:
+                        err_txt = await resp.text()
+                        print(f"Gemini Manga Translate HTTP {resp.status}: {err_txt[:200]}")
+        except Exception as e:
+            print(f"Gemini Manga Translate warning (falling back to Groq Vision): {e}")
+
+    if GROQ_API_KEY:
+        try:
+            groq_payload = {
+                "model": GROQ_VISION_FALLBACK_MODEL,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": manga_system_instruction},
+                            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
+                        ],
+                    }
+                ],
+                "temperature": 0.2,
+                "max_tokens": 4096,
+            }
+            headers = {
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
+                async with session.post(
+                    "[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)",
+                    headers=headers,
+                    json=groq_payload,
+                ) as resp:
+                    if resp.status == 200:
+                        g_data = await resp.json()
+                        content = g_data["choices"][0]["message"]["content"].strip()
+                        content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+                        json_match = re.search(r"\{[\s\S]*\}", content)
+                        if json_match:
+                            parsed = json.loads(json_match.group(0))
+                            return parsed.get("bubbles") or [], parsed.get("summary") or ""
+                        return [], content
+        except Exception as e:
+            print(f"Groq Manga Translate fallback error: {e}")
+
+    return [], ""
+
+
+def _wrap_text_to_pixel_width(
+    draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int
+) -> list[str]:
+    words = text.split(" ") if " " in text else [text]
+    lines = []
+    current = ""
+
+    for word in words:
+        test_line = f"{current} {word}".strip() if current else word
+        bbox = draw.textbbox((0, 0), test_line, font=font)
+        if (bbox[2] - bbox[0]) <= max_width:
+            current = test_line
+        else:
+            if current:
+                lines.append(current)
+                current = ""
+            chunk = ""
+            for ch in word:
+                test_ch = chunk + ch
+                cbbox = draw.textbbox((0, 0), test_ch, font=font)
+                is_combining = "\u0E31" <= ch <= "\u0E3A" or "\u0E47" <= ch <= "\u0E4E"
+                if (cbbox[2] - cbbox[0]) > max_width and chunk and not is_combining:
+                    lines.append(chunk)
+                    chunk = ch
+                else:
+                    chunk = test_ch
+            current = chunk
+    if current:
+        lines.append(current)
+    return lines
+
+
+def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) -> bytes | None:
+    valid_boxes = [
+        b for b in bubbles
+        if isinstance(b.get("box_2d"), list)
+        and len(b["box_2d"]) == 4
+        and (b.get("translated_text") or "").strip()
+    ]
+    if not valid_boxes:
+        return None
+
+    img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    width, height = img.size
+    draw = ImageDraw.Draw(img)
+
+    for b in valid_boxes:
+        ymin, xmin, ymax, xmax = [float(v) for v in b["box_2d"]]
+        x1 = max(0, int((xmin / 1000.0) * width))
+        y1 = max(0, int((ymin / 1000.0) * height))
+        x2 = min(width, int((xmax / 1000.0) * width))
+        y2 = min(height, int((ymax / 1000.0) * height))
+
+        box_w = x2 - x1
+        box_h = y2 - y1
+        if box_w < 16 or box_h < 16:
+            continue
+
+        crop_region = img.crop((x1, y1, x2, y2)).convert("L")
+        mean_luma = ImageStat.Stat(crop_region).mean[0]
+        is_light_bg = mean_luma >= 115
+        bg_fill = (255, 255, 255) if is_light_bg else (20, 20, 20)
+        fg_text = (15, 15, 15) if is_light_bg else (245, 245, 245)
+        stroke_col = (255, 255, 255) if is_light_bg else (0, 0, 0)
+
+        pad_clean = 3
+        cx1 = max(0, x1 - pad_clean)
+        cy1 = max(0, y1 - pad_clean)
+        cx2 = min(width, x2 + pad_clean)
+        cy2 = min(height, y2 + pad_clean)
+        radius = min(12, min(box_w, box_h) // 4)
+        draw.rounded_rectangle([cx1, cy1, cx2, cy2], radius=radius, fill=bg_fill)
+
+        trans_text = b["translated_text"].strip()
+        usable_w = max(24, int(box_w * 0.94))
+        usable_h = max(20, int(box_h * 0.94))
+
+        start_font_size = min(34, max(14, int(min(box_w, box_h) * 0.30)))
+        chosen_font = _load_manga_font(12)
+        chosen_lines = [trans_text]
+        line_height = 15
+
+        for fsize in range(start_font_size, 10, -2):
+            font = _load_manga_font(fsize)
+            wrapped = _wrap_text_to_pixel_width(draw, trans_text, font, usable_w)
+            sample_bbox = draw.textbbox((0, 0), "Agกข้ำ", font=font)
+            lh = int((sample_bbox[3] - sample_bbox[1]) * 1.18)
+            total_h = lh * len(wrapped)
+            max_line_w = max(
+                (draw.textbbox((0, 0), ln, font=font)[2] - draw.textbbox((0, 0), ln, font=font)[0])
+                for ln in wrapped
+            )
+            if total_h <= usable_h and max_line_w <= usable_w:
+                chosen_font = font
+                chosen_lines = wrapped
+                line_height = lh
+                break
+            chosen_font = font
+            chosen_lines = wrapped
+            line_height = lh
+
+        total_text_h = line_height * len(chosen_lines)
+        curr_y = y1 + max(0, (box_h - total_text_h) // 2)
+
+        for ln in chosen_lines:
+            lbbox = draw.textbbox((0, 0), ln, font=chosen_font)
+            lw = lbbox[2] - lbbox[0]
+            curr_x = x1 + max(0, (box_w - lw) // 2)
+            draw.text(
+                (curr_x, curr_y),
+                ln,
+                font=chosen_font,
+                fill=fg_text,
+                stroke_width=2,
+                stroke_fill=stroke_col,
+            )
+            curr_y += line_height
+
+    out_io = io.BytesIO()
+    img.save(out_io, format="PNG", optimize=True)
+    return out_io.getvalue()
+
+
+async def process_manga_translation_request(ctx_or_message, user_prompt: str):
+    msg = ctx_or_message.message if hasattr(ctx_or_message, "message") else ctx_or_message
+    channel = ctx_or_message.channel
+
+    image_attachments = [
+        a for a in msg.attachments if a.filename.lower().endswith(IMAGE_EXTENSIONS)
+    ]
+    if not image_attachments and msg.reference and isinstance(msg.reference.resolved, discord.Message):
+        image_attachments = [
+            a for a in msg.reference.resolved.attachments
+            if a.filename.lower().endswith(IMAGE_EXTENSIONS)
+        ]
+
+    if not image_attachments:
+        await channel.send(
+            "กรุณาแนบรูปภาพหน้ามังงะหรือข้อความที่ต้องการให้แปลมาด้วยนะคะ "
+            "(เช่น แนบรูปพร้อมพิมพ์ `!manga en` เพื่อแปลเป็นภาษาอังกฤษ หรือ `!manga th` เพื่อแปลเป็นภาษาไทยค่ะ)"
+        )
+        return
+
+    _, target_lang_name = _detect_target_translation_lang(user_prompt)
+    att = image_attachments[0]
+
+    async with channel.typing():
+        raw_bytes = await att.read()
+        bubbles, scene_summary = await extract_and_translate_manga_bubbles(
+            raw_bytes, att.filename, target_lang_name
+        )
+
+        if not bubbles and scene_summary:
+            await send_chunked_response(
+                channel,
+                f"**📖 คำแปลข้อความจากภาพ ({target_lang_name}):**\n\n{scene_summary}",
+            )
+            return
+
+        if not bubbles:
+            await channel.send("ไม่สามารถตรวจจับข้อความในภาพนี้ได้ค่ะ กรุณาตรวจสอบว่าภาพมีความคมชัดนะคะ")
+            return
+
+        transcript_lines = [
+            f"**📖 คำแปลมังงะตามลำดับช่องอ่าน ขวาไปซ้าย ({target_lang_name}):**"
+        ]
+        if scene_summary:
+            transcript_lines.append(f"-# *บริบทของฉาก: {scene_summary}*")
+
+        for idx, b in enumerate(bubbles, 1):
+            speaker = (b.get("speaker_or_note") or f"ช่องคำพูด {idx}").strip()
+            src_txt = (b.get("source_text") or "").strip()
+            tr_txt = (b.get("translated_text") or "").strip()
+            if tr_txt:
+                transcript_lines.append(f"**{idx}. [{speaker}]** `{src_txt}`\n   ↳ **{tr_txt}**")
+
+        transcript_text = "\n".join(transcript_lines)
+
+        rendered_png = None
+        try:
+            rendered_png = await asyncio.to_thread(
+                render_translated_manga_image_sync, raw_bytes, bubbles
+            )
+        except Exception as e:
+            print(f"Manga image rendering fallback to text-only: {e}")
+
+        if rendered_png:
+            await channel.send(
+                content=transcript_text[:1950],
+                file=discord.File(io.BytesIO(rendered_png), filename=f"translated_{att.filename}.png"),
+            )
+        else:
+            await send_chunked_response(channel, transcript_text)
+
+
 async def query_local_ollama_chat(
     prompt: str, model: str, system_prompt: str, channel_id: int = None,
     temperature: float = 0.55, allow_agentic_search: bool = True,
     has_fresh_attachment: bool = False
 ) -> tuple[str, bool]:
-    # 0. Instant internal Python shortcut for pure date/time questions (0 LLM calls, $0 Modal cost)
     if not has_fresh_attachment:
         instant_reply = try_instant_datetime_reply(prompt)
         if instant_reply:
@@ -1416,7 +1946,6 @@ async def query_local_ollama_chat(
     did_search = False
     working_prompt = prompt
 
-    # 1. Inject live Thailand date & time into the system prompt on every turn
     live_clock_str = get_current_thai_datetime_str()
     dynamic_system_prompt = (
         f"{system_prompt}\n\n"
@@ -1425,7 +1954,6 @@ async def query_local_ollama_chat(
         f"- ใช้ข้อมูลวันและเวลานี้ตอบผู้ใช้โดยตรงเมื่อถูกถามว่าวันนี้วันอะไรหรือตอนนี้กี่โมง"
     )
 
-    # 2. If the user asks a follow-up question without re-uploading a file, include recent channel attachment
     if (
         not has_fresh_attachment
         and channel_id is not None
@@ -1438,13 +1966,11 @@ async def query_local_ollama_chat(
             f"[ไฟล์อ้างอิงล่าสุดในห้องแชทนี้ (ใช้ประกอบการตอบหากคำถามต่อเนื่องกัน)]:\n{cached_ctx}"
         )
 
-    # 3. If the user asks about weather/rain/temperature, fetch live meteorological data
     if allow_agentic_search and detect_weather_intent(prompt):
         weather_block = await fetch_live_weather_context(prompt)
         if weather_block:
             working_prompt = f"{working_prompt}\n\n{weather_block}"
 
-    # 4. If the user asks about live news/prices/events, run multi-backend web search
     if (
         allow_agentic_search
         and "<untrusted_web_search_results" not in working_prompt
@@ -1467,28 +1993,28 @@ async def query_local_ollama_chat(
             try:
                 ans = await _call_groq_chat(messages, GROQ_CODE_MODEL, temperature, is_coding=True)
                 if ans:
-                    return ans
+                    return strip_cjk_leakage(ans, prompt)
             except Exception as e:
                 print(f"Groq coding primary fallback to Modal GPU Ollama: {e}")
 
             try:
                 ans = await _call_modal_ollama_chat(messages, ACTIVE_CODE_MODEL, temperature)
                 if ans:
-                    return ans
+                    return strip_cjk_leakage(ans, prompt)
             except Exception as e:
                 print(f"Modal GPU coding error: {e}")
         else:
             try:
                 ans = await _call_modal_ollama_chat(messages, model, temperature)
                 if ans:
-                    return ans
+                    return strip_cjk_leakage(ans, prompt)
             except Exception as e:
                 print(f"Modal GPU chat fallback to Groq LPU: {e}")
 
             try:
                 ans = await _call_groq_chat(messages, GROQ_CHAT_FALLBACK_MODEL, temperature, is_coding=False)
                 if ans:
-                    return ans
+                    return strip_cjk_leakage(ans, prompt)
             except Exception as e:
                 print(f"Groq chat fallback error: {e}")
 
@@ -1509,14 +2035,6 @@ async def query_local_ollama_chat(
         channel_memory[channel_id].append({"role": "user", "content": prompt[:2000]})
         channel_memory[channel_id].append({"role": "assistant", "content": answer[:3000]})
     return answer, did_search
-
-
-# Reject Nordic/Icelandic characters, special tokens, or 3x repeated character stutters from Whisper noise
-NOISE_HALLUCINATION_REGEX = re.compile(r"(<\|.*?\|>|[ðþæøåÐÞÆØÅ]|(.)\2\2)", re.IGNORECASE)
-WHISPER_HALLUCINATIONS = {
-    "ขอบคุณครับ", "ขอบคุณค่ะ", "โปรดติดตามตอนต่อไป", "พากย์ไทยโดย", "ซับไทยโดย",
-    "thank you", "thanks for watching", "you", "bye", ".", "..", "..."
-}
 
 
 async def handle_spoken_voice_command(guild: discord.Guild, text_channel, speaker_name: str, spoken_text: str):
@@ -1549,9 +2067,8 @@ async def handle_spoken_voice_command(guild: discord.Guild, text_channel, speake
 
 
 class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
-    # Frame RMS threshold (filters out PC fan hum / open-mic hiss; normal speech is 800-8000)
     SPEECH_FRAME_RMS_THRESHOLD = 450
-    MIN_ACTIVE_SPEECH_FRAMES = 15  # At least 15 frames (300ms) of actual vocal energy
+    MIN_ACTIVE_SPEECH_FRAMES = 15
 
     def __init__(self, guild: discord.Guild, text_channel):
         super().__init__()
@@ -1567,10 +2084,8 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
         return False
 
     def write(self, user, data):
-        # Ignore bot's own audio or empty/corrupted packets
         if not user or user.bot or not hasattr(data, "pcm") or not data.pcm:
             return
-        # Ignore incoming audio while the bot itself is speaking to prevent echo loops
         if self.guild.voice_client and self.guild.voice_client.is_playing():
             return
 
@@ -1579,13 +2094,11 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
         except Exception:
             return
 
-        # Only start/extend recording when vocal energy exceeds the fan-noise floor
         if frame_rms >= self.SPEECH_FRAME_RMS_THRESHOLD:
             self.user_buffers[user].extend(data.pcm)
             self.speech_frame_counts[user] += 1
             self.last_spoken[user] = time.monotonic()
         elif user in self.user_buffers and (time.monotonic() - self.last_spoken.get(user, 0) < 0.8):
-            # Keep natural trailing syllables/pauses inside an active utterance
             self.user_buffers[user].extend(data.pcm)
 
     def cleanup(self):
@@ -1651,8 +2164,15 @@ async def on_message(message: discord.Message):
 
     clean_prompt = re.sub(rf"\<@\!?{bot.user.id}\>", "", message.content).strip()
 
+    # 1. Natural Chat Manga / Image Translation Trigger (e.g., "แปลมังงะหน้านี้ให้หน่อย")
     if MANGA_TRANSLATE_INTENT_PATTERN.search(clean_prompt):
         await process_manga_translation_request(message, clean_prompt)
+        return
+
+    # 2. Natural Chat Image Generation Trigger (e.g., "ลองวาดรูปแมวส้มดูหน่อย", "ช่วยวาดภาพ...")
+    if not message.attachments and IMAGE_GEN_INTENT_PATTERN.search(clean_prompt):
+        async with message.channel.typing():
+            await send_generated_image_to_channel(message.channel, clean_prompt)
         return
 
     async with message.channel.typing():
@@ -1671,6 +2191,13 @@ async def on_message(message: discord.Message):
             allow_agentic_search=(not use_coder),
             has_fresh_attachment=bool(extracted_ctx),
         )
+
+        # 3. If the LLM itself emitted an agentic [IMAGE: ...] tag, generate the image automatically!
+        img_tag_match = AGENTIC_IMAGE_TAG_REGEX.search(answer)
+        if img_tag_match and CF_ACCOUNT_ID and CF_API_TOKEN:
+            await send_generated_image_to_channel(message.channel, clean_prompt or img_tag_match.group(1).strip())
+            return
+
         await send_chunked_response(message.channel, answer)
         if has_audio and not use_coder:
             await speak_in_voice_channel(message.guild, answer, fallback_channel=message.channel)
@@ -1698,7 +2225,6 @@ async def join_voice(ctx):
                 timeout=15.0,
             )
         )
-        # Wait 1.0s for Discord's DAVE E2EE MLS handshake to finish before playing greeting audio
         await asyncio.sleep(1.0)
 
         if HAS_VOICE_RECV and hasattr(vc, "listen"):
@@ -1723,6 +2249,7 @@ async def leave_voice(ctx):
         )
         await ctx.guild.voice_client.disconnect(force=True)
 
+
 @bot.command(name="wakeword")
 async def toggle_wakeword(ctx, mode: str = ""):
     gid = ctx.guild.id if ctx.guild else 0
@@ -1740,6 +2267,20 @@ async def toggle_wakeword(ctx, mode: str = ""):
         else "ปิดใช้งาน (พูดคุยได้ทันทีโดยไม่ต้องเรียกชื่อนำหน้า)"
     )
     await ctx.send(f"🎙️ โหมดคำเรียกขานในห้องเสียงตอนนี้: **{state_th}** ค่ะ")
+
+
+@bot.command(name="imagine", aliases=["img", "draw"])
+async def imagine_command(ctx, *, prompt: str = ""):
+    if not prompt.strip():
+        await ctx.send("กรุณาระบุสิ่งที่ต้องการให้วาดด้วยนะคะ เช่น `!imagine แมวส้มนั่งใช้คอมพิวเตอร์ในห้อง` ค่ะ")
+        return
+    async with ctx.typing():
+        await send_generated_image_to_channel(ctx.channel, prompt)
+
+
+@bot.command(name="manga", aliases=["translate", "tl"])
+async def manga_command(ctx, *, args: str = "English"):
+    await process_manga_translation_request(ctx, args)
 
 
 @bot.command(name="ask")
@@ -1770,519 +2311,6 @@ async def ask_code(ctx, *, prompt: str = "วิเคราะห์โค้�
             has_fresh_attachment=bool(ctx_text),
         )
         await send_chunked_response(ctx, answer)
-
-async def generate_image_cloudflare_flux(user_prompt: str) -> tuple[bytes, str]:
-    """
-    Future-proof Cloudflare Workers AI image generator (zero deprecated Stable Diffusion IDs):
-    - Default: @cf/black-forest-labs/flux-1-schnell (steps=8, ~104 free images/day)
-    - '--anime': @cf/black-forest-labs/flux-1-schnell (steps=8 + 2D anime key-visual prompt styling)
-    - '--fl2': @cf/black-forest-labs/flux-2-klein-4b (fast distilled FLUX.2 4B model)
-    - '--fl2hq': @cf/black-forest-labs/flux-2-klein-9b (Cloudflare's official SDXL replacement)
-    - '--hq' or '--phoenix': @cf/leonardo/phoenix-1.0 (25 steps, high prompt & text adherence)
-    """
-    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
-        raise RuntimeError("ยังไม่ได้ตั้งค่า `CF_ACCOUNT_ID` และ `CF_API_TOKEN` ใน Render Environment ค่ะ")
-
-    raw_p = user_prompt.strip()
-    selected_model = CF_IMAGE_MODEL
-    mode_tag = "FLUX.1-schnell (8 steps)"
-    is_anime_style = False
-
-    lower_p = raw_p.lower()
-    if lower_p.startswith(("--hq ", "--phoenix ")):
-        selected_model = "@cf/leonardo/phoenix-1.0"
-        mode_tag = "Leonardo Phoenix 1.0 (HQ)"
-        raw_p = raw_p.split(" ", 1)[1].strip()
-    elif lower_p.startswith("--fl2hq "):
-        selected_model = "@cf/black-forest-labs/flux-2-klein-9b"
-        mode_tag = "FLUX.2 Klein 9B"
-        raw_p = raw_p.split(" ", 1)[1].strip()
-    elif lower_p.startswith(("--fl2 ", "--flux2 ")):
-        selected_model = "@cf/black-forest-labs/flux-2-klein-4b"
-        mode_tag = "FLUX.2 Klein 4B"
-        raw_p = raw_p.split(" ", 1)[1].strip()
-    elif lower_p.startswith("--anime "):
-        selected_model = "@cf/black-forest-labs/flux-1-schnell"
-        mode_tag = "FLUX.1-schnell (Anime Style)"
-        is_anime_style = True
-        raw_p = raw_p.split(" ", 1)[1].strip()
-
-    english_prompt = raw_p
-    if (THAI_CHAR_REGEX.search(english_prompt) or is_anime_style) and GROQ_API_KEY:
-        try:
-            style_instruction = (
-                "Format the output strictly as a 2D Japanese anime illustration prompt "
-                "(include tags: '2D anime key visual, cel-shaded anime art style, crisp lineart, "
-                "vibrant colors, high-detail anime background, not 3D, not photorealistic'). "
-                if is_anime_style
-                else "Include vivid lighting, composition, and high-quality visual descriptors. "
-            )
-            trans_messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "Translate and expand the user's image request into a detailed English text-to-image prompt. "
-                        f"{style_instruction}"
-                        "Return ONLY the English prompt, nothing else."
-                    ),
-                },
-                {"role": "user", "content": english_prompt},
-            ]
-            translated = await _call_groq_chat(trans_messages, GROQ_CHAT_FALLBACK_MODEL, 0.3, is_coding=False)
-            if translated:
-                english_prompt = translated.strip(' "\'')
-        except Exception:
-            if is_anime_style:
-                english_prompt = f"2D anime key visual, cel-shaded anime illustration, crisp lineart, {english_prompt}"
-
-    cf_url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{selected_model}"
-    headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
-
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
-        # Case 1: FLUX.2 models (flux-2-klein-4b / 9b / dev) require multipart/form-data
-        if "flux-2-" in selected_model:
-            form = aiohttp.FormData()
-            form.add_field("prompt", english_prompt)
-            form.add_field("width", "1024")
-            form.add_field("height", "1024")
-            req_ctx = session.post(cf_url, headers=headers, data=form)
-        # Case 2: Leonardo Phoenix 1.0 (25 steps + negative prompt)
-        elif "phoenix" in selected_model:
-            headers["Content-Type"] = "application/json"
-            payload = {
-                "prompt": english_prompt,
-                "negative_prompt": "blurry, low quality, deformed hands, extra fingers, watermark, bad anatomy",
-                "num_steps": 25,
-                "guidance": 3.5,
-                "width": 1024,
-                "height": 1024,
-            }
-            req_ctx = session.post(cf_url, headers=headers, json=payload)
-        # Case 3: Default FLUX.1-schnell with maximum steps=8
-        else:
-            headers["Content-Type"] = "application/json"
-            payload = {"prompt": english_prompt, "steps": 8}
-            req_ctx = session.post(cf_url, headers=headers, json=payload)
-
-        async with req_ctx as resp:
-            if resp.status != 200:
-                err_txt = await resp.text()
-                raise RuntimeError(f"Cloudflare Workers AI HTTP {resp.status}: {err_txt[:200]}")
-
-            content_type = (resp.headers.get("Content-Type") or "").lower()
-            if "image/" in content_type or "octet-stream" in content_type:
-                return await resp.read(), f"[{mode_tag}] {english_prompt}"
-
-            data = await resp.json()
-            b64_img = (data.get("result") or {}).get("image")
-            if not b64_img:
-                raise RuntimeError("Cloudflare Workers AI did not return an image payload.")
-            return base64.b64decode(b64_img), f"[{mode_tag}] {english_prompt}"
-
-
-@bot.command(name="imagine", aliases=["img", "draw"])
-async def imagine_command(ctx, *, prompt: str = ""):
-    if not prompt.strip():
-        await ctx.send("กรุณาระบุสิ่งที่ต้องการให้วาดด้วยนะคะ เช่น `!imagine แมวสีดำนั่งอ่านหนังสือในห้องชมรม` ค่ะ")
-        return
-    async with ctx.typing():
-        try:
-            img_bytes, en_prompt = await generate_image_cloudflare_flux(prompt)
-            await ctx.send(
-                content=(
-                    f"วาดภาพตามที่คุณขอเรียบร้อยแล้วค่ะ (`{prompt}`)\n"
-                    f"-# Prompt: *{en_prompt[:180]}*"
-                ),
-                file=discord.File(io.BytesIO(img_bytes), filename="yukinon_flux.png"),
-            )
-        except Exception as e:
-            await ctx.send(f"ไม่สามารถสร้างรูปภาพได้ในขณะนี้ค่ะ (`{e}`)")
-
-
-import json
-from PIL import Image, ImageDraw, ImageFont, ImageStat
-
-MANGA_TRANSLATE_INTENT_PATTERN = re.compile(
-    r"(แปลมังงะ|แปลรูป|แปลภาพ|แปลการ์ตูน|แปลข้อความในรูป|translate\s+(this\s+)?(manga|image|panel|comic|page))",
-    re.IGNORECASE,
-)
-
-# Font paths installed in the Debian container (supports both Thai and English)
-FONT_CANDIDATES = (
-    "/usr/share/fonts/truetype/tlwg/Garuda-Bold.ttf",
-    "/usr/share/fonts/truetype/tlwg/Garuda.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSansThai-Bold.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-)
-
-
-def _load_manga_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    for path in FONT_CANDIDATES:
-        if os.path.exists(path):
-            try:
-                return ImageFont.truetype(path, size=size)
-            except Exception:
-                continue
-    return ImageFont.load_default()
-
-
-def _detect_target_translation_lang(user_prompt: str) -> tuple[str, str]:
-    """
-    Returns (language_code, language_name).
-    If the user mentions English / อังกฤษ / en -> translates to English.
-    If the user mentions Thai / ไทย / th (or writes in Thai without asking for English) -> translates to Thai.
-    Defaults to English for standard '!manga' or English prompts.
-    """
-    lower_p = user_prompt.lower()
-    if any(k in lower_p for k in ("english", "eng", "อังกฤษ", "เป็นอิ้ง", "แปลอิ้ง", " to en")):
-        return "en", "English"
-    if any(k in lower_p for k in ("thai", "ไทย", "เป็นไทย", "แปลไทย", " to th")):
-        return "th", "Thai"
-    if THAI_CHAR_REGEX.search(user_prompt):
-        return "th", "Thai"
-    return "en", "English"
-
-
-async def extract_and_translate_manga_bubbles(
-    raw_bytes: bytes, filename: str, target_lang_name: str
-) -> tuple[list[dict], str]:
-    """
-    Stage 1: Uses Gemini 2.5 Flash (Structured JSON + 2D Bounding Boxes) to detect all speech bubbles
-    in Right-to-Left manga reading order and perform in-context localization into English or Thai.
-    Falls back to Groq Vision (qwen/qwen3.8-27b) plain-text localization if Gemini is unavailable.
-    """
-    b64_img = base64.b64encode(raw_bytes).decode("utf-8")
-    fname_lower = filename.lower()
-    mime_type = (
-        "image/png" if fname_lower.endswith(".png")
-        else "image/webp" if fname_lower.endswith(".webp")
-        else "image/jpeg"
-    )
-
-    manga_system_instruction = f"""
-You are a professional Manga, Manhwa, and Comic Localizer.
-Analyze the entire image visually (character expressions, action, speaker relationships, and panel layout)
-and translate all speech bubbles and important text into natural, idiomatic {target_lang_name}.
-
-CRITICAL RULES:
-1. Reading Order: Order the bubbles strictly in traditional Japanese Manga reading order (Top-to-Bottom, Right-to-Left across panels).
-2. In-Context Localization: Do NOT translate word-for-word statically. Adapt Japanese/Korean/Chinese idioms, pronouns, tone, and emotion so the dialogue sounds completely natural in {target_lang_name} while fitting inside a speech bubble. Ignore tiny background noise/watermarks.
-3. Bounding Boxes: For each text region inside a speech bubble, provide `box_2d` as `[ymin, xmin, ymax, xmax]` normalized from 0 to 1000 covering ONLY the text characters inside the bubble (stay inside the bubble border).
-4. Return ONLY valid JSON matching this exact structure:
-{{
-  "summary": "Brief 1-sentence scene context",
-  "bubbles": [
-    {{
-      "id": 1,
-      "speaker_or_note": "Character / SFX / Narration",
-      "source_text": "Original text",
-      "translated_text": "Natural {target_lang_name} translation",
-      "box_2d": [ymin, xmin, ymax, xmax]
-    }}
-  ]
-}}
-""".strip()
-
-    # 1. Primary Engine: Google AI Studio (Gemini 2.5 Flash) with accurate 2D bounding boxes
-    if GEMINI_API_KEY:
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{GEMINI_SEARCH_MODEL}:generateContent?key={GEMINI_API_KEY}"
-        )
-        payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {"text": manga_system_instruction},
-                        {"inlineData": {"mimeType": mime_type, "data": b64_img}},
-                    ]
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.2,
-                "responseMimeType": "application/json",
-            },
-        }
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
-                async with session.post(url, json=payload) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        parts = (
-                            ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-                        )
-                        raw_json_str = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
-                        raw_json_str = re.sub(r"^```(?:json)?|```$", "", raw_json_str).strip()
-                        parsed = json.loads(raw_json_str)
-                        bubbles = parsed.get("bubbles") or []
-                        summary = parsed.get("summary") or ""
-                        if bubbles:
-                            return bubbles, summary
-                    else:
-                        err_txt = await resp.text()
-                        print(f"Gemini Manga Translate HTTP {resp.status}: {err_txt[:200]}")
-        except Exception as e:
-            print(f"Gemini Manga Translate warning (falling back to Groq Vision): {e}")
-
-    # 2. Automatic Fallback: Groq Vision (qwen/qwen3.8-27b)
-    if GROQ_API_KEY:
-        try:
-            groq_payload = {
-                "model": GROQ_VISION_FALLBACK_MODEL,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": manga_system_instruction},
-                            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
-                        ],
-                    }
-                ],
-                "temperature": 0.2,
-                "max_tokens": 4096,
-            }
-            headers = {
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            }
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
-                async with session.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers=headers,
-                    json=groq_payload,
-                ) as resp:
-                    if resp.status == 200:
-                        g_data = await resp.json()
-                        content = g_data["choices"][0]["message"]["content"].strip()
-                        content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
-                        json_match = re.search(r"\{[\s\S]*\}", content)
-                        if json_match:
-                            parsed = json.loads(json_match.group(0))
-                            return parsed.get("bubbles") or [], parsed.get("summary") or ""
-                        return [], content
-        except Exception as e:
-            print(f"Groq Manga Translate fallback error: {e}")
-
-    return [], ""
-
-
-def _wrap_text_to_pixel_width(
-    draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int
-) -> list[str]:
-    """Wraps English (by words) or Thai (by words/characters without splitting combining vowels) to fit max_width."""
-    words = text.split(" ") if " " in text else [text]
-    lines = []
-    current = ""
-
-    for word in words:
-        test_line = f"{current} {word}".strip() if current else word
-        bbox = draw.textbbox((0, 0), test_line, font=font)
-        if (bbox[2] - bbox[0]) <= max_width:
-            current = test_line
-        else:
-            if current:
-                lines.append(current)
-                current = ""
-            # If a single word/phrase (like unspaced Thai) is wider than max_width, wrap cleanly by grapheme
-            chunk = ""
-            for ch in word:
-                test_ch = chunk + ch
-                cbbox = draw.textbbox((0, 0), test_ch, font=font)
-                # Never break immediately before a Thai combining vowel or tone mark (\u0E31-\u0E3A, \u0E47-\u0E4E)
-                is_combining = "\u0E31" <= ch <= "\u0E3A" or "\u0E47" <= ch <= "\u0E4E"
-                if (cbbox[2] - cbbox[0]) > max_width and chunk and not is_combining:
-                    lines.append(chunk)
-                    chunk = ch
-                else:
-                    chunk = test_ch
-            current = chunk
-    if current:
-        lines.append(current)
-    return lines
-
-
-def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) -> bytes | None:
-    """
-    Stage 2: Cleans the original Japanese text inside each bounding box and typesets the
-    localized English or Thai dialogue neatly centered inside each speech bubble.
-    """
-    valid_boxes = [
-        b for b in bubbles
-        if isinstance(b.get("box_2d"), list)
-        and len(b["box_2d"]) == 4
-        and (b.get("translated_text") or "").strip()
-    ]
-    if not valid_boxes:
-        return None
-
-    img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-    width, height = img.size
-    draw = ImageDraw.Draw(img)
-
-    for b in valid_boxes:
-        ymin, xmin, ymax, xmax = [float(v) for v in b["box_2d"]]
-        x1 = max(0, int((xmin / 1000.0) * width))
-        y1 = max(0, int((ymin / 1000.0) * height))
-        x2 = min(width, int((xmax / 1000.0) * width))
-        y2 = min(height, int((ymax / 1000.0) * height))
-
-        box_w = x2 - x1
-        box_h = y2 - y1
-        if box_w < 16 or box_h < 16:
-            continue
-
-        # Determine whether the bubble background is light (standard white bubble) or dark
-        crop_region = img.crop((x1, y1, x2, y2)).convert("L")
-        mean_luma = ImageStat.Stat(crop_region).mean[0]
-        is_light_bg = mean_luma >= 115
-        bg_fill = (255, 255, 255) if is_light_bg else (20, 20, 20)
-        fg_text = (15, 15, 15) if is_light_bg else (245, 245, 245)
-        stroke_col = (255, 255, 255) if is_light_bg else (0, 0, 0)
-
-        # Slightly expand the cleaning rectangle by 3px to cover vertical kanji edges cleanly
-        pad_clean = 3
-        cx1 = max(0, x1 - pad_clean)
-        cy1 = max(0, y1 - pad_clean)
-        cx2 = min(width, x2 + pad_clean)
-        cy2 = min(height, y2 + pad_clean)
-        radius = min(12, min(box_w, box_h) // 4)
-        draw.rounded_rectangle([cx1, cy1, cx2, cy2], radius=radius, fill=bg_fill)
-
-        # Auto-scale font size from large down to 11px until wrapped lines fit inside (box_w, box_h)
-        trans_text = b["translated_text"].strip()
-        usable_w = max(24, int(box_w * 0.94))
-        usable_h = max(20, int(box_h * 0.94))
-
-        start_font_size = min(34, max(14, int(min(box_w, box_h) * 0.30)))
-        chosen_font = _load_manga_font(12)
-        chosen_lines = [trans_text]
-        line_height = 15
-
-        for fsize in range(start_font_size, 10, -2):
-            font = _load_manga_font(fsize)
-            wrapped = _wrap_text_to_pixel_width(draw, trans_text, font, usable_w)
-            sample_bbox = draw.textbbox((0, 0), "Agกข้ำ", font=font)
-            lh = int((sample_bbox[3] - sample_bbox[1]) * 1.18)
-            total_h = lh * len(wrapped)
-            max_line_w = max(
-                (draw.textbbox((0, 0), ln, font=font)[2] - draw.textbbox((0, 0), ln, font=font)[0])
-                for ln in wrapped
-            )
-            if total_h <= usable_h and max_line_w <= usable_w:
-                chosen_font = font
-                chosen_lines = wrapped
-                line_height = lh
-                break
-            chosen_font = font
-            chosen_lines = wrapped
-            line_height = lh
-
-        # Vertically and horizontally center the wrapped text inside the speech bubble
-        total_text_h = line_height * len(chosen_lines)
-        curr_y = y1 + max(0, (box_h - total_text_h) // 2)
-
-        for ln in chosen_lines:
-            lbbox = draw.textbbox((0, 0), ln, font=chosen_font)
-            lw = lbbox[2] - lbbox[0]
-            curr_x = x1 + max(0, (box_w - lw) // 2)
-            draw.text(
-                (curr_x, curr_y),
-                ln,
-                font=chosen_font,
-                fill=fg_text,
-                stroke_width=2,
-                stroke_fill=stroke_col,
-            )
-            curr_y += line_height
-
-    out_io = io.BytesIO()
-    img.save(out_io, format="PNG", optimize=True)
-    return out_io.getvalue()
-
-
-async def process_manga_translation_request(ctx_or_message, user_prompt: str):
-    """Handles !manga / !translate or natural manga translation requests with image + text fallback."""
-    msg = ctx_or_message.message if hasattr(ctx_or_message, "message") else ctx_or_message
-    channel = ctx_or_message.channel
-
-    # Find attached image on current message or on a replied-to message
-    image_attachments = [
-        a for a in msg.attachments if a.filename.lower().endswith(IMAGE_EXTENSIONS)
-    ]
-    if not image_attachments and msg.reference and isinstance(msg.reference.resolved, discord.Message):
-        image_attachments = [
-            a for a in msg.reference.resolved.attachments
-            if a.filename.lower().endswith(IMAGE_EXTENSIONS)
-        ]
-
-    if not image_attachments:
-        await channel.send(
-            "กรุณาแนบรูปภาพหน้ามังงะหรือข้อความที่ต้องการให้แปลมาด้วยนะคะ "
-            "(เช่น แนบรูปพร้อมพิมพ์ `!manga en` เพื่อแปลเป็นภาษาอังกฤษ หรือ `!manga th` เพื่อแปลเป็นภาษาไทยค่ะ)"
-        )
-        return
-
-    _, target_lang_name = _detect_target_translation_lang(user_prompt)
-    att = image_attachments[0]
-
-    async with channel.typing():
-        raw_bytes = await att.read()
-        bubbles, scene_summary = await extract_and_translate_manga_bubbles(
-            raw_bytes, att.filename, target_lang_name
-        )
-
-        # Fallback Case: Model returned plain translated text without JSON bubbles
-        if not bubbles and scene_summary:
-            await send_chunked_response(
-                channel,
-                f"**📖 คำแปลข้อความจากภาพ ({target_lang_name}):**\n\n{scene_summary}",
-            )
-            return
-
-        if not bubbles:
-            await channel.send("ไม่สามารถตรวจจับข้อความในภาพนี้ได้ค่ะ กรุณาตรวจสอบว่าภาพมีความคมชัดนะคะ")
-            return
-
-        # Format the Right-to-Left in-context transcript as a clean bulleted guide
-        transcript_lines = [
-            f"**📖 คำแปลมังงะตามลำดับช่องอ่าน ขวาไปซ้าย ({target_lang_name}):**"
-        ]
-        if scene_summary:
-            transcript_lines.append(f"-# *บริบทของฉาก: {scene_summary}*")
-
-        for idx, b in enumerate(bubbles, 1):
-            speaker = (b.get("speaker_or_note") or f"ช่องคำพูด {idx}").strip()
-            src_txt = (b.get("source_text") or "").strip()
-            tr_txt = (b.get("translated_text") or "").strip()
-            if tr_txt:
-                transcript_lines.append(f"**{idx}. [{speaker}]** `{src_txt}`\n   ↳ **{tr_txt}**")
-
-        transcript_text = "\n".join(transcript_lines)
-
-        # Try rendering the translated text directly onto the manga speech bubbles
-        rendered_png = None
-        try:
-            rendered_png = await asyncio.to_thread(
-                render_translated_manga_image_sync, raw_bytes, bubbles
-            )
-        except Exception as e:
-            print(f"Manga image rendering fallback to text-only: {e}")
-
-        if rendered_png:
-            await channel.send(
-                content=transcript_text[:1950],
-                file=discord.File(io.BytesIO(rendered_png), filename=f"translated_{att.filename}.png"),
-            )
-        else:
-            # Automatic fallback if bounding boxes were unavailable
-            await send_chunked_response(channel, transcript_text)
-
-
-@bot.command(name="manga", aliases=["translate", "tl"])
-async def manga_command(ctx, *, args: str = "English"):
-    await process_manga_translation_request(ctx, args)
 
 
 @bot.command(name="clear")
