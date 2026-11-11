@@ -647,7 +647,7 @@ async def fetch_live_weather_context(user_text: str) -> str:
     t0 = time.monotonic()
     try:
         session = get_http_session()
-            async with session.get(url, headers={"User-Agent": "curl/8.5.0"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        async with session.get(url, headers={"User-Agent": "curl/8.5.0"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     api_log(f"Weather -> wttr.in ({target_city}) 200 OK ({time.monotonic() - t0:.2f}s)")
@@ -700,7 +700,7 @@ async def fetch_live_weather_context(user_text: str) -> str:
             "&timezone=Asia%2FBangkok&forecast_days=1"
         )
         session = get_http_session()
-            async with session.get(om_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        async with session.get(om_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     om = await resp.json()
                     api_log(f"Weather (Fallback) -> Open-Meteo 200 OK ({time.monotonic() - t1:.2f}s)")
@@ -785,7 +785,7 @@ async def _discover_active_gemini_flash_model() -> list[str]:
     )
     try:
         session = get_http_session()
-            async with session.get(list_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        async with session.get(list_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     api_models = []
@@ -910,7 +910,7 @@ async def _call_cloudflare_vision_chat(
     t0 = time.monotonic()
     try:
         session = get_http_session()
-            async with session.post(cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=22)) as resp:
+        async with session.post(cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=22)) as resp:
                 elapsed = time.monotonic() - t0
                 if resp.status == 200:
                     data = await resp.json()
@@ -1301,7 +1301,7 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
             stt_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/audio/transcriptions")
             session = get_http_session()
-                async with session.post(stt_url, headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+            async with session.post(stt_url, headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=25)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         segments = data.get("segments") or []
@@ -1642,7 +1642,7 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
     t0 = time.monotonic()
     try:
         async with ollama_lock:
-            session = get_http_session()
+        session = get_http_session()
                 async with session.post(
                     clean_url(f"{OLLAMA_BASE_URL}/api/chat"),
                     headers=get_modal_headers(),
@@ -1878,7 +1878,7 @@ async def _call_groq_chat(
     chat_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/chat/completions")
     t0 = time.monotonic()
     session = get_http_session()
-        async with session.post(chat_url, headers=headers, json=groq_payload, timeout=aiohttp.ClientTimeout(total=90)) as resp:
+    async with session.post(chat_url, headers=headers, json=groq_payload, timeout=aiohttp.ClientTimeout(total=90)) as resp:
             elapsed = time.monotonic() - t0
             if resp.status == 200:
                 g_data = await resp.json()
@@ -1911,7 +1911,7 @@ async def _call_modal_ollama_chat(
     t0 = time.monotonic()
     async with ollama_lock:
         session = get_http_session()
-            async with session.post(
+        async with session.post(
                 clean_url(f"{OLLAMA_BASE_URL}/api/chat"),
                 headers=get_modal_headers(),
                 json=payload, timeout=aiohttp.ClientTimeout(total=180)
@@ -1961,7 +1961,7 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
             f"?client=gtx&sl=th&tl=en&dt=t&q={quote_plus(raw_prompt)}"
         )
         session = get_http_session()
-            async with session.get(gt_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        async with session.get(gt_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     gt_data = await resp.json(content_type=None)
                     translated_segments = [seg[0] for seg in (gt_data[0] or []) if seg and seg[0]]
