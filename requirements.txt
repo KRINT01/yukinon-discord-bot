@@ -1,4 +1,5 @@
-discord.py[voice]>=2.3,<3
+discord.py[voice]>=2.7.0,<3
+davey>=0.1.6
 discord-ext-voice-recv
 edge-tts>=7.3.0
 SpeechRecognition

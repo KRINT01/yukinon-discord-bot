@@ -10,6 +10,7 @@ import logging
 import audioop
 import ipaddress
 import tempfile
+import threading
 import asyncio
 import platform
 import subprocess
@@ -196,6 +197,17 @@ BOOT_TIME = time.time()
 channel_memory = defaultdict(lambda: deque(maxlen=12))
 # Stores the most recent file/code attachment per channel so follow-up questions still see the full code
 channel_last_attachment = {}
+
+
+def prune_stale_attachments(ttl_sec: int = 1800):
+    """Evicts cached channel attachments older than ttl_sec (default 30 mins) to free RAM."""
+    now = time.time()
+    stale_ids = [
+        cid for cid, data in list(channel_last_attachment.items())
+        if now - data.get("timestamp", 0) >= ttl_sec
+    ]
+    for cid in stale_ids:
+        channel_last_attachment.pop(cid, None)
 
 # False = reply to all speech in voice channel; True = require wake word ("ยูกิโนะ", etc.)
 voice_wake_word_enabled = defaultdict(lambda: False)
@@ -572,8 +584,10 @@ class YukinonBot(commands.Bot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.web_runner = None
+        self.http_session: aiohttp.ClientSession | None = None
 
     async def setup_hook(self):
+        self.http_session = aiohttp.ClientSession()
         app = web.Application()
         app.router.add_get("/", handle_root)
         app.router.add_get("/healthz", handle_healthz)
@@ -583,8 +597,22 @@ class YukinonBot(commands.Bot):
         await site.start()
         print(f"[Render Web Service Health Server] Listening on 0.0.0.0:{PORT}")
 
+    async def close(self):
+        if self.http_session and not self.http_session.closed:
+            await self.http_session.close()
+        if self.web_runner:
+            await self.web_runner.cleanup()
+        await super().close()
+
 
 bot = YukinonBot(command_prefix="!", intents=intents, help_command=None)
+
+
+def get_http_session() -> aiohttp.ClientSession:
+    """Returns the shared bot aiohttp.ClientSession (creates one if not yet initialized)."""
+    if bot.http_session is None or bot.http_session.closed:
+        bot.http_session = aiohttp.ClientSession()
+    return bot.http_session
 
 
 def detect_coding_intent(text: str, attachments: list, channel_id: int = None) -> bool:
@@ -593,6 +621,7 @@ def detect_coding_intent(text: str, attachments: list, channel_id: int = None) -
             return True
     if bool(CODE_INTENT_PATTERN.search(text)):
         return True
+    prune_stale_attachments()
     if channel_id and channel_id in channel_last_attachment:
         if channel_last_attachment[channel_id].get("is_code"):
             return True
@@ -617,8 +646,8 @@ async def fetch_live_weather_context(user_text: str) -> str:
     url = clean_url(f"{HTTPS}wttr.in/{target_city}?format=j1&lang=th")
     t0 = time.monotonic()
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-            async with session.get(url, headers={"User-Agent": "curl/8.5.0"}) as resp:
+        session = get_http_session()
+            async with session.get(url, headers={"User-Agent": "curl/8.5.0"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     api_log(f"Weather -> wttr.in ({target_city}) 200 OK ({time.monotonic() - t0:.2f}s)")
@@ -670,8 +699,8 @@ async def fetch_live_weather_context(user_text: str) -> str:
             "&daily=precipitation_probability_max,temperature_2m_max,temperature_2m_min"
             "&timezone=Asia%2FBangkok&forecast_days=1"
         )
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-            async with session.get(om_url) as resp:
+        session = get_http_session()
+            async with session.get(om_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     om = await resp.json()
                     api_log(f"Weather (Fallback) -> Open-Meteo 200 OK ({time.monotonic() - t1:.2f}s)")
@@ -755,8 +784,8 @@ async def _discover_active_gemini_flash_model() -> list[str]:
         f"{HTTPS}generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
     )
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-            async with session.get(list_url) as resp:
+        session = get_http_session()
+            async with session.get(list_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     api_models = []
@@ -787,7 +816,7 @@ async def call_gemini_generate_content_self_healing(
     candidate_models = await _discover_active_gemini_flash_model()
     tried = set()
 
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_sec)) as session:
+    session = get_http_session()
         idx = 0
         while idx < len(candidate_models):
             model_id = candidate_models[idx]
@@ -806,7 +835,7 @@ async def call_gemini_generate_content_self_healing(
 
             for attempt in range(2):
                 t0 = time.monotonic()
-                async with session.post(url, json=work_payload) as resp:
+                async with session.post(url, json=work_payload, timeout=aiohttp.ClientTimeout(total=timeout_sec)) as resp:
                     status = resp.status
                     body_text = await resp.text()
                 elapsed = time.monotonic() - t0
@@ -880,8 +909,8 @@ async def _call_cloudflare_vision_chat(
     }
     t0 = time.monotonic()
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=22)) as session:
-            async with session.post(cf_chat_url, headers=headers, json=payload) as resp:
+        session = get_http_session()
+            async with session.post(cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=22)) as resp:
                 elapsed = time.monotonic() - t0
                 if resp.status == 200:
                     data = await resp.json()
@@ -1121,13 +1150,13 @@ def _split_tts_chunks(text: str, max_len: int = 180) -> list[str]:
 async def _fallback_google_tts_with_yukino_pitch(spoken_text: str, lang_code: str) -> bytes:
     raw_mp3_parts = bytearray()
     headers = {"User-Agent": "Mozilla/5.0"}
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
+    session = get_http_session()
         for chunk in _split_tts_chunks(spoken_text, max_len=180):
             tts_url = clean_url(
                 f"{HTTPS}translate.googleapis.com/translate_tts"
                 f"?ie=UTF-8&client=tw-ob&tl={lang_code}&q={quote_plus(chunk)}"
             )
-            async with session.get(tts_url, headers=headers) as resp:
+            async with session.get(tts_url, headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp:
                 if resp.status == 200:
                     raw_mp3_parts.extend(await resp.read())
 
@@ -1144,6 +1173,7 @@ async def _fallback_google_tts_with_yukino_pitch(spoken_text: str, lang_code: st
             input=mp3_bytes,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            timeout=30,
             check=True,
         )
         return proc.stdout
@@ -1270,8 +1300,8 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
             form.add_field("response_format", "verbose_json")
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
             stt_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/audio/transcriptions")
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as session:
-                async with session.post(stt_url, headers=headers, data=form) as resp:
+            session = get_http_session()
+                async with session.post(stt_url, headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=25)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         segments = data.get("segments") or []
@@ -1303,7 +1333,7 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
 def convert_audio_bytes_to_wav_sync(raw_bytes: bytes) -> bytes:
     proc = subprocess.run(
         ["ffmpeg", "-i", "pipe:0", "-ac", "1", "-ar", "16000", "-f", "wav", "pipe:1", "-loglevel", "error"],
-        input=raw_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
+        input=raw_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=True
     )
     return proc.stdout
 
@@ -1540,7 +1570,7 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Content-Type": "application/json",
         }
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=35)) as session:
+        session = get_http_session()
             for g_mod in groq_candidates:
                 t0 = time.monotonic()
                 try:
@@ -1558,7 +1588,7 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
                         "temperature": 0.0,
                         "max_tokens": 4096,
                     }
-                    async with session.post(chat_url, headers=headers, json=groq_vision_payload) as resp:
+                    async with session.post(chat_url, headers=headers, json=groq_vision_payload, timeout=aiohttp.ClientTimeout(total=35)) as resp:
                         elapsed = time.monotonic() - t0
                         if resp.status == 200:
                             _ACTIVE_GROQ_VISION_CACHE = g_mod
@@ -1612,11 +1642,11 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
     t0 = time.monotonic()
     try:
         async with ollama_lock:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
+            session = get_http_session()
                 async with session.post(
                     clean_url(f"{OLLAMA_BASE_URL}/api/chat"),
                     headers=get_modal_headers(),
-                    json=payload,
+                    json=payload, timeout=aiohttp.ClientTimeout(total=120)
                 ) as resp:
                     elapsed = time.monotonic() - t0
                     if resp.status == 200:
@@ -1719,6 +1749,7 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
                 blocks.append(f"[Web extraction error: {e}]")
 
     joined_context = "\n\n".join(blocks)[:125000]
+    prune_stale_attachments()
     if joined_context and message.channel:
         channel_last_attachment[message.channel.id] = {
             "content": joined_context,
@@ -1846,8 +1877,8 @@ async def _call_groq_chat(
 
     chat_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/chat/completions")
     t0 = time.monotonic()
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as session:
-        async with session.post(chat_url, headers=headers, json=groq_payload) as resp:
+    session = get_http_session()
+        async with session.post(chat_url, headers=headers, json=groq_payload, timeout=aiohttp.ClientTimeout(total=90)) as resp:
             elapsed = time.monotonic() - t0
             if resp.status == 200:
                 g_data = await resp.json()
@@ -1879,11 +1910,11 @@ async def _call_modal_ollama_chat(
     }
     t0 = time.monotonic()
     async with ollama_lock:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as session:
+        session = get_http_session()
             async with session.post(
                 clean_url(f"{OLLAMA_BASE_URL}/api/chat"),
                 headers=get_modal_headers(),
-                json=payload,
+                json=payload, timeout=aiohttp.ClientTimeout(total=180)
             ) as resp:
                 elapsed = time.monotonic() - t0
                 if resp.status == 200:
@@ -1929,8 +1960,8 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
             f"{HTTPS}translate.googleapis.com/translate_a/single"
             f"?client=gtx&sl=th&tl=en&dt=t&q={quote_plus(raw_prompt)}"
         )
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-            async with session.get(gt_url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+        session = get_http_session()
+            async with session.get(gt_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     gt_data = await resp.json(content_type=None)
                     translated_segments = [seg[0] for seg in (gt_data[0] or []) if seg and seg[0]]
@@ -2037,13 +2068,13 @@ async def generate_image_cloudflare_flux(user_prompt: str) -> tuple[bytes, str, 
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
 
     t0 = time.monotonic()
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
+    session = get_http_session()
         if "flux-2-" in selected_model:
             form = aiohttp.FormData()
             form.add_field("prompt", english_prompt)
             form.add_field("width", "1024")
             form.add_field("height", "1024")
-            req_ctx = session.post(cf_url, headers=headers, data=form)
+            req_ctx = session.post(cf_url, headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=60))
         elif "phoenix" in selected_model:
             headers["Content-Type"] = "application/json"
             payload = {
@@ -2359,12 +2390,12 @@ CRITICAL RULES:
     # Tier 3: Groq Vision (qwen/qwen3.8-27b)
     if GROQ_API_KEY:
         groq_vision_candidates = await _discover_active_groq_vision_models()
-        chat_url = clean_url(f"{HTTPS}[api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)")
+        chat_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/chat/completions")
         headers = {
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Content-Type": "application/json",
         }
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as session:
+        session = get_http_session()
             for g_model in groq_vision_candidates:
                 try:
                     groq_payload = {
@@ -2381,7 +2412,7 @@ CRITICAL RULES:
                         "temperature": 0.1,
                         "max_tokens": 4096,
                     }
-                    async with session.post(chat_url, headers=headers, json=groq_payload) as resp:
+                    async with session.post(chat_url, headers=headers, json=groq_payload, timeout=aiohttp.ClientTimeout(total=25)) as resp:
                         if resp.status == 200:
                             _ACTIVE_GROQ_VISION_CACHE = g_model
                             g_data = await resp.json()
@@ -2709,14 +2740,13 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
             print(f"Manga image rendering fallback to text-only: {e}")
 
         if rendered_png:
-            await _send_or_reply(
-                channel,
-                msg,
-                content=transcript_text[:1950],
-                file=discord.File(io.BytesIO(rendered_png), filename=f"translated_{att.filename}.png"),
-            )
-        else:
-            await send_chunked_response(channel, transcript_text, reply_to=msg)
+            base_name = os.path.splitext(att.filename)[0]
+            discord_file = discord.File(io.BytesIO(rendered_png), filename=f"translated_{base_name}.png")
+            if len(transcript_text) <= 1950:
+                await _send_or_reply(channel, msg, content=transcript_text, file=discord_file)
+            else:
+                await _send_or_reply(channel, msg, file=discord_file)
+                await send_chunked_response(channel, transcript_text, reply_to=None)
 
 
 # ==============================================================================
@@ -2754,6 +2784,7 @@ async def query_local_ollama_chat(
         f"- ใช้ข้อมูลวันและเวลานี้ตอบผู้ใช้โดยตรงเมื่อถูกถามว่าวันนี้วันอะไรหรือตอนนี้กี่โมง"
     ).strip()
 
+    prune_stale_attachments()
     if (
         not has_fresh_attachment
         and channel_id is not None
@@ -2793,40 +2824,56 @@ async def query_local_ollama_chat(
             try:
                 ans = await _call_groq_chat(messages, GROQ_CODE_MODEL, temperature, is_coding=True)
                 if ans:
-                    return sanitize_yukino_output(ans, prompt, speaker_user, speaker_name)
+                    return ans
             except Exception as e:
                 print(f"Groq coding primary fallback to Modal GPU Ollama: {e}")
 
             try:
                 ans = await _call_modal_ollama_chat(messages, ACTIVE_CODE_MODEL, temperature)
                 if ans:
-                    return sanitize_yukino_output(ans, prompt, speaker_user, speaker_name)
+                    return ans
             except Exception as e:
                 print(f"Modal GPU coding error: {e}")
         else:
             try:
                 ans = await _call_modal_ollama_chat(messages, model, temperature)
                 if ans:
-                    return sanitize_yukino_output(ans, prompt, speaker_user, speaker_name)
+                    return ans
             except Exception as e:
                 print(f"Modal GPU chat fallback to Groq LPU: {e}")
 
             try:
                 ans = await _call_groq_chat(messages, GROQ_CHAT_FALLBACK_MODEL, temperature, is_coding=False)
                 if ans:
-                    return sanitize_yukino_output(ans, prompt, speaker_user, speaker_name)
+                    return ans
             except Exception as e:
                 print(f"Groq chat fallback error: {e}")
 
         return "ระบบประมวลผลทั้งฝั่ง Modal และ Groq ไม่สามารถเชื่อมต่อได้ชั่วคราวค่ะ กรุณาลองใหม่อีกครั้งนะคะ"
 
-    answer = await _run_inference_pass(working_prompt)
+    raw_answer = await _run_inference_pass(working_prompt)
 
-    # Safety net: if an old memory turn caused the model to emit an empty response after tag stripping, re-run cleanly
+    # Check if the LLM emitted [SEARCH: ...] and execute the search before sanitizing
+    search_tag_match = AGENTIC_SEARCH_TAG_REGEX.search(raw_answer)
+    if allow_agentic_search and not did_search and search_tag_match:
+        agent_query = search_tag_match.group(1).strip()[:180]
+        extra_search_block = await asyncio.to_thread(run_safe_web_search_sync, agent_query)
+        if extra_search_block:
+            did_search = True
+            working_prompt = (
+                f"{working_prompt}\n\n{extra_search_block}\n\n"
+                "(ตอบคำถามโดยตรงตามข้อมูลผลการค้นหาด้านบน ห้ามพิมพ์แท็ก [SEARCH: ...] เด็ดขาด)"
+            )
+            raw_answer = await _run_inference_pass(working_prompt)
+
+    answer = sanitize_yukino_output(raw_answer, prompt, speaker_user, speaker_name)
+
+    # Safety net: if tag stripping left an empty response, re-run cleanly
     if not answer.strip():
-        answer = await _run_inference_pass(
+        retry_raw = await _run_inference_pass(
             f"{working_prompt}\n\n(ตอบคำถามโดยตรงตามข้อมูลที่มีในบริบท ห้ามใช้แท็ก [SEARCH: ...] เด็ดขาด)"
         )
+        answer = sanitize_yukino_output(retry_raw, prompt, speaker_user, speaker_name)
 
     if channel_id is not None and answer:
         channel_memory[channel_id].append({"role": "user", "content": prompt[:2000]})
@@ -2875,53 +2922,47 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
         super().__init__()
         self.guild = guild
         self.text_channel = text_channel
+        self._lock = threading.Lock()
         self.user_buffers = defaultdict(bytearray)
         self.speech_frame_counts = defaultdict(int)
         self.last_spoken = {}
         self.running = True
         self.monitor_task = bot.loop.create_task(self._silence_monitor_loop())
 
-    def wants_opus(self) -> bool:
-        return False
-
     def write(self, user, data):
         if not user or user.bot or not hasattr(data, "pcm") or not data.pcm:
             return
         if self.guild.voice_client and self.guild.voice_client.is_playing():
             return
-
         try:
             frame_rms = audioop.rms(data.pcm, 2)
         except Exception:
             return
 
-        if frame_rms >= self.SPEECH_FRAME_RMS_THRESHOLD:
-            self.user_buffers[user].extend(data.pcm)
-            self.speech_frame_counts[user] += 1
-            self.last_spoken[user] = time.monotonic()
-        elif user in self.user_buffers and (time.monotonic() - self.last_spoken.get(user, 0) < 0.8):
-            self.user_buffers[user].extend(data.pcm)
-
-    def cleanup(self):
-        self.running = False
-        if getattr(self, "monitor_task", None) and not self.monitor_task.done():
-            self.monitor_task.cancel()
-        self.user_buffers.clear()
-        self.speech_frame_counts.clear()
-        self.last_spoken.clear()
+        now = time.monotonic()
+        with self._lock:
+            if frame_rms >= self.SPEECH_FRAME_RMS_THRESHOLD:
+                self.user_buffers[user].extend(data.pcm)
+                self.speech_frame_counts[user] += 1
+                self.last_spoken[user] = now
+            elif user in self.user_buffers and (now - self.last_spoken.get(user, 0) < 0.8):
+                self.user_buffers[user].extend(data.pcm)
 
     async def _silence_monitor_loop(self):
         while self.running:
             await asyncio.sleep(0.35)
             now = time.monotonic()
-            for user, last_t in list(self.last_spoken.items()):
-                if now - last_t >= 1.1:
-                    pcm_bytes = bytes(self.user_buffers.pop(user, b""))
-                    active_frames = self.speech_frame_counts.pop(user, 0)
-                    self.last_spoken.pop(user, None)
-
-                    if active_frames >= self.MIN_ACTIVE_SPEECH_FRAMES and len(pcm_bytes) >= 57600:
-                        bot.loop.create_task(self._process_user_pcm(user, pcm_bytes))
+            ready_Payloads = []
+            with self._lock:
+                for user, last_t in list(self.last_spoken.items()):
+                    if now - last_t >= 1.1:
+                        pcm_bytes = bytes(self.user_buffers.pop(user, b""))
+                        active_frames = self.speech_frame_counts.pop(user, 0)
+                        self.last_spoken.pop(user, None)
+                        if active_frames >= self.MIN_ACTIVE_SPEECH_FRAMES and len(pcm_bytes) >= 57600:
+                            ready_Payloads.append((user, pcm_bytes))
+            for user, pcm_bytes in ready_Payloads:
+                bot.loop.create_task(self._process_user_pcm(user, pcm_bytes))
 
     async def _process_user_pcm(self, user, pcm_bytes: bytes):
         try:
