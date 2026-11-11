@@ -786,19 +786,19 @@ async def _discover_active_gemini_flash_model() -> list[str]:
     try:
         session = get_http_session()
         async with session.get(list_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    api_models = []
-                    for m in data.get("models") or []:
-                        name = (m.get("name") or "").replace("models/", "")
-                        lower_name = name.lower()
-                        methods = m.get("supportedGenerationMethods") or []
-                        if "generateContent" in methods and "flash" in lower_name:
-                            if not any(bad in lower_name for bad in GEMINI_EXCLUDED_SUBSTRINGS):
-                                api_models.append(name)
-                    for m_name in api_models:
-                        if m_name not in candidates:
-                            candidates.append(m_name)
+            if resp.status == 200:
+                data = await resp.json()
+                api_models = []
+                for m in data.get("models") or []:
+                    name = (m.get("name") or "").replace("models/", "")
+                    lower_name = name.lower()
+                    methods = m.get("supportedGenerationMethods") or []
+                    if "generateContent" in methods and "flash" in lower_name:
+                        if not any(bad in lower_name for bad in GEMINI_EXCLUDED_SUBSTRINGS):
+                            api_models.append(name)
+                for m_name in api_models:
+                    if m_name not in candidates:
+                        candidates.append(m_name)
     except Exception as e:
         print(f"Gemini model auto-discovery warning: {e}")
 
@@ -817,53 +817,55 @@ async def call_gemini_generate_content_self_healing(
     tried = set()
 
     session = get_http_session()
-        idx = 0
-        while idx < len(candidate_models):
-            model_id = candidate_models[idx]
-            idx += 1
-            if not model_id or model_id in tried:
+    idx = 0
+    while idx < len(candidate_models):
+        model_id = candidate_models[idx]
+        idx += 1
+        if not model_id or model_id in tried:
+            continue
+        if any(bad in model_id.lower() for bad in GEMINI_EXCLUDED_SUBSTRINGS):
+            continue
+        tried.add(model_id)
+
+        url = clean_url(
+            f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
+            f"{model_id}:generateContent?key={GEMINI_API_KEY}"
+        )
+        work_payload = json.loads(json.dumps(payload))
+
+        for attempt in range(2):
+            t0 = time.monotonic()
+            async with session.post(
+                url, json=work_payload, timeout=aiohttp.ClientTimeout(total=timeout_sec)
+            ) as resp:
+                status = resp.status
+                body_text = await resp.text()
+            elapsed = time.monotonic() - t0
+
+            if status == 200:
+                if _ACTIVE_GEMINI_MODEL_CACHE != model_id:
+                    _ACTIVE_GEMINI_MODEL_CACHE = model_id
+                api_log(f"Gemini ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
+                return json.loads(body_text)
+
+            if status == 400 and "thinkingConfig" in body_text and attempt == 0:
+                work_payload.get("generationConfig", {}).pop("thinkingConfig", None)
                 continue
-            if any(bad in model_id.lower() for bad in GEMINI_EXCLUDED_SUBSTRINGS):
-                continue
-            tried.add(model_id)
 
-            url = clean_url(
-                f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
-                f"{model_id}:generateContent?key={GEMINI_API_KEY}"
-            )
-            work_payload = json.loads(json.dumps(payload))
-
-            for attempt in range(2):
-                t0 = time.monotonic()
-                async with session.post(url, json=work_payload, timeout=aiohttp.ClientTimeout(total=timeout_sec)) as resp:
-                    status = resp.status
-                    body_text = await resp.text()
-                elapsed = time.monotonic() - t0
-
-                if status == 200:
-                    if _ACTIVE_GEMINI_MODEL_CACHE != model_id:
-                        _ACTIVE_GEMINI_MODEL_CACHE = model_id
-                    api_log(f"Gemini ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
-                    return json.loads(body_text)
-
-                if status == 400 and "thinkingConfig" in body_text and attempt == 0:
-                    work_payload.get("generationConfig", {}).pop("thinkingConfig", None)
-                    continue
-
-                if status in (404, 400):
-                    hint_matches = GEMINI_MODEL_HINT_REGEX.findall(body_text)
-                    for hinted_model in hint_matches:
-                        if (
-                            hinted_model != model_id
-                            and hinted_model not in tried
-                            and not any(b in hinted_model.lower() for b in GEMINI_EXCLUDED_SUBSTRINGS)
-                        ):
-                            candidate_models.insert(idx, hinted_model)
-                    api_log(f"Gemini ({purpose}) -> {model_id} HTTP {status}; trying next model")
-                    break
-                else:
-                    api_log(f"Gemini ({purpose}) -> {model_id} HTTP {status}; trying next model")
-                    break
+            if status in (404, 400):
+                hint_matches = GEMINI_MODEL_HINT_REGEX.findall(body_text)
+                for hinted_model in hint_matches:
+                    if (
+                        hinted_model != model_id
+                        and hinted_model not in tried
+                        and not any(b in hinted_model.lower() for b in GEMINI_EXCLUDED_SUBSTRINGS)
+                    ):
+                        candidate_models.insert(idx, hinted_model)
+                api_log(f"Gemini ({purpose}) -> {model_id} HTTP {status}; trying next model")
+                break
+            else:
+                api_log(f"Gemini ({purpose}) -> {model_id} HTTP {status}; trying next model")
+                break
 
     return None
 
@@ -910,19 +912,21 @@ async def _call_cloudflare_vision_chat(
     t0 = time.monotonic()
     try:
         session = get_http_session()
-        async with session.post(cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=22)) as resp:
-                elapsed = time.monotonic() - t0
-                if resp.status == 200:
-                    data = await resp.json()
-                    choices = data.get("choices") or []
-                    if choices:
-                        msg_obj = choices[0].get("message") or {}
-                        content = msg_obj.get("content") or ""
-                        content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
-                        if content:
-                            api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
-                            return content
-                api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} HTTP {resp.status} ({elapsed:.2f}s)")
+        async with session.post(
+            cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=22)
+        ) as resp:
+            elapsed = time.monotonic() - t0
+            if resp.status == 200:
+                data = await resp.json()
+                choices = data.get("choices") or []
+                if choices:
+                    msg_obj = choices[0].get("message") or {}
+                    content = msg_obj.get("content") or ""
+                    content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+                    if content:
+                        api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
+                        return content
+            api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} HTTP {resp.status} ({elapsed:.2f}s)")
     except Exception as e:
         api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} failed ({type(e).__name__})")
     return ""
@@ -1151,14 +1155,16 @@ async def _fallback_google_tts_with_yukino_pitch(spoken_text: str, lang_code: st
     raw_mp3_parts = bytearray()
     headers = {"User-Agent": "Mozilla/5.0"}
     session = get_http_session()
-        for chunk in _split_tts_chunks(spoken_text, max_len=180):
-            tts_url = clean_url(
-                f"{HTTPS}translate.googleapis.com/translate_tts"
-                f"?ie=UTF-8&client=tw-ob&tl={lang_code}&q={quote_plus(chunk)}"
-            )
-            async with session.get(tts_url, headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp:
-                if resp.status == 200:
-                    raw_mp3_parts.extend(await resp.read())
+    for chunk in _split_tts_chunks(spoken_text, max_len=180):
+        tts_url = clean_url(
+            f"{HTTPS}translate.googleapis.com/translate_tts"
+            f"?ie=UTF-8&client=tw-ob&tl={lang_code}&q={quote_plus(chunk)}"
+        )
+        async with session.get(
+            tts_url, headers=headers, timeout=aiohttp.ClientTimeout(total=12)
+        ) as resp:
+            if resp.status == 200:
+                raw_mp3_parts.extend(await resp.read())
 
     if not raw_mp3_parts:
         return b""
@@ -1301,29 +1307,31 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
             stt_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/audio/transcriptions")
             session = get_http_session()
-            async with session.post(stt_url, headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=25)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        segments = data.get("segments") or []
-                        valid_parts = []
-                        for seg in segments:
-                            no_speech = float(seg.get("no_speech_prob", 0.0))
-                            avg_logprob = float(seg.get("avg_logprob", 0.0))
-                            comp_ratio = float(seg.get("compression_ratio", 1.0))
-                            seg_text = (seg.get("text") or "").strip()
-                            if no_speech > 0.40 or avg_logprob < -0.75 or comp_ratio > 2.1:
-                                print(
-                                    f"[Voice VAD Filter] Dropped noise segment '{seg_text}' "
-                                    f"(no_speech={no_speech:.2f}, logprob={avg_logprob:.2f}, comp={comp_ratio:.2f})"
-                                )
-                                continue
-                            if seg_text:
-                                valid_parts.append(seg_text)
+            async with session.post(
+                stt_url, headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=25)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    segments = data.get("segments") or []
+                    valid_parts = []
+                    for seg in segments:
+                        no_speech = float(seg.get("no_speech_prob", 0.0))
+                        avg_logprob = float(seg.get("avg_logprob", 0.0))
+                        comp_ratio = float(seg.get("compression_ratio", 1.0))
+                        seg_text = (seg.get("text") or "").strip()
+                        if no_speech > 0.40 or avg_logprob < -0.75 or comp_ratio > 2.1:
+                            print(
+                                f"[Voice VAD Filter] Dropped noise segment '{seg_text}' "
+                                f"(no_speech={no_speech:.2f}, logprob={avg_logprob:.2f}, comp={comp_ratio:.2f})"
+                            )
+                            continue
+                        if seg_text:
+                            valid_parts.append(seg_text)
 
-                        txt = " ".join(valid_parts).strip()
-                        if txt and not NOISE_HALLUCINATION_REGEX.search(txt):
-                            return txt
-                        return ""
+                    txt = " ".join(valid_parts).strip()
+                    if txt and not NOISE_HALLUCINATION_REGEX.search(txt):
+                        return txt
+                    return ""
         except Exception as e:
             print(f"Groq Whisper STT error: {e}")
 
@@ -1571,36 +1579,38 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
             "Content-Type": "application/json",
         }
         session = get_http_session()
-            for g_mod in groq_candidates:
-                t0 = time.monotonic()
-                try:
-                    groq_vision_payload = {
-                        "model": g_mod,
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": ocr_prompt},
-                                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
-                                ],
-                            }
-                        ],
-                        "temperature": 0.0,
-                        "max_tokens": 4096,
-                    }
-                    async with session.post(chat_url, headers=headers, json=groq_vision_payload, timeout=aiohttp.ClientTimeout(total=35)) as resp:
-                        elapsed = time.monotonic() - t0
-                        if resp.status == 200:
-                            _ACTIVE_GROQ_VISION_CACHE = g_mod
-                            g_data = await resp.json()
-                            content = g_data["choices"][0]["message"]["content"].strip()
-                            content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
-                            if content:
-                                api_log(f"Image OCR (Tier 1 Groq) -> {g_mod} 200 OK ({elapsed:.2f}s)")
-                                return content
-                        api_log(f"Image OCR (Tier 1 Groq) -> {g_mod} HTTP {resp.status}; fallback to Tier 2")
-                except Exception as e:
-                    api_log(f"Image OCR (Tier 1 Groq) -> {g_mod} failed ({type(e).__name__}); fallback to Tier 2")
+        for g_mod in groq_candidates:
+            t0 = time.monotonic()
+            try:
+                groq_vision_payload = {
+                    "model": g_mod,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": ocr_prompt},
+                                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
+                            ],
+                        }
+                    ],
+                    "temperature": 0.0,
+                    "max_tokens": 4096,
+                }
+                async with session.post(
+                    chat_url, headers=headers, json=groq_vision_payload, timeout=aiohttp.ClientTimeout(total=35)
+                ) as resp:
+                    elapsed = time.monotonic() - t0
+                    if resp.status == 200:
+                        _ACTIVE_GROQ_VISION_CACHE = g_mod
+                        g_data = await resp.json()
+                        content = g_data["choices"][0]["message"]["content"].strip()
+                        content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+                        if content:
+                            api_log(f"Image OCR (Tier 1 Groq) -> {g_mod} 200 OK ({elapsed:.2f}s)")
+                            return content
+                    api_log(f"Image OCR (Tier 1 Groq) -> {g_mod} HTTP {resp.status}; fallback to Tier 2")
+            except Exception as e:
+                api_log(f"Image OCR (Tier 1 Groq) -> {g_mod} failed ({type(e).__name__}); fallback to Tier 2")
 
     # Tier 2: Cloudflare Workers AI Vision (@cf/google/gemma-4-26b-a4b-it)
     cf_ocr = await _call_cloudflare_vision_chat(ocr_prompt, mime_type, b64_img, purpose="Image OCR Tier 2")
@@ -1642,20 +1652,21 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
     t0 = time.monotonic()
     try:
         async with ollama_lock:
-        session = get_http_session()
-                async with session.post(
-                    clean_url(f"{OLLAMA_BASE_URL}/api/chat"),
-                    headers=get_modal_headers(),
-                    json=payload, timeout=aiohttp.ClientTimeout(total=120)
-                ) as resp:
-                    elapsed = time.monotonic() - t0
-                    if resp.status == 200:
-                        data = await resp.json()
-                        content = data.get("message", {}).get("content", "").strip()
-                        if content:
-                            api_log(f"Image OCR (Tier 4 Modal) -> {ACTIVE_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
-                            return content
-                    api_log(f"Image OCR (Tier 4 Modal) -> {ACTIVE_VISION_MODEL} HTTP {resp.status}")
+            session = get_http_session()
+            async with session.post(
+                clean_url(f"{OLLAMA_BASE_URL}/api/chat"),
+                headers=get_modal_headers(),
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as resp:
+                elapsed = time.monotonic() - t0
+                if resp.status == 200:
+                    data = await resp.json()
+                    content = data.get("message", {}).get("content", "").strip()
+                    if content:
+                        api_log(f"Image OCR (Tier 4 Modal) -> {ACTIVE_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
+                        return content
+                api_log(f"Image OCR (Tier 4 Modal) -> {ACTIVE_VISION_MODEL} HTTP {resp.status}")
     except Exception as e:
         api_log(f"Image OCR (Tier 4 Modal) -> {ACTIVE_VISION_MODEL} failed ({type(e).__name__})")
 
@@ -1878,17 +1889,19 @@ async def _call_groq_chat(
     chat_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/chat/completions")
     t0 = time.monotonic()
     session = get_http_session()
-    async with session.post(chat_url, headers=headers, json=groq_payload, timeout=aiohttp.ClientTimeout(total=90)) as resp:
-            elapsed = time.monotonic() - t0
-            if resp.status == 200:
-                g_data = await resp.json()
-                content = g_data["choices"][0]["message"]["content"].strip()
-                content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
-                api_log(f"Groq ({purpose}) -> {groq_model} 200 OK ({elapsed:.2f}s)")
-                return content
-            else:
-                err_txt = await resp.text()
-                api_log(f"Groq ({purpose}) -> {groq_model} HTTP {resp.status} ({elapsed:.2f}s): {err_txt[:120]}")
+    async with session.post(
+        chat_url, headers=headers, json=groq_payload, timeout=aiohttp.ClientTimeout(total=90)
+    ) as resp:
+        elapsed = time.monotonic() - t0
+        if resp.status == 200:
+            g_data = await resp.json()
+            content = g_data["choices"][0]["message"]["content"].strip()
+            content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+            api_log(f"Groq ({purpose}) -> {groq_model} 200 OK ({elapsed:.2f}s)")
+            return content
+        else:
+            err_txt = await resp.text()
+            api_log(f"Groq ({purpose}) -> {groq_model} HTTP {resp.status} ({elapsed:.2f}s): {err_txt[:120]}")
     return ""
 
 
@@ -1912,19 +1925,20 @@ async def _call_modal_ollama_chat(
     async with ollama_lock:
         session = get_http_session()
         async with session.post(
-                clean_url(f"{OLLAMA_BASE_URL}/api/chat"),
-                headers=get_modal_headers(),
-                json=payload, timeout=aiohttp.ClientTimeout(total=180)
-            ) as resp:
-                elapsed = time.monotonic() - t0
-                if resp.status == 200:
-                    data = await resp.json()
-                    content = data.get("message", {}).get("content", "").strip()
-                    api_log(f"Modal Ollama ({purpose}) -> {ollama_model} 200 OK ({elapsed:.2f}s)")
-                    return content
-                else:
-                    err_txt = await resp.text()
-                    api_log(f"Modal Ollama ({purpose}) -> {ollama_model} HTTP {resp.status} ({elapsed:.2f}s): {err_txt[:120]}")
+            clean_url(f"{OLLAMA_BASE_URL}/api/chat"),
+            headers=get_modal_headers(),
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=180),
+        ) as resp:
+            elapsed = time.monotonic() - t0
+            if resp.status == 200:
+                data = await resp.json()
+                content = data.get("message", {}).get("content", "").strip()
+                api_log(f"Modal Ollama ({purpose}) -> {ollama_model} 200 OK ({elapsed:.2f}s)")
+                return content
+            else:
+                err_txt = await resp.text()
+                api_log(f"Modal Ollama ({purpose}) -> {ollama_model} HTTP {resp.status} ({elapsed:.2f}s): {err_txt[:120]}")
     return ""
 
 
@@ -1961,14 +1975,16 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
             f"?client=gtx&sl=th&tl=en&dt=t&q={quote_plus(raw_prompt)}"
         )
         session = get_http_session()
-        async with session.get(gt_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    gt_data = await resp.json(content_type=None)
-                    translated_segments = [seg[0] for seg in (gt_data[0] or []) if seg and seg[0]]
-                    en_literal = "".join(translated_segments).strip()
-                    if en_literal and not THAI_CHAR_REGEX.search(en_literal):
-                        api_log(f"Prompt Translate (Tier 1 Google NMT) -> 200 OK ({time.monotonic() - t0:.2f}s)")
-                        return f"{prefix}{en_literal}"
+        async with session.get(
+            gt_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            if resp.status == 200:
+                gt_data = await resp.json(content_type=None)
+                translated_segments = [seg[0] for seg in (gt_data[0] or []) if seg and seg[0]]
+                en_literal = "".join(translated_segments).strip()
+                if en_literal and not THAI_CHAR_REGEX.search(en_literal):
+                    api_log(f"Prompt Translate (Tier 1 Google NMT) -> 200 OK ({time.monotonic() - t0:.2f}s)")
+                    return f"{prefix}{en_literal}"
     except Exception as e:
         api_log(f"Prompt Translate (Tier 1 Google NMT) -> failed ({type(e).__name__}); fallback to Tier 2")
 
@@ -2069,45 +2085,46 @@ async def generate_image_cloudflare_flux(user_prompt: str) -> tuple[bytes, str, 
 
     t0 = time.monotonic()
     session = get_http_session()
-        if "flux-2-" in selected_model:
-            form = aiohttp.FormData()
-            form.add_field("prompt", english_prompt)
-            form.add_field("width", "1024")
-            form.add_field("height", "1024")
-            req_ctx = session.post(cf_url, headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=60))
-        elif "phoenix" in selected_model:
-            headers["Content-Type"] = "application/json"
-            payload = {
-                "prompt": english_prompt,
-                "negative_prompt": "blurry, low quality, deformed hands, extra fingers, watermark, bad anatomy",
-                "num_steps": 25,
-                "guidance": 3.5,
-                "width": 1024,
-                "height": 1024,
-            }
-            req_ctx = session.post(cf_url, headers=headers, json=payload)
-        else:
-            headers["Content-Type"] = "application/json"
-            payload = {"prompt": english_prompt, "steps": 8}
-            req_ctx = session.post(cf_url, headers=headers, json=payload)
+    req_timeout = aiohttp.ClientTimeout(total=60)
+    if "flux-2-" in selected_model:
+        form = aiohttp.FormData()
+        form.add_field("prompt", english_prompt)
+        form.add_field("width", "1024")
+        form.add_field("height", "1024")
+        req_ctx = session.post(cf_url, headers=headers, data=form, timeout=req_timeout)
+    elif "phoenix" in selected_model:
+        headers["Content-Type"] = "application/json"
+        payload = {
+            "prompt": english_prompt,
+            "negative_prompt": "blurry, low quality, deformed hands, extra fingers, watermark, bad anatomy",
+            "num_steps": 25,
+            "guidance": 3.5,
+            "width": 1024,
+            "height": 1024,
+        }
+        req_ctx = session.post(cf_url, headers=headers, json=payload, timeout=req_timeout)
+    else:
+        headers["Content-Type"] = "application/json"
+        payload = {"prompt": english_prompt, "steps": 8}
+        req_ctx = session.post(cf_url, headers=headers, json=payload, timeout=req_timeout)
 
-        async with req_ctx as resp:
-            elapsed = time.monotonic() - t0
-            if resp.status != 200:
-                err_txt = await resp.text()
-                api_log(f"Cloudflare Image -> {selected_model} HTTP {resp.status} ({elapsed:.2f}s)")
-                raise RuntimeError(f"Cloudflare Workers AI HTTP {resp.status}: {err_txt[:200]}")
+    async with req_ctx as resp:
+        elapsed = time.monotonic() - t0
+        if resp.status != 200:
+            err_txt = await resp.text()
+            api_log(f"Cloudflare Image -> {selected_model} HTTP {resp.status} ({elapsed:.2f}s)")
+            raise RuntimeError(f"Cloudflare Workers AI HTTP {resp.status}: {err_txt[:200]}")
 
-            api_log(f"Cloudflare Image -> {selected_model} 200 OK ({elapsed:.2f}s)")
-            content_type = (resp.headers.get("Content-Type") or "").lower()
-            if "image/" in content_type or "octet-stream" in content_type:
-                return await resp.read(), f"[{mode_tag}] {english_prompt}", cleaned_subject
+        api_log(f"Cloudflare Image -> {selected_model} 200 OK ({elapsed:.2f}s)")
+        content_type = (resp.headers.get("Content-Type") or "").lower()
+        if "image/" in content_type or "octet-stream" in content_type:
+            return await resp.read(), f"[{mode_tag}] {english_prompt}", cleaned_subject
 
-            data = await resp.json()
-            b64_img = (data.get("result") or {}).get("image")
-            if not b64_img:
-                raise RuntimeError("Cloudflare Workers AI did not return an image payload.")
-            return base64.b64decode(b64_img), f"[{mode_tag}] {english_prompt}", cleaned_subject
+        data = await resp.json()
+        b64_img = (data.get("result") or {}).get("image")
+        if not b64_img:
+            raise RuntimeError("Cloudflare Workers AI did not return an image payload.")
+        return base64.b64decode(b64_img), f"[{mode_tag}] {english_prompt}", cleaned_subject
 
 
 def build_yukino_image_caption(subject_text: str, formatted_en_prompt: str) -> str:
@@ -2396,46 +2413,48 @@ CRITICAL RULES:
             "Content-Type": "application/json",
         }
         session = get_http_session()
-            for g_model in groq_vision_candidates:
-                try:
-                    groq_payload = {
-                        "model": g_model,
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": manga_system_instruction},
-                                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
-                                ],
-                            }
-                        ],
-                        "temperature": 0.1,
-                        "max_tokens": 4096,
-                    }
-                    async with session.post(chat_url, headers=headers, json=groq_payload, timeout=aiohttp.ClientTimeout(total=25)) as resp:
-                        if resp.status == 200:
-                            _ACTIVE_GROQ_VISION_CACHE = g_model
-                            g_data = await resp.json()
-                            content = g_data["choices"][0]["message"]["content"].strip()
-                            bubbles, summary = _parse_manga_bubbles_json(content)
-                            if bubbles:
-                                has_boxes_and_text = any(
-                                    isinstance(b.get("box_2d"), list)
-                                    and len(b["box_2d"]) == 4
-                                    and bool(b.get("translated_text"))
-                                    for b in bubbles
-                                )
-                                if has_boxes_and_text:
-                                    print(f"[Manga Vision] Completed via Tier 3 Groq ({g_model}) - {len(bubbles)} bubbles")
-                                    return bubbles, summary
-                                if not fallback_bubbles_no_boxes:
-                                    fallback_bubbles_no_boxes = bubbles
-                                    fallback_summary = summary
-                        else:
-                            err_txt = await resp.text()
-                            print(f"Groq Manga Vision ({g_model}) HTTP {resp.status}: {err_txt[:150]}")
-                except Exception as e:
-                    print(f"Groq Manga Vision ({g_model}) warning: {e}")
+        for g_model in groq_vision_candidates:
+            try:
+                groq_payload = {
+                    "model": g_model,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": manga_system_instruction},
+                                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
+                            ],
+                        }
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 4096,
+                }
+                async with session.post(
+                    chat_url, headers=headers, json=groq_payload, timeout=aiohttp.ClientTimeout(total=25)
+                ) as resp:
+                    if resp.status == 200:
+                        _ACTIVE_GROQ_VISION_CACHE = g_model
+                        g_data = await resp.json()
+                        content = g_data["choices"][0]["message"]["content"].strip()
+                        bubbles, summary = _parse_manga_bubbles_json(content)
+                        if bubbles:
+                            has_boxes_and_text = any(
+                                isinstance(b.get("box_2d"), list)
+                                and len(b["box_2d"]) == 4
+                                and bool(b.get("translated_text"))
+                                for b in bubbles
+                            )
+                            if has_boxes_and_text:
+                                print(f"[Manga Vision] Completed via Tier 3 Groq ({g_model}) - {len(bubbles)} bubbles")
+                                return bubbles, summary
+                            if not fallback_bubbles_no_boxes:
+                                fallback_bubbles_no_boxes = bubbles
+                                fallback_summary = summary
+                    else:
+                        err_txt = await resp.text()
+                        print(f"Groq Manga Vision ({g_model}) HTTP {resp.status}: {err_txt[:150]}")
+            except Exception as e:
+                print(f"Groq Manga Vision ({g_model}) warning: {e}")
 
     if fallback_bubbles_no_boxes:
         return fallback_bubbles_no_boxes, fallback_summary
