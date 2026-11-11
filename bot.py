@@ -223,7 +223,11 @@ CAT_TOPIC_REGEX = re.compile(
     r"(แมว|ลูกแมว|เหมียว|เนโกะ|แพนซัง|แพนด้า|\bcat\b|\bcats\b|\bkitten\b|\bkitty\b|\bneko\b|\bpan-san\b|\bpansan\b|\bpanda\b)",
     re.IGNORECASE,
 )
-STUTTER_REGEX = re.compile(r"([ก-ฮA-Za-z]-\1|ฉะ\.\.\.|ม-ไม่|ข-ขอ|ฉ-ฉัน|I-It's|I-I\b)", re.IGNORECASE)
+# Detects stuttering patterns in Yukino's Gap Moe replies for dynamic TTS prosody
+STUTTER_REGEX = re.compile(
+    r"(?:([ก-ฮA-Za-z])-[เแโใไ]?\1|ฉะ\.\.\.|ม-ไม่|ข-ขอ|ฉ-ฉัน|I-It's|I-I\b)",
+    re.IGNORECASE,
+)
 PROMPT_INJECTION_REGEX = re.compile(
     r"(ignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions|"
     r"disregard\s+(?:all\s+)?(?:previous|system)\s+(?:instructions|prompts)|"
