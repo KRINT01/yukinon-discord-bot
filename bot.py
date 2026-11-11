@@ -59,6 +59,13 @@ def clean_url(url: str) -> str:
     s = re.sub(r"^\[|\]$", "", s)
     return s.strip()
 
+_GEMINI_GROUNDING_COOLDOWN_UNTIL = 0.0
+
+
+def api_log(msg: str):
+    """Minimal single-line API logger with immediate stdout flush for Render logs."""
+    print(f"[API] {msg}", flush=True)
+
 
 # Silence noisy RTCP SenderReport logs (type=200) from discord-ext-voice-recv
 logging.getLogger("discord.ext.voice_recv").setLevel(logging.WARNING)
@@ -608,11 +615,13 @@ async def fetch_live_weather_context(user_text: str) -> str:
             break
 
     url = clean_url(f"{HTTPS}wttr.in/{target_city}?format=j1&lang=th")
+    t0 = time.monotonic()
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
             async with session.get(url, headers={"User-Agent": "curl/8.5.0"}) as resp:
                 if resp.status == 200:
                     data = await resp.json()
+                    api_log(f"Weather -> wttr.in ({target_city}) 200 OK ({time.monotonic() - t0:.2f}s)")
                     curr = (data.get("current_condition") or [{}])[0]
                     weather_days = data.get("weather") or [{}]
                     today_w = weather_days[0] if weather_days else {}
@@ -648,9 +657,11 @@ async def fetch_live_weather_context(user_text: str) -> str:
                         f"พยากรณ์อากาศรายชั่วโมงวันนี้:\n" + "\n".join(hourly_summary) + "\n"
                         f"</live_weather_report>"
                     )
+                api_log(f"Weather -> wttr.in HTTP {resp.status}; falling back to Open-Meteo")
     except Exception as e:
-        print(f"wttr.in weather warning: {e}")
+        api_log(f"Weather -> wttr.in failed ({type(e).__name__}); falling back to Open-Meteo")
 
+    t1 = time.monotonic()
     try:
         om_url = clean_url(
             f"{HTTPS}api.open-meteo.com/v1/forecast"
@@ -663,6 +674,7 @@ async def fetch_live_weather_context(user_text: str) -> str:
             async with session.get(om_url) as resp:
                 if resp.status == 200:
                     om = await resp.json()
+                    api_log(f"Weather (Fallback) -> Open-Meteo 200 OK ({time.monotonic() - t1:.2f}s)")
                     c = om.get("current") or {}
                     d = om.get("daily") or {}
                     rain_prob = (d.get("precipitation_probability_max") or [0])[0]
@@ -674,7 +686,7 @@ async def fetch_live_weather_context(user_text: str) -> str:
                         f"</live_weather_report>"
                     )
     except Exception as e:
-        print(f"Open-Meteo weather fallback error: {e}")
+        api_log(f"Weather (Fallback) -> Open-Meteo failed ({type(e).__name__})")
     return ""
 
 
@@ -766,7 +778,7 @@ async def _discover_active_gemini_flash_model() -> list[str]:
 
 
 async def call_gemini_generate_content_self_healing(
-    payload: dict, timeout_sec: int = 25
+    payload: dict, timeout_sec: int = 25, purpose: str = "Generate"
 ) -> dict | None:
     global _ACTIVE_GEMINI_MODEL_CACHE
     if not GEMINI_API_KEY:
@@ -793,14 +805,16 @@ async def call_gemini_generate_content_self_healing(
             work_payload = json.loads(json.dumps(payload))
 
             for attempt in range(2):
+                t0 = time.monotonic()
                 async with session.post(url, json=work_payload) as resp:
                     status = resp.status
                     body_text = await resp.text()
+                elapsed = time.monotonic() - t0
 
                 if status == 200:
                     if _ACTIVE_GEMINI_MODEL_CACHE != model_id:
-                        print(f"[Self-Healing Gemini] Active model locked to '{model_id}'")
                         _ACTIVE_GEMINI_MODEL_CACHE = model_id
+                    api_log(f"Gemini ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
                     return json.loads(body_text)
 
                 if status == 400 and "thinkingConfig" in body_text and attempt == 0:
@@ -816,10 +830,10 @@ async def call_gemini_generate_content_self_healing(
                             and not any(b in hinted_model.lower() for b in GEMINI_EXCLUDED_SUBSTRINGS)
                         ):
                             candidate_models.insert(idx, hinted_model)
-                    print(f"Gemini model '{model_id}' unavailable (HTTP {status}); trying next...")
+                    api_log(f"Gemini ({purpose}) -> {model_id} HTTP {status}; trying next model")
                     break
                 else:
-                    print(f"Gemini HTTP {status} on '{model_id}'; trying next...")
+                    api_log(f"Gemini ({purpose}) -> {model_id} HTTP {status}; trying next model")
                     break
 
     return None
@@ -835,12 +849,8 @@ async def _discover_active_groq_vision_models() -> list[str]:
 
 
 async def _call_cloudflare_vision_chat(
-    prompt_text: str, mime_type: str, b64_img: str, max_tokens: int = 3072
+    prompt_text: str, mime_type: str, b64_img: str, max_tokens: int = 3072, purpose: str = "Vision"
 ) -> str:
-    """
-    Calls Cloudflare Workers AI (@cf/google/gemma-4-26b-a4b-it) with minimal reasoning
-    overhead so it outputs structured JSON / OCR text quickly without timing out.
-    """
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
         return ""
     cf_chat_url = clean_url(
@@ -868,9 +878,11 @@ async def _call_cloudflare_vision_chat(
         "temperature": 0.1,
         "max_tokens": max_tokens,
     }
+    t0 = time.monotonic()
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=22)) as session:
             async with session.post(cf_chat_url, headers=headers, json=payload) as resp:
+                elapsed = time.monotonic() - t0
                 if resp.status == 200:
                     data = await resp.json()
                     choices = data.get("choices") or []
@@ -879,22 +891,17 @@ async def _call_cloudflare_vision_chat(
                         content = msg_obj.get("content") or ""
                         content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
                         if content:
-                            print(f"[Cloudflare Vision] Succeeded with '{CF_VISION_MODEL}'")
+                            api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
                             return content
-                else:
-                    err_txt = await resp.text()
-                    print(f"Cloudflare Vision HTTP {resp.status}: {err_txt[:160]}")
+                api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} HTTP {resp.status} ({elapsed:.2f}s)")
     except Exception as e:
-        print(f"Cloudflare Vision skipped ({type(e).__name__})")
+        api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} failed ({type(e).__name__})")
     return ""
 
 
 def _search_google_ai_studio_grounded_sync(query: str) -> str:
-    """
-    Tries Google Search Grounding on _ACTIVE_GEMINI_MODEL_CACHE once;
-    if HTTP 429 (quota exceeded) occurs, immediately returns '' so DDGS/RSS takes over without delay.
-    """
-    if not GEMINI_API_KEY:
+    global _GEMINI_GROUNDING_COOLDOWN_UNTIL
+    if not GEMINI_API_KEY or time.time() < _GEMINI_GROUNDING_COOLDOWN_UNTIL:
         return ""
     payload = {
         "contents": [
@@ -917,6 +924,7 @@ def _search_google_ai_studio_grounded_sync(query: str) -> str:
         f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
         f"{model_id}:generateContent?key={GEMINI_API_KEY}"
     )
+    t0 = time.monotonic()
     try:
         req = urllib.request.Request(
             url,
@@ -926,6 +934,7 @@ def _search_google_ai_studio_grounded_sync(query: str) -> str:
         )
         with urllib.request.urlopen(req, timeout=12) as resp:
             data = json.loads(resp.read().decode("utf-8"))
+        elapsed = time.monotonic() - t0
         candidates = data.get("candidates") or []
         if not candidates:
             return ""
@@ -943,6 +952,7 @@ def _search_google_ai_studio_grounded_sync(query: str) -> str:
                 sources.append(f"[{idx}] {title}: {uri}")
 
         if summary_text:
+            api_log(f"Search (Tier 1 Gemini Grounding) -> {model_id} 200 OK ({elapsed:.2f}s)")
             sources_block = "\n".join(sources)
             return (
                 f'<untrusted_web_search_results query="{query}" engine="google_search_grounding">\n'
@@ -951,7 +961,13 @@ def _search_google_ai_studio_grounded_sync(query: str) -> str:
                 f"</untrusted_web_search_results>"
             )
     except Exception as e:
-        print(f"Google AI Studio Grounded Search ({model_id}) skipped ({e}); using DDGS/RSS.")
+        err_str = str(e)
+        if "429" in err_str:
+            # Cooldown Gemini Grounded Search for 10 minutes on 429 so subsequent searches go straight to DDGS
+            _GEMINI_GROUNDING_COOLDOWN_UNTIL = time.time() + 600
+            api_log(f"Search (Tier 1 Gemini Grounding) -> {model_id} HTTP 429 (cooldown 10m); fallback to DDGS")
+        else:
+            api_log(f"Search (Tier 1 Gemini Grounding) -> {model_id} skipped ({err_str}); fallback to DDGS")
     return ""
 
 
@@ -961,6 +977,7 @@ def _search_google_news_rss_sync(query: str, is_thai: bool, max_results: int = 4
     ceid = "TH:th" if is_thai else "US:en"
     rss_url = clean_url(f"{HTTPS}news.google.com/rss/search?q={quote_plus(query)}&hl={hl}&gl={gl}&ceid={ceid}")
     results = []
+    t0 = time.monotonic()
     try:
         req = urllib.request.Request(rss_url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -976,8 +993,10 @@ def _search_google_news_rss_sync(query: str, is_thai: bool, max_results: int = 4
                 "href": link,
                 "body": f"Published: {pub_date} | Source: {source} | Headline: {title}",
             })
+        if results:
+            api_log(f"Search (Fallback Google News RSS) -> {len(results)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception as e:
-        print(f"Google News RSS fallback warning: {e}")
+        api_log(f"Search (Fallback Google News RSS) -> failed ({type(e).__name__})")
     return results
 
 
@@ -997,6 +1016,7 @@ def run_safe_web_search_sync(query: str, max_results: int = 4) -> str:
     hits = []
 
     if TAVILY_API_KEY:
+        t0 = time.monotonic()
         try:
             t_req = urllib.request.Request(
                 clean_url(f"{HTTPS}api.tavily.com/search"),
@@ -1016,10 +1036,13 @@ def run_safe_web_search_sync(query: str, max_results: int = 4) -> str:
                         "href": r.get("url", ""),
                         "body": r.get("content", ""),
                     })
+            if hits:
+                api_log(f"Search (Tavily) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
         except Exception as e:
-            print(f"Tavily search warning: {e}")
+            api_log(f"Search (Tavily) -> failed ({type(e).__name__}); fallback to DDGS")
 
     if not hits:
+        t0 = time.monotonic()
         with DDGS(proxy=DDGS_PROXY, timeout=15) as ddgs:
             for backend_choice in ("auto", "html", "lite"):
                 try:
@@ -1030,14 +1053,17 @@ def run_safe_web_search_sync(query: str, max_results: int = 4) -> str:
                         )
                     )
                     if hits:
+                        api_log(f"Search (DDGS:{backend_choice}) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
                         break
-                except Exception as e:
-                    print(f"DDGS text ({backend_choice}) warning: {e}")
+                except Exception:
+                    continue
             if not hits:
                 try:
                     hits = list(ddgs.news(clean_q, region=region_code, max_results=max_results))
-                except Exception as e:
-                    print(f"DDGS news warning: {e}")
+                    if hits:
+                        api_log(f"Search (DDGS:news) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
+                except Exception:
+                    pass
 
     if not hits:
         hits = _search_google_news_rss_sync(clean_q, is_thai=is_thai, max_results=max_results)
@@ -1375,21 +1401,20 @@ def fetch_youtube_context_sync(
     video_id: str, discord_embed_info: dict | None = None, max_chars: int = 20000
 ) -> str:
     """
-    5-Layer YouTube Context Extractor (Japanese, Thai, & English):
-    1) Uses Discord's own message.embeds metadata (already fetched by Discord's servers, 100% immune to IP blocks!).
+    4-Layer YouTube Context Extractor (Japanese, Thai, & English):
+    1) Uses Discord's own message.embeds metadata (already fetched by Discord's servers).
     2) Queries noembed.com + youtube.com/oembed for Video Title & Channel Name.
-    3) Queries YouTube's Innertube Android Player API + watch page for the full uploader description & keywords.
+    3) Extracts the full uploader shortDescription from the watch page HTML.
     4) Fetches subtitles/transcripts prioritizing ['th', 'ja', 'en', 'en-US', 'en-GB'].
-    5) Runs a DDGS/RSS web search using the video title if subtitles are absent (e.g. anime PVs/trailers).
     """
+    t0 = time.monotonic()
     watch_url = clean_url(f"{HTTPS}www.youtube.com/watch?v={video_id}")
     title = (discord_embed_info or {}).get("title", "").strip()
     author = (discord_embed_info or {}).get("author", "").strip()
     description = (discord_embed_info or {}).get("description", "").strip()
-    keywords_str = ""
     transcript_text = ""
 
-    # Layer 1: Noembed & YouTube oEmbed (Cloud-IP friendly)
+    # Layer 1: Noembed & YouTube oEmbed
     if not title or not author:
         for oe_endpoint in (
             clean_url(f"{HTTPS}noembed.com/embed?url={quote_plus(watch_url)}"),
@@ -1406,42 +1431,8 @@ def fetch_youtube_context_sync(
             except Exception:
                 continue
 
-    # Layer 2: YouTube Innertube Player API (Returns full shortDescription, title, channel, and keywords)
-    try:
-        innertube_url = clean_url(f"{HTTPS}www.youtube.com/youtubei/v1/player?prettyPrint=false")
-        it_payload = {
-            "videoId": video_id,
-            "context": {
-                "client": {
-                    "hl": "ja",
-                    "gl": "JP",
-                    "clientName": "WEB",
-                    "clientVersion": "2.20250312.04.00",
-                }
-            },
-        }
-        req_it = urllib.request.Request(
-            innertube_url,
-            data=json.dumps(it_payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req_it, timeout=10) as resp:
-            it_data = json.loads(resp.read().decode("utf-8"))
-        vd = it_data.get("videoDetails") or {}
-        title = title or (vd.get("title") or "").strip()
-        author = author or (vd.get("author") or "").strip()
-        full_desc = (vd.get("shortDescription") or "").strip()
-        if len(full_desc) > len(description):
-            description = full_desc
-        kw_list = vd.get("keywords") or []
-        if kw_list:
-            keywords_str = ", ".join(kw_list[:25])
-    except Exception as e:
-        print(f"YouTube Innertube player note ({video_id}): {e}")
-
-    # Layer 3: Watch Page HTML Fallback (if description is still empty)
-    if not description or not title:
+    # Layer 2: Watch Page HTML (Extracts full shortDescription & title without 403 Innertube blocks)
+    if len(description) < 200 or not title:
         try:
             req_page = urllib.request.Request(
                 watch_url,
@@ -1467,9 +1458,9 @@ def fetch_youtube_context_sync(
                 if len(full_d) > len(description):
                     description = full_d
         except Exception as e:
-            print(f"YouTube HTML fallback note ({video_id}): {e}")
+            api_log(f"YouTube HTML metadata note ({video_id}): {type(e).__name__}")
 
-    # Layer 4: Subtitles / Transcript strictly in Thai, Japanese, or English
+    # Layer 3: Subtitles / Transcript strictly in Thai, Japanese, or English
     proxy_cfg = (
         GenericProxyConfig(http_url=YOUTUBE_PROXY_URL, https_url=YOUTUBE_PROXY_URL)
         if YOUTUBE_PROXY_URL else None
@@ -1494,21 +1485,24 @@ def fetch_youtube_context_sync(
     except Exception:
         pass
 
-    # Layer 5: Supplemental Web Search using the Video Title (for anime trailers/PVs without subtitles)
+    # Layer 4: Only run web search if BOTH transcript AND description are short/missing
     search_enrichment = ""
-    if len(transcript_text) < 120 and title:
+    if len(transcript_text) < 80 and len(description) < 80 and title:
         try:
             search_enrichment = run_safe_web_search_sync(f"{title} {author}".strip(), max_results=3)
         except Exception:
             pass
+
+    api_log(
+        f"YouTube -> id={video_id} (title={'yes' if title else 'no'}, "
+        f"desc={len(description)}c, transcript={len(transcript_text)}c, {time.monotonic() - t0:.2f}s)"
+    )
 
     sections = [f"YouTube Video ID: {video_id}"]
     if title:
         sections.append(f"Video Title: {title}")
     if author:
         sections.append(f"Channel / Uploader: {author}")
-    if keywords_str:
-        sections.append(f"Video Tags / Keywords: {keywords_str}")
     if description:
         sections.append(f"Official Video Description:\n{description[:6000]}")
     if transcript_text:
@@ -1548,6 +1542,7 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
         }
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=35)) as session:
             for g_mod in groq_candidates:
+                t0 = time.monotonic()
                 try:
                     groq_vision_payload = {
                         "model": g_mod,
@@ -1564,21 +1559,21 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
                         "max_tokens": 4096,
                     }
                     async with session.post(chat_url, headers=headers, json=groq_vision_payload) as resp:
+                        elapsed = time.monotonic() - t0
                         if resp.status == 200:
                             _ACTIVE_GROQ_VISION_CACHE = g_mod
                             g_data = await resp.json()
                             content = g_data["choices"][0]["message"]["content"].strip()
                             content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
                             if content:
+                                api_log(f"Image OCR (Tier 1 Groq) -> {g_mod} 200 OK ({elapsed:.2f}s)")
                                 return content
-                        else:
-                            err_txt = await resp.text()
-                            print(f"Groq Vision OCR ({g_mod}) HTTP {resp.status}: {err_txt[:150]}")
+                        api_log(f"Image OCR (Tier 1 Groq) -> {g_mod} HTTP {resp.status}; fallback to Tier 2")
                 except Exception as e:
-                    print(f"Groq Vision OCR ({g_mod}) warning: {e}")
+                    api_log(f"Image OCR (Tier 1 Groq) -> {g_mod} failed ({type(e).__name__}); fallback to Tier 2")
 
     # Tier 2: Cloudflare Workers AI Vision (@cf/google/gemma-4-26b-a4b-it)
-    cf_ocr = await _call_cloudflare_vision_chat(ocr_prompt, mime_type, b64_img)
+    cf_ocr = await _call_cloudflare_vision_chat(ocr_prompt, mime_type, b64_img, purpose="Image OCR Tier 2")
     if cf_ocr:
         return cf_ocr
 
@@ -1595,7 +1590,9 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
             ],
             "generationConfig": {"temperature": 0.0},
         }
-        g_data = await call_gemini_generate_content_self_healing(g_payload, timeout_sec=25)
+        g_data = await call_gemini_generate_content_self_healing(
+            g_payload, timeout_sec=25, purpose="Image OCR Tier 3"
+        )
         if g_data:
             parts = ((g_data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
             g_text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
@@ -1612,6 +1609,7 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
         "keep_alive": "5m",
         "options": {"temperature": 0.1, "top_p": 0.6, "repeat_penalty": 1.1},
     }
+    t0 = time.monotonic()
     try:
         async with ollama_lock:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
@@ -1620,13 +1618,16 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
                     headers=get_modal_headers(),
                     json=payload,
                 ) as resp:
+                    elapsed = time.monotonic() - t0
                     if resp.status == 200:
                         data = await resp.json()
                         content = data.get("message", {}).get("content", "").strip()
                         if content:
+                            api_log(f"Image OCR (Tier 4 Modal) -> {ACTIVE_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
                             return content
+                    api_log(f"Image OCR (Tier 4 Modal) -> {ACTIVE_VISION_MODEL} HTTP {resp.status}")
     except Exception as e:
-        print(f"Modal Typhoon OCR fallback error: {e}")
+        api_log(f"Image OCR (Tier 4 Modal) -> {ACTIVE_VISION_MODEL} failed ({type(e).__name__})")
 
     return "[OCR could not extract text from image]"
 
@@ -1825,7 +1826,7 @@ async def send_chunked_response(
 
 
 async def _call_groq_chat(
-    messages: list, groq_model: str, temperature: float, is_coding: bool = False
+    messages: list, groq_model: str, temperature: float, is_coding: bool = False, purpose: str = "Chat"
 ) -> str:
     if not GROQ_API_KEY:
         return ""
@@ -1843,21 +1844,26 @@ async def _call_groq_chat(
     if "gpt-oss" in groq_model:
         groq_payload["reasoning_effort"] = "high" if is_coding else "medium"
 
-    chat_url = clean_url(f"{HTTPS}[api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)")
+    chat_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/chat/completions")
+    t0 = time.monotonic()
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as session:
         async with session.post(chat_url, headers=headers, json=groq_payload) as resp:
+            elapsed = time.monotonic() - t0
             if resp.status == 200:
                 g_data = await resp.json()
                 content = g_data["choices"][0]["message"]["content"].strip()
                 content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+                api_log(f"Groq ({purpose}) -> {groq_model} 200 OK ({elapsed:.2f}s)")
                 return content
             else:
                 err_txt = await resp.text()
-                print(f"Groq Chat HTTP {resp.status} ({groq_model}): {err_txt}")
+                api_log(f"Groq ({purpose}) -> {groq_model} HTTP {resp.status} ({elapsed:.2f}s): {err_txt[:120]}")
     return ""
 
 
-async def _call_modal_ollama_chat(messages: list, ollama_model: str, temperature: float) -> str:
+async def _call_modal_ollama_chat(
+    messages: list, ollama_model: str, temperature: float, purpose: str = "Chat"
+) -> str:
     trimmed_messages = []
     for m in messages:
         content = m.get("content", "")
@@ -1871,6 +1877,7 @@ async def _call_modal_ollama_chat(messages: list, ollama_model: str, temperature
         "stream": False,
         "options": {"temperature": temperature},
     }
+    t0 = time.monotonic()
     async with ollama_lock:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as session:
             async with session.post(
@@ -1878,9 +1885,15 @@ async def _call_modal_ollama_chat(messages: list, ollama_model: str, temperature
                 headers=get_modal_headers(),
                 json=payload,
             ) as resp:
+                elapsed = time.monotonic() - t0
                 if resp.status == 200:
                     data = await resp.json()
-                    return data.get("message", {}).get("content", "").strip()
+                    content = data.get("message", {}).get("content", "").strip()
+                    api_log(f"Modal Ollama ({purpose}) -> {ollama_model} 200 OK ({elapsed:.2f}s)")
+                    return content
+                else:
+                    err_txt = await resp.text()
+                    api_log(f"Modal Ollama ({purpose}) -> {ollama_model} HTTP {resp.status} ({elapsed:.2f}s): {err_txt[:120]}")
     return ""
 
 
@@ -1910,9 +1923,10 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
     prefix = "2D anime illustration, " if is_anime_style else ""
 
     # Tier 1: Keyless Google Translate NMT
+    t0 = time.monotonic()
     try:
         gt_url = clean_url(
-            f"{HTTPS}[translate.googleapis.com/translate_a/single](https://translate.googleapis.com/translate_a/single)"
+            f"{HTTPS}translate.googleapis.com/translate_a/single"
             f"?client=gtx&sl=th&tl=en&dt=t&q={quote_plus(raw_prompt)}"
         )
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
@@ -1922,9 +1936,10 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
                     translated_segments = [seg[0] for seg in (gt_data[0] or []) if seg and seg[0]]
                     en_literal = "".join(translated_segments).strip()
                     if en_literal and not THAI_CHAR_REGEX.search(en_literal):
+                        api_log(f"Prompt Translate (Tier 1 Google NMT) -> 200 OK ({time.monotonic() - t0:.2f}s)")
                         return f"{prefix}{en_literal}"
     except Exception as e:
-        print(f"FLUX Prompt Translate Tier 1 (Google Translate) warning: {e}")
+        api_log(f"Prompt Translate (Tier 1 Google NMT) -> failed ({type(e).__name__}); fallback to Tier 2")
 
     strict_sys_msg = (
         "You are a strict, literal Thai-to-English translator. "
@@ -1947,34 +1962,40 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
                 "contents": [{"parts": [{"text": f"{strict_sys_msg}\n\nThai text: {raw_prompt}"}]}],
                 "generationConfig": {"temperature": 0.0},
             }
-            g_data = await call_gemini_generate_content_self_healing(g_payload, timeout_sec=15)
+            g_data = await call_gemini_generate_content_self_healing(
+                g_payload, timeout_sec=15, purpose="Prompt Translate Tier 2"
+            )
             if g_data:
                 parts = ((g_data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
                 raw_parts_text = " ".join(p.get("text", "") for p in parts if p.get("text")).strip()
                 clean_txt = raw_parts_text.strip(' "\'\n\r\t')
                 if clean_txt and not THAI_CHAR_REGEX.search(clean_txt):
                     return f"{prefix}{clean_txt}"
-        except Exception as e:
-            print(f"FLUX Prompt Translate Tier 2 (Gemini) warning: {e}")
+        except Exception:
+            pass
 
     # Tier 3: Modal GPU Ollama
     try:
-        res = await _call_modal_ollama_chat(trans_messages, ACTIVE_FAST_MODEL, 0.0)
+        res = await _call_modal_ollama_chat(
+            trans_messages, ACTIVE_FAST_MODEL, 0.0, purpose="Prompt Translate Tier 3"
+        )
         if res and not THAI_CHAR_REGEX.search(res):
             clean_res = res.strip(' "\'\n\r\t')
             return f"{prefix}{clean_res}"
-    except Exception as e:
-        print(f"FLUX Prompt Translate Tier 3 (Modal Typhoon) warning: {e}")
+    except Exception:
+        pass
 
     # Tier 4: Groq LPU
     if GROQ_API_KEY:
         try:
-            res = await _call_groq_chat(trans_messages, GROQ_CHAT_FALLBACK_MODEL, 0.0, is_coding=False)
+            res = await _call_groq_chat(
+                trans_messages, GROQ_CHAT_FALLBACK_MODEL, 0.0, is_coding=False, purpose="Prompt Translate Tier 4"
+            )
             if res and not THAI_CHAR_REGEX.search(res):
                 clean_res = res.strip(' "\'\n\r\t')
                 return f"{prefix}{clean_res}"
-        except Exception as e:
-            print(f"FLUX Prompt Translate Tier 4 (Groq) warning: {e}")
+        except Exception:
+            pass
 
     return raw_prompt
 
@@ -2012,9 +2033,10 @@ async def generate_image_cloudflare_flux(user_prompt: str) -> tuple[bytes, str, 
     if THAI_CHAR_REGEX.search(cleaned_subject) or is_anime_style:
         english_prompt = await translate_prompt_to_english_for_flux(cleaned_subject, is_anime_style=is_anime_style)
 
-    cf_url = clean_url(f"{HTTPS}[api.cloudflare.com/client/v4/accounts/](https://api.cloudflare.com/client/v4/accounts/){CF_ACCOUNT_ID}/ai/run/{selected_model}")
+    cf_url = clean_url(f"{HTTPS}api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{selected_model}")
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
 
+    t0 = time.monotonic()
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
         if "flux-2-" in selected_model:
             form = aiohttp.FormData()
@@ -2039,10 +2061,13 @@ async def generate_image_cloudflare_flux(user_prompt: str) -> tuple[bytes, str, 
             req_ctx = session.post(cf_url, headers=headers, json=payload)
 
         async with req_ctx as resp:
+            elapsed = time.monotonic() - t0
             if resp.status != 200:
                 err_txt = await resp.text()
+                api_log(f"Cloudflare Image -> {selected_model} HTTP {resp.status} ({elapsed:.2f}s)")
                 raise RuntimeError(f"Cloudflare Workers AI HTTP {resp.status}: {err_txt[:200]}")
 
+            api_log(f"Cloudflare Image -> {selected_model} 200 OK ({elapsed:.2f}s)")
             content_type = (resp.headers.get("Content-Type") or "").lower()
             if "image/" in content_type or "octet-stream" in content_type:
                 return await resp.read(), f"[{mode_tag}] {english_prompt}", cleaned_subject
