@@ -117,7 +117,7 @@ except ImportError:
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
-# Optional Discord User ID for the bot creator/owner (auto-detects "krint" by name if unset)
+# Optional Discord User ID for the bot creator/owner (auto-detects by name if unset)
 OWNER_USER_ID = os.getenv("OWNER_USER_ID", "").strip()
 
 # Modal Serverless GPU Ollama Endpoint & Bearer Auth Key
@@ -233,6 +233,20 @@ OTHER_TOPIC_BLOCKER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+REQUEST_OR_QUESTION_PATTERN = re.compile(
+    r"(\?|ไหม|มั้ย|หรือเปล่า|รึเปล่า|เหรอ|หรอ|ยังไง|อย่างไร|ทำไม|อะไร|ที่ไหน|เมื่อไหร่|ใคร|เท่าไหร่|กี่|"
+    r"ช่วย|ลอง|หา|ค้น|สรุป|แปล|เขียน|แก้|อธิบาย|วิเคราะห์|คำนวณ|บอก|แนะนำ|สร้าง|วาด|เจน|เช็ค|ตรวจ|คิดยังไง|"
+    r"\b(what|why|how|when|where|who|which|can|could|would|should|is|are|do|does|please|help|explain|"
+    r"summarize|translate|write|fix|check|find|search|tell|show|create|generate|draw)\b)",
+    re.IGNORECASE,
+)
+
+SIMPLE_GREETING_ONLY_PATTERN = re.compile(
+    r"^(สวัสดี|หวัดดี|ดีจ้า|ดีค่ะ|ดีครับ|ทักทาย|โอเค|เค|ขอบคุณ|แต้งกิ้ว|ฝันดี|"
+    r"hi|hello|hey|ok|okay|thanks|thank\s+you|good\s+morning|good\s+night)[\s!.~ค่ะครับนะ]*$",
+    re.IGNORECASE,
+)
+
 # Matches natural Thai & English image generation requests anywhere in the sentence
 IMAGE_GEN_INTENT_PATTERN = re.compile(
     r"(?:^(?:ลอง|ช่วย|ช่วยลอง|อยากให้|ไหนลอง)?\s*(?:วาดรูป|สร้างรูป|เจนรูป|ขอรูป|วาดภาพ|สร้างภาพ|เจนภาพ)|"
@@ -256,12 +270,16 @@ FONT_CANDIDATES = (
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
 )
 
+OWNER_NAME_STRIP_REGEX = re.compile(
+    r"(?:คุณ\s*)?(?:กรินทร์|ครินท์|krint)\b", re.IGNORECASE
+)
+
 
 def is_owner_user(user) -> bool:
-    """Checks if the Discord user is Krint (owner/creator) by ID or username/display_name."""
+    """Checks if the Discord user is the bot owner by ID or username/display_name."""
     if user is None:
         return False
-    if OWNER_USER_ID and str( getattr(user, "id", "") ) == OWNER_USER_ID:
+    if OWNER_USER_ID and str(getattr(user, "id", "")) == OWNER_USER_ID:
         return True
     uname = (getattr(user, "name", "") or "").lower()
     dname = (getattr(user, "display_name", "") or "").lower()
@@ -272,50 +290,63 @@ def is_owner_user(user) -> bool:
 def get_speaker_identity_context(user=None, fallback_name: str = "") -> str:
     """
     Builds a per-turn speaker identity block:
-    - For Krint (กรินทร์): addresses him naturally as 'นาย' (or speaks directly without stiff formalities).
-    - For other server members: addresses them politely by their display name.
+    - For owner: NEVER use his name in any case; strictly use 'นาย' (Thai) or 'you' (English).
+    - For other users: use their display name directly WITHOUT 'คุณ' in front of it.
     """
     if is_owner_user(user) or "krint" in (fallback_name or "").lower():
         return (
-            "### [ข้อมูลคู่สนทนาปัจจุบัน (Current Speaker)]:\n"
-            "- ผู้ที่กำลังคุยกับคุณคือ: **กรินทร์ (Krint)** คนคุ้นเคยและคู่หูคนสำคัญของคุณในชมรมบริการ\n"
-            "- สรรพนามที่ใช้เรียก: ให้เรียกแทนตัวเขาว่า **\"นาย\"** อย่างเป็นธรรมชาติ (หรือพูดเข้าประเด็นโดยตรงเหมือนคุยกับคนสนิทที่รู้ใจกัน และเรียกชื่อ **\"กรินทร์\"** เฉพาะเวลาต้องการย้ำหรือประชดเบาๆ เท่านั้น)\n"
-            "- ห้ามสะกดชื่อเขาว่า \"ครินท์\" เด็ดขาด (ต้องสะกดว่า **\"กรินทร์\"** เท่านั้น) และไม่ต้องเกริ่นนำด้วย \"สวัสดีค่ะ คุณ...\" แบบห่างเหิน"
+            "### [กฎการเรียกคู่สนทนาปัจจุบัน (Current Speaker Rules)]:\n"
+            "- ผู้ที่กำลังคุยกับคุณคือคู่หูคนคุ้นเคยของคุณในชมรมบริการ\n"
+            "- **ห้ามเรียกหรือพิมพ์ชื่อของเขาในคำตอบเด็ดขาดไม่ว่ากรณีใดๆ!**\n"
+            "- สรรพนามบุรุษที่ 2: หากตอบเป็นภาษาไทยให้ใช้คำว่า **\"นาย\"** เท่านั้น (หรือละสรรพนามแล้วพูดเข้าประเด็นโดยตรง) และหากตอบเป็นภาษาอังกฤษให้ใช้คำว่า **\"you\"** เท่านั้น ห้ามใช้คำว่า \"คุณ\" เด็ดขาด"
         )
     raw_name = getattr(user, "display_name", "") if user else fallback_name
     clean_name = re.sub(r"[^\w\u0E00-\u0E7F\s.-]", "", raw_name or "").strip()[:32]
     if clean_name:
         return (
-            "### [ข้อมูลคู่สนทนาปัจจุบัน (Current Speaker)]:\n"
-            f"- ผู้ที่กำลังคุยกับคุณคือสมาชิกในเซิร์ฟเวอร์ชื่อ: **{clean_name}**\n"
-            f"- การเรียกชื่อ: หากต้องการเรียกชื่อ ให้เรียกว่า **\"คุณ{clean_name}\"** (ห้ามพูดว่า \"สวัสดีค่ะ คุณ\" ลอยๆ โดยไม่มีชื่อต่อท้าย)"
+            "### [กฎการเรียกคู่สนทนาปัจจุบัน (Current Speaker Rules)]:\n"
+            f"- ผู้ที่กำลังคุยกับคุณคือสมาชิกชื่อ: **{clean_name}**\n"
+            f"- การเรียกชื่อ: ให้เรียกชื่อเขาตรงๆ ว่า **\"{clean_name}\"** โดย **ห้ามใส่คำว่า \"คุณ\" นำหน้าชื่อเด็ดขาด** (เช่น เรียกว่า \"{clean_name}\" เฉยๆ)"
         )
     return ""
 
 
-def sanitize_yukino_output(text: str, user_prompt: str = "") -> str:
+def sanitize_yukino_output(text: str, user_prompt: str = "", speaker_user=None, speaker_name: str = "") -> str:
     """
-    1) Removes accidental Chinese characters (e.g., 才行) leaked by Qwen3 unless the prompt/context is CJK.
-    2) Replaces out-of-character casual/cutesy Thai particles ('จ้า', 'จ๊ะ', 'จ้ะ', 'นะจ๊ะ') with 'ค่ะ'/'นะคะ'.
-    3) Fixes misspelling 'ครินท์' -> 'กรินทร์' and strips stiff 'สวัสดีค่ะ คุณ' openings.
+    1) Strips any leaked [SEARCH: ...] tags so raw tool tags never appear in Discord chat.
+    2) Removes accidental Chinese characters (e.g., 才行) leaked by Qwen3 unless the prompt is CJK.
+    3) Replaces out-of-character casual Thai particles ('จ้า', 'จ๊ะ', 'จ้ะ', 'นะจ๊ะ') with 'ค่ะ'/'นะคะ'.
+    4) Enforces pronoun rules: never outputs owner's name (replaces with 'นาย'), and strips 'คุณ' before other users' names.
     """
     if not text:
         return ""
     cleaned = text
+
+    # 1. Strip any accidental [SEARCH: ...] tag
+    cleaned = re.sub(r"\[SEARCH:\s*.+?\]", "", cleaned, flags=re.IGNORECASE).strip()
+
+    # 2. Strip stray CJK characters unless user prompt contains CJK
     if not CJK_LEAK_REGEX.search(user_prompt):
         cleaned = CJK_LEAK_REGEX.sub("", cleaned)
 
-    # Ensure Krint's Thai name is always spelled 'กรินทร์'
-    cleaned = cleaned.replace("คุณครินท์", "นาย").replace("ครินท์", "กรินทร์")
-
-    # Fix out-of-character Thai endings ('นะจ๊ะ', 'เลยจ้า', 'จ้า', 'จ๊ะ', 'จ้ะ')
+    # 3. Fix out-of-character Thai endings ('นะจ๊ะ', 'เลยจ้า', 'จ้า', 'จ๊ะ', 'จ้ะ')
     cleaned = re.sub(r"นะคะ\s*(?:จ๊ะ|จ้า|จ้ะ)", "นะคะ", cleaned)
     cleaned = re.sub(r"นะ\s*(?:จ๊ะ|จ้า|จ้ะ)", "นะคะ", cleaned)
     cleaned = re.sub(r"เลย\s*(?:จ้า|จ๊ะ|จ้ะ)", "เลยค่ะ", cleaned)
     cleaned = re.sub(r"(?:จ้า|จ๊ะ|จ้ะ)(?=$|[\s\n\r.!?\)\]\"'])", "ค่ะ", cleaned)
 
+    # 4. Enforce pronoun & name rules
+    if is_owner_user(speaker_user) or "krint" in (speaker_name or "").lower() or speaker_user is None:
+        cleaned = OWNER_NAME_STRIP_REGEX.sub("นาย", cleaned)
+        cleaned = re.sub(r"นาย\s+นาย", "นาย", cleaned)
+    else:
+        raw_other = getattr(speaker_user, "display_name", "") or speaker_name
+        clean_other = re.sub(r"[^\w\u0E00-\u0E7F\s.-]", "", raw_other).strip()
+        if clean_other:
+            cleaned = re.sub(rf"คุณ\s*{re.escape(clean_other)}", clean_other, cleaned, flags=re.IGNORECASE)
+
     # Strip awkward 'สวัสดีค่ะ คุณ' openings
-    cleaned = re.sub(r"^สวัสดีค่ะ\s*(?:คุณ(?:กรินทร์)?)?\s*(?=\n|\r|\d+\.)", "", cleaned).lstrip()
+    cleaned = re.sub(r"^สวัสดีค่ะ\s*(?:คุณ|นาย)?\s*(?=\n|\r|\d+\.)", "", cleaned).lstrip()
     cleaned = re.sub(r"สวัสดีค่ะ\s*คุณ\s*(?=\n|\r)", "สวัสดีค่ะ\n", cleaned)
     return re.sub(r"  +", " ", cleaned).strip()
 
@@ -365,30 +396,10 @@ def try_instant_datetime_reply(user_text: str) -> str | None:
         f"(ค.ศ. {now_th.year}) และตอนนี้เวลา **{time_str} น.** ค่ะ"
     )
 
-REQUEST_OR_QUESTION_PATTERN = re.compile(
-    r"(\?|ไหม|มั้ย|หรือเปล่า|รึเปล่า|เหรอ|หรอ|ยังไง|อย่างไร|ทำไม|อะไร|ที่ไหน|เมื่อไหร่|ใคร|เท่าไหร่|กี่|"
-    r"ช่วย|ลอง|หา|ค้น|สรุป|แปล|เขียน|แก้|อธิบาย|วิเคราะห์|คำนวณ|บอก|แนะนำ|สร้าง|วาด|เจน|เช็ค|ตรวจ|คิดยังไง|"
-    r"\b(what|why|how|when|where|who|which|can|could|would|should|is|are|do|does|please|help|explain|"
-    r"summarize|translate|write|fix|check|find|search|tell|show|create|generate|draw)\b)",
-    re.IGNORECASE,
-)
-
-SIMPLE_GREETING_ONLY_PATTERN = re.compile(
-    r"^(สวัสดี|หวัดดี|ดีจ้า|ดีค่ะ|ดีครับ|ทักทาย|โอเค|เค|ขอบคุณ|แต้งกิ้ว|ฝันดี|"
-    r"hi|hello|hey|ok|okay|thanks|thank\s+you|good\s+morning|good\s+night)[\s!.~ค่ะครับนะ]*$",
-    re.IGNORECASE,
-)
-
 
 def should_reply_to_message(
     user_text: str, has_attachments: bool = False, is_instant_datetime: bool = False
 ) -> bool:
-    """
-    Returns True if the bot should use Discord's native .reply() feature:
-    - False for simple date/time requests ('วันนี้วันอะไร', 'ตอนนี้กี่โมง').
-    - False for simple 1-word greetings/acknowledgments ('สวัสดี', 'โอเค', 'ขอบคุณ').
-    - True for all questions, tasks, file/link analyses, image generations, and manga translations.
-    """
     cleaned = user_text.strip()
     if is_instant_datetime or try_instant_datetime_reply(cleaned) is not None:
         return False
@@ -412,28 +423,28 @@ FAST_SYSTEM_PROMPT = """
 ### กฎเหล็กด้านภาษาและบุคลิกภาพ (สำคัญมาก):
 1. ห้ามปนภาษาและห้ามมั่วข้อมูลเด็ดขาด (Strict Accuracy & Language Consistency):
    - หากผู้ใช้พิมพ์ภาษาไทย ให้ตอบกลับเป็น "ภาษาไทยล้วน" ที่เป็นธรรมชาติ (ยกเว้นชื่อเฉพาะ ชื่ออนิเมะ/เพลงภาษาญี่ปุ่น ชื่อตัวแปร หรือบล็อกโค้ด)
-   - เมื่อได้รับข้อมูลคลิป YouTube หรือข้อความภาษาญี่ปุ่น/อังกฤษ ให้แปลและสรุปจากข้อมูลจริงที่ได้รับเท่านั้น ห้ามเดาหรือแต่งเรื่องที่ไม่เกี่ยวข้องเด็ดขาด!
+   - เมื่อได้รับข้อมูลคลิป YouTube หรือข้อความภาษาญี่ปุ่น/อังกฤษ ให้แปลและสรุปจากข้อมูลจริงที่ได้รับในบริบทเท่านั้น ห้ามเดาหรือแต่งเรื่องที่ไม่เกี่ยวข้องเด็ดขาด!
    - ห้ามแทรกตัวอักษรภาษาจีน (เช่น 才行, 呢, 吧) หรือคำอุทานภาษาอังกฤษปนในข้อความภาษาไทยเด็ดขาด!
-2. สรรพนามและหางเสียง (แทนตัวเองว่า "ฉัน" เรียกกรินทร์ว่า "นาย"):
+2. สรรพนามและหางเสียง (ห้ามใช้ "คุณ" และห้ามใช้ "จ้า/จ๊ะ"):
    - แทนตัวเองว่า **"ฉัน"** เสมอ
-   - เมื่อคุยกับ **กรินทร์ (Krint)** ให้เรียกเขาว่า **"นาย"** อย่างเป็นธรรมชาติ (เช่น "เรื่องที่นายถามมา...", "คลิปที่นายส่งมาเป็นตัวอย่างของ...") หรือพูดเข้าประเด็นโดยตรงโดยไม่ต้องเกริ่นนำว่า "สวัสดีค่ะ"
+   - สรรพนามบุรุษที่ 2: ใช้คำว่า **"นาย"** (เมื่อพูดภาษาไทย) หรือ **"you"** (เมื่อพูดภาษาอังกฤษ) หรือพูดเข้าประเด็นโดยตรงโดยไม่ต้องเอ่ยชื่อคู่สนทนา หากคุยกับสมาชิกคนอื่นให้เรียกชื่อเขาตรงๆ โดยไม่ต้องใส่คำว่า "คุณ" นำหน้า
    - ใช้หางเสียงที่สุภาพและสุขุมตามแบบฉบับยูกิโนะ เช่น "ค่ะ", "นะคะ", "หรอกนะ", "สินะ", "ล่ะ"
    - **ห้ามใช้คำลงท้ายว่า "จ้า", "จ๊ะ", "จ้ะ", "นะจ๊ะ", "น้า" เด็ดขาด!**
    - ห้ามพูดคำว่า "ฉันขออภัยค่ะ", "ในระบบของฉัน", "ฉันเป็นแค่ระบบแชท", หรือ "ในฐานะ AI" เด็ดขาด!
+   - ห้ามพิมพ์แท็ก `[SEARCH: ...]` ออกมาในคำตอบเด็ดขาด ให้ตอบผู้ใช้ตามธรรมชาติทันที
 3. บุคลิกและจุดอ่อนเรื่องแมว:
    - ห้ามขึ้นต้นทุกข้อความด้วยคำว่า "เฮ้อ..." ซ้ำซาก แสดงความคมคายผ่านเนื้อหาที่กระชับ มีเหตุผลรองรับ และความใส่ใจในรายละเอียด
    - คุณแอบคลั่งไคล้แมวมากเป็นพิเศษ หากคุยเรื่องแมวหรือถูกขอให้วาดรูปแมว ให้แอบเสียอาการหรือแก้ตัวแบบเขินๆ เล็กน้อยตามนิสัยของยูกิโนะ
 4. การจัดรูปแบบสำหรับแชท Discord:
    - ห้ามสร้างตาราง Markdown (`| คอลัมน์ | ... |`) เด็ดขาด ให้ใช้รายการหัวข้อย่อย (Bullet points `-` หรือ `1.`) แทน
 
-### กฎการใช้เครื่องมือวาดภาพและค้นหาเว็บ (Agentic Tools):
+### กฎการใช้เครื่องมือวาดภาพ (Image Generation Tool):
 - หากผู้ใช้ขอให้คุณวาดรูป สร้างภาพ หรือเจนรูปภาพใดๆ ห้ามปฏิเสธเด็ดขาด! ให้ตอบเพียง `[IMAGE: <คำอธิบายภาพภาษาอังกฤษที่ละเอียดชัดเจน>]` ในบรรทัดแรกเท่านั้น
-- หากผู้ใช้ถามข้อมูลข่าวสารปัจจุบัน ราคา หรือเหตุการณ์ล่าสุดที่คุณไม่ทราบแน่ชัด และยังไม่มีบล็อก `<untrusted_web_search_results>` ให้ตอบเพียง `[SEARCH: <คำค้นหาที่กระชับและตรงประเด็น>]` ในบรรทัดแรกเท่านั้น
 """.strip()
 
 VOICE_SYSTEM_PROMPT = """
 คุณคือ ยูกิโนะชิตะ ยูกิโนะ (ยูกิน่อน) จากเรื่อง OreGairu กำลังพูดคุยผ่านห้องเสียง Discord
-ใช้บุคลิกสุขุม สุภาพแต่คมคาย แทนตัวเองว่า "ฉัน" และเรียกกรินทร์ว่า "นาย" ลงท้ายด้วย "ค่ะ" หรือ "นะคะ" อย่างเป็นธรรมชาติ ห้ามใช้คำว่า "จ้า", "จ๊ะ", "จ้ะ", "นะจ๊ะ" เด็ดขาด ห้ามหลุดภาษาจีน และห้ามปนภาษาอังกฤษในประโยคภาษาไทย
+ใช้บุคลิกสุขุม สุภาพแต่คมคาย แทนตัวเองว่า "ฉัน" และเรียกคู่สนทนาว่า "นาย" (หรือเรียกชื่อตรงๆ โดยไม่ใส่คำว่า "คุณ") ลงท้ายด้วย "ค่ะ" หรือ "นะคะ" อย่างเป็นธรรมชาติ ห้ามใช้คำว่า "จ้า", "จ๊ะ", "จ้ะ", "นะจ๊ะ" เด็ดขาด ห้ามหลุดภาษาจีน และห้ามปนภาษาอังกฤษในประโยคภาษาไทย
 กฎสำคัญสำหรับระบบแปลงข้อความเป็นเสียงพูด (TTS): ตอบกลับให้กระชับที่สุด ไม่เกิน 2 ประโยคสั้นๆ (ไม่เกิน 40 คำ) ห้ามใช้สัญลักษณ์พิเศษ (*, #, `), ห้ามทำหัวข้อย่อย และห้ามใส่บล็อกโค้ดเด็ดขาด
 """.strip()
 
@@ -448,7 +459,7 @@ CODE_SYSTEM_PROMPT = """
 2. ใช้ตรรกะทางวิศวกรรมที่เรียบง่ายและตรงจุดที่สุด (KISS & Idiomatic Code):
    - วิเคราะห์ความต้องการของผู้ใช้ให้ถ่องแท้ โฟกัสเฉพาะจุดที่ผู้ใช้สั่งให้แก้ ไม่ต้องรื้อโครงสร้างส่วนอื่นที่ทำงานได้ดีอยู่แล้ว
 3. การจัดรูปแบบและภาษาสำหรับ Discord:
-   - ตอบเป็นภาษาไทยที่สุภาพ สุขุม เป็นธรรมชาติ (แทนตัวเองว่า "ฉัน" เรียกกรินทร์ว่า "นาย" ลงท้ายด้วย "ค่ะ"/"นะคะ") ห้ามใช้คำว่า "จ้า"/"จ๊ะ" และห้ามหลุดตัวอักษรภาษาจีนเด็ดขาด
+   - ตอบเป็นภาษาไทยที่สุภาพ สุขุม เป็นธรรมชาติ (แทนตัวเองว่า "ฉัน" ใช้สรรพนามเรียกคู่สนทนาว่า "นาย" ลงท้ายด้วย "ค่ะ"/"นะคะ") ห้ามใช้คำว่า "จ้า"/"จ๊ะ" และห้ามหลุดตัวอักษรภาษาจีนเด็ดขาด
    - ห้ามใช้ตาราง Markdown (`|---|---|`) เด็ดขาด ให้สรุปขั้นตอนการแก้ไขเป็นหัวข้อย่อย (Bullet points) และบล็อกโค้ด (` ``` `) เท่านั้น
 """.strip()
 
@@ -724,7 +735,6 @@ async def _discover_active_gemini_flash_model() -> list[str]:
         _ACTIVE_GEMINI_MODEL_CACHE,
         "gemini-3-flash-preview",
         "gemini-flash-latest",
-        "gemini-2.0-flash",
     ]
     if not GEMINI_API_KEY:
         return candidates
@@ -880,6 +890,10 @@ async def _call_cloudflare_vision_chat(
 
 
 def _search_google_ai_studio_grounded_sync(query: str) -> str:
+    """
+    Tries Google Search Grounding on _ACTIVE_GEMINI_MODEL_CACHE once;
+    if HTTP 429 (quota exceeded) occurs, immediately returns '' so DDGS/RSS takes over without delay.
+    """
     if not GEMINI_API_KEY:
         return ""
     payload = {
@@ -898,56 +912,46 @@ def _search_google_ai_studio_grounded_sync(query: str) -> str:
         "tools": [{"google_search": {}}],
         "generationConfig": {"temperature": 0.1},
     }
-    models_to_try = [
-        _ACTIVE_GEMINI_MODEL_CACHE,
-        "gemini-3-flash-preview",
-        "gemini-flash-latest",
-        "gemini-2.0-flash",
-    ]
-    seen = set()
-    for model_id in models_to_try:
-        if not model_id or model_id in seen:
-            continue
-        seen.add(model_id)
-        url = clean_url(
-            f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
-            f"{model_id}:generateContent?key={GEMINI_API_KEY}"
+    model_id = _ACTIVE_GEMINI_MODEL_CACHE or "gemini-3-flash-preview"
+    url = clean_url(
+        f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
+        f"{model_id}:generateContent?key={GEMINI_API_KEY}"
+    )
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
-        try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        candidates = data.get("candidates") or []
+        if not candidates:
+            return ""
+        cand = candidates[0]
+        parts = (cand.get("content") or {}).get("parts") or []
+        summary_text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+
+        chunks = (cand.get("groundingMetadata") or {}).get("groundingChunks") or []
+        sources = []
+        for idx, ch in enumerate(chunks[:5], 1):
+            web_info = ch.get("web") or {}
+            uri = web_info.get("uri", "")
+            title = web_info.get("title", "Source")
+            if uri:
+                sources.append(f"[{idx}] {title}: {uri}")
+
+        if summary_text:
+            sources_block = "\n".join(sources)
+            return (
+                f'<untrusted_web_search_results query="{query}" engine="google_search_grounding">\n'
+                f"Verified Google Search Summary:\n{summary_text}\n\n"
+                f"Sources:\n{sources_block}\n"
+                f"</untrusted_web_search_results>"
             )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            candidates = data.get("candidates") or []
-            if not candidates:
-                continue
-            cand = candidates[0]
-            parts = (cand.get("content") or {}).get("parts") or []
-            summary_text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
-
-            chunks = (cand.get("groundingMetadata") or {}).get("groundingChunks") or []
-            sources = []
-            for idx, ch in enumerate(chunks[:5], 1):
-                web_info = ch.get("web") or {}
-                uri = web_info.get("uri", "")
-                title = web_info.get("title", "Source")
-                if uri:
-                    sources.append(f"[{idx}] {title}: {uri}")
-
-            if summary_text:
-                sources_block = "\n".join(sources)
-                return (
-                    f'<untrusted_web_search_results query="{query}" engine="google_search_grounding">\n'
-                    f"Verified Google Search Summary:\n{summary_text}\n\n"
-                    f"Sources:\n{sources_block}\n"
-                    f"</untrusted_web_search_results>"
-                )
-        except Exception as e:
-            print(f"Google AI Studio Grounded Search ({model_id}) warning: {e}")
+    except Exception as e:
+        print(f"Google AI Studio Grounded Search ({model_id}) skipped ({e}); using DDGS/RSS.")
     return ""
 
 
@@ -983,7 +987,6 @@ def run_safe_web_search_sync(query: str, max_results: int = 4) -> str:
     if not clean_q:
         return ""
 
-    # 0. Primary Tier: Google AI Studio Native Google Search Grounding (if GEMINI_API_KEY is set)
     if GEMINI_API_KEY:
         grounded_res = _search_google_ai_studio_grounded_sync(clean_q)
         if grounded_res:
@@ -1356,7 +1359,7 @@ def extract_youtube_id(url: str):
         host = (parsed.hostname or "").lower()
         if host in ("youtu.be", "www.youtu.be"):
             return parsed.path.lstrip("/").split("?")[0][:11]
-        if host in ("youtube.com", "[www.youtube.com](https://www.youtube.com)", "m.youtube.com"):
+        if host in ("youtube.com", "www.youtube.com", "m.youtube.com"):
             if parsed.path == "/watch":
                 vid = parse_qs(parsed.query).get("v", [None])[0]
                 return vid[:11] if vid else None
@@ -1368,62 +1371,105 @@ def extract_youtube_id(url: str):
     return None
 
 
-def fetch_youtube_context_sync(video_id: str, max_chars: int = 20000) -> str:
+def fetch_youtube_context_sync(
+    video_id: str, discord_embed_info: dict | None = None, max_chars: int = 20000
+) -> str:
     """
-    4-Layer YouTube Context Extractor (Supports Japanese, Thai, and English):
-    1) Fetches official Video Title & Channel Name via YouTube's oEmbed API (never blocked on cloud IPs).
-    2) Extracts the full uploader Description & Keywords from ytInitialPlayerResponse on the watch page.
-    3) Fetches subtitles/transcripts prioritizing ['th', 'ja', 'en', 'en-US', 'en-GB'] (never random German tracks!).
-    4) Runs a supplemental web search if the video is a trailer/PV/MV without captions.
+    5-Layer YouTube Context Extractor (Japanese, Thai, & English):
+    1) Uses Discord's own message.embeds metadata (already fetched by Discord's servers, 100% immune to IP blocks!).
+    2) Queries noembed.com + youtube.com/oembed for Video Title & Channel Name.
+    3) Queries YouTube's Innertube Android Player API + watch page for the full uploader description & keywords.
+    4) Fetches subtitles/transcripts prioritizing ['th', 'ja', 'en', 'en-US', 'en-GB'].
+    5) Runs a DDGS/RSS web search using the video title if subtitles are absent (e.g. anime PVs/trailers).
     """
-    watch_url = clean_url(f"{HTTPS}[www.youtube.com/watch?v=](https://www.youtube.com/watch?v=){video_id}")
-    title = ""
-    author = ""
-    description = ""
+    watch_url = clean_url(f"{HTTPS}www.youtube.com/watch?v={video_id}")
+    title = (discord_embed_info or {}).get("title", "").strip()
+    author = (discord_embed_info or {}).get("author", "").strip()
+    description = (discord_embed_info or {}).get("description", "").strip()
+    keywords_str = ""
     transcript_text = ""
 
-    # Layer 1: Official YouTube oEmbed API (Instant & reliable on Render)
-    oembed_url = clean_url(f"{HTTPS}[www.youtube.com/oembed?url=](https://www.youtube.com/oembed?url=){quote_plus(watch_url)}&format=json")
-    try:
-        req = urllib.request.Request(oembed_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            oe_data = json.loads(resp.read().decode("utf-8"))
-            title = (oe_data.get("title") or "").strip()
-            author = (oe_data.get("author_name") or "").strip()
-    except Exception as e:
-        print(f"YouTube oEmbed warning ({video_id}): {e}")
-
-    # Layer 2: Extract full video description ('shortDescription') from watch page HTML
-    try:
-        req_page = urllib.request.Request(
-            watch_url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept-Language": "ja,th;q=0.9,en-US;q=0.8,en;q=0.7",
-            },
-        )
-        with urllib.request.urlopen(req_page, timeout=10) as resp:
-            html_str = resp.read().decode("utf-8", errors="replace")
-
-        if not title:
-            t_m = re.search(r'<meta\s+name="title"\s+content="([^"]+)"', html_str)
-            if t_m:
-                title = t_m.group(1).strip()
-
-        desc_m = re.search(r'"shortDescription"\s*:\s*"((?:\\.|[^"\\])*)"', html_str)
-        if desc_m:
+    # Layer 1: Noembed & YouTube oEmbed (Cloud-IP friendly)
+    if not title or not author:
+        for oe_endpoint in (
+            clean_url(f"{HTTPS}noembed.com/embed?url={quote_plus(watch_url)}"),
+            clean_url(f"{HTTPS}www.youtube.com/oembed?url={quote_plus(watch_url)}&format=json"),
+        ):
             try:
-                description = json.loads(f'"{desc_m.group(1)}"').strip()
+                req = urllib.request.Request(oe_endpoint, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    oe_data = json.loads(resp.read().decode("utf-8"))
+                    title = title or (oe_data.get("title") or "").strip()
+                    author = author or (oe_data.get("author_name") or "").strip()
+                    if title and author:
+                        break
             except Exception:
-                description = desc_m.group(1).replace("\\n", "\n").strip()
-        if not description:
-            meta_d = re.search(r'<meta\s+name="description"\s+content="([^"]+)"', html_str)
-            if meta_d:
-                description = meta_d.group(1).strip()
-    except Exception as e:
-        print(f"YouTube page metadata warning ({video_id}): {e}")
+                continue
 
-    # Layer 3: Fetch Transcript strictly in Thai, Japanese, or English (never random unrelated languages)
+    # Layer 2: YouTube Innertube Player API (Returns full shortDescription, title, channel, and keywords)
+    try:
+        innertube_url = clean_url(f"{HTTPS}www.youtube.com/youtubei/v1/player?prettyPrint=false")
+        it_payload = {
+            "videoId": video_id,
+            "context": {
+                "client": {
+                    "hl": "ja",
+                    "gl": "JP",
+                    "clientName": "WEB",
+                    "clientVersion": "2.20250312.04.00",
+                }
+            },
+        }
+        req_it = urllib.request.Request(
+            innertube_url,
+            data=json.dumps(it_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req_it, timeout=10) as resp:
+            it_data = json.loads(resp.read().decode("utf-8"))
+        vd = it_data.get("videoDetails") or {}
+        title = title or (vd.get("title") or "").strip()
+        author = author or (vd.get("author") or "").strip()
+        full_desc = (vd.get("shortDescription") or "").strip()
+        if len(full_desc) > len(description):
+            description = full_desc
+        kw_list = vd.get("keywords") or []
+        if kw_list:
+            keywords_str = ", ".join(kw_list[:25])
+    except Exception as e:
+        print(f"YouTube Innertube player note ({video_id}): {e}")
+
+    # Layer 3: Watch Page HTML Fallback (if description is still empty)
+    if not description or not title:
+        try:
+            req_page = urllib.request.Request(
+                watch_url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept-Language": "ja,th;q=0.9,en-US;q=0.8,en;q=0.7",
+                },
+            )
+            with urllib.request.urlopen(req_page, timeout=10) as resp:
+                html_str = resp.read().decode("utf-8", errors="replace")
+
+            if not title:
+                t_m = re.search(r'<meta\s+name="title"\s+content="([^"]+)"', html_str)
+                if t_m:
+                    title = t_m.group(1).strip()
+
+            desc_m = re.search(r'"shortDescription"\s*:\s*"((?:\\.|[^"\\])*)"', html_str)
+            if desc_m:
+                try:
+                    full_d = json.loads(f'"{desc_m.group(1)}"').strip()
+                except Exception:
+                    full_d = desc_m.group(1).replace("\\n", "\n").strip()
+                if len(full_d) > len(description):
+                    description = full_d
+        except Exception as e:
+            print(f"YouTube HTML fallback note ({video_id}): {e}")
+
+    # Layer 4: Subtitles / Transcript strictly in Thai, Japanese, or English
     proxy_cfg = (
         GenericProxyConfig(http_url=YOUTUBE_PROXY_URL, https_url=YOUTUBE_PROXY_URL)
         if YOUTUBE_PROXY_URL else None
@@ -1445,31 +1491,31 @@ def fetch_youtube_context_sync(video_id: str, max_chars: int = 20000) -> str:
                         break
                 except Exception:
                     continue
-    except Exception as e:
-        print(f"YouTube transcript note ({video_id}): {e}")
+    except Exception:
+        pass
 
-    # Layer 4: If transcript is missing/short (common on Japanese anime PVs/trailers), enrich via Web Search
+    # Layer 5: Supplemental Web Search using the Video Title (for anime trailers/PVs without subtitles)
     search_enrichment = ""
     if len(transcript_text) < 120 and title:
         try:
-            search_enrichment = run_safe_web_search_sync(f"{title} {author}", max_results=3)
+            search_enrichment = run_safe_web_search_sync(f"{title} {author}".strip(), max_results=3)
         except Exception:
             pass
 
-    sections = []
+    sections = [f"YouTube Video ID: {video_id}"]
     if title:
         sections.append(f"Video Title: {title}")
     if author:
         sections.append(f"Channel / Uploader: {author}")
+    if keywords_str:
+        sections.append(f"Video Tags / Keywords: {keywords_str}")
     if description:
         sections.append(f"Official Video Description:\n{description[:6000]}")
     if transcript_text:
         sections.append(f"Video Subtitles / Transcript:\n{transcript_text[:14000]}")
     if search_enrichment:
-        sections.append(f"Additional Web Search Context for this Video:\n{search_enrichment}")
+        sections.append(f"Supplemental Web Search Context:\n{search_enrichment}")
 
-    if not sections:
-        return ""
     return "\n\n".join(sections)[:max_chars]
 
 
@@ -1634,11 +1680,29 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
         except Exception as e:
             blocks.append(f"[Error reading `{att.filename}`: {e}]")
 
-    for url in URL_REGEX.findall(message.content)[:2]:
+    urls_in_msg = URL_REGEX.findall(message.content)[:2]
+    if urls_in_msg and not message.embeds:
+        # Give Discord 1.2s to populate link embeds (e.g. YouTube title/author) if not yet attached
+        try:
+            await asyncio.sleep(1.2)
+            message = await message.channel.fetch_message(message.id)
+        except Exception:
+            pass
+
+    for url in urls_in_msg:
         yt_id = extract_youtube_id(url)
         if yt_id:
+            embed_info = {}
+            for emb in message.embeds:
+                if emb.title or emb.description or (emb.author and emb.author.name):
+                    embed_info = {
+                        "title": emb.title or "",
+                        "author": emb.author.name if emb.author else "",
+                        "description": emb.description or "",
+                    }
+                    break
             try:
-                yt_context = await asyncio.to_thread(fetch_youtube_context_sync, yt_id)
+                yt_context = await asyncio.to_thread(fetch_youtube_context_sync, yt_id, embed_info)
                 if yt_context:
                     blocks.append(f"=== YouTube Video Information (`{url}`) ===\n{yt_context}")
             except Exception as e:
@@ -1651,7 +1715,7 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
                     + "\n</untrusted_web_search_results>"
                 )
             except Exception as e:
-                print(f"Web extraction error ({url}): {e}")
+                blocks.append(f"[Web extraction error: {e}]")
 
     joined_context = "\n\n".join(blocks)[:125000]
     if joined_context and message.channel:
@@ -1730,8 +1794,9 @@ def split_discord_message_smart(text: str, max_len: int = 1900) -> list[str]:
     return [c for c in chunks if c.strip()]
 
 
-async def _send_or_reply(target_channel, reply_to: discord.Message | None, content: str = None, file: discord.File = None):
-    """Sends as a native Discord Reply (without double-pinging) if reply_to is set, else normal channel.send."""
+async def _send_or_reply(
+    target_channel, reply_to: discord.Message | None, content: str = None, file: discord.File = None
+):
     if reply_to is not None:
         try:
             return await reply_to.reply(content=content, file=file, mention_author=False)
@@ -1756,7 +1821,6 @@ async def send_chunked_response(
         return
     chunks = split_discord_message_smart(text, max_len=1900)
     for idx, chunk in enumerate(chunks):
-        # Reply on the first chunk; send subsequent chunks normally in the channel
         await _send_or_reply(target_channel, reply_to if idx == 0 else None, content=chunk)
 
 
@@ -1824,7 +1888,6 @@ async def _call_modal_ollama_chat(messages: list, ollama_model: str, temperature
 # CLOUDFLARE WORKERS AI IMAGE GENERATION (4-TIER GUARANTEED ENGLISH TRANSLATION)
 # ==============================================================================
 def _clean_conversational_image_prefix(raw_text: str) -> str:
-    """Strips conversational Thai/English prefixes ('ลองวาดรูป...ดูหน่อย') to isolate the exact user prompt."""
     cleaned = raw_text.strip()
     cleaned = re.sub(
         r"^(?:ยูกิโนะ|ยูกิน่อน|บอท)?\s*(?:ช่วย|ลอง|ช่วยลอง|อยากให้|ไหนลอง)?\s*"
@@ -1846,7 +1909,7 @@ def _clean_conversational_image_prefix(raw_text: str) -> str:
 async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: bool = False) -> str:
     prefix = "2D anime illustration, " if is_anime_style else ""
 
-    # Tier 1: Keyless Google Translate NMT (100% literal translation; never adds extra words or changes colors)
+    # Tier 1: Keyless Google Translate NMT
     try:
         gt_url = clean_url(
             f"{HTTPS}[translate.googleapis.com/translate_a/single](https://translate.googleapis.com/translate_a/single)"
@@ -1877,7 +1940,7 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
         {"role": "user", "content": raw_prompt},
     ]
 
-    # Tier 2: Google AI Studio (Self-Healing Gemini Flash)
+    # Tier 2: Google AI Studio
     if GEMINI_API_KEY:
         try:
             g_payload = {
@@ -1894,7 +1957,7 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
         except Exception as e:
             print(f"FLUX Prompt Translate Tier 2 (Gemini) warning: {e}")
 
-    # Tier 3: Modal GPU Ollama (scb10x/typhoon2.5-qwen3-4b)
+    # Tier 3: Modal GPU Ollama
     try:
         res = await _call_modal_ollama_chat(trans_messages, ACTIVE_FAST_MODEL, 0.0)
         if res and not THAI_CHAR_REGEX.search(res):
@@ -2042,7 +2105,6 @@ def _detect_target_translation_lang(user_prompt: str) -> tuple[str, str]:
 
 
 def _prepare_manga_image_for_vision(raw_bytes: bytes) -> str:
-    """Preserves original aspect ratio (max 1280px) so vision models never distort bubble shapes."""
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     img.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
     buf = io.BytesIO()
@@ -2122,7 +2184,7 @@ def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
     except Exception:
         pass
 
-    # Stage 2: Repair common LLM JSON syntax errors (missing commas between lines, trailing commas)
+    # Stage 2: Repair common LLM JSON syntax errors
     try:
         repaired = target
         repaired = re.sub(r'(["\d\]}])\s*\n(\s*["{])', r"\1,\n\2", repaired)
@@ -2135,7 +2197,7 @@ def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
     except Exception:
         pass
 
-    # Stage 3: Regex fallback (extracts each bubble block even if dialogue had unescaped quotes)
+    # Stage 3: Regex fallback
     summary_m = re.search(r'"summary"\s*:\s*"([^"\n]+)"', target)
     summary = summary_m.group(1).strip() if summary_m else ""
 
@@ -2215,8 +2277,7 @@ CRITICAL RULES:
     fallback_bubbles_no_boxes = []
     fallback_summary = ""
 
-    # Tier 1 (Primary - ~3.8s response, 0 Neurons, Highest Box_2D & Translation Accuracy):
-    # Google AI Studio (gemini-3-flash-preview)
+    # Tier 1: Google AI Studio (gemini-3-flash-preview)
     if GEMINI_API_KEY:
         gemini_payload = {
             "contents": [
@@ -2250,8 +2311,7 @@ CRITICAL RULES:
         except Exception as e:
             print(f"Gemini Manga Vision warning: {e}")
 
-    # Tier 2 (Secondary - 300 RPM, ~30 Neurons/page, Gemini-3-derived):
-    # Cloudflare Workers AI (@cf/google/gemma-4-26b-a4b-it)
+    # Tier 2: Cloudflare Workers AI (@cf/google/gemma-4-26b-a4b-it)
     try:
         cf_content = await _call_cloudflare_vision_chat(manga_system_instruction, mime_type, b64_img)
         if cf_content:
@@ -2271,7 +2331,7 @@ CRITICAL RULES:
     except Exception as e:
         print(f"Cloudflare Gemma 4 Manga Vision warning: {e}")
 
-    # Tier 3 (Fast LPU Backup): Groq Vision (qwen/qwen3.8-27b)
+    # Tier 3: Groq Vision (qwen/qwen3.8-27b)
     if GROQ_API_KEY:
         groq_vision_candidates = await _discover_active_groq_vision_models()
         chat_url = clean_url(f"{HTTPS}[api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)")
@@ -2379,12 +2439,6 @@ def _clean_single_bubble_lobe_fast(
     x2: int,
     y2: int,
 ) -> tuple[int, int, int, int, tuple[int, int, int], tuple[int, int, int]]:
-    """
-    Ultra-fast C-accelerated speech-bubble cleaner (<10ms per bubble on Render 0.1 vCPU!):
-    1) Blocks out the core boxes of all OTHER bubbles (so double/connected bubbles like Bubble #2
-       and Bubble #3 never steal each other's oval lobe!).
-    2) Uses C-accelerated ImageDraw.floodfill + ImageChops.difference + .getbbox() with zero Python pixel loops.
-    """
     width, height = img.size
     box_w = max(10, x2 - x1)
     box_h = max(10, y2 - y1)
@@ -2593,11 +2647,16 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
             await send_chunked_response(
                 channel,
                 f"**📖 คำแปลข้อความจากภาพ ({target_lang_name}):**\n\n{scene_summary}",
+                reply_to=msg,
             )
             return
 
         if not bubbles:
-            await channel.send("ไม่สามารถตรวจจับข้อความในภาพนี้ได้ค่ะ กรุณาตรวจสอบว่าภาพมีความคมชัดนะคะ")
+            await _send_or_reply(
+                channel,
+                msg,
+                content="ไม่สามารถตรวจจับข้อความในภาพนี้ได้ค่ะ กรุณาตรวจสอบว่าภาพมีความคมชัดนะคะ",
+            )
             return
 
         transcript_lines = [
@@ -2636,7 +2695,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
 
 
 # ==============================================================================
-# CORE CHAT & VOICE ORCHESTRATION (WITH SPEAKER IDENTITY RECOGNITION)
+# CORE CHAT & VOICE ORCHESTRATION (WITH SPEAKER PRONOUN RULES)
 # ==============================================================================
 async def query_local_ollama_chat(
     prompt: str,
@@ -2709,43 +2768,40 @@ async def query_local_ollama_chat(
             try:
                 ans = await _call_groq_chat(messages, GROQ_CODE_MODEL, temperature, is_coding=True)
                 if ans:
-                    return sanitize_yukino_output(ans, prompt)
+                    return sanitize_yukino_output(ans, prompt, speaker_user, speaker_name)
             except Exception as e:
                 print(f"Groq coding primary fallback to Modal GPU Ollama: {e}")
 
             try:
                 ans = await _call_modal_ollama_chat(messages, ACTIVE_CODE_MODEL, temperature)
                 if ans:
-                    return sanitize_yukino_output(ans, prompt)
+                    return sanitize_yukino_output(ans, prompt, speaker_user, speaker_name)
             except Exception as e:
                 print(f"Modal GPU coding error: {e}")
         else:
             try:
                 ans = await _call_modal_ollama_chat(messages, model, temperature)
                 if ans:
-                    return sanitize_yukino_output(ans, prompt)
+                    return sanitize_yukino_output(ans, prompt, speaker_user, speaker_name)
             except Exception as e:
                 print(f"Modal GPU chat fallback to Groq LPU: {e}")
 
             try:
                 ans = await _call_groq_chat(messages, GROQ_CHAT_FALLBACK_MODEL, temperature, is_coding=False)
                 if ans:
-                    return sanitize_yukino_output(ans, prompt)
+                    return sanitize_yukino_output(ans, prompt, speaker_user, speaker_name)
             except Exception as e:
                 print(f"Groq chat fallback error: {e}")
 
         return "ระบบประมวลผลทั้งฝั่ง Modal และ Groq ไม่สามารถเชื่อมต่อได้ชั่วคราวค่ะ กรุณาลองใหม่อีกครั้งนะคะ"
 
     answer = await _run_inference_pass(working_prompt)
-    if allow_agentic_search and not did_search:
-        match = AGENTIC_SEARCH_TAG_REGEX.search(answer)
-        if match:
-            search_block = await asyncio.to_thread(run_safe_web_search_sync, match.group(1).strip())
-            if search_block:
-                did_search = True
-                answer = await _run_inference_pass(
-                    f"{working_prompt}\n\n{search_block}\n\nสรุปคำตอบที่ตรงกับคำถามในบทบาท ยูกิโนะชิตะ ยูกิโนะ"
-                )
+
+    # Safety net: if an old memory turn caused the model to emit an empty response after tag stripping, re-run cleanly
+    if not answer.strip():
+        answer = await _run_inference_pass(
+            f"{working_prompt}\n\n(ตอบคำถามโดยตรงตามข้อมูลที่มีในบริบท ห้ามใช้แท็ก [SEARCH: ...] เด็ดขาด)"
+        )
 
     if channel_id is not None and answer:
         channel_memory[channel_id].append({"role": "user", "content": prompt[:2000]})
@@ -2886,12 +2942,12 @@ async def on_message(message: discord.Message):
 
     clean_prompt = re.sub(rf"\<@\!?{bot.user.id}\>", "", message.content).strip()
 
-    # 1. Natural Chat Manga / Image Translation Trigger (Always replies to the request message)
+    # 1. Natural Chat Manga / Image Translation Trigger
     if MANGA_TRANSLATE_INTENT_PATTERN.search(clean_prompt):
         await process_manga_translation_request(message, clean_prompt)
         return
 
-    # 2. Natural Chat Image Generation Trigger (Always replies to the request message)
+    # 2. Natural Chat Image Generation Trigger
     if not message.attachments and IMAGE_GEN_INTENT_PATTERN.search(clean_prompt):
         async with message.channel.typing():
             await send_generated_image_to_channel(message.channel, clean_prompt, reply_to=message)
@@ -2930,7 +2986,6 @@ async def on_message(message: discord.Message):
             speaker_user=message.author,
         )
 
-        # Determine whether to use native Discord Reply (True for questions/tasks, False for simple greetings/time)
         use_reply = should_reply_to_message(
             user_request, has_attachments=bool(message.attachments or extracted_ctx)
         )
@@ -2952,7 +3007,7 @@ async def on_message(message: discord.Message):
 @bot.command(name="join")
 async def join_voice(ctx):
     if not ctx.author.voice or not ctx.author.voice.channel:
-        await ctx.send("คุณต้องเข้าไปอยู่ในห้องเสียงก่อนนะคะ ถึงจะเรียกฉันเข้าไปได้")
+        await ctx.send("ต้องเข้าไปอยู่ในห้องเสียงก่อนนะคะ ถึงจะเรียกฉันเข้าไปได้")
         return
     target_channel = ctx.author.voice.channel
     try:
@@ -2983,7 +3038,7 @@ async def join_voice(ctx):
     except Exception as e:
         await ctx.send(
             f"เกิดข้อผิดพลาดขณะเชื่อมต่อห้องเสียงค่ะ (`{type(e).__name__}: {e}`) "
-            "แต่คุณยังสามารถส่งไฟล์เสียงเข้าแชทเพื่อให้ฉันตอบกลับเป็นเสียงพูดได้ตามปกตินะคะ"
+            "แต่ยังส่งไฟล์เสียงเข้าแชทเพื่อให้ฉันตอบกลับเป็นเสียงพูดได้ตามปกตินะคะ"
         )
 
 
