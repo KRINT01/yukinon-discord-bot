@@ -2052,7 +2052,62 @@ CRITICAL RULES:
     fallback_bubbles_no_boxes = []
     fallback_summary = ""
 
-    # Tier 1 (Primary - Fast LPU): Groq Vision (qwen/qwen3.8-27b)
+    # Tier 1 (Primary - 300 RPM, ~30 Neurons/page, Gemini-3-derived):
+    # Cloudflare Workers AI (@cf/google/gemma-4-26b-a4b-it)
+    try:
+        cf_content = await _call_cloudflare_vision_chat(manga_system_instruction, mime_type, b64_img)
+        if cf_content:
+            bubbles, summary = _parse_manga_bubbles_json(cf_content)
+            if bubbles:
+                has_boxes_and_text = any(
+                    isinstance(b.get("box_2d"), list)
+                    and len(b["box_2d"]) == 4
+                    and bool(b.get("translated_text"))
+                    for b in bubbles
+                )
+                if has_boxes_and_text:
+                    print(f"[Manga Vision] Completed via Tier 1 Cloudflare Gemma 4 - {len(bubbles)} bubbles")
+                    return bubbles, summary
+                fallback_bubbles_no_boxes = bubbles
+                fallback_summary = summary
+    except Exception as e:
+        print(f"Cloudflare Gemma 4 Manga Vision warning: {e}")
+
+    # Tier 2 (High-Precision Google AI Studio): Gemini 3 Flash (gemini-3-flash-preview)
+    if GEMINI_API_KEY:
+        gemini_payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": manga_system_instruction},
+                        {"inlineData": {"mimeType": mime_type, "data": b64_img}},
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.1,
+                "responseMimeType": "application/json",
+                "thinkingConfig": {"thinkingBudget": 0},
+            },
+        }
+        try:
+            data = await call_gemini_generate_content_self_healing(gemini_payload, timeout_sec=45)
+            if data:
+                parts = (
+                    ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                )
+                raw_json_str = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+                bubbles, summary = _parse_manga_bubbles_json(raw_json_str)
+                if bubbles:
+                    print(
+                        f"[Manga Vision] Completed via Tier 2 Gemini ({_ACTIVE_GEMINI_MODEL_CACHE}) "
+                        f"- {len(bubbles)} bubbles"
+                    )
+                    return bubbles, summary
+        except Exception as e:
+            print(f"Gemini Manga Vision warning: {e}")
+
+    # Tier 3 (Fast LPU Backup - 8K TPM / 200K TPD): Groq Vision (qwen/qwen3.8-27b)
     if GROQ_API_KEY:
         groq_vision_candidates = await _discover_active_groq_vision_models()
         chat_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/chat/completions")
@@ -2091,70 +2146,16 @@ CRITICAL RULES:
                                     for b in bubbles
                                 )
                                 if has_boxes_and_text:
-                                    print(f"[Manga Vision] Completed via Tier 1 Groq ({g_model}) - {len(bubbles)} bubbles")
+                                    print(f"[Manga Vision] Completed via Tier 3 Groq ({g_model}) - {len(bubbles)} bubbles")
                                     return bubbles, summary
-                                fallback_bubbles_no_boxes = bubbles
-                                fallback_summary = summary
+                                if not fallback_bubbles_no_boxes:
+                                    fallback_bubbles_no_boxes = bubbles
+                                    fallback_summary = summary
                         else:
                             err_txt = await resp.text()
                             print(f"Groq Manga Vision ({g_model}) HTTP {resp.status}: {err_txt[:150]}")
                 except Exception as e:
                     print(f"Groq Manga Vision ({g_model}) warning: {e}")
-
-    # Tier 2 (High-Precision Box_2D + Manga OCR): Google AI Studio (gemini-3-flash-preview)
-    if GEMINI_API_KEY:
-        gemini_payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {"text": manga_system_instruction},
-                        {"inlineData": {"mimeType": mime_type, "data": b64_img}},
-                    ]
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.1,
-                "responseMimeType": "application/json",
-                "thinkingConfig": {"thinkingBudget": 0},
-            },
-        }
-        try:
-            data = await call_gemini_generate_content_self_healing(gemini_payload, timeout_sec=45)
-            if data:
-                parts = (
-                    ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-                )
-                raw_json_str = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
-                bubbles, summary = _parse_manga_bubbles_json(raw_json_str)
-                if bubbles:
-                    print(
-                        f"[Manga Vision] Completed via Tier 2 Gemini ({_ACTIVE_GEMINI_MODEL_CACHE}) "
-                        f"- {len(bubbles)} bubbles"
-                    )
-                    return bubbles, summary
-        except Exception as e:
-            print(f"Gemini Manga Vision warning: {e}")
-
-    # Tier 3 (Backup Edge GPU): Cloudflare Workers AI Vision (@cf/meta/llama-4-scout-17b-16e-instruct)
-    try:
-        cf_content = await _call_cloudflare_vision_chat(manga_system_instruction, mime_type, b64_img)
-        if cf_content:
-            bubbles, summary = _parse_manga_bubbles_json(cf_content)
-            if bubbles:
-                has_boxes_and_text = any(
-                    isinstance(b.get("box_2d"), list)
-                    and len(b["box_2d"]) == 4
-                    and bool(b.get("translated_text"))
-                    for b in bubbles
-                )
-                if has_boxes_and_text:
-                    print(f"[Manga Vision] Completed via Tier 3 Cloudflare Workers AI - {len(bubbles)} bubbles")
-                    return bubbles, summary
-                if not fallback_bubbles_no_boxes:
-                    fallback_bubbles_no_boxes = bubbles
-                    fallback_summary = summary
-    except Exception as e:
-        print(f"Cloudflare Manga Vision warning: {e}")
 
     if fallback_bubbles_no_boxes:
         return fallback_bubbles_no_boxes, fallback_summary
