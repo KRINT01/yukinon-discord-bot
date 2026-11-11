@@ -68,52 +68,125 @@ def api_log(msg: str):
     print(f"[API] {msg}", flush=True)
 
 
-# Silence noisy RTCP SenderReport logs (type=200) from discord-ext-voice-recv
-logging.getLogger("discord.ext.voice_recv").setLevel(logging.WARNING)
+# Silence noisy RTCP SenderReport logs (type=200) and gateway warnings from discord-ext-voice-recv
+logging.getLogger("discord.ext.voice_recv").setLevel(logging.ERROR)
+logging.getLogger("discord.ext.voice_recv.opus").setLevel(logging.ERROR)
+logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.ERROR)
+logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.ERROR)
 
-# Save discord.py 2.7's native Voice WebSocket handler BEFORE voice_recv overwrites it
-import discord.gateway as _dpy_gateway
-_NATIVE_DPY_VOICE_WS_RECEIVED = _dpy_gateway.DiscordVoiceWebSocket.received_message
+OPUS_SILENCE_FRAME = b"\xf8\xff\xfe"
+PCM_SILENCE_20MS = b"\x00" * 3840
 
 try:
     from discord.ext import voice_recv
     import discord.ext.voice_recv.opus as _vr_opus
+    import discord.ext.voice_recv.gateway as _vr_gateway
 
-    _VOICE_RECV_WS_RECEIVED = _dpy_gateway.DiscordVoiceWebSocket.received_message
+    _ORIG_VR_PAYLOAD_ROUTER = _vr_gateway.payload_router
 
-    async def _dpy27_dave_compatible_received_message(self, msg):
-        await _NATIVE_DPY_VOICE_WS_RECEIVED(self, dict(msg) if isinstance(msg, dict) else msg)
-        if isinstance(msg, dict) and msg.get("op") in (5, 12, 13, 18, 20):
-            try:
-                vr_msg = dict(msg)
-                vr_msg.pop("seq", None)
-                await _VOICE_RECV_WS_RECEIVED(self, vr_msg)
-            except Exception:
-                pass
+    def _dpy27_safe_gateway_hook(ws, vc):
+        """
+        Wraps the Voice WebSocket instance so:
+        1) discord.py 2.7's native received_message runs ONCE on all frames (including binary DAVE MLS bytes).
+        2) Binary DAVE MLS frames (bytes) never reach voice_recv's payload_router (which crashes on msg.pop('op')).
+        3) SSRC -> user_id mappings are captured from op 5 (SPEAKING) and op 12 (CLIENTS_CONNECT).
+        """
+        orig_received_message = ws.received_message
 
-    _dpy_gateway.DiscordVoiceWebSocket.received_message = _dpy27_dave_compatible_received_message
+        async def _wrapped_received_message(msg):
+            await orig_received_message(msg)
+
+            if isinstance(msg, dict):
+                op = msg.get("op")
+                data = msg.get("d")
+                if op == 5 and isinstance(data, dict):
+                    uid, ssrc = data.get("user_id"), data.get("ssrc")
+                    if uid and ssrc is not None:
+                        try:
+                            vc._add_ssrc(int(uid), int(ssrc))
+                        except Exception:
+                            pass
+                elif op == 12 and isinstance(data, dict):
+                    uid, ssrc = data.get("user_id"), data.get("audio_ssrc")
+                    if uid and ssrc:
+                        try:
+                            vc._add_ssrc(int(uid), int(ssrc))
+                        except Exception:
+                            pass
+                if op in (5, 12, 13, 18, 20):
+                    try:
+                        vr_copy = {"op": op, "d": dict(data) if isinstance(data, dict) else data}
+                        await _ORIG_VR_PAYLOAD_ROUTER(vc, vr_copy)
+                    except Exception:
+                        pass
+
+        ws.received_message = _wrapped_received_message
+
+    _vr_gateway.hook = _dpy27_safe_gateway_hook
+    if hasattr(voice_recv, "voice_client") and hasattr(voice_recv.voice_client, "hook"):
+        voice_recv.voice_client.hook = _dpy27_safe_gateway_hook
+
+    _ORIG_DECODE_PACKET = _vr_opus.PacketDecoder._decode_packet
 
     def _safe_dave_decode_packet(self, packet):
         if not packet or not getattr(packet, "decrypted_data", None):
-            return packet, b""
-        try:
-            vc = getattr(getattr(self, "sink", None), "voice_client", None)
-            conn = getattr(vc, "_connection", None)
-            dave_session = getattr(conn, "dave_session", None)
+            return packet, PCM_SILENCE_20MS
 
-            if dave_session is not None and davey is not None:
-                user_id = vc._get_id_from_ssrc(packet.ssrc) if hasattr(vc, "_get_id_from_ssrc") else None
-                if user_id is None:
-                    return packet, b""
-                if not dave_session.can_passthrough(user_id):
-                    packet.decrypted_data = dave_session.decrypt(
-                        user_id, davey.MediaType.audio, packet.decrypted_data
+        # 3-byte payloads (b'\xf8\xff\xfe') are unencrypted Opus silence frames — never pass to DAVE decrypt
+        if len(packet.decrypted_data) > 3:
+            try:
+                sink_obj = getattr(self, "sink", None)
+                vc = (
+                    getattr(sink_obj, "voice_client", None)
+                    or getattr(sink_obj, "_voice_client", None)
+                )
+                conn = getattr(vc, "_connection", None) if vc is not None else None
+                dave_session = getattr(conn, "dave_session", None) if conn is not None else None
+                dave_version = getattr(conn, "dave_protocol_version", 0) if conn is not None else 0
+
+                if dave_session is not None and dave_version > 0 and davey is not None:
+                    ssrc = getattr(self, "ssrc", None) or getattr(packet, "ssrc", None)
+                    user_id = getattr(self, "_cached_id", None) or (
+                        vc._get_id_from_ssrc(ssrc) if (vc and hasattr(vc, "_get_id_from_ssrc") and ssrc) else None
                     )
 
-            pcm = self._decoder.decode(packet.decrypted_data, fec=False)
-            return packet, pcm
+                    # Fallback: if user was already in VC before bot joined, test human members in channel
+                    if not user_id and vc and getattr(vc, "channel", None):
+                        human_members = [m for m in vc.channel.members if not m.bot]
+                        for m in human_members:
+                            try:
+                                if dave_session.can_passthrough(int(m.id)):
+                                    user_id = m.id
+                                    break
+                                dec = dave_session.decrypt(
+                                    int(m.id), davey.MediaType.audio, packet.decrypted_data
+                                )
+                                if dec:
+                                    packet.decrypted_data = dec
+                                    user_id = m.id
+                                    self._cached_id = m.id
+                                    if ssrc and hasattr(vc, "_add_ssrc"):
+                                        vc._add_ssrc(int(m.id), int(ssrc))
+                                    return _ORIG_DECODE_PACKET(self, packet)
+                            except Exception:
+                                continue
+
+                    if not user_id:
+                        packet.decrypted_data = OPUS_SILENCE_FRAME
+                    else:
+                        uid_int = int(user_id)
+                        self._cached_id = uid_int
+                        if not dave_session.can_passthrough(uid_int):
+                            packet.decrypted_data = dave_session.decrypt(
+                                uid_int, davey.MediaType.audio, packet.decrypted_data
+                            )
+            except Exception:
+                packet.decrypted_data = OPUS_SILENCE_FRAME
+
+        try:
+            return _ORIG_DECODE_PACKET(self, packet)
         except Exception:
-            return packet, b""
+            return packet, PCM_SILENCE_20MS
 
     _vr_opus.PacketDecoder._decode_packet = _safe_dave_decode_packet
     HAS_VOICE_RECV = True
@@ -1231,11 +1304,10 @@ async def _fallback_google_tts_with_yukino_pitch(
     if not raw_mp3_parts:
         return b""
 
-    # Kuudere calm tone (1.06x pitch, 0.98x tempo) vs Flustered Gap-Moe tone (1.10x pitch, 1.04x tempo)
     af_filter = (
-        "asetrate=24000*1.10,aresample=24000,atempo=1.04"
+        "asetrate=24000*1.10,aresample=48000,atempo=1.04,volume=1.6"
         if is_flustered
-        else "asetrate=24000*1.06,aresample=24000,atempo=0.98"
+        else "asetrate=24000*1.06,aresample=48000,atempo=0.98,volume=1.6"
     )
 
     def _apply_ffmpeg_yukino_voice(mp3_bytes: bytes) -> bytes:
@@ -1243,6 +1315,7 @@ async def _fallback_google_tts_with_yukino_pitch(
             [
                 "ffmpeg", "-i", "pipe:0",
                 "-af", af_filter,
+                "-ac", "2", "-ar", "48000", "-b:a", "128k",
                 "-f", "mp3", "pipe:1", "-loglevel", "error"
             ],
             input=mp3_bytes,
@@ -3042,13 +3115,14 @@ async def handle_spoken_voice_command(
 
 
 class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
-    SPEECH_FRAME_RMS_THRESHOLD = 450
-    MIN_ACTIVE_SPEECH_FRAMES = 15
+    SPEECH_FRAME_RMS_THRESHOLD = 250
+    MIN_ACTIVE_SPEECH_FRAMES = 10
 
-    def __init__(self, guild: discord.Guild, text_channel):
+    def __init__(self, guild: discord.Guild, text_channel, vc=None):
         super().__init__()
         self.guild = guild
         self.text_channel = text_channel
+        self._vc_ref = vc
         self._lock = threading.Lock()
         self.user_buffers = defaultdict(bytearray)
         self.speech_frame_counts = defaultdict(int)
@@ -3056,11 +3130,38 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
         self.running = True
         self.monitor_task = bot.loop.create_task(self._silence_monitor_loop())
 
+    @property
+    def voice_client(self):
+        return self._vc_ref or getattr(self, "_voice_client", None) or self.guild.voice_client
+
     def wants_opus(self) -> bool:
         return False
 
+    def _resolve_speaker(self, user, data):
+        if user is not None:
+            return user
+        vc = self.voice_client
+        if not vc:
+            return None
+        pkt = getattr(data, "packet", None)
+        ssrc = getattr(pkt, "ssrc", None)
+        if ssrc and hasattr(vc, "_get_id_from_ssrc"):
+            uid = vc._get_id_from_ssrc(ssrc)
+            if uid:
+                member = self.guild.get_member(int(uid))
+                if member:
+                    return member
+        if getattr(vc, "channel", None):
+            humans = [m for m in vc.channel.members if not m.bot]
+            if len(humans) == 1:
+                return humans[0]
+        return None
+
     def write(self, user, data):
-        if not user or user.bot or not hasattr(data, "pcm") or not data.pcm:
+        if not hasattr(data, "pcm") or not data.pcm:
+            return
+        speaker = self._resolve_speaker(user, data)
+        if not speaker or speaker.bot:
             return
         if self.guild.voice_client and self.guild.voice_client.is_playing():
             return
@@ -3072,11 +3173,11 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
         now = time.monotonic()
         with self._lock:
             if frame_rms >= self.SPEECH_FRAME_RMS_THRESHOLD:
-                self.user_buffers[user].extend(data.pcm)
-                self.speech_frame_counts[user] += 1
-                self.last_spoken[user] = now
-            elif user in self.user_buffers and (now - self.last_spoken.get(user, 0) < 0.8):
-                self.user_buffers[user].extend(data.pcm)
+                self.user_buffers[speaker].extend(data.pcm)
+                self.speech_frame_counts[speaker] += 1
+                self.last_spoken[speaker] = now
+            elif speaker in self.user_buffers and (now - self.last_spoken.get(speaker, 0) < 0.8):
+                self.user_buffers[speaker].extend(data.pcm)
 
     def cleanup(self):
         self.running = False
@@ -3094,13 +3195,18 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
             ready_payloads = []
             with self._lock:
                 for user, last_t in list(self.last_spoken.items()):
-                    if now - last_t >= 1.1:
+                    if now - last_t >= 1.0:
                         pcm_bytes = bytes(self.user_buffers.pop(user, b""))
                         active_frames = self.speech_frame_counts.pop(user, 0)
                         self.last_spoken.pop(user, None)
-                        if active_frames >= self.MIN_ACTIVE_SPEECH_FRAMES and len(pcm_bytes) >= 57600:
-                            ready_payloads.append((user, pcm_bytes))
-            for user, pcm_bytes in ready_payloads:
+                        if active_frames >= self.MIN_ACTIVE_SPEECH_FRAMES and len(pcm_bytes) >= 38400:
+                            ready_payloads.append((user, pcm_bytes, active_frames))
+            for user, pcm_bytes, active_frames in ready_payloads:
+                print(
+                    f"[Voice VAD] Captured speech from {user.display_name} "
+                    f"({active_frames} active frames, {len(pcm_bytes)} bytes)",
+                    flush=True,
+                )
                 bot.loop.create_task(self._process_user_pcm(user, pcm_bytes))
 
     async def _process_user_pcm(self, user, pcm_bytes: bytes):
@@ -3118,7 +3224,7 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
                     self.guild, self.text_channel, user, user.display_name, spoken_text
                 )
         except Exception as e:
-            print(f"Voice PCM processing error: {e}")
+            print(f"Voice PCM processing error: {e}", flush=True)
 
 
 async def process_yukipedia_request(ctx_or_message, raw_prompt: str = ""):
@@ -3320,10 +3426,24 @@ async def join_voice(ctx):
                 timeout=15.0,
             )
         )
-        await asyncio.sleep(1.0)
+
+        # Wait up to 2.0s for DAVE E2EE MLS handshake to finish before transmitting audio
+        for _ in range(10):
+            await asyncio.sleep(0.2)
+            conn = getattr(vc, "_connection", None)
+            if getattr(conn, "dave_session", None) is not None:
+                break
 
         if HAS_VOICE_RECV and hasattr(vc, "listen"):
-            vc.listen(SilenceGatedVoiceSink(ctx.guild, ctx.channel))
+            vc.listen(SilenceGatedVoiceSink(ctx.guild, ctx.channel, vc=vc))
+
+        conn = getattr(vc, "_connection", None)
+        dave_active = getattr(conn, "dave_session", None) is not None
+        print(
+            f"[Voice Join] Connected to '{target_channel.name}' "
+            f"(discord.py={discord.__version__}, davey={davey is not None}, dave_session={dave_active})",
+            flush=True,
+        )
 
         await ctx.send(f"เข้ามาในห้องเสียง `{target_channel.name}` แล้วค่ะ 🎙️")
         await speak_in_voice_channel(
