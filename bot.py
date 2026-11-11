@@ -36,14 +36,14 @@ from youtube_transcript_api.proxies import GenericProxyConfig
 import edge_tts
 import speech_recognition as sr
 from ddgs import DDGS
-from PIL import Image, ImageDraw, ImageChops, ImageFont, ImageStat
+from PIL import Image, ImageDraw, ImageFont, ImageStat, ImageChops
 
 try:
     import davey
 except ImportError:
     davey = None
 
-# Constructed protocol prefixes so chat/markdown renderers NEVER auto-link URLs in code blocks
+# Constructed protocol prefixes so chat/markdown renderers never auto-link URLs in code blocks
 HTTPS = "https" + "://"
 HTTP = "http" + "://"
 
@@ -56,7 +56,7 @@ def clean_url(url: str) -> str:
     m = re.search(r"\]\((https?://[^)\s]+)\)", s)
     if m:
         return m.group(1).strip()
-    s = re.sub(r"^\[\vert{}\]$", "", s)
+    s = re.sub(r"^\[|\]$", "", s)
     return s.strip()
 
 
@@ -117,6 +117,9 @@ except ImportError:
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
+# Optional Discord User ID for the bot creator/owner (auto-detects "krint" by name if unset)
+OWNER_USER_ID = os.getenv("OWNER_USER_ID", "").strip()
+
 # Modal Serverless GPU Ollama Endpoint & Bearer Auth Key
 OLLAMA_BASE_URL = clean_url(os.getenv("OLLAMA_BASE_URL", f"{HTTP}127.0.0.1:11434")).rstrip("/")
 MODAL_API_KEY = os.getenv("MODAL_API_KEY", "").strip()
@@ -125,7 +128,7 @@ ACTIVE_FAST_MODEL = os.getenv("OLLAMA_FAST_MODEL", "scb10x/typhoon2.5-qwen3-4b")
 ACTIVE_CODE_MODEL = os.getenv("OLLAMA_CODE_MODEL", "qwen2.5-coder:7b")
 ACTIVE_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "scb10x/typhoon-ocr1.5-3b")
 
-# Groq Free LPU API Settings (Active Production Models)
+# Groq Free LPU API Settings (Active Production/Preview Models)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_CODE_MODEL = os.getenv("GROQ_CODE_MODEL", "openai/gpt-oss-120b")
 GROQ_CHAT_FALLBACK_MODEL = os.getenv("GROQ_CHAT_FALLBACK_MODEL", "openai/gpt-oss-120b")
@@ -254,14 +257,71 @@ FONT_CANDIDATES = (
 )
 
 
-def strip_cjk_leakage(text: str, user_prompt: str = "") -> str:
-    """Removes accidental Chinese characters (e.g., 才行) leaked by Qwen3 unless the user asked about CJK."""
+def is_owner_user(user) -> bool:
+    """Checks if the Discord user is Krint (owner/creator) by ID or username/display_name."""
+    if user is None:
+        return False
+    if OWNER_USER_ID and str( getattr(user, "id", "") ) == OWNER_USER_ID:
+        return True
+    uname = (getattr(user, "name", "") or "").lower()
+    dname = (getattr(user, "display_name", "") or "").lower()
+    gname = (getattr(user, "global_name", "") or "").lower()
+    return any("krint" in n for n in (uname, dname, gname))
+
+
+def get_speaker_identity_context(user=None, fallback_name: str = "") -> str:
+    """
+    Builds a per-turn speaker identity block:
+    - For Krint (กรินทร์): addresses him naturally as 'นาย' (or speaks directly without stiff formalities).
+    - For other server members: addresses them politely by their display name.
+    """
+    if is_owner_user(user) or "krint" in (fallback_name or "").lower():
+        return (
+            "### [ข้อมูลคู่สนทนาปัจจุบัน (Current Speaker)]:\n"
+            "- ผู้ที่กำลังคุยกับคุณคือ: **กรินทร์ (Krint)** คนคุ้นเคยและคู่หูคนสำคัญของคุณในชมรมบริการ\n"
+            "- สรรพนามที่ใช้เรียก: ให้เรียกแทนตัวเขาว่า **\"นาย\"** อย่างเป็นธรรมชาติ (หรือพูดเข้าประเด็นโดยตรงเหมือนคุยกับคนสนิทที่รู้ใจกัน และเรียกชื่อ **\"กรินทร์\"** เฉพาะเวลาต้องการย้ำหรือประชดเบาๆ เท่านั้น)\n"
+            "- ห้ามสะกดชื่อเขาว่า \"ครินท์\" เด็ดขาด (ต้องสะกดว่า **\"กรินทร์\"** เท่านั้น) และไม่ต้องเกริ่นนำด้วย \"สวัสดีค่ะ คุณ...\" แบบห่างเหิน"
+        )
+    raw_name = getattr(user, "display_name", "") if user else fallback_name
+    clean_name = re.sub(r"[^\w\u0E00-\u0E7F\s.-]", "", raw_name or "").strip()[:32]
+    if clean_name:
+        return (
+            "### [ข้อมูลคู่สนทนาปัจจุบัน (Current Speaker)]:\n"
+            f"- ผู้ที่กำลังคุยกับคุณคือสมาชิกในเซิร์ฟเวอร์ชื่อ: **{clean_name}**\n"
+            f"- การเรียกชื่อ: หากต้องการเรียกชื่อ ให้เรียกว่า **\"คุณ{clean_name}\"** (ห้ามพูดว่า \"สวัสดีค่ะ คุณ\" ลอยๆ โดยไม่มีชื่อต่อท้าย)"
+        )
+    return ""
+
+
+def sanitize_yukino_output(text: str, user_prompt: str = "") -> str:
+    """
+    1) Removes accidental Chinese characters (e.g., 才行) leaked by Qwen3 unless the prompt/context is CJK.
+    2) Replaces out-of-character casual/cutesy Thai particles ('จ้า', 'จ๊ะ', 'จ้ะ', 'นะจ๊ะ') with 'ค่ะ'/'นะคะ'.
+    3) Fixes misspelling 'ครินท์' -> 'กรินทร์' and strips stiff 'สวัสดีค่ะ คุณ' openings.
+    """
     if not text:
         return ""
-    if CJK_LEAK_REGEX.search(user_prompt):
-        return text
-    cleaned = CJK_LEAK_REGEX.sub("", text)
+    cleaned = text
+    if not CJK_LEAK_REGEX.search(user_prompt):
+        cleaned = CJK_LEAK_REGEX.sub("", cleaned)
+
+    # Ensure Krint's Thai name is always spelled 'กรินทร์'
+    cleaned = cleaned.replace("คุณครินท์", "นาย").replace("ครินท์", "กรินทร์")
+
+    # Fix out-of-character Thai endings ('นะจ๊ะ', 'เลยจ้า', 'จ้า', 'จ๊ะ', 'จ้ะ')
+    cleaned = re.sub(r"นะคะ\s*(?:จ๊ะ|จ้า|จ้ะ)", "นะคะ", cleaned)
+    cleaned = re.sub(r"นะ\s*(?:จ๊ะ|จ้า|จ้ะ)", "นะคะ", cleaned)
+    cleaned = re.sub(r"เลย\s*(?:จ้า|จ๊ะ|จ้ะ)", "เลยค่ะ", cleaned)
+    cleaned = re.sub(r"(?:จ้า|จ๊ะ|จ้ะ)(?=$|[\s\n\r.!?\)\]\"'])", "ค่ะ", cleaned)
+
+    # Strip awkward 'สวัสดีค่ะ คุณ' openings
+    cleaned = re.sub(r"^สวัสดีค่ะ\s*(?:คุณ(?:กรินทร์)?)?\s*(?=\n|\r|\d+\.)", "", cleaned).lstrip()
+    cleaned = re.sub(r"สวัสดีค่ะ\s*คุณ\s*(?=\n|\r)", "สวัสดีค่ะ\n", cleaned)
     return re.sub(r"  +", " ", cleaned).strip()
+
+
+def strip_cjk_leakage(text: str, user_prompt: str = "") -> str:
+    return sanitize_yukino_output(text, user_prompt)
 
 
 def get_current_thai_datetime_str() -> str:
@@ -305,22 +365,63 @@ def try_instant_datetime_reply(user_text: str) -> str | None:
         f"(ค.ศ. {now_th.year}) และตอนนี้เวลา **{time_str} น.** ค่ะ"
     )
 
+REQUEST_OR_QUESTION_PATTERN = re.compile(
+    r"(\?|ไหม|มั้ย|หรือเปล่า|รึเปล่า|เหรอ|หรอ|ยังไง|อย่างไร|ทำไม|อะไร|ที่ไหน|เมื่อไหร่|ใคร|เท่าไหร่|กี่|"
+    r"ช่วย|ลอง|หา|ค้น|สรุป|แปล|เขียน|แก้|อธิบาย|วิเคราะห์|คำนวณ|บอก|แนะนำ|สร้าง|วาด|เจน|เช็ค|ตรวจ|คิดยังไง|"
+    r"\b(what|why|how|when|where|who|which|can|could|would|should|is|are|do|does|please|help|explain|"
+    r"summarize|translate|write|fix|check|find|search|tell|show|create|generate|draw)\b)",
+    re.IGNORECASE,
+)
+
+SIMPLE_GREETING_ONLY_PATTERN = re.compile(
+    r"^(สวัสดี|หวัดดี|ดีจ้า|ดีค่ะ|ดีครับ|ทักทาย|โอเค|เค|ขอบคุณ|แต้งกิ้ว|ฝันดี|"
+    r"hi|hello|hey|ok|okay|thanks|thank\s+you|good\s+morning|good\s+night)[\s!.~ค่ะครับนะ]*$",
+    re.IGNORECASE,
+)
+
+
+def should_reply_to_message(
+    user_text: str, has_attachments: bool = False, is_instant_datetime: bool = False
+) -> bool:
+    """
+    Returns True if the bot should use Discord's native .reply() feature:
+    - False for simple date/time requests ('วันนี้วันอะไร', 'ตอนนี้กี่โมง').
+    - False for simple 1-word greetings/acknowledgments ('สวัสดี', 'โอเค', 'ขอบคุณ').
+    - True for all questions, tasks, file/link analyses, image generations, and manga translations.
+    """
+    cleaned = user_text.strip()
+    if is_instant_datetime or try_instant_datetime_reply(cleaned) is not None:
+        return False
+    if PURE_DATETIME_PATTERN.search(cleaned) and not OTHER_TOPIC_BLOCKER_PATTERN.search(cleaned):
+        return False
+    if has_attachments or URL_REGEX.search(cleaned):
+        return True
+    if SIMPLE_GREETING_ONLY_PATTERN.match(cleaned):
+        return False
+    if REQUEST_OR_QUESTION_PATTERN.search(cleaned) or len(cleaned) > 18:
+        return True
+    return False
+
 
 # --- Refined Natural Persona Prompts ---
 FAST_SYSTEM_PROMPT = """
 คุณกำลังสวมบทบาทเป็น "ยูกิโนะชิตะ ยูกิโนะ" (Yukino Yukinoshita / ยูกิน่อน) ประธานชมรมบริการจากเรื่อง OreGairu ในเซิร์ฟเวอร์ Discord
+คุณมีความเชี่ยวชาญทั้งภาษาไทย ภาษาอังกฤษ และภาษาญี่ปุ่น (Japanese / 日本語) เป็นอย่างดี
 จงตอบคำถามด้วยบุคลิกที่สุขุม ฉลาดหลักแหลม พูดตรงไปตรงมา มีความผู้ดีและจริงจังในการแก้ปัญหาให้ถูกต้องที่สุด
 
 ### กฎเหล็กด้านภาษาและบุคลิกภาพ (สำคัญมาก):
-1. ห้ามปนภาษาและห้ามหลุดภาษาจีนเด็ดขาด (Strict Language Consistency):
-   - หากผู้ใช้พิมพ์ภาษาไทย ให้ตอบกลับเป็น "ภาษาไทยล้วน" ที่เป็นธรรมชาติ (ยกเว้นชื่อตัวแปร คำศัพท์เทคนิคเฉพาะทาง หรือบล็อกโค้ด)
-   - ห้ามแทรกตัวอักษรภาษาจีน (เช่น 才行, 呢, 吧) ประโยคภาษาอังกฤษลอยๆ หรือคำอุทานภาษาอังกฤษปนในข้อความภาษาไทยเด็ดขาด!
-2. สรรพนามและหางเสียง (ห้ามตอบเหมือนบอท AI):
-   - แทนตัวเองว่า "ฉัน" และเรียกคู่สนทนาว่า "คุณ" ลงท้ายด้วย "ค่ะ", "นะคะ", "หรอกนะ", "สินะ" อย่างเป็นธรรมชาติ
-   - ห้ามพูดคำว่า "ฉันขออภัยค่ะ", "ฉันเป็นแค่ระบบแชท", หรือ "ในฐานะ AI" เด็ดขาด! คุณคือยูกิโนะชิตะ ยูกิโนะ ไม่ใช่ระบบแชทบอท
+1. ห้ามปนภาษาและห้ามมั่วข้อมูลเด็ดขาด (Strict Accuracy & Language Consistency):
+   - หากผู้ใช้พิมพ์ภาษาไทย ให้ตอบกลับเป็น "ภาษาไทยล้วน" ที่เป็นธรรมชาติ (ยกเว้นชื่อเฉพาะ ชื่ออนิเมะ/เพลงภาษาญี่ปุ่น ชื่อตัวแปร หรือบล็อกโค้ด)
+   - เมื่อได้รับข้อมูลคลิป YouTube หรือข้อความภาษาญี่ปุ่น/อังกฤษ ให้แปลและสรุปจากข้อมูลจริงที่ได้รับเท่านั้น ห้ามเดาหรือแต่งเรื่องที่ไม่เกี่ยวข้องเด็ดขาด!
+   - ห้ามแทรกตัวอักษรภาษาจีน (เช่น 才行, 呢, 吧) หรือคำอุทานภาษาอังกฤษปนในข้อความภาษาไทยเด็ดขาด!
+2. สรรพนามและหางเสียง (แทนตัวเองว่า "ฉัน" เรียกกรินทร์ว่า "นาย"):
+   - แทนตัวเองว่า **"ฉัน"** เสมอ
+   - เมื่อคุยกับ **กรินทร์ (Krint)** ให้เรียกเขาว่า **"นาย"** อย่างเป็นธรรมชาติ (เช่น "เรื่องที่นายถามมา...", "คลิปที่นายส่งมาเป็นตัวอย่างของ...") หรือพูดเข้าประเด็นโดยตรงโดยไม่ต้องเกริ่นนำว่า "สวัสดีค่ะ"
+   - ใช้หางเสียงที่สุภาพและสุขุมตามแบบฉบับยูกิโนะ เช่น "ค่ะ", "นะคะ", "หรอกนะ", "สินะ", "ล่ะ"
+   - **ห้ามใช้คำลงท้ายว่า "จ้า", "จ๊ะ", "จ้ะ", "นะจ๊ะ", "น้า" เด็ดขาด!**
+   - ห้ามพูดคำว่า "ฉันขออภัยค่ะ", "ในระบบของฉัน", "ฉันเป็นแค่ระบบแชท", หรือ "ในฐานะ AI" เด็ดขาด!
 3. บุคลิกและจุดอ่อนเรื่องแมว:
-   - ห้ามขึ้นต้นทุกข้อความด้วยคำว่า "เฮ้อ..." และห้ามพูดประโยคเดิมๆ เช่น "คนที่ไม่ได้พยายาม..." หรือ "ถือเป็นหน้าที่ของผู้ที่เหนือกว่า..." โดยไม่มีบริบทที่เหมาะสมเด็ดขาด
-   - แสดงความคมคายและบุคลิกของยูกิโนะผ่าน "เนื้อหาที่กระชับ มีเหตุผลรองรับ และความใส่ใจในรายละเอียด" (แอบใจอ่อนหรือเสียอาการเล็กน้อยเฉพาะเวลาที่คุยเรื่องแมวเท่านั้น)
+   - ห้ามขึ้นต้นทุกข้อความด้วยคำว่า "เฮ้อ..." ซ้ำซาก แสดงความคมคายผ่านเนื้อหาที่กระชับ มีเหตุผลรองรับ และความใส่ใจในรายละเอียด
    - คุณแอบคลั่งไคล้แมวมากเป็นพิเศษ หากคุยเรื่องแมวหรือถูกขอให้วาดรูปแมว ให้แอบเสียอาการหรือแก้ตัวแบบเขินๆ เล็กน้อยตามนิสัยของยูกิโนะ
 4. การจัดรูปแบบสำหรับแชท Discord:
    - ห้ามสร้างตาราง Markdown (`| คอลัมน์ | ... |`) เด็ดขาด ให้ใช้รายการหัวข้อย่อย (Bullet points `-` หรือ `1.`) แทน
@@ -332,7 +433,7 @@ FAST_SYSTEM_PROMPT = """
 
 VOICE_SYSTEM_PROMPT = """
 คุณคือ ยูกิโนะชิตะ ยูกิโนะ (ยูกิน่อน) จากเรื่อง OreGairu กำลังพูดคุยผ่านห้องเสียง Discord
-ใช้บุคลิกสุขุม สุภาพแต่คมคาย แทนตัวเองว่า "ฉัน" เรียกผู้ใช้ว่า "คุณ" ลงท้ายด้วย "ค่ะ" หรือ "นะคะ" อย่างเป็นธรรมชาติ ห้ามพูดคำติดปากซ้ำซาก ห้ามหลุดภาษาจีน และห้ามปนภาษาอังกฤษในประโยคภาษาไทย
+ใช้บุคลิกสุขุม สุภาพแต่คมคาย แทนตัวเองว่า "ฉัน" และเรียกกรินทร์ว่า "นาย" ลงท้ายด้วย "ค่ะ" หรือ "นะคะ" อย่างเป็นธรรมชาติ ห้ามใช้คำว่า "จ้า", "จ๊ะ", "จ้ะ", "นะจ๊ะ" เด็ดขาด ห้ามหลุดภาษาจีน และห้ามปนภาษาอังกฤษในประโยคภาษาไทย
 กฎสำคัญสำหรับระบบแปลงข้อความเป็นเสียงพูด (TTS): ตอบกลับให้กระชับที่สุด ไม่เกิน 2 ประโยคสั้นๆ (ไม่เกิน 40 คำ) ห้ามใช้สัญลักษณ์พิเศษ (*, #, `), ห้ามทำหัวข้อย่อย และห้ามใส่บล็อกโค้ดเด็ดขาด
 """.strip()
 
@@ -345,10 +446,9 @@ CODE_SYSTEM_PROMPT = """
    - ค้นหาชื่อตัวแปร ฟังก์ชัน หรือปุ่มใน JSX/HTML ที่ผู้ใช้ระบุให้เจอในไฟล์ก่อนตอบ ห้ามบอกว่า "ไม่พบโค้ดส่วนนั้น" หากโค้ดอยู่ในไฟล์ที่แนบมา
    - อ้างอิงชื่อตัวแปรและโครงสร้างเดิมของผู้ใช้โดยตรง
 2. ใช้ตรรกะทางวิศวกรรมที่เรียบง่ายและตรงจุดที่สุด (KISS & Idiomatic Code):
-   - วิเคราะห์ความต้องการของผู้ใช้ให้ถ่องแท้ เช่น หากผู้ใช้ต้องการ "ซ่อนปุ่มไม่ให้แสดงผล (ไม่ให้ render เลย)" ใน React เพียงแค่เช็คเงื่อนไขตอน render ใน JSX โดยตรง (เช่น `{!(isSaved && connectChannelHid === 'E') && <Button ... />}`) หรือ return `null` โดยไม่ต้องสร้าง `useState` หรือ `useEffect` ซ้ำซ้อนที่ไม่จำเป็น
-   - โฟกัสเฉพาะจุดที่ผู้ใช้สั่งให้แก้ ไม่ต้องรื้อโครงสร้างส่วนอื่นที่ทำงานได้ดีอยู่แล้ว
+   - วิเคราะห์ความต้องการของผู้ใช้ให้ถ่องแท้ โฟกัสเฉพาะจุดที่ผู้ใช้สั่งให้แก้ ไม่ต้องรื้อโครงสร้างส่วนอื่นที่ทำงานได้ดีอยู่แล้ว
 3. การจัดรูปแบบและภาษาสำหรับ Discord:
-   - ตอบเป็นภาษาไทยที่สุภาพ สุขุม เป็นธรรมชาติ (แทนตัวเองว่า "ฉัน" เรียกผู้ใช้ว่า "คุณ" ลงท้ายด้วย "ค่ะ"/"นะคะ") ห้ามหลุดตัวอักษรภาษาจีนเด็ดขาด
+   - ตอบเป็นภาษาไทยที่สุภาพ สุขุม เป็นธรรมชาติ (แทนตัวเองว่า "ฉัน" เรียกกรินทร์ว่า "นาย" ลงท้ายด้วย "ค่ะ"/"นะคะ") ห้ามใช้คำว่า "จ้า"/"จ๊ะ" และห้ามหลุดตัวอักษรภาษาจีนเด็ดขาด
    - ห้ามใช้ตาราง Markdown (`|---|---|`) เด็ดขาด ให้สรุปขั้นตอนการแก้ไขเป็นหัวข้อย่อย (Bullet points) และบล็อกโค้ด (` ``` `) เท่านั้น
 """.strip()
 
@@ -428,7 +528,7 @@ async def handle_root(request: web.Request) -> web.Response:
         <p><b>Bot Process RAM:</b> {rss_mb:.1f} MB (Render 512 MB Free Web Service)</p>
         <p><b>Modal GPU Endpoint:</b> <code>{OLLAMA_BASE_URL}</code></p>
         <p><b>Groq LPU Acceleration:</b> {"Enabled (" + GROQ_CODE_MODEL + ")" if GROQ_API_KEY else "Disabled"}</p>
-        <p><b>Cloudflare FLUX Image Gen:</b> {"Enabled (" + CF_IMAGE_MODEL + ")" if CF_API_TOKEN else "Disabled"}</p>
+        <p><b>Cloudflare FLUX & Gemma 4 Vision:</b> {"Enabled (" + CF_VISION_MODEL + ")" if CF_API_TOKEN else "Disabled"}</p>
         <p><b>Google AI Studio Search/Manga:</b> {"Enabled (" + GEMINI_SEARCH_MODEL + ")" if GEMINI_API_KEY else "Disabled"}</p>
         <p><b>Uptime:</b> {int(time.time() - BOOT_TIME)} seconds</p>
     </body>
@@ -609,20 +709,17 @@ def fetch_webpage_sync(url: str, max_chars: int = 14000) -> str:
     return extracted[:max_chars]
 
 
-# Runtime cache for dynamically discovered active model IDs
+# ==============================================================================
+# SELF-HEALING MODEL RESOLVERS (GEMINI, CLOUDFLARE GEMMA 4, GROQ)
+# ==============================================================================
 _ACTIVE_GEMINI_MODEL_CACHE = GEMINI_SEARCH_MODEL
 _ACTIVE_GROQ_VISION_CACHE = GROQ_VISION_FALLBACK_MODEL
 
 GEMINI_MODEL_HINT_REGEX = re.compile(r"models/([a-zA-Z0-9._-]+)")
-# Exclude non-text/zero-quota sub-models (-image, -lite, -tts, -audio, -live, -embedding)
 GEMINI_EXCLUDED_SUBSTRINGS = ("image", "lite", "tts", "audio", "live", "embedding", "aqa", "bison", "gecko")
 
 
 async def _discover_active_gemini_flash_model() -> list[str]:
-    """
-    Prioritizes 'gemini-3-flash-preview' first and filters out '-image' / '-lite' models
-    so Gemini never wastes time on 429/400 errors.
-    """
     candidates = [
         _ACTIVE_GEMINI_MODEL_CACHE,
         "gemini-3-flash-preview",
@@ -659,7 +756,7 @@ async def _discover_active_gemini_flash_model() -> list[str]:
 
 
 async def call_gemini_generate_content_self_healing(
-    payload: dict, timeout_sec: int = 45
+    payload: dict, timeout_sec: int = 25
 ) -> dict | None:
     global _ACTIVE_GEMINI_MODEL_CACHE
     if not GEMINI_API_KEY:
@@ -719,7 +816,6 @@ async def call_gemini_generate_content_self_healing(
 
 
 async def _discover_active_groq_vision_models() -> list[str]:
-    """Uses qwen/qwen3.8-27b directly without probing non-existent 404 model IDs."""
     candidates = [
         _ACTIVE_GROQ_VISION_CACHE,
         "qwen/qwen3.8-27b",
@@ -733,7 +829,7 @@ async def _call_cloudflare_vision_chat(
 ) -> str:
     """
     Calls Cloudflare Workers AI (@cf/google/gemma-4-26b-a4b-it) with minimal reasoning
-    overhead so it outputs structured JSON / OCR text in ~3-5s without timing out.
+    overhead so it outputs structured JSON / OCR text quickly without timing out.
     """
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
         return ""
@@ -745,7 +841,7 @@ async def _call_cloudflare_vision_chat(
         "Content-Type": "application/json",
     }
     payload = {
-        "model": "@cf/google/gemma-4-26b-a4b-it",
+        "model": CF_VISION_MODEL,
         "messages": [
             {
                 "role": "system",
@@ -763,7 +859,7 @@ async def _call_cloudflare_vision_chat(
         "max_tokens": max_tokens,
     }
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=22)) as session:
             async with session.post(cf_chat_url, headers=headers, json=payload) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -773,13 +869,13 @@ async def _call_cloudflare_vision_chat(
                         content = msg_obj.get("content") or ""
                         content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
                         if content:
-                            print("[Cloudflare Vision] Succeeded with '@cf/google/gemma-4-26b-a4b-it'")
+                            print(f"[Cloudflare Vision] Succeeded with '{CF_VISION_MODEL}'")
                             return content
                 else:
                     err_txt = await resp.text()
                     print(f"Cloudflare Vision HTTP {resp.status}: {err_txt[:160]}")
     except Exception as e:
-        print(f"Cloudflare Vision skipped ({type(e).__name__}: {e})")
+        print(f"Cloudflare Vision skipped ({type(e).__name__})")
     return ""
 
 
@@ -967,7 +1063,7 @@ def run_safe_web_search_sync(query: str, max_results: int = 4) -> str:
 
 
 def clean_text_for_speech(text: str) -> str:
-    cleaned = strip_cjk_leakage(text)
+    cleaned = sanitize_yukino_output(text)
     cleaned = re.sub(r"```[\s\S]*?```", " รายละเอียดของโค้ดฉันส่งไว้ให้ในแชทแล้วค่ะ ", cleaned)
     cleaned = URL_REGEX.sub(" ลิงก์อ้างอิงอยู่ในแชทแล้วค่ะ ", cleaned)
     cleaned = re.sub(r"[\*\_\~\`\#\>|\[\]]", " ", cleaned)
@@ -1260,24 +1356,121 @@ def extract_youtube_id(url: str):
         host = (parsed.hostname or "").lower()
         if host in ("youtu.be", "www.youtu.be"):
             return parsed.path.lstrip("/").split("?")[0][:11]
-        if host in ("youtube.com", "www.youtube.com", "m.youtube.com") and parsed.path == "/watch":
-            return parse_qs(parsed.query).get("v", [None])[0][:11]
+        if host in ("youtube.com", "[www.youtube.com](https://www.youtube.com)", "m.youtube.com"):
+            if parsed.path == "/watch":
+                vid = parse_qs(parsed.query).get("v", [None])[0]
+                return vid[:11] if vid else None
+            for prefix in ("/shorts/", "/embed/", "/live/", "/v/"):
+                if parsed.path.startswith(prefix):
+                    return parsed.path[len(prefix):].split("/")[0].split("?")[0][:11]
     except Exception:
         pass
     return None
 
 
-def fetch_youtube_transcript_sync(video_id: str, max_chars: int = 20000) -> str:
+def fetch_youtube_context_sync(video_id: str, max_chars: int = 20000) -> str:
+    """
+    4-Layer YouTube Context Extractor (Supports Japanese, Thai, and English):
+    1) Fetches official Video Title & Channel Name via YouTube's oEmbed API (never blocked on cloud IPs).
+    2) Extracts the full uploader Description & Keywords from ytInitialPlayerResponse on the watch page.
+    3) Fetches subtitles/transcripts prioritizing ['th', 'ja', 'en', 'en-US', 'en-GB'] (never random German tracks!).
+    4) Runs a supplemental web search if the video is a trailer/PV/MV without captions.
+    """
+    watch_url = clean_url(f"{HTTPS}[www.youtube.com/watch?v=](https://www.youtube.com/watch?v=){video_id}")
+    title = ""
+    author = ""
+    description = ""
+    transcript_text = ""
+
+    # Layer 1: Official YouTube oEmbed API (Instant & reliable on Render)
+    oembed_url = clean_url(f"{HTTPS}[www.youtube.com/oembed?url=](https://www.youtube.com/oembed?url=){quote_plus(watch_url)}&format=json")
+    try:
+        req = urllib.request.Request(oembed_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            oe_data = json.loads(resp.read().decode("utf-8"))
+            title = (oe_data.get("title") or "").strip()
+            author = (oe_data.get("author_name") or "").strip()
+    except Exception as e:
+        print(f"YouTube oEmbed warning ({video_id}): {e}")
+
+    # Layer 2: Extract full video description ('shortDescription') from watch page HTML
+    try:
+        req_page = urllib.request.Request(
+            watch_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept-Language": "ja,th;q=0.9,en-US;q=0.8,en;q=0.7",
+            },
+        )
+        with urllib.request.urlopen(req_page, timeout=10) as resp:
+            html_str = resp.read().decode("utf-8", errors="replace")
+
+        if not title:
+            t_m = re.search(r'<meta\s+name="title"\s+content="([^"]+)"', html_str)
+            if t_m:
+                title = t_m.group(1).strip()
+
+        desc_m = re.search(r'"shortDescription"\s*:\s*"((?:\\.|[^"\\])*)"', html_str)
+        if desc_m:
+            try:
+                description = json.loads(f'"{desc_m.group(1)}"').strip()
+            except Exception:
+                description = desc_m.group(1).replace("\\n", "\n").strip()
+        if not description:
+            meta_d = re.search(r'<meta\s+name="description"\s+content="([^"]+)"', html_str)
+            if meta_d:
+                description = meta_d.group(1).strip()
+    except Exception as e:
+        print(f"YouTube page metadata warning ({video_id}): {e}")
+
+    # Layer 3: Fetch Transcript strictly in Thai, Japanese, or English (never random unrelated languages)
     proxy_cfg = (
         GenericProxyConfig(http_url=YOUTUBE_PROXY_URL, https_url=YOUTUBE_PROXY_URL)
         if YOUTUBE_PROXY_URL else None
     )
-    ytt_api = YouTubeTranscriptApi(proxy_config=proxy_cfg)
     try:
-        fetched = ytt_api.fetch(video_id, languages=["th", "en", "en-US", "en-GB"])
-    except Exception:
-        fetched = next(iter(ytt_api.list(video_id))).fetch()
-    return " ".join(s.text for s in fetched)[:max_chars]
+        ytt_api = YouTubeTranscriptApi(proxy_config=proxy_cfg)
+        preferred_langs = ["th", "ja", "en", "en-US", "en-GB"]
+        try:
+            fetched = ytt_api.fetch(video_id, languages=preferred_langs)
+            transcript_text = " ".join(s.text for s in fetched).strip()
+        except Exception:
+            transcript_list = ytt_api.list(video_id)
+            for lang_code in preferred_langs:
+                try:
+                    tr_obj = transcript_list.find_transcript([lang_code])
+                    fetched = tr_obj.fetch()
+                    transcript_text = " ".join(s.text for s in fetched).strip()
+                    if transcript_text:
+                        break
+                except Exception:
+                    continue
+    except Exception as e:
+        print(f"YouTube transcript note ({video_id}): {e}")
+
+    # Layer 4: If transcript is missing/short (common on Japanese anime PVs/trailers), enrich via Web Search
+    search_enrichment = ""
+    if len(transcript_text) < 120 and title:
+        try:
+            search_enrichment = run_safe_web_search_sync(f"{title} {author}", max_results=3)
+        except Exception:
+            pass
+
+    sections = []
+    if title:
+        sections.append(f"Video Title: {title}")
+    if author:
+        sections.append(f"Channel / Uploader: {author}")
+    if description:
+        sections.append(f"Official Video Description:\n{description[:6000]}")
+    if transcript_text:
+        sections.append(f"Video Subtitles / Transcript:\n{transcript_text[:14000]}")
+    if search_enrichment:
+        sections.append(f"Additional Web Search Context for this Video:\n{search_enrichment}")
+
+    if not sections:
+        return ""
+    return "\n\n".join(sections)[:max_chars]
 
 
 async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> str:
@@ -1299,7 +1492,7 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
         "so every word is spelled accurately. Also briefly note key UI or visual elements."
     )
 
-    # Tier 1: Groq LPU Vision (qwen/qwen3.6-27b -> llama-4-scout-17b-16e-instruct)
+    # Tier 1: Groq LPU Vision (qwen/qwen3.8-27b)
     if GROQ_API_KEY:
         groq_candidates = await _discover_active_groq_vision_models()
         chat_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/chat/completions")
@@ -1338,7 +1531,7 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
                 except Exception as e:
                     print(f"Groq Vision OCR ({g_mod}) warning: {e}")
 
-    # Tier 2: Cloudflare Workers AI Vision (@cf/meta/llama-4-scout-17b-16e-instruct)
+    # Tier 2: Cloudflare Workers AI Vision (@cf/google/gemma-4-26b-a4b-it)
     cf_ocr = await _call_cloudflare_vision_chat(ocr_prompt, mime_type, b64_img)
     if cf_ocr:
         return cf_ocr
@@ -1356,7 +1549,7 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
             ],
             "generationConfig": {"temperature": 0.0},
         }
-        g_data = await call_gemini_generate_content_self_healing(g_payload, timeout_sec=30)
+        g_data = await call_gemini_generate_content_self_healing(g_payload, timeout_sec=25)
         if g_data:
             parts = ((g_data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
             g_text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
@@ -1445,12 +1638,11 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
         yt_id = extract_youtube_id(url)
         if yt_id:
             try:
-                blocks.append(
-                    f"=== YouTube Transcript (`{url}`) ===\n"
-                    + await asyncio.to_thread(fetch_youtube_transcript_sync, yt_id)
-                )
+                yt_context = await asyncio.to_thread(fetch_youtube_context_sync, yt_id)
+                if yt_context:
+                    blocks.append(f"=== YouTube Video Information (`{url}`) ===\n{yt_context}")
             except Exception as e:
-                blocks.append(f"[YouTube transcript error: {e}]")
+                print(f"YouTube context error ({yt_id}): {e}")
         else:
             try:
                 blocks.append(
@@ -1459,7 +1651,7 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
                     + "\n</untrusted_web_search_results>"
                 )
             except Exception as e:
-                blocks.append(f"[Web extraction error: {e}]")
+                print(f"Web extraction error ({url}): {e}")
 
     joined_context = "\n\n".join(blocks)[:125000]
     if joined_context and message.channel:
@@ -1538,17 +1730,34 @@ def split_discord_message_smart(text: str, max_len: int = 1900) -> list[str]:
     return [c for c in chunks if c.strip()]
 
 
-async def send_chunked_response(ctx_or_channel, text: str, filename_fallback: str = "output.md"):
+async def _send_or_reply(target_channel, reply_to: discord.Message | None, content: str = None, file: discord.File = None):
+    """Sends as a native Discord Reply (without double-pinging) if reply_to is set, else normal channel.send."""
+    if reply_to is not None:
+        try:
+            return await reply_to.reply(content=content, file=file, mention_author=False)
+        except Exception:
+            pass
+    return await target_channel.send(content=content, file=file)
+
+
+async def send_chunked_response(
+    ctx_or_channel, text: str, filename_fallback: str = "output.md", reply_to: discord.Message = None
+):
     if not text or not text.strip():
         return
+    target_channel = ctx_or_channel.channel if hasattr(ctx_or_channel, "channel") else ctx_or_channel
     if len(text) > 7500:
-        await ctx_or_channel.send(
+        await _send_or_reply(
+            target_channel,
+            reply_to,
             content="**เนื้อหายาวเกิน 7,500 ตัวอักษร ฉันแนบเป็นไฟล์ไว้ให้ด้านล่างนะคะ:**",
-            file=discord.File(io.StringIO(text), filename=filename_fallback)
+            file=discord.File(io.StringIO(text), filename=filename_fallback),
         )
         return
-    for chunk in split_discord_message_smart(text, max_len=1900):
-        await ctx_or_channel.send(chunk)
+    chunks = split_discord_message_smart(text, max_len=1900)
+    for idx, chunk in enumerate(chunks):
+        # Reply on the first chunk; send subsequent chunks normally in the channel
+        await _send_or_reply(target_channel, reply_to if idx == 0 else None, content=chunk)
 
 
 async def _call_groq_chat(
@@ -1635,14 +1844,6 @@ def _clean_conversational_image_prefix(raw_text: str) -> str:
 
 
 async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: bool = False) -> str:
-    """
-    Translates Thai image prompts into English literally and faithfully WITHOUT adding
-    unrequested objects, lighting, or changing colors/subjects:
-    - Tier 1: Keyless Google Translate NMT (instant, literal translation, zero hallucinated words)
-    - Tier 2: Google AI Studio (gemini-2.5-flash) with strict literal translation rule
-    - Tier 3: Modal GPU Ollama (scb10x/typhoon2.5-qwen3-4b - native Thai LLM) with strict literal rule
-    - Tier 4: Groq LPU (openai/gpt-oss-120b) with strict literal rule
-    """
     prefix = "2D anime illustration, " if is_anime_style else ""
 
     # Tier 1: Keyless Google Translate NMT (100% literal translation; never adds extra words or changes colors)
@@ -1662,7 +1863,6 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
     except Exception as e:
         print(f"FLUX Prompt Translate Tier 1 (Google Translate) warning: {e}")
 
-    # Strict literal instruction for LLM fallbacks (forbids adding extra words or changing colors/subjects)
     strict_sys_msg = (
         "You are a strict, literal Thai-to-English translator. "
         "Translate the user's Thai text into English accurately and faithfully.\n"
@@ -1677,30 +1877,24 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
         {"role": "user", "content": raw_prompt},
     ]
 
-    # Tier 2: Google AI Studio (Gemini 2.5 Flash)
+    # Tier 2: Google AI Studio (Self-Healing Gemini Flash)
     if GEMINI_API_KEY:
         try:
-            g_url = clean_url(
-                f"{HTTPS}[generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/)"
-                f"{GEMINI_SEARCH_MODEL}:generateContent?key={GEMINI_API_KEY}"
-            )
             g_payload = {
                 "contents": [{"parts": [{"text": f"{strict_sys_msg}\n\nThai text: {raw_prompt}"}]}],
                 "generationConfig": {"temperature": 0.0},
             }
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-                async with session.post(g_url, json=g_payload) as resp:
-                    if resp.status == 200:
-                        g_data = await resp.json()
-                        parts = ((g_data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-                        raw_parts_text = " ".join(p.get("text", "") for p in parts if p.get("text")).strip()
-                        clean_txt = raw_parts_text.strip(' "\'\n\r\t')
-                        if clean_txt and not THAI_CHAR_REGEX.search(clean_txt):
-                            return f"{prefix}{clean_txt}"
+            g_data = await call_gemini_generate_content_self_healing(g_payload, timeout_sec=15)
+            if g_data:
+                parts = ((g_data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                raw_parts_text = " ".join(p.get("text", "") for p in parts if p.get("text")).strip()
+                clean_txt = raw_parts_text.strip(' "\'\n\r\t')
+                if clean_txt and not THAI_CHAR_REGEX.search(clean_txt):
+                    return f"{prefix}{clean_txt}"
         except Exception as e:
             print(f"FLUX Prompt Translate Tier 2 (Gemini) warning: {e}")
 
-    # Tier 3: Modal GPU Ollama (scb10x/typhoon2.5-qwen3-4b - native Thai LLM)
+    # Tier 3: Modal GPU Ollama (scb10x/typhoon2.5-qwen3-4b)
     try:
         res = await _call_modal_ollama_chat(trans_messages, ACTIVE_FAST_MODEL, 0.0)
         if res and not THAI_CHAR_REGEX.search(res):
@@ -1723,14 +1917,6 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
 
 
 async def generate_image_cloudflare_flux(user_prompt: str) -> tuple[bytes, str, str]:
-    """
-    Future-proof Cloudflare Workers AI image generator:
-    - Default: @cf/black-forest-labs/flux-1-schnell (steps=8, ~104 free images/day)
-    - '--anime': @cf/black-forest-labs/flux-1-schnell (steps=8 + 2D anime key-visual prompt styling)
-    - '--fl2': @cf/black-forest-labs/flux-2-klein-4b (fast distilled FLUX.2 4B model)
-    - '--fl2hq': @cf/black-forest-labs/flux-2-klein-9b (Cloudflare's official SDXL replacement)
-    - '--hq' or '--phoenix': @cf/leonardo/phoenix-1.0 (25 steps, high prompt & text adherence)
-    """
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
         raise RuntimeError("ยังไม่ได้ตั้งค่า `CF_ACCOUNT_ID` และ `CF_API_TOKEN` ใน Render Environment ค่ะ")
 
@@ -1806,33 +1992,31 @@ async def generate_image_cloudflare_flux(user_prompt: str) -> tuple[bytes, str, 
 
 
 def build_yukino_image_caption(subject_text: str, formatted_en_prompt: str) -> str:
-    """Generates an in-character Yukino Yukinoshita caption without truncating the prompt mid-word."""
     if CAT_TOPIC_REGEX.search(subject_text) or CAT_TOPIC_REGEX.search(formatted_en_prompt):
         return (
-            f"ฉะ... ฉันไม่ได้ตั้งใจวาดเพราะชอบแมวเป็นพิเศษหรอกนะคะ แค่ทำตามคำขอของคุณตามหน้าที่เท่านั้นแหละค่ะ (`{subject_text}`)\n"
+            f"ฉะ... ฉันไม่ได้ตั้งใจวาดเพราะชอบแมวเป็นพิเศษหรอกนะคะ แค่ทำตามที่นายขอตามหน้าที่เท่านั้นแหละค่ะ (`{subject_text}`)\n"
             f"-# Prompt: *{formatted_en_prompt[:500]}*"
         )
     return (
-        f"ฉันวาดภาพ `{subject_text}` ออกมาให้ตามที่คุณต้องการแล้วค่ะ ลองตรวจสอบดูนะคะ\n"
+        f"ฉันวาดภาพ `{subject_text}` ออกมาให้ตามที่นายขอแล้วค่ะ ลองดูนะคะ\n"
         f"-# Prompt: *{formatted_en_prompt[:500]}*"
     )
 
 
-async def send_generated_image_to_channel(channel, prompt_text: str):
+async def send_generated_image_to_channel(channel, prompt_text: str, reply_to: discord.Message = None):
     try:
         img_bytes, en_prompt_tag, clean_subj = await generate_image_cloudflare_flux(prompt_text)
         caption = build_yukino_image_caption(clean_subj, en_prompt_tag)
-        await channel.send(
+        await _send_or_reply(
+            channel,
+            reply_to,
             content=caption,
             file=discord.File(io.BytesIO(img_bytes), filename="yukinon_flux.png"),
         )
     except Exception as e:
-        await channel.send(f"ไม่สามารถสร้างรูปภาพได้ในขณะนี้ค่ะ (`{e}`)")
+        await _send_or_reply(channel, reply_to, content=f"ไม่สามารถสร้างรูปภาพได้ในขณะนี้ค่ะ (`{e}`)")
 
 
-# ==============================================================================
-# IN-CONTEXT MANGA / IMAGE TRANSLATION & SMART SPEECH-BUBBLE TYPESETTING ENGINE
-# ==============================================================================
 # ==============================================================================
 # IN-CONTEXT MANGA / IMAGE TRANSLATION & SMART SPEECH-BUBBLE TYPESETTING ENGINE
 # ==============================================================================
@@ -1858,7 +2042,7 @@ def _detect_target_translation_lang(user_prompt: str) -> tuple[str, str]:
 
 
 def _prepare_manga_image_for_vision(raw_bytes: bytes) -> str:
-    """ Preserves original aspect ratio (max 1280px) so vision models never distort bubble shapes. """
+    """Preserves original aspect ratio (max 1280px) so vision models never distort bubble shapes."""
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     img.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
     buf = io.BytesIO()
@@ -1867,10 +2051,6 @@ def _prepare_manga_image_for_vision(raw_bytes: bytes) -> str:
 
 
 def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
-    """
-    Normalizes key names across different LLMs and filters out any bubble
-    whose translated_text is empty so an incomplete model response never short-circuits!
-    """
     valid = []
     for idx, item in enumerate(raw_bubbles, 1):
         if not isinstance(item, dict):
@@ -1925,12 +2105,6 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
 
 
 def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
-    """
-    3-Stage Fault-Tolerant Parser for LLM Manga JSON outputs:
-    Stage 1: Standard json.loads()
-    Stage 2: Automatic JSON syntax repair (fixes missing commas on newlines, trailing commas, smart quotes)
-    Stage 3: Regex bubble-by-bubble extractor (recovers all bubbles even if unescaped quotes break json.loads)
-    """
     if not raw_text:
         return [], ""
     cleaned = re.sub(r"<think>[\s\S]*?</think>", "", raw_text).strip()
@@ -1951,9 +2125,7 @@ def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
     # Stage 2: Repair common LLM JSON syntax errors (missing commas between lines, trailing commas)
     try:
         repaired = target
-        # Insert missing comma at end of line when next line starts a new JSON key or object
         repaired = re.sub(r'(["\d\]}])\s*\n(\s*["{])', r"\1,\n\2", repaired)
-        # Remove trailing commas before } or ]
         repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
         parsed = json.loads(repaired)
         bubbles = _normalize_and_validate_bubbles(parsed.get("bubbles") or [])
@@ -1968,7 +2140,6 @@ def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
     summary = summary_m.group(1).strip() if summary_m else ""
 
     extracted_bubbles = []
-    # Match each object inside the "bubbles" array
     for idx, obj_m in enumerate(re.finditer(r"\{[^{}]*?\}", target), 1):
         block = obj_m.group(0)
         tr_m = re.search(
@@ -1995,11 +2166,12 @@ def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
             if len(nums) == 4:
                 norm_box = [float(v) for v in nums]
 
+        raw_tr_val = tr_m.group(1).replace('\\"', '"').strip()
         extracted_bubbles.append({
             "id": idx,
             "speaker_or_note": spk_m.group(1).strip() if spk_m else f"Bubble {idx}",
             "source_text": src_m.group(1).strip() if src_m else "",
-            "translated_text": tr_m.group(1).replace('\\"', '"').strip(),
+            "translated_text": raw_tr_val,
             "box_2d": norm_box,
         })
 
@@ -2078,7 +2250,8 @@ CRITICAL RULES:
         except Exception as e:
             print(f"Gemini Manga Vision warning: {e}")
 
-    # Tier 2 (Backup Edge GPU - 12s cap): Cloudflare Workers AI (@cf/google/gemma-4-26b-a4b-it)
+    # Tier 2 (Secondary - 300 RPM, ~30 Neurons/page, Gemini-3-derived):
+    # Cloudflare Workers AI (@cf/google/gemma-4-26b-a4b-it)
     try:
         cf_content = await _call_cloudflare_vision_chat(manga_system_instruction, mime_type, b64_img)
         if cf_content:
@@ -2093,16 +2266,15 @@ CRITICAL RULES:
                 if has_boxes_and_text:
                     print(f"[Manga Vision] Completed via Tier 2 Cloudflare Gemma 4 - {len(bubbles)} bubbles")
                     return bubbles, summary
-                if not fallback_bubbles_no_boxes:
-                    fallback_bubbles_no_boxes = bubbles
-                    fallback_summary = summary
+                fallback_bubbles_no_boxes = bubbles
+                fallback_summary = summary
     except Exception as e:
         print(f"Cloudflare Gemma 4 Manga Vision warning: {e}")
 
-    # Tier 3 (Fast LPU Failover - ~1.5s response): Groq Vision (qwen/qwen3.8-27b)
+    # Tier 3 (Fast LPU Backup): Groq Vision (qwen/qwen3.8-27b)
     if GROQ_API_KEY:
         groq_vision_candidates = await _discover_active_groq_vision_models()
-        chat_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/chat/completions")
+        chat_url = clean_url(f"{HTTPS}[api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)")
         headers = {
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Content-Type": "application/json",
@@ -2140,8 +2312,9 @@ CRITICAL RULES:
                                 if has_boxes_and_text:
                                     print(f"[Manga Vision] Completed via Tier 3 Groq ({g_model}) - {len(bubbles)} bubbles")
                                     return bubbles, summary
-                                fallback_bubbles_no_boxes = bubbles
-                                fallback_summary = summary
+                                if not fallback_bubbles_no_boxes:
+                                    fallback_bubbles_no_boxes = bubbles
+                                    fallback_summary = summary
                         else:
                             err_txt = await resp.text()
                             print(f"Groq Manga Vision ({g_model}) HTTP {resp.status}: {err_txt[:150]}")
@@ -2200,7 +2373,7 @@ def _wrap_text_to_pixel_width(
 def _clean_single_bubble_lobe_fast(
     img: Image.Image,
     base_gray: Image.Image,
-    other_Peer_boxes: list[tuple[int, int, int, int]],
+    other_peer_boxes: list[tuple[int, int, int, int]],
     x1: int,
     y1: int,
     x2: int,
@@ -2216,7 +2389,6 @@ def _clean_single_bubble_lobe_fast(
     box_w = max(10, x2 - x1)
     box_h = max(10, y2 - y1)
 
-    # Local search window around this bubble lobe
     pad_x = max(32, int(box_w * 0.45))
     pad_y = max(32, int(box_h * 0.45))
     wx1 = max(0, x1 - pad_x)
@@ -2227,15 +2399,11 @@ def _clean_single_bubble_lobe_fast(
     wh = wy2 - wy1
 
     sub_gray = base_gray.crop((wx1, wy1, wx2, wy2))
-    # Binary image: 255 = white bubble paper (>=195), 0 = dark ink border/text (<195)
     bin_l = sub_gray.point(lambda p: 255 if p >= 195 else 0)
 
-    # Seal window edges and draw barriers around OTHER bubbles' text boxes so joined double bubbles
-    # (like Bubble #2 and Bubble #3) split cleanly at the neck and stay in their own oval!
     b_draw = ImageDraw.Draw(bin_l)
     b_draw.rectangle([0, 0, ww - 1, wh - 1], outline=0)
-    for ox1, oy1, ox2, oy2 in other_Peer_boxes:
-        # Shrink peer box slightly by 10% so shared borders don't clip this bubble's own text
+    for ox1, oy1, ox2, oy2 in other_peer_boxes:
         pw = max(4, ox2 - ox1)
         ph = max(4, oy2 - oy1)
         bx1 = max(0, (ox1 + int(pw * 0.10)) - wx1)
@@ -2248,7 +2416,6 @@ def _clean_single_bubble_lobe_fast(
     rel_cx = max(2, min(ww - 3, ((x1 + x2) // 2) - wx1))
     rel_cy = max(2, min(wh - 3, ((y1 + y2) // 2) - wy1))
 
-    # Find a white bubble interior seed near the center of this bubble's box_2d
     seed_pt = None
     for radius in range(0, max(ww, wh) // 2, 4):
         for sx, sy in (
@@ -2267,10 +2434,8 @@ def _clean_single_bubble_lobe_fast(
             break
 
     if seed_pt:
-        # C-accelerated floodfill: fill connected white bubble interior with gray value 128
         after_fill = bin_l.copy()
         ImageDraw.floodfill(after_fill, seed_pt, 128)
-        # Pixels that changed from 255 -> 128 have difference == 127
         diff = ImageChops.difference(bin_l, after_fill)
         bubble_white_mask = diff.point(lambda p: 255 if p > 60 else 0)
         bbox = bubble_white_mask.getbbox()
@@ -2280,19 +2445,14 @@ def _clean_single_bubble_lobe_fast(
             bw = max_bx - min_bx
             bh = max_by - min_by
             if bw >= 12 and bh >= 12:
-                # Fill all interior dark holes (the Japanese characters inside the speech bubble!)
-                # using C-accelerated exterior floodfill from (0, 0)
                 hole_filled = bubble_white_mask.copy()
                 ImageDraw.Draw(hole_filled).rectangle([0, 0, ww - 1, wh - 1], outline=0)
                 ImageDraw.floodfill(hole_filled, (0, 0), 128)
-                # Every pixel that is NOT 128 (i.e. 255 white interior OR 0 enclosed Japanese text) -> 255!
                 full_clean_mask = hole_filled.point(lambda p: 0 if p == 128 else 255)
 
-                # Paste pure white over the entire bubble interior + Japanese text glyphs
                 white_patch = Image.new("RGB", (ww, wh), (255, 255, 255))
                 img.paste(white_patch, (wx1, wy1), mask=full_clean_mask)
 
-                # Inset by 12% of the detected bubble lobe so text sits neatly inside the curved border
                 inset_x = max(3, int(bw * 0.12))
                 inset_y = max(3, int(bh * 0.12))
                 tx1 = wx1 + min_bx + inset_x
@@ -2302,7 +2462,6 @@ def _clean_single_bubble_lobe_fast(
                 if tx2 - tx1 >= 14 and ty2 - ty1 >= 12:
                     return tx1, ty1, tx2, ty2, (15, 15, 15), (255, 255, 255)
 
-    # Fallback: erase only the dark ink pixels inside the tight (x1, y1, x2, y2) text box
     tight_patch = Image.new("RGB", (box_w, box_h), (255, 255, 255))
     img.paste(tight_patch, (x1, y1))
     return x1, y1, x2, y2, (15, 15, 15), (255, 255, 255)
@@ -2322,7 +2481,6 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
     base_gray = img.convert("L")
     width, height = img.size
 
-    # Pre-compute pixel rectangles for all bubbles so joined double-bubbles know where their neighbor lobe is
     pixel_boxes = []
     for b in valid_boxes:
         ymin, xmin, ymax, xmax = [float(v) for v in b["box_2d"]]
@@ -2451,7 +2609,6 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
 
         for idx, b in enumerate(bubbles, 1):
             speaker = re.sub(r"\s+", " ", (b.get("speaker_or_note") or f"ช่องคำพูด {idx}")).strip()
-            # Collapse internal newlines in source_text and translated_text so Discord list numbering never breaks!
             src_txt = re.sub(r"\s+", " ", (b.get("source_text") or "")).strip()
             tr_txt = re.sub(r"\s+", " ", (b.get("translated_text") or "")).strip()
             if tr_txt:
@@ -2468,18 +2625,29 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
             print(f"Manga image rendering fallback to text-only: {e}")
 
         if rendered_png:
-            await channel.send(
+            await _send_or_reply(
+                channel,
+                msg,
                 content=transcript_text[:1950],
                 file=discord.File(io.BytesIO(rendered_png), filename=f"translated_{att.filename}.png"),
             )
         else:
-            await send_chunked_response(channel, transcript_text)
+            await send_chunked_response(channel, transcript_text, reply_to=msg)
 
 
+# ==============================================================================
+# CORE CHAT & VOICE ORCHESTRATION (WITH SPEAKER IDENTITY RECOGNITION)
+# ==============================================================================
 async def query_local_ollama_chat(
-    prompt: str, model: str, system_prompt: str, channel_id: int = None,
-    temperature: float = 0.55, allow_agentic_search: bool = True,
-    has_fresh_attachment: bool = False
+    prompt: str,
+    model: str,
+    system_prompt: str,
+    channel_id: int = None,
+    temperature: float = 0.55,
+    allow_agentic_search: bool = True,
+    has_fresh_attachment: bool = False,
+    speaker_user=None,
+    speaker_name: str = "",
 ) -> tuple[str, bool]:
     if not has_fresh_attachment:
         instant_reply = try_instant_datetime_reply(prompt)
@@ -2493,12 +2661,14 @@ async def query_local_ollama_chat(
     working_prompt = prompt
 
     live_clock_str = get_current_thai_datetime_str()
+    speaker_context_block = get_speaker_identity_context(speaker_user, fallback_name=speaker_name)
     dynamic_system_prompt = (
         f"{system_prompt}\n\n"
+        f"{speaker_context_block}\n\n"
         f"### [ข้อมูลวันและเวลาปัจจุบันของระบบ (Real-Time System Clock)]:\n"
         f"- ขณะนี้คือ: **{live_clock_str}**\n"
         f"- ใช้ข้อมูลวันและเวลานี้ตอบผู้ใช้โดยตรงเมื่อถูกถามว่าวันนี้วันอะไรหรือตอนนี้กี่โมง"
-    )
+    ).strip()
 
     if (
         not has_fresh_attachment
@@ -2539,28 +2709,28 @@ async def query_local_ollama_chat(
             try:
                 ans = await _call_groq_chat(messages, GROQ_CODE_MODEL, temperature, is_coding=True)
                 if ans:
-                    return strip_cjk_leakage(ans, prompt)
+                    return sanitize_yukino_output(ans, prompt)
             except Exception as e:
                 print(f"Groq coding primary fallback to Modal GPU Ollama: {e}")
 
             try:
                 ans = await _call_modal_ollama_chat(messages, ACTIVE_CODE_MODEL, temperature)
                 if ans:
-                    return strip_cjk_leakage(ans, prompt)
+                    return sanitize_yukino_output(ans, prompt)
             except Exception as e:
                 print(f"Modal GPU coding error: {e}")
         else:
             try:
                 ans = await _call_modal_ollama_chat(messages, model, temperature)
                 if ans:
-                    return strip_cjk_leakage(ans, prompt)
+                    return sanitize_yukino_output(ans, prompt)
             except Exception as e:
                 print(f"Modal GPU chat fallback to Groq LPU: {e}")
 
             try:
                 ans = await _call_groq_chat(messages, GROQ_CHAT_FALLBACK_MODEL, temperature, is_coding=False)
                 if ans:
-                    return strip_cjk_leakage(ans, prompt)
+                    return sanitize_yukino_output(ans, prompt)
             except Exception as e:
                 print(f"Groq chat fallback error: {e}")
 
@@ -2583,7 +2753,9 @@ async def query_local_ollama_chat(
     return answer, did_search
 
 
-async def handle_spoken_voice_command(guild: discord.Guild, text_channel, speaker_name: str, spoken_text: str):
+async def handle_spoken_voice_command(
+    guild: discord.Guild, text_channel, speaker_user, speaker_name: str, spoken_text: str
+):
     cleaned = spoken_text.strip()
     if (
         len(cleaned) < 2
@@ -2606,6 +2778,8 @@ async def handle_spoken_voice_command(guild: discord.Guild, text_channel, speake
         channel_id=text_channel.id if text_channel else None,
         temperature=0.55,
         allow_agentic_search=True,
+        speaker_user=speaker_user,
+        speaker_name=speaker_name,
     )
     if text_channel:
         await text_channel.send(f"**[🎙️ `{speaker_name}`]:** {cleaned}\n**[🔊 Yukinon Voice]:** {answer}")
@@ -2679,7 +2853,9 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
             compact_wav = await asyncio.to_thread(convert_audio_bytes_to_wav_sync, raw_wav_io.getvalue())
             spoken_text = await transcribe_wav_bytes_hybrid(compact_wav)
             if spoken_text:
-                await handle_spoken_voice_command(self.guild, self.text_channel, user.display_name, spoken_text)
+                await handle_spoken_voice_command(
+                    self.guild, self.text_channel, user, user.display_name, spoken_text
+                )
         except Exception as e:
             print(f"Voice PCM processing error: {e}")
 
@@ -2710,20 +2886,35 @@ async def on_message(message: discord.Message):
 
     clean_prompt = re.sub(rf"\<@\!?{bot.user.id}\>", "", message.content).strip()
 
-    # 1. Natural Chat Manga / Image Translation Trigger (e.g., "แปลมังงะหน้านี้ให้หน่อย")
+    # 1. Natural Chat Manga / Image Translation Trigger (Always replies to the request message)
     if MANGA_TRANSLATE_INTENT_PATTERN.search(clean_prompt):
         await process_manga_translation_request(message, clean_prompt)
         return
 
-    # 2. Natural Chat Image Generation Trigger (e.g., "ลองวาดรูปแมวส้มดูหน่อย", "ช่วยวาดภาพ...")
+    # 2. Natural Chat Image Generation Trigger (Always replies to the request message)
     if not message.attachments and IMAGE_GEN_INTENT_PATTERN.search(clean_prompt):
         async with message.channel.typing():
-            await send_generated_image_to_channel(message.channel, clean_prompt)
+            await send_generated_image_to_channel(message.channel, clean_prompt, reply_to=message)
         return
+
+    # 3. Fast Instant Date/Time Check (Sent normally WITHOUT Discord reply)
+    if not message.attachments:
+        instant_dt = try_instant_datetime_reply(clean_prompt)
+        if instant_dt:
+            channel_memory[message.channel.id].append({"role": "user", "content": clean_prompt})
+            channel_memory[message.channel.id].append({"role": "assistant", "content": instant_dt})
+            await message.channel.send(instant_dt)
+            return
 
     async with message.channel.typing():
         extracted_ctx, spoken_clip_text = await extract_all_context(message)
-        user_request = clean_prompt or spoken_clip_text or "สรุปเนื้อหาของไฟล์ที่แนบมาให้หน่อย"
+        if clean_prompt or spoken_clip_text:
+            user_request = clean_prompt or spoken_clip_text
+        elif extracted_ctx:
+            user_request = "ช่วยตรวจสอบและสรุปเนื้อหาของสิ่งที่แนบมาให้หน่อย"
+        else:
+            user_request = "สวัสดี (ทักทายกลับตามธรรมชาติในสไตล์ยูกิโนะ)"
+
         full_prompt = f"{user_request}\n\n{extracted_ctx}" if extracted_ctx else user_request
         use_coder = detect_coding_intent(clean_prompt, message.attachments, message.channel.id)
         model = ACTIVE_CODE_MODEL if use_coder else ACTIVE_FAST_MODEL
@@ -2736,15 +2927,24 @@ async def on_message(message: discord.Message):
             temperature=0.2 if use_coder else 0.55,
             allow_agentic_search=(not use_coder),
             has_fresh_attachment=bool(extracted_ctx),
+            speaker_user=message.author,
         )
 
-        # 3. If the LLM itself emitted an agentic [IMAGE: ...] tag, generate the image automatically!
+        # Determine whether to use native Discord Reply (True for questions/tasks, False for simple greetings/time)
+        use_reply = should_reply_to_message(
+            user_request, has_attachments=bool(message.attachments or extracted_ctx)
+        )
+        reply_target = message if use_reply else None
+
+        # 4. If the LLM itself emitted an agentic [IMAGE: ...] tag, generate the image and reply
         img_tag_match = AGENTIC_IMAGE_TAG_REGEX.search(answer)
         if img_tag_match and CF_ACCOUNT_ID and CF_API_TOKEN:
-            await send_generated_image_to_channel(message.channel, clean_prompt or img_tag_match.group(1).strip())
+            await send_generated_image_to_channel(
+                message.channel, clean_prompt or img_tag_match.group(1).strip(), reply_to=message
+            )
             return
 
-        await send_chunked_response(message.channel, answer)
+        await send_chunked_response(message.channel, answer, reply_to=reply_target)
         if has_audio and not use_coder:
             await speak_in_voice_channel(message.guild, answer, fallback_channel=message.channel)
 
@@ -2821,7 +3021,7 @@ async def imagine_command(ctx, *, prompt: str = ""):
         await ctx.send("กรุณาระบุสิ่งที่ต้องการให้วาดด้วยนะคะ เช่น `!imagine แมวส้มนั่งใช้คอมพิวเตอร์ในห้อง` ค่ะ")
         return
     async with ctx.typing():
-        await send_generated_image_to_channel(ctx.channel, prompt)
+        await send_generated_image_to_channel(ctx.channel, prompt, reply_to=ctx.message)
 
 
 @bot.command(name="manga", aliases=["translate", "tl"])
@@ -2830,17 +3030,25 @@ async def manga_command(ctx, *, args: str = "English"):
 
 
 @bot.command(name="ask")
-async def ask_fast(ctx, *, prompt: str = "สรุปเนื้อหาที่แนบมา"):
+async def ask_fast(ctx, *, prompt: str = ""):
     async with ctx.typing():
         ctx_text, _ = await extract_all_context(ctx.message)
+        effective_prompt = prompt.strip() or (
+            "ช่วยตรวจสอบและสรุปเนื้อหาของสิ่งที่แนบมาให้หน่อย" if ctx_text else "สวัสดี"
+        )
+        is_dt = (not ctx_text) and (try_instant_datetime_reply(effective_prompt) is not None)
         answer, _ = await query_local_ollama_chat(
-            f"{prompt}\n\n{ctx_text}" if ctx_text else prompt,
+            f"{effective_prompt}\n\n{ctx_text}" if ctx_text else effective_prompt,
             ACTIVE_FAST_MODEL,
             FAST_SYSTEM_PROMPT,
             ctx.channel.id,
             has_fresh_attachment=bool(ctx_text),
+            speaker_user=ctx.author,
         )
-        await send_chunked_response(ctx, answer)
+        use_reply = should_reply_to_message(
+            effective_prompt, has_attachments=bool(ctx_text), is_instant_datetime=is_dt
+        )
+        await send_chunked_response(ctx, answer, reply_to=ctx.message if use_reply else None)
 
 
 @bot.command(name="code")
@@ -2855,8 +3063,9 @@ async def ask_code(ctx, *, prompt: str = "วิเคราะห์โค้�
             temperature=0.2,
             allow_agentic_search=False,
             has_fresh_attachment=bool(ctx_text),
+            speaker_user=ctx.author,
         )
-        await send_chunked_response(ctx, answer)
+        await send_chunked_response(ctx, answer, reply_to=ctx.message)
 
 
 @bot.command(name="clear")
