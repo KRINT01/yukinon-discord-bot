@@ -68,7 +68,7 @@ def api_log(msg: str):
     print(f"[API] {msg}", flush=True)
 
 
-# Silence noisy RTCP SenderReport logs (type=200) and gateway warnings from discord-ext-voice-recv
+# Silence noisy RTCP SenderReport logs (type=200) and opus flush warnings from discord-ext-voice-recv
 logging.getLogger("discord.ext.voice_recv").setLevel(logging.ERROR)
 logging.getLogger("discord.ext.voice_recv.opus").setLevel(logging.ERROR)
 logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.ERROR)
@@ -77,62 +77,74 @@ logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.ERROR)
 OPUS_SILENCE_FRAME = b"\xf8\xff\xfe"
 PCM_SILENCE_20MS = b"\x00" * 3840
 
+# Save discord.py 2.7's native Voice WebSocket handler BEFORE voice_recv overwrites it
+import discord.gateway as _dpy_gateway
+_NATIVE_DPY_VOICE_WS_RECEIVED = _dpy_gateway.DiscordVoiceWebSocket.received_message
+
 try:
     from discord.ext import voice_recv
     import discord.ext.voice_recv.opus as _vr_opus
-    import discord.ext.voice_recv.gateway as _vr_gateway
 
-    _ORIG_VR_PAYLOAD_ROUTER = _vr_gateway.payload_router
+    _VOICE_RECV_WS_RECEIVED = _dpy_gateway.DiscordVoiceWebSocket.received_message
+    _ORIG_DECODE_PACKET = _vr_opus.PacketDecoder._decode_packet
 
-    def _dpy27_safe_gateway_hook(ws, vc):
-        """
-        Wraps the Voice WebSocket instance so:
-        1) discord.py 2.7's native received_message runs ONCE on all frames (including binary DAVE MLS bytes).
-        2) Binary DAVE MLS frames (bytes) never reach voice_recv's payload_router (which crashes on msg.pop('op')).
-        3) SSRC -> user_id mappings are captured from op 5 (SPEAKING) and op 12 (CLIENTS_CONNECT).
-        """
-        orig_received_message = ws.received_message
+    async def _dpy27_dave_compatible_received_message(self, msg):
+        # 1. Binary frames (DAVE MLS E2EE key exchange opcodes 25-30) must go ONLY to discord.py 2.7
+        if not isinstance(msg, dict):
+            await _NATIVE_DPY_VOICE_WS_RECEIVED(self, msg)
+            return
 
-        async def _wrapped_received_message(msg):
-            await orig_received_message(msg)
+        # 2. Bridge discord.py 2.7's VoiceConnectionState (self._connection) to VoiceRecvClient
+        conn = getattr(self, "_connection", None)
+        vc = getattr(conn, "voice_client", None) if conn is not None else None
+        if vc is None and "bot" in globals() and getattr(bot, "voice_clients", None):
+            vc = bot.voice_clients[0]
 
-            if isinstance(msg, dict):
-                op = msg.get("op")
-                data = msg.get("d")
-                if op == 5 and isinstance(data, dict):
-                    uid, ssrc = data.get("user_id"), data.get("ssrc")
-                    if uid and ssrc is not None:
-                        try:
-                            vc._add_ssrc(int(uid), int(ssrc))
-                        except Exception:
-                            pass
-                elif op == 12 and isinstance(data, dict):
-                    uid, ssrc = data.get("user_id"), data.get("audio_ssrc")
-                    if uid and ssrc:
-                        try:
-                            vc._add_ssrc(int(uid), int(ssrc))
-                        except Exception:
-                            pass
-                if op in (5, 12, 13, 18, 20):
+        if conn is not None and vc is not None and conn is not vc:
+            for attr_name in ("_add_ssrc", "_remove_ssrc", "_get_id_from_ssrc", "_packet_router"):
+                if not hasattr(conn, attr_name) and hasattr(vc, attr_name):
                     try:
-                        vr_copy = {"op": op, "d": dict(data) if isinstance(data, dict) else data}
-                        await _ORIG_VR_PAYLOAD_ROUTER(vc, vr_copy)
+                        setattr(conn, attr_name, getattr(vc, attr_name))
                     except Exception:
                         pass
 
-        ws.received_message = _wrapped_received_message
+        # 3. Explicitly register SSRC -> user_id mappings on op 5 (SPEAKING) and op 12 (CLIENT_CONNECT)
+        op = msg.get("op")
+        data = msg.get("d")
+        if isinstance(data, dict) and vc is not None and hasattr(vc, "_add_ssrc"):
+            if op == 5 and data.get("user_id") and data.get("ssrc") is not None:
+                try:
+                    vc._add_ssrc(int(data["user_id"]), int(data["ssrc"]))
+                except Exception:
+                    pass
+            elif op == 12 and data.get("user_id") and data.get("audio_ssrc"):
+                try:
+                    vc._add_ssrc(int(data["user_id"]), int(data["audio_ssrc"]))
+                except Exception:
+                    pass
 
-    _vr_gateway.hook = _dpy27_safe_gateway_hook
-    if hasattr(voice_recv, "voice_client") and hasattr(voice_recv.voice_client, "hook"):
-        voice_recv.voice_client.hook = _dpy27_safe_gateway_hook
+        # 4. Run discord.py 2.7's native handler ONCE (with 'seq' intact)
+        await _NATIVE_DPY_VOICE_WS_RECEIVED(self, msg)
 
-    _ORIG_DECODE_PACKET = _vr_opus.PacketDecoder._decode_packet
+        # 5. Forward speaking/ssrc opcodes to voice_recv's handler
+        if op in (5, 12, 13, 18, 20):
+            try:
+                vr_msg = dict(msg)
+                vr_msg.pop("seq", None)
+                await _VOICE_RECV_WS_RECEIVED(self, vr_msg)
+            except Exception:
+                pass
+
+    _dpy_gateway.DiscordVoiceWebSocket.received_message = _dpy27_dave_compatible_received_message
 
     def _safe_dave_decode_packet(self, packet):
         if not packet or not getattr(packet, "decrypted_data", None):
-            return packet, PCM_SILENCE_20MS
+            try:
+                return _ORIG_DECODE_PACKET(self, packet)
+            except Exception:
+                return packet, PCM_SILENCE_20MS
 
-        # 3-byte payloads (b'\xf8\xff\xfe') are unencrypted Opus silence frames — never pass to DAVE decrypt
+        # 3-byte frames (b'\xf8\xff\xfe') are unencrypted Opus silence; do not pass to DAVE decrypt
         if len(packet.decrypted_data) > 3:
             try:
                 sink_obj = getattr(self, "sink", None)
@@ -140,6 +152,9 @@ try:
                     getattr(sink_obj, "voice_client", None)
                     or getattr(sink_obj, "_voice_client", None)
                 )
+                if vc is None and "bot" in globals() and getattr(bot, "voice_clients", None):
+                    vc = bot.voice_clients[0]
+
                 conn = getattr(vc, "_connection", None) if vc is not None else None
                 dave_session = getattr(conn, "dave_session", None) if conn is not None else None
                 dave_version = getattr(conn, "dave_protocol_version", 0) if conn is not None else 0
@@ -150,24 +165,29 @@ try:
                         vc._get_id_from_ssrc(ssrc) if (vc and hasattr(vc, "_get_id_from_ssrc") and ssrc) else None
                     )
 
-                    # Fallback: if user was already in VC before bot joined, test human members in channel
+                    # Fallback if user was already in the voice channel before the bot joined
                     if not user_id and vc and getattr(vc, "channel", None):
-                        human_members = [m for m in vc.channel.members if not m.bot]
-                        for m in human_members:
+                        for m in vc.channel.members:
+                            if m.bot:
+                                continue
                             try:
-                                if dave_session.can_passthrough(int(m.id)):
-                                    user_id = m.id
-                                    break
-                                dec = dave_session.decrypt(
-                                    int(m.id), davey.MediaType.audio, packet.decrypted_data
-                                )
-                                if dec:
-                                    packet.decrypted_data = dec
-                                    user_id = m.id
-                                    self._cached_id = m.id
+                                uid_candidate = int(m.id)
+                                if not dave_session.can_passthrough(uid_candidate):
+                                    dec = dave_session.decrypt(
+                                        uid_candidate, davey.MediaType.audio, packet.decrypted_data
+                                    )
+                                    if dec:
+                                        packet.decrypted_data = bytes(dec)
+                                        self._cached_id = uid_candidate
+                                        if ssrc and hasattr(vc, "_add_ssrc"):
+                                            vc._add_ssrc(uid_candidate, int(ssrc))
+                                        return _ORIG_DECODE_PACKET(self, packet)
+                                else:
+                                    user_id = uid_candidate
+                                    self._cached_id = uid_candidate
                                     if ssrc and hasattr(vc, "_add_ssrc"):
-                                        vc._add_ssrc(int(m.id), int(ssrc))
-                                    return _ORIG_DECODE_PACKET(self, packet)
+                                        vc._add_ssrc(uid_candidate, int(ssrc))
+                                    break
                             except Exception:
                                 continue
 
@@ -177,8 +197,10 @@ try:
                         uid_int = int(user_id)
                         self._cached_id = uid_int
                         if not dave_session.can_passthrough(uid_int):
-                            packet.decrypted_data = dave_session.decrypt(
-                                uid_int, davey.MediaType.audio, packet.decrypted_data
+                            packet.decrypted_data = bytes(
+                                dave_session.decrypt(
+                                    uid_int, davey.MediaType.audio, packet.decrypted_data
+                                )
                             )
             except Exception:
                 packet.decrypted_data = OPUS_SILENCE_FRAME
