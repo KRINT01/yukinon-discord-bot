@@ -77,53 +77,75 @@ logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.ERROR)
 OPUS_SILENCE_FRAME = b"\xf8\xff\xfe"
 PCM_SILENCE_20MS = b"\x00" * 3840
 
-# Save discord.py 2.7's native Voice WebSocket handler
+# Save discord.py 2.7's native Voice WebSocket handlers
 import discord.gateway as _dpy_gateway
 _NATIVE_DPY_VOICE_WS_RECEIVED = _dpy_gateway.DiscordVoiceWebSocket.received_message
+_NATIVE_DPY_VOICE_WS_BINARY = getattr(_dpy_gateway.DiscordVoiceWebSocket, "received_binary_message", None)
 
 try:
     from discord.ext import voice_recv
     import discord.ext.voice_recv.opus as _vr_opus
     import discord.ext.voice_recv.gateway as _vr_gateway
+    import discord.ext.voice_recv.voice_client as _vr_vc
 
     _ORIG_VR_HOOK = getattr(_vr_gateway, "hook", None)
     _ORIG_DECODE_PACKET = _vr_opus.PacketDecoder._decode_packet
     _DAVE_LOG_TS = 0.0
 
-    async def _safe_vr_hook(ws, msg):
-        # CRITICAL: In discord.py 2.7+, DAVE MLS frames arrive as binary `bytes`.
-        # Passing `bytes` to voice_recv.gateway.hook raises TypeError on `msg['op']`
-        # and kills the VoiceConnectionState.poll_voice_ws task mid-handshake!
-        if not isinstance(msg, dict):
-            return
-        if _ORIG_VR_HOOK is not None:
-            try:
-                await _ORIG_VR_HOOK(ws, msg)
-            except Exception as e:
-                print(f"[Voice Hook Warning] {type(e).__name__}: {e}", flush=True)
-
-    if _ORIG_VR_HOOK is not None:
-        _vr_gateway.hook = _safe_vr_hook
-
-    async def _dpy27_dave_compatible_received_message(self, msg):
-        # Bridge discord.py 2.7's VoiceConnectionState (self._connection) to VoiceRecvClient
-        conn = getattr(self, "_connection", None)
+    def _bridge_conn_to_vc(ws):
+        """Bridges discord.py 2.7's VoiceConnectionState (ws._connection) to VoiceRecvClient."""
+        conn = getattr(ws, "_connection", None)
         vc = getattr(conn, "voice_client", None) if conn is not None else None
         if vc is None and "bot" in globals() and getattr(bot, "voice_clients", None):
             vc = bot.voice_clients[0]
 
         if conn is not None and vc is not None and conn is not vc:
-            for attr_name in ("_add_ssrc", "_remove_ssrc", "_get_id_from_ssrc", "_packet_router"):
+            for attr_name in (
+                "_add_ssrc", "_remove_ssrc", "_get_id_from_ssrc",
+                "_packet_router", "_speaking_timer", "_reader", "_decoder", "guild"
+            ):
                 if not hasattr(conn, attr_name) and hasattr(vc, attr_name):
                     try:
                         setattr(conn, attr_name, getattr(vc, attr_name))
                     except Exception:
                         pass
+        return conn, vc
 
-        # Capture SSRC -> user_id mappings on Opcode 5 (SPEAKING) and Opcode 12 (CLIENT_CONNECT)
-        if isinstance(msg, dict):
+    async def _safe_vr_hook(ws, msg):
+        """
+        Safe wrapper around voice_recv.gateway.hook:
+        1) Ignores binary DAVE MLS frames (bytes) so msg['op'] NEVER raises TypeError.
+        2) Bridges ws._connection attributes to VoiceRecvClient so opcodes 5/12/13 don't raise AttributeError.
+        """
+        if not isinstance(msg, dict):
+            return
+        _bridge_conn_to_vc(ws)
+        op = msg.get("op")
+        # Only forward voice_recv relevant JSON opcodes; ignore DAVE transition opcodes (21-24)
+        if _ORIG_VR_HOOK is not None and op in (2, 4, 5, 8, 12, 13, 18, 20):
+            try:
+                await _ORIG_VR_HOOK(ws, msg)
+            except Exception as e:
+                print(f"[Voice Hook Ignored] op={op} {type(e).__name__}: {e}", flush=True)
+
+    # Patch BOTH gateway.hook AND voice_client.hook (since voice_client.py used `from .gateway import hook`)
+    if _ORIG_VR_HOOK is not None:
+        _vr_gateway.hook = _safe_vr_hook
+        setattr(_vr_vc, "hook", _safe_vr_hook)
+
+    async def _dpy27_dave_compatible_received_message(self, msg):
+        # Permanently lock self._hook to _safe_vr_hook on this WebSocket instance
+        self._hook = _safe_vr_hook
+        conn, vc = _bridge_conn_to_vc(self)
+
+        if isinstance(msg, (bytes, bytearray)):
+            b_op = msg[2] if len(msg) > 2 else -1
+            print(f"[DAVE WS Binary] Received binary MLS frame (op={b_op}, len={len(msg)}B)", flush=True)
+        elif isinstance(msg, dict):
             op = msg.get("op")
             data = msg.get("d")
+            if op in (21, 22, 24):
+                print(f"[DAVE WS JSON] Transition event op={op} d={data}", flush=True)
             if isinstance(data, dict) and vc is not None and hasattr(vc, "_add_ssrc"):
                 if op == 5 and data.get("user_id") and data.get("ssrc") is not None:
                     try:
@@ -138,26 +160,19 @@ try:
                     except Exception:
                         pass
 
-        # Guard self._hook so binary DAVE MLS frames (bytes) inside _NATIVE_DPY_VOICE_WS_RECEIVED
-        # NEVER reach voice_recv's hook and never crash poll_voice_ws
-        orig_instance_hook = getattr(self, "_hook", None)
-
-        async def _guarded_instance_hook(ws, payload):
-            if not isinstance(payload, dict):
-                return
-            if orig_instance_hook is not None:
-                try:
-                    await orig_instance_hook(ws, payload)
-                except Exception as e:
-                    print(f"[Voice WS Hook Warning] {type(e).__name__}: {e}", flush=True)
-
-        self._hook = _guarded_instance_hook
-        try:
-            await _NATIVE_DPY_VOICE_WS_RECEIVED(self, msg)
-        finally:
-            self._hook = orig_instance_hook
+        await _NATIVE_DPY_VOICE_WS_RECEIVED(self, msg)
 
     _dpy_gateway.DiscordVoiceWebSocket.received_message = _dpy27_dave_compatible_received_message
+
+    if _NATIVE_DPY_VOICE_WS_BINARY is not None:
+        async def _dpy27_dave_compatible_binary_message(self, msg: bytes):
+            self._hook = _safe_vr_hook
+            _bridge_conn_to_vc(self)
+            b_op = msg[2] if len(msg) > 2 else -1
+            print(f"[DAVE WS Binary] Received binary MLS frame (op={b_op}, len={len(msg)}B)", flush=True)
+            await _NATIVE_DPY_VOICE_WS_BINARY(self, msg)
+
+        _dpy_gateway.DiscordVoiceWebSocket.received_binary_message = _dpy27_dave_compatible_binary_message
 
     def _safe_dave_decode_packet(self, packet):
         global _DAVE_LOG_TS
@@ -188,7 +203,6 @@ try:
                         vc._get_id_from_ssrc(ssrc) if (vc and hasattr(vc, "_get_id_from_ssrc") and ssrc) else None
                     )
 
-                    # Fallback if user was already in the voice channel before the bot joined
                     if not user_id and vc and getattr(vc, "channel", None):
                         for m in vc.channel.members:
                             if m.bot:
