@@ -734,40 +734,123 @@ def get_modal_headers() -> dict:
     return headers
 
 
+def _format_uptime(seconds: int) -> str:
+    days, rem = divmod(max(0, int(seconds)), 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours}h {mins}m {secs}s"
+    if hours > 0:
+        return f"{hours}h {mins}m {secs}s"
+    return f"{mins}m {secs}s"
+
+
+def _collect_health_metrics() -> dict:
+    """Collects zero-cost in-memory telemetry and prunes expired attachment caches."""
+    prune_stale_attachments()
+    now = time.time()
+    proc = psutil.Process(os.getpid())
+    rss_mb = round(proc.memory_info().rss / (1024 ** 2), 1)
+    ram_pct = round((rss_mb / 512.0) * 100, 1)
+    uptime_sec = int(now - BOOT_TIME)
+
+    ws_ping_ms = (
+        round(bot.latency * 1000, 1)
+        if bot.is_ready() and bot.latency == bot.latency
+        else None
+    )
+    gemini_cd = max(0, int(_GEMINI_GROUNDING_COOLDOWN_UNTIL - now))
+    edge_cd = max(0, int(globals().get("_EDGE_TTS_COOLDOWN_UNTIL", 0.0) - now))
+
+    return {
+        "status": "ok" if rss_mb < 480 else "warning_high_memory",
+        "system_time_th": get_current_thai_datetime_str(),
+        "uptime_sec": uptime_sec,
+        "uptime_human": _format_uptime(uptime_sec),
+        "discord": {
+            "connected": bot.is_ready(),
+            "user": str(bot.user) if bot.user else None,
+            "gateway_ping_ms": ws_ping_ms,
+            "guilds_count": len(bot.guilds) if bot.is_ready() else 0,
+            "active_voice_sessions": len(bot.voice_clients),
+            "dave_e2ee_ready": bool(davey is not None and HAS_VOICE_RECV),
+        },
+        "memory": {
+            "bot_ram_mb": rss_mb,
+            "render_limit_mb": 512,
+            "ram_usage_pct": ram_pct,
+            "active_chat_channels": len(channel_memory),
+            "cached_attachments": len(channel_last_attachment),
+        },
+        "ai_backends": {
+            "modal_ollama_configured": bool(OLLAMA_BASE_URL),
+            "fast_model": ACTIVE_FAST_MODEL,
+            "code_model": GROQ_CODE_MODEL if GROQ_API_KEY else ACTIVE_CODE_MODEL,
+            "groq_enabled": bool(GROQ_API_KEY),
+            "groq_vision_model": _ACTIVE_GROQ_VISION_CACHE if GROQ_API_KEY else None,
+            "cloudflare_enabled": bool(CF_API_TOKEN and CF_ACCOUNT_ID),
+            "cloudflare_image_model": CF_IMAGE_MODEL if CF_API_TOKEN else None,
+            "cloudflare_vision_model": CF_VISION_MODEL if CF_API_TOKEN else None,
+            "gemini_enabled": bool(GEMINI_API_KEY),
+            "gemini_active_model": _ACTIVE_GEMINI_MODEL_CACHE if GEMINI_API_KEY else None,
+            "gemini_grounding_cooldown_sec": gemini_cd,
+            "edge_tts_cooldown_sec": edge_cd,
+            "openclaw_gateway_ready": bool(globals().get("OPENCLAW_GATEWAY_URL")),
+        },
+    }
+
+
 # --- Embedded aiohttp.web Health Server for Render Web Service ($PORT) ---
 async def handle_root(request: web.Request) -> web.Response:
-    proc = psutil.Process(os.getpid())
-    rss_mb = proc.memory_info().rss / (1024 ** 2)
+    m = _collect_health_metrics()
+    d = m["discord"]
+    mem = m["memory"]
+    ai = m["ai_backends"]
+
+    ping_str = f"{d['gateway_ping_ms']} ms" if d["gateway_ping_ms"] is not None else "N/A"
+    gw_status = (
+        f"🟢 Connected as <b>{d['user']}</b> ({d['guilds_count']} guilds | Ping: {ping_str})"
+        if d["connected"]
+        else "🟡 Connecting to Discord Gateway..."
+    )
+    gemini_cd_note = f" (Grounding Cooldown: {ai['gemini_grounding_cooldown_sec']}s)" if ai["gemini_grounding_cooldown_sec"] else ""
+    edge_cd_note = f" (Fallback Google TTS active: {ai['edge_tts_cooldown_sec']}s left)" if ai["edge_tts_cooldown_sec"] else " (Edge-TTS Primary)"
+
     html = f"""
     <html>
-    <head><title>Yukinon Discord Bot - Render + Modal + Groq Hybrid</title></head>
-    <body style="font-family: sans-serif; max-width: 680px; margin: 40px auto; line-height: 1.6;">
+    <head>
+        <meta charset="utf-8">
+        <title>Yukinon Discord Bot - System Telemetry</title>
+    </head>
+    <body style="font-family: system-ui, sans-serif; max-width: 720px; margin: 36px auto; line-height: 1.6; color: #1f2937; padding: 0 16px;">
         <h2>❄️ Yukino Yukinoshita Discord Bot (Hybrid Cloud Edition)</h2>
-        <p><b>System Time (TH):</b> {get_current_thai_datetime_str()}</p>
-        <p><b>Discord Gateway:</b> {"Connected as " + str(bot.user) if bot.is_ready() else "Connecting..."}</p>
-        <p><b>Bot Process RAM:</b> {rss_mb:.1f} MB (Render 512 MB Free Web Service)</p>
-        <p><b>Modal GPU Endpoint:</b> <code>{OLLAMA_BASE_URL}</code></p>
-        <p><b>Groq LPU Acceleration:</b> {"Enabled (" + GROQ_CODE_MODEL + ")" if GROQ_API_KEY else "Disabled"}</p>
-        <p><b>Cloudflare FLUX & Gemma 4 Vision:</b> {"Enabled (" + CF_VISION_MODEL + ")" if CF_API_TOKEN else "Disabled"}</p>
-        <p><b>Google AI Studio Search/Manga:</b> {"Enabled (" + GEMINI_SEARCH_MODEL + ")" if GEMINI_API_KEY else "Disabled"}</p>
-        <p><b>Uptime:</b> {int(time.time() - BOOT_TIME)} seconds</p>
+        <p><b>System Time (TH):</b> {m['system_time_th']}</p>
+        <p><b>Discord Gateway:</b> {gw_status}</p>
+        <p><b>Voice & DAVE E2EE:</b> {d['active_voice_sessions']} active session(s) | DAVE Ready: {d['dave_e2ee_ready']}{edge_cd_note}</p>
+        <p><b>Container RAM:</b> {mem['bot_ram_mb']} MB / {mem['render_limit_mb']} MB ({mem['ram_usage_pct']}%) |
+           <b>Cached Contexts:</b> {mem['active_chat_channels']} chat(s), {mem['cached_attachments']} file(s)</p>
+        <hr style="border: 0; border-top: 1px solid #e5e7eb; margin: 16px 0;">
+        <p><b>Modal GPU Ollama:</b> {"Configured" if ai['modal_ollama_configured'] else "Not Configured"} (Fast: <code>{ai['fast_model']}</code>)</p>
+        <p><b>Groq LPU Acceleration:</b> {"Enabled (Code: <code>" + GROQ_CODE_MODEL + "</code> | Vision: <code>" + str(ai['groq_vision_model']) + "</code>)" if ai['groq_enabled'] else "Disabled"}</p>
+        <p><b>Cloudflare Workers AI:</b> {"Enabled (Image: <code>" + str(ai['cloudflare_image_model']) + "</code> | Vision: <code>" + str(ai['cloudflare_vision_model']) + "</code>)" if ai['cloudflare_enabled'] else "Disabled"}</p>
+        <p><b>Google AI Studio:</b> {"Enabled (<code>" + str(ai['gemini_active_model']) + "</code>)" + gemini_cd_note if ai['gemini_enabled'] else "Disabled"}</p>
+        <p><b>Uptime:</b> {m['uptime_human']} ({m['uptime_sec']}s)</p>
     </body>
     </html>
     """
-    return web.Response(text=html, content_type="text/html")
+    return web.Response(
+        text=html,
+        content_type="text/html",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
 
 
 async def handle_healthz(request: web.Request) -> web.Response:
-    proc = psutil.Process(os.getpid())
-    return web.json_response({
-        "status": "ok",
-        "discord_connected": bot.is_ready(),
-        "bot_ram_mb": round(proc.memory_info().rss / (1024 ** 2), 1),
-        "groq_enabled": bool(GROQ_API_KEY),
-        "cloudflare_flux_enabled": bool(CF_API_TOKEN),
-        "gemini_enabled": bool(GEMINI_API_KEY),
-        "uptime_sec": int(time.time() - BOOT_TIME)
-    })
+    metrics = _collect_health_metrics()
+    return web.json_response(
+        metrics,
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
 
 
 class YukinonBot(commands.Bot):
@@ -781,11 +864,12 @@ class YukinonBot(commands.Bot):
         app = web.Application()
         app.router.add_get("/", handle_root)
         app.router.add_get("/healthz", handle_healthz)
-        self.web_runner = web.AppRunner(app)
+        # access_log=None silences per-ping health check spam in Render logs
+        self.web_runner = web.AppRunner(app, access_log=None)
         await self.web_runner.setup()
         site = web.TCPSite(self.web_runner, "0.0.0.0", PORT)
         await site.start()
-        print(f"[Render Web Service Health Server] Listening on 0.0.0.0:{PORT}")
+        print(f"[Render Web Service Health Server] Listening on 0.0.0.0:{PORT}", flush=True)
 
     async def close(self):
         if self.http_session and not self.http_session.closed:
