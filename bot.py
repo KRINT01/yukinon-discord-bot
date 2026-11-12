@@ -91,6 +91,7 @@ try:
     _ORIG_VR_HOOK = getattr(_vr_gateway, "hook", None)
     _ORIG_DECODE_PACKET = _vr_opus.PacketDecoder._decode_packet
     _DAVE_LOG_TS = 0.0
+    _KNOWN_VOICE_USER_IDS: set[str] = set()
 
     def _bridge_conn_to_vc(ws):
         """Bridges discord.py 2.7's VoiceConnectionState (ws._connection) to VoiceRecvClient."""
@@ -111,54 +112,121 @@ try:
                         pass
         return conn, vc
 
+    async def _sync_dave_recognized_users(ws, conn, vc):
+        """
+        Ensures discord.py 2.7.1 knows all user IDs in the voice channel BEFORE op=27 (DAVE_MLS_PROPOSALS).
+        Without this, if a user was already in the channel and only sent op=5 (SPEAKING) instead of op=11/12,
+        process_proposals() rejects their Add proposal and commits a 1-member MLS group (breaking both directions).
+        """
+        user_id_strs = set(_KNOWN_VOICE_USER_IDS)
+        if vc is not None and getattr(vc, "channel", None):
+            for m in vc.channel.members:
+                user_id_strs.add(str(m.id))
+        if "bot" in globals() and getattr(bot, "user", None):
+            user_id_strs.add(str(bot.user.id))
+
+        if not user_id_strs:
+            return
+
+        # 1. Inject synthetic op=11 (CLIENTS_CONNECT) into discord.py 2.7.1's native handler
+        try:
+            await _NATIVE_DPY_VOICE_WS_RECEIVED(
+                ws, {"op": 11, "d": {"user_ids": list(user_id_strs)}}
+            )
+        except Exception:
+            pass
+
+        # 2. Also populate any set attribute on VoiceConnectionState / DiscordVoiceWebSocket directly
+        uid_ints = {int(u) for u in user_id_strs if u.isdigit()}
+        for target_obj in (conn, ws):
+            if target_obj is None:
+                continue
+            for k, v in list(getattr(target_obj, "__dict__", {}).items()):
+                if isinstance(v, set) and ("user" in k.lower() or "client" in k.lower() or "dave" in k.lower()):
+                    try:
+                        if any(isinstance(x, str) for x in v):
+                            v.update(user_id_strs)
+                        else:
+                            v.update(uid_ints)
+                    except Exception:
+                        pass
+
+        # 3. Enable DAVE passthrough mode for smooth transition window
+        dave_sess = getattr(conn, "dave_session", None) if conn is not None else None
+        if dave_sess is not None and hasattr(dave_sess, "set_passthrough_mode"):
+            try:
+                dave_sess.set_passthrough_mode(True, 120)
+            except Exception:
+                pass
+
     async def _safe_vr_hook(ws, msg):
-        """
-        Safe wrapper around voice_recv.gateway.hook:
-        1) Ignores binary DAVE MLS frames (bytes) so msg['op'] NEVER raises TypeError.
-        2) Bridges ws._connection attributes to VoiceRecvClient so opcodes 5/12/13 don't raise AttributeError.
-        """
         if not isinstance(msg, dict):
             return
         _bridge_conn_to_vc(ws)
         op = msg.get("op")
-        # Only forward voice_recv relevant JSON opcodes; ignore DAVE transition opcodes (21-24)
         if _ORIG_VR_HOOK is not None and op in (2, 4, 5, 8, 12, 13, 18, 20):
             try:
                 await _ORIG_VR_HOOK(ws, msg)
             except Exception as e:
                 print(f"[Voice Hook Ignored] op={op} {type(e).__name__}: {e}", flush=True)
 
-    # Patch BOTH gateway.hook AND voice_client.hook (since voice_client.py used `from .gateway import hook`)
     if _ORIG_VR_HOOK is not None:
         _vr_gateway.hook = _safe_vr_hook
         setattr(_vr_vc, "hook", _safe_vr_hook)
 
     async def _dpy27_dave_compatible_received_message(self, msg):
-        # Permanently lock self._hook to _safe_vr_hook on this WebSocket instance
         self._hook = _safe_vr_hook
         conn, vc = _bridge_conn_to_vc(self)
 
         if isinstance(msg, (bytes, bytearray)):
             b_op = msg[2] if len(msg) > 2 else -1
+            if b_op in (25, 27):
+                await _sync_dave_recognized_users(self, conn, vc)
             print(f"[DAVE WS Binary] Received binary MLS frame (op={b_op}, len={len(msg)}B)", flush=True)
-        elif isinstance(msg, dict):
+            await _NATIVE_DPY_VOICE_WS_RECEIVED(self, msg)
+
+            dave_s = getattr(conn, "dave_session", None) if conn is not None else None
+            if dave_s is not None and b_op in (25, 27, 29, 30):
+                uids = dave_s.get_user_ids() if hasattr(dave_s, "get_user_ids") else "?"
+                status = getattr(dave_s, "status", "?")
+                print(
+                    f"[DAVE State after op={b_op}] status={status}, group_user_ids={uids}",
+                    flush=True,
+                )
+            return
+
+        if isinstance(msg, dict):
             op = msg.get("op")
             data = msg.get("d")
             if op in (21, 22, 24):
                 print(f"[DAVE WS JSON] Transition event op={op} d={data}", flush=True)
-            if isinstance(data, dict) and vc is not None and hasattr(vc, "_add_ssrc"):
-                if op == 5 and data.get("user_id") and data.get("ssrc") is not None:
-                    try:
-                        vc._add_ssrc(int(data["user_id"]), int(data["ssrc"]))
-                        print(f"[Voice WS] Mapped SSRC {data['ssrc']} -> user_id {data['user_id']}", flush=True)
-                    except Exception:
-                        pass
-                elif op == 12 and data.get("user_id") and data.get("audio_ssrc"):
-                    try:
-                        vc._add_ssrc(int(data["user_id"]), int(data["audio_ssrc"]))
-                        print(f"[Voice WS] Mapped audio_ssrc {data['audio_ssrc']} -> user_id {data['user_id']}", flush=True)
-                    except Exception:
-                        pass
+            if isinstance(data, dict):
+                uid_val = data.get("user_id")
+                if uid_val:
+                    _KNOWN_VOICE_USER_IDS.add(str(uid_val))
+                if isinstance(data.get("user_ids"), list):
+                    for u in data["user_ids"]:
+                        if u:
+                            _KNOWN_VOICE_USER_IDS.add(str(u))
+
+                if vc is not None and hasattr(vc, "_add_ssrc"):
+                    if op == 5 and uid_val and data.get("ssrc") is not None:
+                        try:
+                            vc._add_ssrc(int(uid_val), int(data["ssrc"]))
+                            print(f"[Voice WS] Mapped SSRC {data['ssrc']} -> user_id {uid_val}", flush=True)
+                        except Exception:
+                            pass
+                    elif op == 12 and uid_val and data.get("audio_ssrc"):
+                        try:
+                            vc._add_ssrc(int(uid_val), int(data["audio_ssrc"]))
+                            print(f"[Voice WS] Mapped audio_ssrc {data['audio_ssrc']} -> user_id {uid_val}", flush=True)
+                        except Exception:
+                            pass
+
+            await _NATIVE_DPY_VOICE_WS_RECEIVED(self, msg)
+            if op in (4, 5, 11, 12):
+                await _sync_dave_recognized_users(self, conn, vc)
+            return
 
         await _NATIVE_DPY_VOICE_WS_RECEIVED(self, msg)
 
@@ -167,8 +235,10 @@ try:
     if _NATIVE_DPY_VOICE_WS_BINARY is not None:
         async def _dpy27_dave_compatible_binary_message(self, msg: bytes):
             self._hook = _safe_vr_hook
-            _bridge_conn_to_vc(self)
+            conn, vc = _bridge_conn_to_vc(self)
             b_op = msg[2] if len(msg) > 2 else -1
+            if b_op in (25, 27):
+                await _sync_dave_recognized_users(self, conn, vc)
             print(f"[DAVE WS Binary] Received binary MLS frame (op={b_op}, len={len(msg)}B)", flush=True)
             await _NATIVE_DPY_VOICE_WS_BINARY(self, msg)
 
@@ -182,8 +252,9 @@ try:
             except Exception:
                 return packet, PCM_SILENCE_20MS
 
+        raw_payload = packet.decrypted_data
         # 3-byte frames (b'\xf8\xff\xfe') are unencrypted Opus silence; do not pass to DAVE decrypt
-        if len(packet.decrypted_data) > 3 and packet.decrypted_data != OPUS_SILENCE_FRAME:
+        if len(raw_payload) > 3 and raw_payload != OPUS_SILENCE_FRAME:
             try:
                 sink_obj = getattr(self, "sink", None)
                 vc = (
@@ -204,46 +275,28 @@ try:
                     )
 
                     if not user_id and vc and getattr(vc, "channel", None):
-                        for m in vc.channel.members:
-                            if m.bot:
-                                continue
-                            uid_candidate = int(m.id)
-                            try:
-                                if dave_session.can_passthrough(uid_candidate):
-                                    user_id = uid_candidate
-                                    self._cached_id = uid_candidate
-                                    if ssrc and hasattr(vc, "_add_ssrc"):
-                                        vc._add_ssrc(uid_candidate, int(ssrc))
-                                    break
-                                dec = dave_session.decrypt(
-                                    uid_candidate, davey.MediaType.audio, packet.decrypted_data
-                                )
-                                if dec:
-                                    packet.decrypted_data = bytes(dec)
-                                    self._cached_id = uid_candidate
-                                    if ssrc and hasattr(vc, "_add_ssrc"):
-                                        vc._add_ssrc(uid_candidate, int(ssrc))
-                                    return _ORIG_DECODE_PACKET(self, packet)
-                            except Exception:
-                                continue
+                        humans = [m for m in vc.channel.members if not m.bot]
+                        if len(humans) == 1:
+                            user_id = int(humans[0].id)
+                            self._cached_id = user_id
 
-                    if not user_id:
-                        packet.decrypted_data = OPUS_SILENCE_FRAME
-                    else:
+                    if user_id:
                         uid_int = int(user_id)
                         self._cached_id = uid_int
-                        if not dave_session.can_passthrough(uid_int):
+                        # DAVE-encrypted frames end with the 2-byte magic trailer 0xFAFA
+                        is_dave_framed = raw_payload.endswith(b"\xfa\xfa")
+                        if is_dave_framed or not dave_session.can_passthrough(uid_int):
                             packet.decrypted_data = bytes(
-                                dave_session.decrypt(
-                                    uid_int, davey.MediaType.audio, packet.decrypted_data
-                                )
+                                dave_session.decrypt(uid_int, davey.MediaType.audio, raw_payload)
                             )
             except Exception as e:
                 now = time.monotonic()
                 if now - _DAVE_LOG_TS > 5.0:
                     _DAVE_LOG_TS = now
                     print(f"[DAVE Decrypt Note] ssrc={getattr(packet, 'ssrc', '?')}: {type(e).__name__}: {e}", flush=True)
-                packet.decrypted_data = OPUS_SILENCE_FRAME
+                # If frame has DAVE 0xFAFA trailer and failed decrypt, replace with silence so Opus doesn't corrupt
+                if raw_payload.endswith(b"\xfa\xfa"):
+                    packet.decrypted_data = OPUS_SILENCE_FRAME
 
         try:
             return _ORIG_DECODE_PACKET(self, packet)
