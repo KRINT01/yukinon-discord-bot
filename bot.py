@@ -361,6 +361,11 @@ YUKIPEDIA_INTENT_PATTERN = re.compile(
     r"(\byukipedia\b|ยูกิพีเดีย|ยูคิพีเดีย)",
     re.IGNORECASE,
 )
+CUSTOM_EMOJI_REGEX = re.compile(r"<a?:([a-zA-Z0-9_]+):(\d+)>")
+AGENTIC_REACT_TAG_REGEX = re.compile(r"\[REACT:\s*([^\]]+?)\s*\]", re.IGNORECASE)
+UNICODE_EMOJI_ONLY_REGEX = re.compile(
+    r"^[\s\U0001F300-\U0001FAFF\U00002600-\U000027BF\u200d\ufe0f]+$"
+)
 
 CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
@@ -488,8 +493,9 @@ def sanitize_yukino_output(text: str, user_prompt: str = "", speaker_user=None, 
         return ""
     cleaned = text
 
-    # 1. Strip any accidental [SEARCH: ...] tag
+    # 1. Strip any accidental [SEARCH: ...] or [REACT: ...] tag
     cleaned = re.sub(r"\[SEARCH:\s*.+?\]", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = AGENTIC_REACT_TAG_REGEX.sub("", cleaned).strip()
 
     # 2. Strip stray CJK characters unless user prompt contains CJK
     if not CJK_LEAK_REGEX.search(user_prompt):
@@ -583,6 +589,40 @@ def should_reply_to_message(
     return False
 
 
+async def maybe_react_to_discord_message(
+    message: discord.Message, raw_llm_output: str = "", user_text: str = ""
+):
+    """
+    Applies an in-character Discord emoji reaction to the user's message:
+    1) Uses the [REACT: <emoji>] tag if the LLM emitted one.
+    2) Automatically reacts with 🐾/🐼 on cat/Pan-san topics or when the user sends a sticker.
+    """
+    if not message:
+        return
+    chosen_emoji = None
+
+    m = AGENTIC_REACT_TAG_REGEX.search(raw_llm_output or "")
+    if m:
+        candidate = m.group(1).strip().split()[0]
+        if len(candidate) <= 8:
+            chosen_emoji = candidate
+
+    combined = f"{user_text} {raw_llm_output}"
+    if not chosen_emoji:
+        if re.search(r"(แพนซัง|แพนด้า|pan-san|pansan|panda)", combined, re.IGNORECASE):
+            chosen_emoji = "🐼"
+        elif CAT_TOPIC_REGEX.search(combined):
+            chosen_emoji = "🐾"
+        elif message.stickers:
+            chosen_emoji = "❄️"
+
+    if chosen_emoji:
+        try:
+            await message.add_reaction(chosen_emoji)
+        except Exception:
+            pass
+
+
 # --- Refined Natural Persona Prompts (CARE Framework + Anti-Sycophancy + Yukipedia Mode) ---
 FAST_SYSTEM_PROMPT = """
 ## [Role & Identity]
@@ -629,6 +669,7 @@ FAST_SYSTEM_PROMPT = """
 - **OCR / การแปลภาษาและมังงะ (Yukipedia Mode)**: สกัดข้อความและแปลอย่างแม่นยำ พร้อมสังเกตรายละเอียดเล็กน้อย (Nitty-gritty) หากต้นฉบับมีคำผิดหรือใช้สำนวนตื้นเขิน ให้วิจารณ์เชิงภาษาศาสตร์ควบคู่ไปด้วย
 - **Image Generation Tool**: หากผู้ใช้ขอให้วาดรูป สร้างภาพ หรือเจนรูปภาพใดๆ ห้ามปฏิเสธเด็ดขาด! ให้ตอบเพียง `[IMAGE: <คำอธิบายภาพภาษาอังกฤษที่ละเอียดชัดเจน>]` ในบรรทัดแรกเท่านั้น
 - **Discord Formatting**: ห้ามสร้างตาราง Markdown (`| คอลัมน์ | ... |`) เด็ดขาด ให้ใช้รายการหัวข้อย่อย (`-` หรือ `1.`) แทน
+- **Discord Stickers & Emojis**: เมื่อผู้ใช้ส่งสติกเกอร์หรืออิโมจิมา ให้ตอบกลับหรือจิกกัดอารมณ์ของสติกเกอร์/อิโมจินั้นตามบุคลิกของยูกิโนะ (หากเป็นสติกเกอร์แมวหรือแพนด้าให้แอบเสียอาการ) และคุณสามารถแนบแท็ก `[REACT: <อิโมจิ 1 ตัว เช่น ❄️, 🐾, 🐼, 😒, ☕, 📖>]` ไว้ท้ายข้อความเมื่อต้องการกดรีแอคชันใสข้อความของผู้ใช้
 """.strip()
 
 YUKIPEDIA_SYSTEM_PROMPT = """
@@ -830,6 +871,7 @@ async def handle_root(request: web.Request) -> web.Response:
         <p><b>Container RAM:</b> {mem['bot_ram_mb']} MB / {mem['render_limit_mb']} MB ({mem['ram_usage_pct']}%) |
            <b>Cached Contexts:</b> {mem['active_chat_channels']} chat(s), {mem['cached_attachments']} file(s)</p>
         <hr style="border: 0; border-top: 1px solid #e5e7eb; margin: 16px 0;">
+        <p><b>Autonomous Agent / OpenClaw:</b> {"Connected (" + OPENCLAW_GATEWAY_URL + ")" if OPENCLAW_GATEWAY_URL else "Internal 8-Skill Agent Active (OpenClaw Gateway on Standby)"}</p>
         <p><b>Modal GPU Ollama:</b> {"Configured" if ai['modal_ollama_configured'] else "Not Configured"} (Fast: <code>{ai['fast_model']}</code>)</p>
         <p><b>Groq LPU Acceleration:</b> {"Enabled (Code: <code>" + GROQ_CODE_MODEL + "</code> | Vision: <code>" + str(ai['groq_vision_model']) + "</code>)" if ai['groq_enabled'] else "Disabled"}</p>
         <p><b>Cloudflare Workers AI:</b> {"Enabled (Image: <code>" + str(ai['cloudflare_image_model']) + "</code> | Vision: <code>" + str(ai['cloudflare_vision_model']) + "</code>)" if ai['cloudflare_enabled'] else "Disabled"}</p>
@@ -849,6 +891,7 @@ async def handle_healthz(request: web.Request) -> web.Response:
     metrics = _collect_health_metrics()
     return web.json_response(
         metrics,
+        "openclaw_gateway_enabled": bool(OPENCLAW_GATEWAY_URL),
         headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
     )
 
@@ -2017,6 +2060,36 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
         except Exception as e:
             blocks.append(f"[Error reading `{att.filename}`: {e}]")
 
+    # Extract Discord Stickers (Name + Optional Vision Inspection for PNG/APNG/GIF stickers)
+    for stk in getattr(message, "stickers", []) or []:
+        stk_name = getattr(stk, "name", "Unknown Sticker")
+        stk_fmt = str(getattr(stk, "format", "")).lower()
+        stk_desc = f"User sent a Discord Sticker named: `{stk_name}`"
+        if any(ext in stk_fmt for ext in ("png", "apng", "gif")) and getattr(stk, "url", None):
+            try:
+                session = get_http_session()
+                async with session.get(
+                    clean_url(str(stk.url)), timeout=aiohttp.ClientTimeout(total=8)
+                ) as s_resp:
+                    if s_resp.status == 200:
+                        stk_bytes = await s_resp.read()
+                        if len(stk_bytes) <= 8 * 1024 * 1024:
+                            stk_vis = await extract_image_via_transient_ocr(stk_bytes, f"{stk_name}.png")
+                            if stk_vis and "[OCR could not" not in stk_vis:
+                                stk_desc += f"\nVisual/Sticker Details:\n{stk_vis}"
+            except Exception as e:
+                print(f"Sticker vision note ({stk_name}): {e}")
+        blocks.append(f"=== Discord Sticker ===\n{stk_desc}")
+
+    # Translate Custom Discord Emojis (<:name:id> / <a:name:id>) into readable emote names
+    custom_emojis = CUSTOM_EMOJI_REGEX.findall(message.content or "")
+    if custom_emojis:
+        emote_names = [f":{name}:" for name, _ in custom_emojis]
+        blocks.append(
+            f"=== Custom Discord Emojis in User Message ===\n"
+            f"User included custom emoji(s): {', '.join(emote_names)}"
+        )
+
     urls_in_msg = URL_REGEX.findall(message.content)[:2]
     if urls_in_msg and not message.embeds:
         # Give Discord 1.2s to populate link embeds (e.g. YouTube title/author) if not yet attached
@@ -3068,6 +3141,290 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
 
 
 # ==============================================================================
+# AUTONOMOUS MULTI-TOOL AGENT ENGINE (DORMANT-READY OPENCLAW BRIDGE)
+# ==============================================================================
+OPENCLAW_GATEWAY_URL = clean_url(os.getenv("OPENCLAW_GATEWAY_URL", "")).rstrip("/")
+OPENCLAW_API_KEY = os.getenv("OPENCLAW_API_KEY", "").strip()
+
+# Persistent in-memory notes per channel so the agent can remember facts/todos
+agent_notes_store = defaultdict(list)
+
+BASE_AGENT_SKILLS_SPEC = """
+Available Tools (Skills):
+1. `web_search`: Search Google/DuckDuckGo/News for real-time information, facts, prices, or current events.
+   Args: {"query": "<search keywords>"}
+2. `read_webpage`: Scrape and read the full text of a public URL found during search or provided by the user.
+   Args: {"url": "<https://...>"}
+3. `get_weather`: Fetch real-time weather and rain forecast for a city/province.
+   Args: {"city_or_text": "<city or Thai province name>"}
+4. `youtube_inspect`: Extract title, description, and subtitles/transcript from a YouTube video URL.
+   Args: {"url": "<youtube url>"}
+5. `calculate`: Evaluate a mathematical expression accurately (e.g., currency conversion, percentages, unit math).
+   Args: {"expression": "<math expression like 42500 * 3.5 * 1.07>"}
+6. `save_note`: Save a reminder, todo item, or key fact for this channel.
+   Args: {"note": "<text to remember>"}
+7. `list_notes`: Retrieve all saved notes/todos for this channel.
+   Args: {}
+8. `generate_image`: Queue an image generation task via Cloudflare FLUX when the user's goal includes drawing/creating a picture.
+   Args: {"prompt": "<detailed description of image to generate>"}
+""".strip()
+
+
+def get_agent_skills_prompt_spec() -> str:
+    """Only exposes `openclaw_task` to the LLM planner when OPENCLAW_GATEWAY_URL is configured."""
+    if OPENCLAW_GATEWAY_URL:
+        return (
+            f"{BASE_AGENT_SKILLS_SPEC}\n"
+            "9. `openclaw_task`: Delegate OS, browser, or external workflow automation to the connected OpenClaw Gateway.\n"
+            '   Args: {"instruction": "<task instruction for OpenClaw>"}'
+        )
+    return BASE_AGENT_SKILLS_SPEC
+
+
+async def execute_agent_skill(
+    tool_name: str, args: dict, channel_id: int = None, pending_images: list = None
+) -> str:
+    """Executes a single agent skill safely and returns the observation string."""
+    t_name = (tool_name or "").strip().lower()
+    args = args if isinstance(args, dict) else {}
+
+    try:
+        if t_name == "web_search":
+            q = str(args.get("query") or "").strip()
+            if not q:
+                return "[Tool Error: Missing 'query']"
+            res = await asyncio.to_thread(run_safe_web_search_sync, q, 4)
+            return res or f"[No web search results found for '{q}']"
+
+        elif t_name == "read_webpage":
+            url = str(args.get("url") or "").strip()
+            if not url:
+                return "[Tool Error: Missing 'url']"
+            text = await asyncio.to_thread(fetch_webpage_sync, url, 6000)
+            return f'<webpage_content url="{url}">\n{text}\n</webpage_content>'
+
+        elif t_name == "get_weather":
+            loc = str(args.get("city_or_text") or DEFAULT_WEATHER_CITY).strip()
+            res = await fetch_live_weather_context(loc)
+            return res or f"[Could not fetch weather for '{loc}']"
+
+        elif t_name == "youtube_inspect":
+            url = str(args.get("url") or "").strip()
+            vid = extract_youtube_id(url) or url[:11]
+            res = await asyncio.to_thread(fetch_youtube_context_sync, vid, None, 10000)
+            return res or f"[Could not extract YouTube video '{url}']"
+
+        elif t_name == "calculate":
+            expr = str(args.get("expression") or "").strip()
+            expr_clean = re.sub(r"[^0-9+\-*/().%\s^]", "", expr).replace("^", "**")
+            val = SimpleEval().eval(expr_clean)
+            return f"Calculation Result ({expr_clean}) = {val}"
+
+        elif t_name == "save_note":
+            note_txt = str(args.get("note") or "").strip()
+            if note_txt and channel_id is not None:
+                ts = get_current_thai_datetime_str()
+                agent_notes_store[channel_id].append(f"[{ts}] {note_txt}")
+                return f"Saved note: {note_txt}"
+            return "[Tool Error: Empty note]"
+
+        elif t_name == "list_notes":
+            notes = agent_notes_store.get(channel_id, [])
+            return "\n".join(f"{i+1}. {n}" for i, n in enumerate(notes)) if notes else "(No saved notes in this channel)"
+
+        elif t_name == "generate_image":
+            img_prompt = str(args.get("prompt") or "").strip()
+            if img_prompt and pending_images is not None:
+                pending_images.append(img_prompt)
+                return f"[Image generation queued for prompt: '{img_prompt}'. It will be attached automatically with your final answer.]"
+            return "[Tool Error: Missing 'prompt']"
+
+        elif t_name == "openclaw_task":
+            if not OPENCLAW_GATEWAY_URL:
+                return "[OpenClaw Gateway is currently on standby (not configured); use internal tools instead.]"
+            instruction = str(args.get("instruction") or "").strip()
+            headers = {"Content-Type": "application/json"}
+            if OPENCLAW_API_KEY:
+                headers["Authorization"] = f"Bearer {OPENCLAW_API_KEY}"
+            session = get_http_session()
+            async with session.post(
+                f"{OPENCLAW_GATEWAY_URL}/api/agent/exec",
+                headers=headers,
+                json={"prompt": instruction},
+                timeout=aiohttp.ClientTimeout(total=45),
+            ) as resp:
+                body = await resp.text()
+                return f"OpenClaw Gateway Response (HTTP {resp.status}):\n{body[:4000]}"
+
+        return f"[Unknown tool '{t_name}']"
+    except Exception as e:
+        return f"[Tool Execution Error in `{t_name}`: {type(e).__name__}: {e}]"
+
+
+AGENT_STEP_LABELS = {
+    "web_search": "🔍 กำลังค้นหาข้อมูลบนเว็บ",
+    "read_webpage": "📄 กำลังอ่านเนื้อหาเว็บไซต์",
+    "get_weather": "🌦️ กำลังตรวจสอบสภาพอากาศ",
+    "youtube_inspect": "▶️ กำลังดึงข้อมูลคลิป YouTube",
+    "calculate": "🧮 กำลังคำนวณตัวเลข",
+    "save_note": "📝 กำลังบันทึกข้อมูล",
+    "list_notes": "🗂️ กำลังเปิดดูบันทึก",
+    "generate_image": "🎨 กำลังเตรียมวาดภาพประกอบ",
+    "openclaw_task": "🦞 กำลังส่งคำสั่งไปยัง OpenClaw Gateway",
+}
+
+
+async def _call_agent_planner_llm(messages: list) -> str:
+    """Uses Groq LPU (gpt-oss-120b), Gemini Flash, or Modal Ollama to decide the next tool action."""
+    if GROQ_API_KEY:
+        try:
+            res = await _call_groq_chat(
+                messages, GROQ_CHAT_FALLBACK_MODEL, temperature=0.1, is_coding=False, purpose="AgentPlanner"
+            )
+            if res:
+                return res
+        except Exception:
+            pass
+
+    if GEMINI_API_KEY:
+        try:
+            joined = "\n\n".join(f"[{m['role'].upper()}]:\n{m['content']}" for m in messages)
+            g_payload = {
+                "contents": [{"parts": [{"text": joined}]}],
+                "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"},
+            }
+            g_data = await call_gemini_generate_content_self_healing(
+                g_payload, timeout_sec=20, purpose="AgentPlanner"
+            )
+            if g_data:
+                parts = ((g_data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                txt = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+                if txt:
+                    return txt
+        except Exception:
+            pass
+
+    return await _call_modal_ollama_chat(messages, ACTIVE_FAST_MODEL, temperature=0.1, purpose="AgentPlanner")
+
+
+async def run_autonomous_agent_loop(
+    ctx_or_message,
+    user_goal: str,
+    max_steps: int = 4,
+):
+    msg = ctx_or_message.message if hasattr(ctx_or_message, "message") else ctx_or_message
+    channel = ctx_or_message.channel
+    author = msg.author
+
+    status_msg = await _send_or_reply(
+        channel, msg, content="❄️ **[Yukinon Autonomous Agent]** กำลังวางแผนและวิเคราะห์ลำดับงานค่ะ..."
+    )
+
+    extracted_ctx, spoken_clip_text = await extract_all_context(msg)
+    effective_goal = user_goal.strip() or spoken_clip_text or "วิเคราะห์และจัดการสิ่งที่แนบมา"
+
+    planner_system = f"""
+You are the internal task-planning engine for Yukino Yukinoshita's autonomous Discord agent.
+Current System Time: {get_current_thai_datetime_str()}
+
+{get_agent_skills_prompt_spec()}
+
+INSTRUCTIONS:
+Break down the user's goal into logical steps. At each turn, output ONLY valid JSON in one of these two formats:
+1) To call a tool:
+{{"thought": "Brief reason for calling this tool", "action": "<tool_name>", "args": {{...}}}}
+2) When you have gathered all necessary facts/calculations/actions to answer the user's goal completely:
+{{"thought": "All steps complete", "action": "final_ready", "summary": "Key facts and numbers gathered"}}
+""".strip()
+
+    planner_messages = [
+        {"role": "system", "content": planner_system},
+        {
+            "role": "user",
+            "content": f"User Goal: {effective_goal}\n\nAttached Context:\n{extracted_ctx[:15000]}"
+            if extracted_ctx
+            else f"User Goal: {effective_goal}",
+        },
+    ]
+
+    observations_log = []
+    pending_images = []
+
+    for step_idx in range(1, max_steps + 1):
+        raw_plan = await _call_agent_planner_llm(planner_messages)
+        json_m = re.search(r"\{[\s\S]*\}", raw_plan or "")
+        if not json_m:
+            break
+        try:
+            plan_obj = json.loads(json_m.group(0))
+        except Exception:
+            break
+
+        action = str(plan_obj.get("action") or "").strip().lower()
+        thought = str(plan_obj.get("thought") or "").strip()
+        args = plan_obj.get("args") or {}
+
+        if not action or action in ("final_ready", "finish", "done", "none"):
+            break
+
+        label = AGENT_STEP_LABELS.get(action, f"⚙️ กำลังรัน `{action}`")
+        try:
+            await status_msg.edit(
+                content=f"❄️ **[Yukinon Autonomous Agent — ขั้นตอนที่ {step_idx}/{max_steps}]** {label}..."
+            )
+        except Exception:
+            pass
+
+        obs = await execute_agent_skill(action, args, channel_id=channel.id, pending_images=pending_images)
+        observations_log.append(
+            f"--- Step {step_idx}: Tool `{action}` (Args: {json.dumps(args, ensure_ascii=False)}) ---\n"
+            f"Planner Thought: {thought}\n"
+            f"Tool Output:\n{obs}"
+        )
+
+        planner_messages.append({"role": "assistant", "content": json.dumps(plan_obj, ensure_ascii=False)})
+        planner_messages.append({"role": "user", "content": f"Observation from `{action}`:\n{obs}"})
+
+    try:
+        await status_msg.edit(content="❄️ **[Yukinon Autonomous Agent]** รวบรวมข้อมูลเสร็จสิ้น กำลังสรุปคำตอบค่ะ...")
+    except Exception:
+        pass
+
+    trace_block = "\n\n".join(observations_log)
+    composed_prompt = effective_goal
+    if extracted_ctx:
+        composed_prompt += f"\n\n[Attached Context]:\n{extracted_ctx}"
+    if trace_block:
+        composed_prompt += (
+            f"\n\n<agent_execution_trace>\n"
+            f"ผลลัพธ์จากการใช้เครื่องมืออัตโนมัติหลายขั้นตอนของคุณ (จงใช้ข้อมูลจริงด้านล่างนี้ตอบผู้ใช้ในสไตล์ยูกิโนะชิตะ ยูกิโนะ "
+            f"ราวกับคุณลงมือค้นคว้า คำนวณ และจัดการให้ด้วยตัวเอง):\n{trace_block}\n"
+            f"</agent_execution_trace>"
+        )
+
+    answer, _ = await query_local_ollama_chat(
+        composed_prompt,
+        model=ACTIVE_FAST_MODEL,
+        system_prompt=FAST_SYSTEM_PROMPT,
+        channel_id=channel.id,
+        temperature=0.45,
+        allow_agentic_search=False,
+        has_fresh_attachment=bool(extracted_ctx or trace_block),
+        speaker_user=author,
+    )
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+    await send_chunked_response(channel, answer, reply_to=msg)
+
+    for img_prompt in pending_images[:2]:
+        await send_generated_image_to_channel(channel, img_prompt, reply_to=msg)
+
+
+# ==============================================================================
 # CORE CHAT & VOICE ORCHESTRATION (WITH SPEAKER PRONOUN RULES)
 # ==============================================================================
 async def query_local_ollama_chat(
@@ -3489,6 +3846,8 @@ async def on_message(message: discord.Message):
         return
 
     clean_prompt = re.sub(rf"\<@\!?{bot.user.id}\>", "", message.content).strip()
+    # Convert raw <:emote_name:123456> IDs into readable :emote_name: for the LLM
+    clean_prompt = CUSTOM_EMOJI_REGEX.sub(r":\1:", clean_prompt).strip()
 
     # 0. Natural Chat "Yukipedia Mode" Trigger (Search / OCR / Translation + Critique)
     if YUKIPEDIA_INTENT_PATTERN.search(clean_prompt):
@@ -3519,6 +3878,9 @@ async def on_message(message: discord.Message):
         extracted_ctx, spoken_clip_text = await extract_all_context(message)
         if clean_prompt or spoken_clip_text:
             user_request = clean_prompt or spoken_clip_text
+        elif message.stickers:
+            stk_names = ", ".join(s.name for s in message.stickers)
+            user_request = f"(ผู้ใช้ส่งสติกเกอร์ `{stk_names}` มาให้ ช่วยตอบโต้หรือแสดงความเห็นต่อสติกเกอร์นี้ในสไตล์ยูกิโนะ)"
         elif extracted_ctx:
             user_request = "ช่วยตรวจสอบ สรุปเนื้อหา และบอกความรู้สึกหรือความคิดเห็นของเธอต่อสิ่งที่แนบมาให้หน่อย"
         else:
@@ -3553,6 +3915,7 @@ async def on_message(message: discord.Message):
             return
 
         await send_chunked_response(message.channel, answer, reply_to=reply_target)
+        await maybe_react_to_discord_message(message, raw_llm_output=answer, user_text=user_request)
         if has_audio and not use_coder:
             await speak_in_voice_channel(message.guild, answer, fallback_channel=message.channel)
 
@@ -3711,6 +4074,17 @@ async def calc_exp(ctx, *, expr: str):
         await ctx.send(f"Result: `{SimpleEval().eval(expr)}`")
     except Exception as e:
         await ctx.send(f"Error: `{e}`")
+
+
+@bot.command(name="agent", aliases=["claw", "auto"])
+async def agent_command(ctx, *, goal: str = ""):
+    if not goal.strip() and not ctx.message.attachments:
+        await ctx.send(
+            "หากต้องการให้ฉันทำงานแบบ **Autonomous Multi-Tool Agent** (วางแผน ค้นหา คำนวณ อ่านเว็บ และสร้างภาพต่อเนื่องกัน) "
+            "กรุณาระบุภารกิจที่ต้องการด้วยนะคะ เช่น `!agent ค้นหาราคาบิตคอยน์ล่าสุดเป็นบาท คำนวณมูลค่า 0.25 BTC แล้ววาดรูปแมวนั่งนับเงิน` ค่ะ"
+        )
+        return
+    await run_autonomous_agent_loop(ctx, goal)
 
 
 if __name__ == "__main__":
