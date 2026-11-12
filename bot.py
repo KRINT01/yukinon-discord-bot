@@ -891,7 +891,6 @@ async def handle_healthz(request: web.Request) -> web.Response:
     metrics = _collect_health_metrics()
     return web.json_response(
         metrics,
-        "openclaw_gateway_enabled": bool(OPENCLAW_GATEWAY_URL),
         headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
     )
 
