@@ -15,6 +15,7 @@ from urllib.parse import quote_plus
 import aiohttp
 import discord
 import discord.gateway as _dpy_gateway
+import discord.voice_state as _dpy_voice_state
 import edge_tts
 import speech_recognition as sr
 
@@ -67,6 +68,7 @@ VOICE_TEST_PHRASE_REGEX = re.compile(
 
 _NATIVE_DPY_VOICE_WS_RECEIVED = _dpy_gateway.DiscordVoiceWebSocket.received_message
 _NATIVE_DPY_VOICE_WS_BINARY = getattr(_dpy_gateway.DiscordVoiceWebSocket, "received_binary_message", None)
+_ORIG_DPY_EXECUTE_TRANSITION = getattr(_dpy_voice_state.VoiceConnectionState, "_execute_transition", None)
 
 try:
     from discord.ext import voice_recv
@@ -78,6 +80,54 @@ try:
     _ORIG_DECODE_PACKET = _vr_opus.PacketDecoder._decode_packet
     _DAVE_LOG_TS = 0.0
     _KNOWN_VOICE_USER_IDS: set[int] = set()
+
+    # Patch VoiceConnectionState._execute_transition because discord.py 2.7.1 omitted dave_session.execute_transition
+    if _ORIG_DPY_EXECUTE_TRANSITION is not None:
+        async def _patched_dpy_execute_transition(self, transition_id: int):
+            await _ORIG_DPY_EXECUTE_TRANSITION(self, transition_id)
+            dave_s = getattr(self, "dave_session", None)
+            if dave_s is not None and hasattr(dave_s, "execute_transition"):
+                try:
+                    dave_s.execute_transition(int(transition_id))
+                    print(
+                        f"[DAVE Transition] Executed transition_id={transition_id} -> "
+                        f"ready={getattr(dave_s, 'ready', '?')}, can_encrypt={getattr(dave_s, 'can_encrypt', '?')}",
+                        flush=True,
+                    )
+                except Exception as e:
+                    print(f"[DAVE Transition Note] execute_transition({transition_id}): {e}", flush=True)
+
+        _dpy_voice_state.VoiceConnectionState._execute_transition = _patched_dpy_execute_transition
+
+    def _activate_dave_epoch_transition(conn, transition_id: int, b_op: int):
+        """
+        Completes the DAVE MLS epoch transition after process_commit (op=29) or process_welcome (op=30).
+        Fixes discord.py 2.7.1 leaving dave_session.ready=False and throwing NoDecryptorForUser.
+        """
+        dave_s = getattr(conn, "dave_session", None) if conn is not None else None
+        if dave_s is None:
+            return
+        proto_ver = getattr(conn, "dave_protocol_version", None) or getattr(dave_s, "protocol_version", 1) or 1
+
+        if hasattr(dave_s, "prepare_transition"):
+            try:
+                dave_s.prepare_transition(int(transition_id), int(proto_ver))
+            except Exception as e:
+                print(f"[DAVE Transition] prepare_transition({transition_id}, v={proto_ver}) note: {e}", flush=True)
+
+        if hasattr(dave_s, "execute_transition"):
+            try:
+                dave_s.execute_transition(int(transition_id))
+            except Exception as e:
+                print(f"[DAVE Transition] execute_transition({transition_id}) note: {e}", flush=True)
+
+        # Fallback: if transition_id != 0 was staged but ready is still False, also try transition_id=0
+        if not getattr(dave_s, "ready", False) and transition_id != 0:
+            try:
+                dave_s.prepare_transition(0, int(proto_ver))
+                dave_s.execute_transition(0)
+            except Exception:
+                pass
 
     def _bridge_conn_to_vc(ws):
         """Bridges discord.py 2.7's VoiceConnectionState (ws._connection) to VoiceRecvClient."""
@@ -100,9 +150,8 @@ try:
 
     async def _inject_dave_clients_connect(ws, conn, vc):
         """
-        Uses discord.py 2.7.1's own native op=11 (CLIENTS_CONNECT) handler to register all
+        Uses discord.py 2.7.1's native op=11 (CLIENTS_CONNECT) handler to register all
         present voice channel members right after op=4 (SESSION_DESCRIPTION) and before op=27 (PROPOSALS).
-        IMPORTANT: Do NOT call set_passthrough_mode(True) here, as True disables DAVE encryption (ready=False)!
         """
         uid_ints = set(_KNOWN_VOICE_USER_IDS)
         if vc is not None and getattr(vc, "channel", None):
@@ -168,6 +217,23 @@ try:
 
             await _NATIVE_DPY_VOICE_WS_RECEIVED(self, msg)
 
+            # Ensure JSON op=21 (PREPARE_TRANSITION) and op=22 (EXECUTE_TRANSITION) also activate dave_session
+            dave_s = getattr(conn, "dave_session", None) if conn is not None else None
+            if dave_s is not None and isinstance(data, dict):
+                t_id = int(data.get("transition_id", 0))
+                if op == 21 and hasattr(dave_s, "prepare_transition"):
+                    p_ver = int(data.get("protocol_version", getattr(conn, "dave_protocol_version", 1) or 1))
+                    try:
+                        dave_s.prepare_transition(t_id, p_ver)
+                    except Exception:
+                        pass
+                elif op == 22 and hasattr(dave_s, "execute_transition"):
+                    try:
+                        dave_s.execute_transition(t_id)
+                        print(f"[DAVE JSON op=22] Executed transition_id={t_id}, ready={getattr(dave_s, 'ready', '?')}", flush=True)
+                    except Exception:
+                        pass
+
             if op in (4, 5, 12):
                 await _inject_dave_clients_connect(self, conn, vc)
             return
@@ -181,30 +247,33 @@ try:
             self._hook = _safe_vr_hook
             conn, vc = _bridge_conn_to_vc(self)
             b_op = msg[2] if len(msg) > 2 else -1
+            transition_id = int.from_bytes(msg[3:5], "big") if len(msg) >= 5 else 0
 
             if b_op in (25, 27):
                 await _inject_dave_clients_connect(self, conn, vc)
 
-            print(f"[DAVE WS Binary] Received binary MLS frame (op={b_op}, len={len(msg)}B)", flush=True)
+            print(
+                f"[DAVE WS Binary] Received binary MLS frame (op={b_op}, len={len(msg)}B, transition_id={transition_id})",
+                flush=True,
+            )
             try:
                 await _NATIVE_DPY_VOICE_WS_BINARY(self, msg)
             except Exception as e:
                 print(f"[DAVE WS Binary Error] op={b_op} {type(e).__name__}: {e}", flush=True)
 
+            # CRITICAL FIX: Activate the staged MLS epoch keys on op=29 (Commit) and op=30 (Welcome)
+            if b_op in (29, 30):
+                _activate_dave_epoch_transition(conn, transition_id, b_op)
+
             dave_s = getattr(conn, "dave_session", None) if conn is not None else None
             if dave_s is not None and b_op in (25, 27, 29, 30):
-                # Ensure passthrough_mode is False once Commit/Welcome (op=29/30) activates the session
-                if b_op in (29, 30) and not getattr(dave_s, "ready", False):
-                    if hasattr(dave_s, "set_passthrough_mode"):
-                        try:
-                            dave_s.set_passthrough_mode(False, 24)
-                        except Exception:
-                            pass
                 uids = dave_s.get_user_ids() if hasattr(dave_s, "get_user_ids") else "?"
                 status = getattr(dave_s, "status", "?")
                 ready = getattr(dave_s, "ready", "?")
+                can_enc = getattr(dave_s, "can_encrypt", "?")
                 print(
-                    f"[DAVE State after op={b_op}] status={status}, ready={ready}, group_user_ids={uids}",
+                    f"[DAVE State after op={b_op}] status={status}, ready={ready}, "
+                    f"can_encrypt={can_enc}, group_user_ids={uids}",
                     flush=True,
                 )
 
@@ -234,6 +303,10 @@ try:
                 dave_version = getattr(conn, "dave_protocol_version", 0) if conn is not None else 0
 
                 if dave_session is not None and dave_version > 0 and davey is not None:
+                    # Lazy safety net: if status is active but ready is still False, execute transition 0
+                    if not getattr(dave_session, "ready", False) and str(getattr(dave_session, "status", "")).endswith("active"):
+                        _activate_dave_epoch_transition(conn, 0, 29)
+
                     ssrc = getattr(self, "ssrc", None) or getattr(packet, "ssrc", None)
                     user_id = getattr(self, "_cached_id", None) or (
                         vc._get_id_from_ssrc(ssrc) if (vc and hasattr(vc, "_get_id_from_ssrc") and ssrc) else None
@@ -258,8 +331,7 @@ try:
                 if now - _DAVE_LOG_TS > 5.0:
                     _DAVE_LOG_TS = now
                     print(f"[DAVE Decrypt Note] ssrc={getattr(packet, 'ssrc', '?')}: {type(e).__name__}: {e}", flush=True)
-                if raw_payload.endswith(b"\xfa\xfa"):
-                    packet.decrypted_data = OPUS_SILENCE_FRAME
+                packet.decrypted_data = OPUS_SILENCE_FRAME
 
         try:
             return _ORIG_DECODE_PACKET(self, packet)

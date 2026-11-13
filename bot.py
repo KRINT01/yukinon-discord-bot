@@ -425,10 +425,11 @@ async def voice_status_command(ctx):
     dave_s = getattr(conn, "dave_session", None) if conn else None
     status = getattr(dave_s, "status", "None") if dave_s else "None"
     ready = getattr(dave_s, "ready", False) if dave_s else False
+    can_enc = getattr(dave_s, "can_encrypt", False) if dave_s else False
     uids = dave_s.get_user_ids() if (dave_s and hasattr(dave_s, "get_user_ids")) else []
     await ctx.send(
         f"🎙️ **สถานะห้องเสียง (`{vc.channel.name}`):**\n"
-        f"- **DAVE E2EE Status:** `{status}` | **Ready:** `{ready}`\n"
+        f"- **DAVE E2EE Status:** `{status}` | **Ready:** `{ready}` | **Can Encrypt:** `{can_enc}`\n"
         f"- **MLS Group User IDs:** `{uids}`\n"
         f"- **ลองพูดในไมค์ว่า:** `\"ถ้าได้ยินแล้วพิมพ์ตอบในแชท\"` หรือ `\"เทสเสียง\"` เพื่อทดสอบไมค์ได้ทันทีค่ะ"
     )
