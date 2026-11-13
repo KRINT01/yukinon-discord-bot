@@ -415,6 +415,25 @@ async def toggle_wakeword(ctx, mode: str = ""):
     await ctx.send(f"🎙️ โหมดคำเรียกขานในห้องเสียงตอนนี้: **{state_th}** ค่ะ")
 
 
+@bot.command(name="vstatus")
+async def voice_status_command(ctx):
+    vc = ctx.guild.voice_client if ctx.guild else None
+    if not vc or not vc.is_connected():
+        await ctx.send("ตอนนี้ฉันไม่ได้อยู่ในห้องเสียงค่ะ")
+        return
+    conn = getattr(vc, "_connection", None)
+    dave_s = getattr(conn, "dave_session", None) if conn else None
+    status = getattr(dave_s, "status", "None") if dave_s else "None"
+    ready = getattr(dave_s, "ready", False) if dave_s else False
+    uids = dave_s.get_user_ids() if (dave_s and hasattr(dave_s, "get_user_ids")) else []
+    await ctx.send(
+        f"🎙️ **สถานะห้องเสียง (`{vc.channel.name}`):**\n"
+        f"- **DAVE E2EE Status:** `{status}` | **Ready:** `{ready}`\n"
+        f"- **MLS Group User IDs:** `{uids}`\n"
+        f"- **ลองพูดในไมค์ว่า:** `\"ถ้าได้ยินแล้วพิมพ์ตอบในแชท\"` หรือ `\"เทสเสียง\"` เพื่อทดสอบไมค์ได้ทันทีค่ะ"
+    )
+
+
 @bot.command(name="imagine", aliases=["img", "draw"])
 async def imagine_command(ctx, *, prompt: str = ""):
     if not prompt.strip():

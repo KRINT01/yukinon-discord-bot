@@ -57,7 +57,16 @@ PCM_SILENCE_20MS = b"\x00" * 3840
 GTRANS_HOST = "translate." + "googleapis.com"
 GROQ_API_HOST = "api." + "groq.com"
 
+# Spoken test phrases that trigger an instant confirmation reply in the Discord text channel
+VOICE_TEST_PHRASE_REGEX = re.compile(
+    r"(ได้ยินไหม|ได้ยินมั้ย|ได้ยินหรือเปล่า|ได้ยินฉันไหม|ถ้าได้ยิน|พิมพ์ตอบในแชท|ตอบในแชท|"
+    r"เทสเสียง|ทดสอบเสียง|ทดสอบไมค์|ฮัลโหลเทส|"
+    r"can\s+you\s+hear\s+me|if\s+you\s+hear\s+me|reply\s+in\s+chat|mic\s+test|testing\s+1\s*2\s*3)",
+    re.IGNORECASE,
+)
+
 _NATIVE_DPY_VOICE_WS_RECEIVED = _dpy_gateway.DiscordVoiceWebSocket.received_message
+_NATIVE_DPY_VOICE_WS_BINARY = getattr(_dpy_gateway.DiscordVoiceWebSocket, "received_binary_message", None)
 
 try:
     from discord.ext import voice_recv
@@ -89,10 +98,10 @@ try:
                         pass
         return conn, vc
 
-    def _sync_dave_recognized_users_sync(ws, conn, vc):
+    async def _inject_dave_clients_connect(ws, conn, vc):
         """
-        Registers all voice channel member IDs ( strictly as ints ) onto VoiceConnectionState
-        BEFORE op=27 (DAVE_MLS_PROPOSALS) so davey accepts every member's MLS Add proposal.
+        Uses discord.py 2.7.1's own native op=11 (CLIENTS_CONNECT) handler to register all
+        present voice channel members right after op=4 (SESSION_DESCRIPTION) and before op=27 (PROPOSALS).
         """
         uid_ints = set(_KNOWN_VOICE_USER_IDS)
         if vc is not None and getattr(vc, "channel", None):
@@ -101,22 +110,13 @@ try:
         if state.bot is not None and getattr(state.bot, "user", None):
             uid_ints.add(int(state.bot.user.id))
 
-        if not uid_ints:
-            return
-
-        for target_obj in (conn, ws):
-            if target_obj is None:
-                continue
-            for k, v in list(getattr(target_obj, "__dict__", {}).items()):
-                if isinstance(v, set) and ("user" in k.lower() or "client" in k.lower() or "dave" in k.lower()):
-                    try:
-                        if any(isinstance(x, str) for x in v):
-                            v.update(str(u) for u in uid_ints)
-                        else:
-                            # Default to int set (required by davey PyO3 Rust bindings)
-                            v.update(uid_ints)
-                    except Exception:
-                        pass
+        if uid_ints:
+            try:
+                await _NATIVE_DPY_VOICE_WS_RECEIVED(
+                    ws, {"op": 11, "d": {"user_ids": [str(u) for u in uid_ints]}}
+                )
+            except Exception as e:
+                print(f"[DAVE op=11 Sync Note] {type(e).__name__}: {e}", flush=True)
 
         dave_sess = getattr(conn, "dave_session", None) if conn is not None else None
         if dave_sess is not None and hasattr(dave_sess, "set_passthrough_mode"):
@@ -143,26 +143,6 @@ try:
     async def _dpy27_dave_compatible_received_message(self, msg):
         self._hook = _safe_vr_hook
         conn, vc = _bridge_conn_to_vc(self)
-
-        if isinstance(msg, (bytes, bytearray)):
-            b_op = msg[2] if len(msg) > 2 else -1
-            if b_op in (25, 27):
-                _sync_dave_recognized_users_sync(self, conn, vc)
-            print(f"[DAVE WS Binary] Received binary MLS frame (op={b_op}, len={len(msg)}B)", flush=True)
-            try:
-                await _NATIVE_DPY_VOICE_WS_RECEIVED(self, msg)
-            except Exception as e:
-                print(f"[DAVE WS Binary Error] op={b_op} {type(e).__name__}: {e}", flush=True)
-
-            dave_s = getattr(conn, "dave_session", None) if conn is not None else None
-            if dave_s is not None and b_op in (25, 27, 29, 30):
-                uids = dave_s.get_user_ids() if hasattr(dave_s, "get_user_ids") else "?"
-                status = getattr(dave_s, "status", "?")
-                print(
-                    f"[DAVE State after op={b_op}] status={status}, group_user_ids={uids}",
-                    flush=True,
-                )
-            return
 
         if isinstance(msg, dict):
             op = msg.get("op")
@@ -193,13 +173,44 @@ try:
                             pass
 
             await _NATIVE_DPY_VOICE_WS_RECEIVED(self, msg)
-            if op in (2, 4, 5, 11, 12):
-                _sync_dave_recognized_users_sync(self, conn, vc)
+
+            # CRITICAL: Right after op=4 (SESSION_DESCRIPTION) initializes dave_session,
+            # register all channel members via native op=11 before binary op=27 arrives!
+            if op in (4, 5, 12):
+                await _inject_dave_clients_connect(self, conn, vc)
             return
 
         await _NATIVE_DPY_VOICE_WS_RECEIVED(self, msg)
 
     _dpy_gateway.DiscordVoiceWebSocket.received_message = _dpy27_dave_compatible_received_message
+
+    if _NATIVE_DPY_VOICE_WS_BINARY is not None:
+        async def _dpy27_dave_compatible_binary_message(self, msg: bytes):
+            self._hook = _safe_vr_hook
+            conn, vc = _bridge_conn_to_vc(self)
+            b_op = msg[2] if len(msg) > 2 else -1
+
+            # Ensure all voice channel members are registered via op=11 before op=25/27 proposals
+            if b_op in (25, 27):
+                await _inject_dave_clients_connect(self, conn, vc)
+
+            print(f"[DAVE WS Binary] Received binary MLS frame (op={b_op}, len={len(msg)}B)", flush=True)
+            try:
+                await _NATIVE_DPY_VOICE_WS_BINARY(self, msg)
+            except Exception as e:
+                print(f"[DAVE WS Binary Error] op={b_op} {type(e).__name__}: {e}", flush=True)
+
+            dave_s = getattr(conn, "dave_session", None) if conn is not None else None
+            if dave_s is not None and b_op in (25, 27, 29, 30):
+                uids = dave_s.get_user_ids() if hasattr(dave_s, "get_user_ids") else "?"
+                status = getattr(dave_s, "status", "?")
+                ready = getattr(dave_s, "ready", "?")
+                print(
+                    f"[DAVE State after op={b_op}] status={status}, ready={ready}, group_user_ids={uids}",
+                    flush=True,
+                )
+
+        _dpy_gateway.DiscordVoiceWebSocket.received_binary_message = _dpy27_dave_compatible_binary_message
 
     def _safe_dave_decode_packet(self, packet):
         global _DAVE_LOG_TS
@@ -249,8 +260,8 @@ try:
                 if now - _DAVE_LOG_TS > 5.0:
                     _DAVE_LOG_TS = now
                     print(f"[DAVE Decrypt Note] ssrc={getattr(packet, 'ssrc', '?')}: {type(e).__name__}: {e}", flush=True)
-                if raw_payload.endswith(b"\xfa\xfa"):
-                    packet.decrypted_data = OPUS_SILENCE_FRAME
+                # Always replace failed decrypt packets with silence so encrypted bytes aren't decoded as static noise
+                packet.decrypted_data = OPUS_SILENCE_FRAME
 
         try:
             return _ORIG_DECODE_PACKET(self, packet)
@@ -517,6 +528,21 @@ async def handle_spoken_voice_command(
         return
     print(f"[Voice STT] {speaker_name} spoke: '{cleaned}' (wake_word_required={voice_wake_word_enabled[guild.id]})", flush=True)
 
+    # Instant Voice-Test Trigger (Always replies in chat even if wakeword is on or LLM is cold)
+    if VOICE_TEST_PHRASE_REGEX.search(cleaned):
+        test_reply = (
+            f"ฉันได้ยินเสียงพูดในห้องเสียงชัดเจนแล้วค่ะ (ข้อความที่ได้ยินคือ: **\"{cleaned}\"**) "
+            "ไม่ต้องพูดย้ำหลายรอบหรอกนะคะ"
+        )
+        test_reply = sanitize_yukino_output(test_reply, cleaned, speaker_user, speaker_name)
+        if text_channel:
+            await text_channel.send(
+                f"✅ **[🎙️ ทดสอบไมค์ — ได้ยินเสียงของ `{speaker_name}` ชัดเจนค่ะ]:** `{cleaned}`\n"
+                f"**[🔊 Yukinon Voice]:** {test_reply}"
+            )
+        await speak_in_voice_channel(guild, test_reply, fallback_channel=text_channel)
+        return
+
     lower_txt = cleaned.lower()
     if voice_wake_word_enabled[guild.id]:
         if not any(lower_txt.startswith(w) or w in lower_txt[:22] for w in VOICE_WAKE_WORDS):
@@ -654,5 +680,7 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
                 await handle_spoken_voice_command(
                     self.guild, self.text_channel, user, user.display_name, spoken_text
                 )
+            else:
+                print(f"[Voice STT] Audio captured from {user.display_name}, but STT returned empty text.", flush=True)
         except Exception as e:
             print(f"Voice PCM processing error: {e}", flush=True)
