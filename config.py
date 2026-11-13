@@ -53,7 +53,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_CODE_MODEL = os.getenv("GROQ_CODE_MODEL", "openai/gpt-oss-120b")
 GROQ_CHAT_FALLBACK_MODEL = os.getenv("GROQ_CHAT_FALLBACK_MODEL", "openai/gpt-oss-120b")
 GROQ_VISION_FALLBACK_MODEL = os.getenv("GROQ_VISION_FALLBACK_MODEL", "qwen/qwen3.8-27b")
-GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")
+GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3")
 
 # Cloudflare Workers AI Free Tier (10,000 Neurons/day for FLUX Image Gen & Gemma 4 Vision)
 CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "").strip()
@@ -81,11 +81,11 @@ OPENCLAW_API_KEY = os.getenv("OPENCLAW_API_KEY", "").strip()
 # Render Free Web Service dynamically injects PORT (defaults to 10000)
 PORT = int(os.getenv("PORT", "10000"))
 
-# Yukino Yukinoshita Neural Voice Settings (edge-tts)
+# Yukino Yukinoshita (Saori Hayami Composed Kuudere Tone: calm neutral pitch, articulate measured rate)
 TTS_VOICE_TH = os.getenv("TTS_VOICE_TH", "th-TH-PremwadeeNeural")
 TTS_VOICE_EN = os.getenv("TTS_VOICE_EN", "en-US-AriaNeural")
-TTS_PITCH = os.getenv("TTS_PITCH", "+14Hz")
-TTS_RATE = os.getenv("TTS_RATE", "+4%")
+TTS_PITCH = os.getenv("TTS_PITCH", "+0Hz")
+TTS_RATE = os.getenv("TTS_RATE", "-4%")
 STT_PRIMARY_LANG = os.getenv("STT_PRIMARY_LANG", "th-TH")
 
 # Multi-server allowlist & AI channel IDs

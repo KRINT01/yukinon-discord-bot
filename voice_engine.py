@@ -9,7 +9,7 @@ import tempfile
 import threading
 import asyncio
 import subprocess
-from collections import defaultdict
+from collections import defaultdict, deque
 from urllib.parse import quote_plus
 
 import aiohttp
@@ -58,12 +58,30 @@ PCM_SILENCE_20MS = b"\x00" * 3840
 GTRANS_HOST = "translate." + "googleapis.com"
 GROQ_API_HOST = "api." + "groq.com"
 
-# Spoken test phrases that trigger an instant confirmation reply in the Discord text channel
+# Spoken test phrases (including common STT phonetic variations like ชัด/แชท, ตัดสอบ/ทดสอบ, หยิน/ยิน)
 VOICE_TEST_PHRASE_REGEX = re.compile(
-    r"(ได้ยินไหม|ได้ยินมั้ย|ได้ยินหรือเปล่า|ได้ยินฉันไหม|ถ้าได้ยิน|พิมพ์ตอบในแชท|ตอบในแชท|"
-    r"เทสเสียง|ทดสอบเสียง|ทดสอบไมค์|ฮัลโหลเทส|"
+    r"(ได้ยินไหม|ได้ยินมั้ย|ได้ยินหรือเปล่า|ได้ยินฉันไหม|ไม่หยินไหม|ได้มิดิน|"
+    r"ถ้าได้ยิน|ถ้าได้อีกแล้ว|พิมพ์ตอบในแชท|พิมพ์ตอบในชัด|ตอบในแชท|ตอบในชัด|"
+    r"เทสเสียง|ทดสอบเสียง|ทดสอบไมค์|ตัดสอบ|ฮัลโหลเทส|"
     r"can\s+you\s+hear\s+me|if\s+you\s+hear\s+me|reply\s+in\s+chat|mic\s+test|testing\s+1\s*2\s*3)",
     re.IGNORECASE,
+)
+
+# Vocabulary hint for Whisper so Thai commands & Yukino's names are spelled accurately
+WHISPER_THAI_PROMPT_HINT = (
+    "ยูกิโนะ ยูกิน่อน สวัสดีค่ะ ได้ยินไหม ถ้าได้ยินแล้วพิมพ์ตอบในแชท "
+    "ทดสอบไมค์ เทสเสียง ทดสอบ วันนี้วันอะไร ตอนนี้เวลากี่โมง อากาศวันนี้เป็นยังไง"
+)
+
+# Common phonetic misrecognitions fixed before processing
+STT_PHONETIC_FIXES = (
+    (re.compile(r"ถ้าได้อีกแล้ว\s*พิมพ์ตอบในชัด"), "ถ้าได้ยินแล้วพิมพ์ตอบในแชท"),
+    (re.compile(r"พิมพ์ตอบในชัด"), "พิมพ์ตอบในแชท"),
+    (re.compile(r"ไม่หยินไหม"), "ได้ยินไหม"),
+    (re.compile(r"ได้มิดินมัย"), "ได้ยินไหม"),
+    (re.compile(r"ตัดสอบ"), "ทดสอบ"),
+    (re.compile(r"^เธอสิ่ง(กัน)?$"), "เทสเสียง"),
+    (re.compile(r"^สอบสิ่ง$"), "ทดสอบเสียง"),
 )
 
 _NATIVE_DPY_VOICE_WS_RECEIVED = _dpy_gateway.DiscordVoiceWebSocket.received_message
@@ -81,7 +99,6 @@ try:
     _DAVE_LOG_TS = 0.0
     _KNOWN_VOICE_USER_IDS: set[int] = set()
 
-    # Patch VoiceConnectionState._execute_transition because discord.py 2.7.1 omitted dave_session.execute_transition
     if _ORIG_DPY_EXECUTE_TRANSITION is not None:
         async def _patched_dpy_execute_transition(self, transition_id: int):
             await _ORIG_DPY_EXECUTE_TRANSITION(self, transition_id)
@@ -100,10 +117,6 @@ try:
         _dpy_voice_state.VoiceConnectionState._execute_transition = _patched_dpy_execute_transition
 
     def _activate_dave_epoch_transition(conn, transition_id: int, b_op: int):
-        """
-        Completes the DAVE MLS epoch transition after process_commit (op=29) or process_welcome (op=30).
-        Fixes discord.py 2.7.1 leaving dave_session.ready=False and throwing NoDecryptorForUser.
-        """
         dave_s = getattr(conn, "dave_session", None) if conn is not None else None
         if dave_s is None:
             return
@@ -121,7 +134,6 @@ try:
             except Exception as e:
                 print(f"[DAVE Transition] execute_transition({transition_id}) note: {e}", flush=True)
 
-        # Fallback: if transition_id != 0 was staged but ready is still False, also try transition_id=0
         if not getattr(dave_s, "ready", False) and transition_id != 0:
             try:
                 dave_s.prepare_transition(0, int(proto_ver))
@@ -130,7 +142,6 @@ try:
                 pass
 
     def _bridge_conn_to_vc(ws):
-        """Bridges discord.py 2.7's VoiceConnectionState (ws._connection) to VoiceRecvClient."""
         conn = getattr(ws, "_connection", None)
         vc = getattr(conn, "voice_client", None) if conn is not None else None
         if vc is None and state.bot is not None and getattr(state.bot, "voice_clients", None):
@@ -149,10 +160,6 @@ try:
         return conn, vc
 
     async def _inject_dave_clients_connect(ws, conn, vc):
-        """
-        Uses discord.py 2.7.1's native op=11 (CLIENTS_CONNECT) handler to register all
-        present voice channel members right after op=4 (SESSION_DESCRIPTION) and before op=27 (PROPOSALS).
-        """
         uid_ints = set(_KNOWN_VOICE_USER_IDS)
         if vc is not None and getattr(vc, "channel", None):
             for m in vc.channel.members:
@@ -217,7 +224,6 @@ try:
 
             await _NATIVE_DPY_VOICE_WS_RECEIVED(self, msg)
 
-            # Ensure JSON op=21 (PREPARE_TRANSITION) and op=22 (EXECUTE_TRANSITION) also activate dave_session
             dave_s = getattr(conn, "dave_session", None) if conn is not None else None
             if dave_s is not None and isinstance(data, dict):
                 t_id = int(data.get("transition_id", 0))
@@ -261,7 +267,6 @@ try:
             except Exception as e:
                 print(f"[DAVE WS Binary Error] op={b_op} {type(e).__name__}: {e}", flush=True)
 
-            # CRITICAL FIX: Activate the staged MLS epoch keys on op=29 (Commit) and op=30 (Welcome)
             if b_op in (29, 30):
                 _activate_dave_epoch_transition(conn, transition_id, b_op)
 
@@ -303,7 +308,6 @@ try:
                 dave_version = getattr(conn, "dave_protocol_version", 0) if conn is not None else 0
 
                 if dave_session is not None and dave_version > 0 and davey is not None:
-                    # Lazy safety net: if status is active but ready is still False, execute transition 0
                     if not getattr(dave_session, "ready", False) and str(getattr(dave_session, "status", "")).endswith("active"):
                         _activate_dave_epoch_transition(conn, 0, 29)
 
@@ -321,8 +325,10 @@ try:
                     if user_id:
                         uid_int = int(user_id)
                         self._cached_id = uid_int
+                        # Only attempt DAVE decrypt if the packet has the 0xFAFA magic trailer!
+                        # Unencrypted comfort-noise / silence packets sent by Discord do not end with 0xFAFA.
                         is_dave_framed = raw_payload.endswith(b"\xfa\xfa")
-                        if is_dave_framed or not dave_session.can_passthrough(uid_int):
+                        if is_dave_framed:
                             packet.decrypted_data = bytes(
                                 dave_session.decrypt(uid_int, davey.MediaType.audio, raw_payload)
                             )
@@ -331,7 +337,8 @@ try:
                 if now - _DAVE_LOG_TS > 5.0:
                     _DAVE_LOG_TS = now
                     print(f"[DAVE Decrypt Note] ssrc={getattr(packet, 'ssrc', '?')}: {type(e).__name__}: {e}", flush=True)
-                packet.decrypted_data = OPUS_SILENCE_FRAME
+                if raw_payload.endswith(b"\xfa\xfa"):
+                    packet.decrypted_data = OPUS_SILENCE_FRAME
 
         try:
             return _ORIG_DECODE_PACKET(self, packet)
@@ -351,7 +358,9 @@ def clean_text_for_speech(text: str) -> str:
     cleaned = sanitize_yukino_output(text)
     cleaned = re.sub(r"```[\s\S]*?```", " รายละเอียดของโค้ดฉันส่งไว้ให้ในแชทแล้วค่ะ ", cleaned)
     cleaned = URL_REGEX.sub(" ลิงก์อ้างอิงอยู่ในแชทแล้วค่ะ ", cleaned)
-    cleaned = re.sub(r"[\*\_\~\`\#\>|\[\]]", " ", cleaned)
+    # Strip markdown symbols and emojis so edge-tts never rejects the text payload
+    cleaned = re.sub(r"[\*\_\~\`\#\>|\[\]\"\']", " ", cleaned)
+    cleaned = re.sub(r"[\U00010000-\U0010ffff]", "", cleaned)
     return re.sub(r"\s+", " ", cleaned).strip()[:450]
 
 
@@ -374,6 +383,30 @@ def _split_tts_chunks(text: str, max_len: int = 180) -> list[str]:
     return chunks
 
 
+def _master_tts_audio_sync(mp3_bytes: bytes, extra_af: str = "") -> bytes:
+    """
+    Applies a warm, natural broadcast mastering filter (softens 3.2kHz robotic sibilance,
+    normalizes loudness, and outputs clean 48kHz stereo CBR MP3 with exact duration headers).
+    """
+    base_af = "equalizer=f=3200:t=q:w=1.2:g=-2.5,acompressor=threshold=-18dB:ratio=2:attack=15:release=150,volume=1.35"
+    full_af = f"{extra_af},{base_af}" if extra_af else base_af
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-i", "pipe:0",
+            "-af", full_af,
+            "-ac", "2", "-ar", "48000", "-b:a", "128k",
+            "-write_xing", "0",
+            "-f", "mp3", "pipe:1", "-loglevel", "error"
+        ],
+        input=mp3_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=True,
+    )
+    return proc.stdout
+
+
 async def _fallback_google_tts_with_yukino_pitch(
     spoken_text: str, lang_code: str, is_flustered: bool = False
 ) -> bytes:
@@ -394,30 +427,10 @@ async def _fallback_google_tts_with_yukino_pitch(
     if not raw_mp3_parts:
         return b""
 
-    af_filter = (
-        "asetrate=24000*1.10,aresample=48000,atempo=1.04,volume=1.6"
-        if is_flustered
-        else "asetrate=24000*1.06,aresample=48000,atempo=0.98,volume=1.6"
-    )
-
-    def _apply_ffmpeg_yukino_voice(mp3_bytes: bytes) -> bytes:
-        proc = subprocess.run(
-            [
-                "ffmpeg", "-i", "pipe:0",
-                "-af", af_filter,
-                "-ac", "2", "-ar", "48000", "-b:a", "128k",
-                "-f", "mp3", "pipe:1", "-loglevel", "error"
-            ],
-            input=mp3_bytes,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=30,
-            check=True,
-        )
-        return proc.stdout
-
+    # Use steady tempo adjustment (without asetrate sample-rate warping) so speed never fluctuates
+    tempo_af = "atempo=1.12" if is_flustered else "atempo=1.06"
     try:
-        return await asyncio.to_thread(_apply_ffmpeg_yukino_voice, bytes(raw_mp3_parts))
+        return await asyncio.to_thread(_master_tts_audio_sync, bytes(raw_mp3_parts), tempo_af)
     except Exception:
         return bytes(raw_mp3_parts)
 
@@ -429,32 +442,46 @@ async def synthesize_tts_mp3_bytes(text: str) -> bytes:
     is_thai = bool(THAI_CHAR_REGEX.search(spoken_text))
     voice_name = TTS_VOICE_TH if is_thai else TTS_VOICE_EN
     is_flustered = bool(CAT_TOPIC_REGEX.search(spoken_text) or STUTTER_REGEX.search(spoken_text))
-    active_pitch = "+14Hz" if is_flustered else TTS_PITCH
-    active_rate = "+8%" if is_flustered else TTS_RATE
+
+    # Saori Hayami Kuudere Prosody: calm & composed by default; slightly faster/higher only when flustered
+    active_pitch = "+4Hz" if is_flustered else TTS_PITCH
+    active_rate = "+2%" if is_flustered else TTS_RATE
 
     if time.time() >= state.edge_tts_cooldown_until:
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
-            mp3_path = tmp_mp3.name
-        try:
-            communicate = edge_tts.Communicate(
-                text=spoken_text,
-                voice=voice_name,
-                rate=active_rate,
-                pitch=active_pitch,
-                proxy=DDGS_PROXY,
-            )
-            await asyncio.wait_for(communicate.save(mp3_path), timeout=8.0)
-            if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 256:
-                with open(mp3_path, "rb") as f:
-                    return f.read()
-        except Exception as e:
-            state.edge_tts_cooldown_until = time.time() + 600
-            print(f"edge-tts blocked/failed ({e}); cooling down 10m & using Google TTS + FFmpeg Yukino filter...", flush=True)
-        finally:
+        for attempt in range(2):
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
+                mp3_path = tmp_mp3.name
             try:
-                os.remove(mp3_path)
-            except OSError:
-                pass
+                # On attempt 2, use neutral prosody (+0Hz, +0%) in case custom rate/pitch caused an SSML rejection
+                use_pitch = active_pitch if attempt == 0 else "+0Hz"
+                use_rate = active_rate if attempt == 0 else "+0%"
+                communicate = edge_tts.Communicate(
+                    text=spoken_text,
+                    voice=voice_name,
+                    rate=use_rate,
+                    pitch=use_pitch,
+                    proxy=DDGS_PROXY,
+                )
+                await asyncio.wait_for(communicate.save(mp3_path), timeout=8.0)
+                if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 256:
+                    with open(mp3_path, "rb") as f:
+                        raw_edge_mp3 = f.read()
+                    try:
+                        return await asyncio.to_thread(_master_tts_audio_sync, raw_edge_mp3)
+                    except Exception:
+                        return raw_edge_mp3
+            except Exception as e:
+                if attempt == 0:
+                    await asyncio.sleep(0.35)
+                else:
+                    # Short 45s cooldown (instead of 10m) so brief network blips don't lock out edge-tts
+                    state.edge_tts_cooldown_until = time.time() + 45
+                    print(f"edge-tts failed after 2 attempts ({e}); cooling down 45s & using Google TTS fallback...", flush=True)
+            finally:
+                try:
+                    os.remove(mp3_path)
+                except OSError:
+                    pass
 
     lang_code = "th" if is_thai else "en"
     return await _fallback_google_tts_with_yukino_pitch(spoken_text, lang_code, is_flustered=is_flustered)
@@ -500,7 +527,7 @@ async def speak_in_voice_channel(guild: discord.Guild, text: str, fallback_chann
                 loop.call_soon_threadsafe(done_event.set)
 
             print(f"[Voice TTS] Playing {len(mp3_bytes)} bytes in '{vc.channel.name}'...", flush=True)
-            audio_source = discord.FFmpegPCMAudio(mp3_path, options="-vn -loglevel warning")
+            audio_source = discord.FFmpegPCMAudio(mp3_path, options="-vn -loglevel error")
             vc.play(audio_source, after=_after_play)
             await asyncio.wait_for(done_event.wait(), timeout=60)
         except Exception as e:
@@ -511,15 +538,24 @@ async def speak_in_voice_channel(guild: discord.Guild, text: str, fallback_chann
                 pass
 
 
+def _apply_phonetic_fixes(text: str) -> str:
+    cleaned = text.strip()
+    for pattern, replacement in STT_PHONETIC_FIXES:
+        cleaned = pattern.sub(replacement, cleaned)
+    return cleaned
+
+
 def transcribe_wav_bytes_google_sync(wav_bytes: bytes) -> str:
     recognizer = sr.Recognizer()
     with sr.AudioFile(io.BytesIO(wav_bytes)) as source:
         audio_data = recognizer.record(source)
     try:
-        return recognizer.recognize_google(audio_data, language=STT_PRIMARY_LANG)
+        res = recognizer.recognize_google(audio_data, language=STT_PRIMARY_LANG)
+        return _apply_phonetic_fixes(res) if res else ""
     except sr.UnknownValueError:
         try:
-            return recognizer.recognize_google(audio_data, language="en-US")
+            res = recognizer.recognize_google(audio_data, language="en-US")
+            return _apply_phonetic_fixes(res) if res else ""
         except Exception:
             return ""
     except Exception as e:
@@ -535,12 +571,16 @@ WHISPER_HALLUCINATIONS = {
 
 
 async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
+    whisper_candidate = ""
+    low_confidence = False
+
     if GROQ_API_KEY:
         try:
             form = aiohttp.FormData()
             form.add_field("file", wav_bytes, filename="speech.wav", content_type="audio/wav")
             form.add_field("model", GROQ_STT_MODEL)
             form.add_field("language", "th")
+            form.add_field("prompt", WHISPER_THAI_PROMPT_HINT)
             form.add_field("temperature", "0")
             form.add_field("response_format", "verbose_json")
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
@@ -558,30 +598,56 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
                         avg_logprob = float(seg.get("avg_logprob", 0.0))
                         comp_ratio = float(seg.get("compression_ratio", 1.0))
                         seg_text = (seg.get("text") or "").strip()
-                        if no_speech > 0.40 or avg_logprob < -0.75 or comp_ratio > 2.1:
+
+                        # Only drop if no_speech is very high OR logprob is extremely low (< -1.35)
+                        if no_speech > 0.60 or avg_logprob < -1.35 or comp_ratio > 2.4:
                             print(
                                 f"[Voice VAD Filter] Dropped noise segment '{seg_text}' "
                                 f"(no_speech={no_speech:.2f}, logprob={avg_logprob:.2f}, comp={comp_ratio:.2f})",
                                 flush=True,
                             )
                             continue
+                        if avg_logprob < -0.55:
+                            low_confidence = True
                         if seg_text:
                             valid_parts.append(seg_text)
 
-                    txt = " ".join(valid_parts).strip()
+                    txt = _apply_phonetic_fixes(" ".join(valid_parts).strip())
                     if txt and not NOISE_HALLUCINATION_REGEX.search(txt):
-                        return txt
-                    return ""
+                        whisper_candidate = txt
         except Exception as e:
             print(f"Groq Whisper STT error (falling back to Google STT): {e}", flush=True)
 
-    return await asyncio.to_thread(transcribe_wav_bytes_google_sync, wav_bytes)
+    # If Whisper had low confidence on a short Thai phrase (or returned empty), cross-check with Google Thai STT
+    if not whisper_candidate or low_confidence:
+        google_txt = await asyncio.to_thread(transcribe_wav_bytes_google_sync, wav_bytes)
+        if google_txt:
+            if whisper_candidate and google_txt != whisper_candidate:
+                print(
+                    f"[Voice STT Cross-Check] Whisper='{whisper_candidate}' (low conf) -> Using Google STT='{google_txt}'",
+                    flush=True,
+                )
+            return google_txt
+
+    return whisper_candidate
 
 
 def convert_audio_bytes_to_wav_sync(raw_bytes: bytes) -> bytes:
+    """
+    Converts raw 48kHz stereo Discord PCM/audio to 16kHz mono WAV with speech band-pass filtering
+    and dynamic audio normalization (dynaudnorm) so quiet microphones are amplified cleanly.
+    """
     proc = subprocess.run(
-        ["ffmpeg", "-i", "pipe:0", "-ac", "1", "-ar", "16000", "-f", "wav", "pipe:1", "-loglevel", "error"],
-        input=raw_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=True
+        [
+            "ffmpeg", "-i", "pipe:0",
+            "-af", "highpass=f=85,lowpass=f=7500,dynaudnorm=f=150:g=15:p=0.92:m=10",
+            "-ac", "1", "-ar", "16000", "-f", "wav", "pipe:1", "-loglevel", "error"
+        ],
+        input=raw_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=True,
     )
     return proc.stdout
 
@@ -589,7 +655,7 @@ def convert_audio_bytes_to_wav_sync(raw_bytes: bytes) -> bytes:
 async def handle_spoken_voice_command(
     guild: discord.Guild, text_channel, speaker_user, speaker_name: str, spoken_text: str
 ):
-    cleaned = spoken_text.strip()
+    cleaned = _apply_phonetic_fixes(spoken_text)
     if (
         len(cleaned) < 2
         or cleaned.lower() in WHISPER_HALLUCINATIONS
@@ -598,7 +664,7 @@ async def handle_spoken_voice_command(
         return
     print(f"[Voice STT] {speaker_name} spoke: '{cleaned}' (wake_word_required={voice_wake_word_enabled[guild.id]})", flush=True)
 
-    # Instant Voice-Test Trigger (Always replies in chat even if wakeword is on or LLM is cold)
+    # Instant Voice-Test Trigger (Always replies in chat even if wakeword is on)
     if VOICE_TEST_PHRASE_REGEX.search(cleaned):
         test_reply = (
             f"ฉันได้ยินเสียงพูดในห้องเสียงชัดเจนแล้วค่ะ (ข้อความที่ได้ยินคือ: **\"{cleaned}\"**) "
@@ -635,7 +701,8 @@ async def handle_spoken_voice_command(
 
 
 class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
-    SPEECH_FRAME_RMS_THRESHOLD = 150
+    # Lowered RMS threshold from 150 -> 55 to match normal speaking volume (rms=55..225)
+    SPEECH_FRAME_RMS_THRESHOLD = 55
     MIN_ACTIVE_SPEECH_FRAMES = 8
 
     def __init__(self, guild: discord.Guild, text_channel, vc=None):
@@ -644,6 +711,8 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
         self.text_channel = text_channel
         self._vc_ref = vc
         self._lock = threading.Lock()
+        # 400ms pre-roll buffer (20 frames x 20ms) so initial consonants are never clipped
+        self.pre_roll_buffers = defaultdict(lambda: deque(maxlen=20))
         self.user_buffers = defaultdict(bytearray)
         self.speech_frame_counts = defaultdict(int)
         self.last_spoken = {}
@@ -693,23 +762,31 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
             return
 
         now = time.monotonic()
-        if frame_rms > 20 and (now - self._last_rms_log > 5.0):
+        if frame_rms > 25 and (now - self._last_rms_log > 5.0):
             self._last_rms_log = now
             print(f"[Voice Mic Level] speaker={speaker.display_name}, rms={frame_rms}", flush=True)
 
         with self._lock:
             if frame_rms >= self.SPEECH_FRAME_RMS_THRESHOLD:
+                # If starting a new utterance, prepend the 400ms pre-roll frames so the first syllable is intact
+                if speaker not in self.user_buffers or len(self.user_buffers[speaker]) == 0:
+                    for pre_frame in self.pre_roll_buffers[speaker]:
+                        self.user_buffers[speaker].extend(pre_frame)
+                    self.pre_roll_buffers[speaker].clear()
                 self.user_buffers[speaker].extend(data.pcm)
                 self.speech_frame_counts[speaker] += 1
                 self.last_spoken[speaker] = now
-            elif speaker in self.user_buffers and (now - self.last_spoken.get(speaker, 0) < 0.8):
+            elif speaker in self.user_buffers and (now - self.last_spoken.get(speaker, 0) < 1.0):
                 self.user_buffers[speaker].extend(data.pcm)
+            else:
+                self.pre_roll_buffers[speaker].append(data.pcm)
 
     def cleanup(self):
         self.running = False
         if getattr(self, "monitor_task", None) and not self.monitor_task.done():
             self.monitor_task.cancel()
         with self._lock:
+            self.pre_roll_buffers.clear()
             self.user_buffers.clear()
             self.speech_frame_counts.clear()
             self.last_spoken.clear()
@@ -722,7 +799,7 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
             ready_payloads = []
             with self._lock:
                 for user, last_t in list(self.last_spoken.items()):
-                    if now - last_t >= 1.0:
+                    if now - last_t >= 1.1:
                         pcm_bytes = bytes(self.user_buffers.pop(user, b""))
                         active_frames = self.speech_frame_counts.pop(user, 0)
                         self.last_spoken.pop(user, None)
