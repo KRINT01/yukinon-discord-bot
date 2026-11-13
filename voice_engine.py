@@ -69,16 +69,17 @@ VOICE_TEST_PHRASE_REGEX = re.compile(
 
 # Vocabulary hint for Whisper so Thai commands & Yukino's names are spelled accurately
 WHISPER_THAI_PROMPT_HINT = (
-    "ยูกิโนะ ยูกิน่อน สวัสดีค่ะ ได้ยินไหม ถ้าได้ยินแล้วพิมพ์ตอบในแชท "
+    "ยูกิโนะ ยูกิน่อน สวัสดีค่ะ แนะนำตัวหน่อย ได้ยินไหม ถ้าได้ยินแล้วพิมพ์ตอบในแชท "
     "ทดสอบไมค์ เทสเสียง ทดสอบ วันนี้วันอะไร ตอนนี้เวลากี่โมง อากาศวันนี้เป็นยังไง"
 )
 
-# Common phonetic misrecognitions fixed before processing
 STT_PHONETIC_FIXES = (
     (re.compile(r"ถ้าได้อีกแล้ว\s*พิมพ์ตอบในชัด"), "ถ้าได้ยินแล้วพิมพ์ตอบในแชท"),
     (re.compile(r"พิมพ์ตอบในชัด"), "พิมพ์ตอบในแชท"),
     (re.compile(r"ไม่หยินไหม"), "ได้ยินไหม"),
     (re.compile(r"ได้มิดินมัย"), "ได้ยินไหม"),
+    (re.compile(r"แม่นำตัว"), "แนะนำตัว"),
+    (re.compile(r"แนะนําตัว"), "แนะนำตัว"),
     (re.compile(r"ตัดสอบ"), "ทดสอบ"),
     (re.compile(r"^เธอสิ่ง(กัน)?$"), "เทสเสียง"),
     (re.compile(r"^สอบสิ่ง$"), "ทดสอบเสียง"),
@@ -354,12 +355,58 @@ except ImportError:
 state.has_voice_recv = HAS_VOICE_RECV
 
 
+THAI_DAY_NUMBER_WORDS = {
+    1: "หนึ่ง", 2: "สอง", 3: "สาม", 4: "สี่", 5: "ห้า",
+    6: "หก", 7: "เจ็ด", 8: "แปด", 9: "เก้า", 10: "สิบ",
+    11: "สิบเอ็ด", 12: "สิบสอง", 13: "สิบสาม", 14: "สิบสี่", 15: "สิบห้า",
+    16: "สิบหก", 17: "สิบเจ็ด", 18: "สิบแปด", 19: "สิบเก้า", 20: "ยี่สิบ",
+    21: "ยี่สิบเอ็ด", 22: "ยี่สิบสอง", 23: "ยี่สิบสาม", 24: "ยี่สิบสี่", 25: "ยี่สิบห้า",
+    26: "ยี่สิบหก", 27: "ยี่สิบเจ็ด", 28: "ยี่สิบแปด", 29: "ยี่สิบเก้า", 30: "สามสิบ",
+    31: "สามสิบเอ็ด",
+}
+
+
+def _normalize_thai_dates_and_times_for_tts(text: str) -> str:
+    """
+    Prevents Thai TTS engines from reading 'วันศุกร์ที่ 13 พฤศจิกายน' as 'วันศุกร์ที่ วันที่ 13 พฤศจิกายน'
+    by converting the day number after 'ที่' into Thai words and expanding HH:MM น. into natural spoken time.
+    """
+    # 1. Remove parenthetical ISO date explanations like (ค.ศ. 2026-11-13) or (เวลาประเทศไทย UTC+7)
+    s = re.sub(r"\(\s*ค\.ศ\.[^)]*\)", " ", text)
+    s = re.sub(r"\(\s*เวลาประเทศไทย[^)]*\)", " ", s)
+
+    # 2. Expand time '22:33 น.' or '22:33' -> '22 นาฬิกา 33 นาที'
+    def _time_repl(m):
+        hh = int(m.group(1))
+        mm = int(m.group(2))
+        if mm == 0:
+            return f" {hh} นาฬิกา "
+        return f" {hh} นาฬิกา {mm} นาที "
+
+    s = re.sub(r"\b(\d{1,2}):(\d{2})\s*(?:น\.)?", _time_repl, s)
+
+    # 3. Convert 'ที่ <1-31>' (e.g. 'วันศุกร์ที่ 13' or 'วันที่ 13') into Thai words ('วันศุกร์ที่สิบสาม')
+    # so the TTS engine's '<number> <month>' auto-expander never inserts a second 'วันที่'
+    def _day_num_repl(m):
+        prefix = m.group(1)
+        day_int = int(m.group(2))
+        day_word = THAI_DAY_NUMBER_WORDS.get(day_int, str(day_int))
+        return f"{prefix}{day_word} "
+
+    s = re.sub(r"(ที่)\s*(\d{1,2})\b", _day_num_repl, s)
+
+    # 4. Expand 'พ.ศ.' for smoother speech
+    s = re.sub(r"พ\.ศ\.\s*(\d{4})", r"พุทธศักราช \1", s)
+    return s
+
+
 def clean_text_for_speech(text: str) -> str:
     cleaned = sanitize_yukino_output(text)
     cleaned = re.sub(r"```[\s\S]*?```", " รายละเอียดของโค้ดฉันส่งไว้ให้ในแชทแล้วค่ะ ", cleaned)
     cleaned = URL_REGEX.sub(" ลิงก์อ้างอิงอยู่ในแชทแล้วค่ะ ", cleaned)
-    # Strip markdown symbols and emojis so edge-tts never rejects the text payload
-    cleaned = re.sub(r"[\*\_\~\`\#\>|\[\]\"\']", " ", cleaned)
+    cleaned = _normalize_thai_dates_and_times_for_tts(cleaned)
+    # Strip parentheses, quotes, and markdown symbols so TTS cadence never slows down or stutters
+    cleaned = re.sub(r"[\(\)\*\_\~\`\#\>|\[\]\"\']", " ", cleaned)
     cleaned = re.sub(r"[\U00010000-\U0010ffff]", "", cleaned)
     return re.sub(r"\s+", " ", cleaned).strip()[:450]
 
@@ -368,7 +415,7 @@ def select_tts_voice(text: str) -> str:
     return TTS_VOICE_TH if THAI_CHAR_REGEX.search(text) else TTS_VOICE_EN
 
 
-def _split_tts_chunks(text: str, max_len: int = 180) -> list[str]:
+def _split_tts_chunks(text: str, max_len: int = 190) -> list[str]:
     words = text.split(" ")
     chunks, cur = [], ""
     for w in words:
@@ -386,7 +433,7 @@ def _split_tts_chunks(text: str, max_len: int = 180) -> list[str]:
 def _master_tts_audio_sync(mp3_bytes: bytes, extra_af: str = "") -> bytes:
     """
     Applies a warm, natural broadcast mastering filter (softens 3.2kHz robotic sibilance,
-    normalizes loudness, and outputs clean 48kHz stereo CBR MP3 with exact duration headers).
+    normalizes loudness, and outputs clean 48kHz stereo CBR MP3).
     """
     base_af = "equalizer=f=3200:t=q:w=1.2:g=-2.5,acompressor=threshold=-18dB:ratio=2:attack=15:release=150,volume=1.35"
     full_af = f"{extra_af},{base_af}" if extra_af else base_af
@@ -407,13 +454,11 @@ def _master_tts_audio_sync(mp3_bytes: bytes, extra_af: str = "") -> bytes:
     return proc.stdout
 
 
-async def _fallback_google_tts_with_yukino_pitch(
-    spoken_text: str, lang_code: str, is_flustered: bool = False
-) -> bytes:
+async def _fallback_google_tts_with_yukino_pitch(spoken_text: str, lang_code: str) -> bytes:
     raw_mp3_parts = bytearray()
     headers = {"User-Agent": "Mozilla/5.0"}
     session = get_http_session()
-    for chunk in _split_tts_chunks(spoken_text, max_len=180):
+    for chunk in _split_tts_chunks(spoken_text, max_len=190):
         tts_url = (
             f"{HTTPS}{GTRANS_HOST}/translate_tts"
             f"?ie=UTF-8&client=tw-ob&tl={lang_code}&q={quote_plus(chunk)}"
@@ -427,10 +472,10 @@ async def _fallback_google_tts_with_yukino_pitch(
     if not raw_mp3_parts:
         return b""
 
-    # Use steady tempo adjustment (without asetrate sample-rate warping) so speed never fluctuates
-    tempo_af = "atempo=1.12" if is_flustered else "atempo=1.06"
+    # Locked constant tempo (1.06x) with subtle pitch refinement so speed never fluctuates between replies
+    steady_af = "asetrate=24000*1.04,aresample=48000,atempo=1.02"
     try:
-        return await asyncio.to_thread(_master_tts_audio_sync, bytes(raw_mp3_parts), tempo_af)
+        return await asyncio.to_thread(_master_tts_audio_sync, bytes(raw_mp3_parts), steady_af)
     except Exception:
         return bytes(raw_mp3_parts)
 
@@ -441,50 +486,39 @@ async def synthesize_tts_mp3_bytes(text: str) -> bytes:
         return b""
     is_thai = bool(THAI_CHAR_REGEX.search(spoken_text))
     voice_name = TTS_VOICE_TH if is_thai else TTS_VOICE_EN
-    is_flustered = bool(CAT_TOPIC_REGEX.search(spoken_text) or STUTTER_REGEX.search(spoken_text))
-
-    # Saori Hayami Kuudere Prosody: calm & composed by default; slightly faster/higher only when flustered
-    active_pitch = "+4Hz" if is_flustered else TTS_PITCH
-    active_rate = "+2%" if is_flustered else TTS_RATE
 
     if time.time() >= state.edge_tts_cooldown_until:
-        for attempt in range(2):
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
-                mp3_path = tmp_mp3.name
-            try:
-                # On attempt 2, use neutral prosody (+0Hz, +0%) in case custom rate/pitch caused an SSML rejection
-                use_pitch = active_pitch if attempt == 0 else "+0Hz"
-                use_rate = active_rate if attempt == 0 else "+0%"
-                communicate = edge_tts.Communicate(
-                    text=spoken_text,
-                    voice=voice_name,
-                    rate=use_rate,
-                    pitch=use_pitch,
-                    proxy=DDGS_PROXY,
-                )
-                await asyncio.wait_for(communicate.save(mp3_path), timeout=8.0)
-                if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 256:
-                    with open(mp3_path, "rb") as f:
-                        raw_edge_mp3 = f.read()
-                    try:
-                        return await asyncio.to_thread(_master_tts_audio_sync, raw_edge_mp3)
-                    except Exception:
-                        return raw_edge_mp3
-            except Exception as e:
-                if attempt == 0:
-                    await asyncio.sleep(0.35)
-                else:
-                    # Short 45s cooldown (instead of 10m) so brief network blips don't lock out edge-tts
-                    state.edge_tts_cooldown_until = time.time() + 45
-                    print(f"edge-tts failed after 2 attempts ({e}); cooling down 45s & using Google TTS fallback...", flush=True)
-            finally:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
+            mp3_path = tmp_mp3.name
+        try:
+            # Avoid passing +0Hz/+0% which edge-tts rejects; only pass rate/pitch if non-zero
+            comm_kwargs = {"text": spoken_text, "voice": voice_name, "proxy": DDGS_PROXY}
+            if TTS_RATE and TTS_RATE not in ("+0%", "-0%", "0%"):
+                comm_kwargs["rate"] = TTS_RATE
+            if TTS_PITCH and TTS_PITCH not in ("+0Hz", "-0Hz", "0Hz"):
+                comm_kwargs["pitch"] = TTS_PITCH
+
+            communicate = edge_tts.Communicate(**comm_kwargs)
+            await asyncio.wait_for(communicate.save(mp3_path), timeout=4.5)
+            if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 256:
+                with open(mp3_path, "rb") as f:
+                    raw_edge_mp3 = f.read()
                 try:
-                    os.remove(mp3_path)
-                except OSError:
-                    pass
+                    return await asyncio.to_thread(_master_tts_audio_sync, raw_edge_mp3)
+                except Exception:
+                    return raw_edge_mp3
+        except Exception as e:
+            # Cooldown for 30m when Render's IP is throttled by Microsoft so voice doesn't flip-flop mid-session
+            state.edge_tts_cooldown_until = time.time() + 1800
+            print(f"edge-tts unavailable ({e}); locking to steady Google TTS + Yukino filter for 30m...", flush=True)
+        finally:
+            try:
+                os.remove(mp3_path)
+            except OSError:
+                pass
 
     lang_code = "th" if is_thai else "en"
-    return await _fallback_google_tts_with_yukino_pitch(spoken_text, lang_code, is_flustered=is_flustered)
+    return await _fallback_google_tts_with_yukino_pitch(spoken_text, lang_code)
 
 
 async def speak_in_voice_channel(guild: discord.Guild, text: str, fallback_channel=None):

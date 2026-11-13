@@ -84,8 +84,8 @@ PORT = int(os.getenv("PORT", "10000"))
 # Yukino Yukinoshita (Saori Hayami Composed Kuudere Tone: calm neutral pitch, articulate measured rate)
 TTS_VOICE_TH = os.getenv("TTS_VOICE_TH", "th-TH-PremwadeeNeural")
 TTS_VOICE_EN = os.getenv("TTS_VOICE_EN", "en-US-AriaNeural")
-TTS_PITCH = os.getenv("TTS_PITCH", "+0Hz")
-TTS_RATE = os.getenv("TTS_RATE", "-4%")
+TTS_PITCH = os.getenv("TTS_PITCH", "+2Hz")
+TTS_RATE = os.getenv("TTS_RATE", "-2%")
 STT_PRIMARY_LANG = os.getenv("STT_PRIMARY_LANG", "th-TH")
 
 # Multi-server allowlist & AI channel IDs
