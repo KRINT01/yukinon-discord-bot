@@ -102,6 +102,7 @@ try:
         """
         Uses discord.py 2.7.1's own native op=11 (CLIENTS_CONNECT) handler to register all
         present voice channel members right after op=4 (SESSION_DESCRIPTION) and before op=27 (PROPOSALS).
+        IMPORTANT: Do NOT call set_passthrough_mode(True) here, as True disables DAVE encryption (ready=False)!
         """
         uid_ints = set(_KNOWN_VOICE_USER_IDS)
         if vc is not None and getattr(vc, "channel", None):
@@ -117,13 +118,6 @@ try:
                 )
             except Exception as e:
                 print(f"[DAVE op=11 Sync Note] {type(e).__name__}: {e}", flush=True)
-
-        dave_sess = getattr(conn, "dave_session", None) if conn is not None else None
-        if dave_sess is not None and hasattr(dave_sess, "set_passthrough_mode"):
-            try:
-                dave_sess.set_passthrough_mode(True, 120)
-            except Exception:
-                pass
 
     async def _safe_vr_hook(ws, msg):
         if not isinstance(msg, dict):
@@ -174,8 +168,6 @@ try:
 
             await _NATIVE_DPY_VOICE_WS_RECEIVED(self, msg)
 
-            # CRITICAL: Right after op=4 (SESSION_DESCRIPTION) initializes dave_session,
-            # register all channel members via native op=11 before binary op=27 arrives!
             if op in (4, 5, 12):
                 await _inject_dave_clients_connect(self, conn, vc)
             return
@@ -190,7 +182,6 @@ try:
             conn, vc = _bridge_conn_to_vc(self)
             b_op = msg[2] if len(msg) > 2 else -1
 
-            # Ensure all voice channel members are registered via op=11 before op=25/27 proposals
             if b_op in (25, 27):
                 await _inject_dave_clients_connect(self, conn, vc)
 
@@ -202,6 +193,13 @@ try:
 
             dave_s = getattr(conn, "dave_session", None) if conn is not None else None
             if dave_s is not None and b_op in (25, 27, 29, 30):
+                # Ensure passthrough_mode is False once Commit/Welcome (op=29/30) activates the session
+                if b_op in (29, 30) and not getattr(dave_s, "ready", False):
+                    if hasattr(dave_s, "set_passthrough_mode"):
+                        try:
+                            dave_s.set_passthrough_mode(False, 24)
+                        except Exception:
+                            pass
                 uids = dave_s.get_user_ids() if hasattr(dave_s, "get_user_ids") else "?"
                 status = getattr(dave_s, "status", "?")
                 ready = getattr(dave_s, "ready", "?")
@@ -260,8 +258,8 @@ try:
                 if now - _DAVE_LOG_TS > 5.0:
                     _DAVE_LOG_TS = now
                     print(f"[DAVE Decrypt Note] ssrc={getattr(packet, 'ssrc', '?')}: {type(e).__name__}: {e}", flush=True)
-                # Always replace failed decrypt packets with silence so encrypted bytes aren't decoded as static noise
-                packet.decrypted_data = OPUS_SILENCE_FRAME
+                if raw_payload.endswith(b"\xfa\xfa"):
+                    packet.decrypted_data = OPUS_SILENCE_FRAME
 
         try:
             return _ORIG_DECODE_PACKET(self, packet)
