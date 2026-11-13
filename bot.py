@@ -332,6 +332,12 @@ async def join_voice(ctx):
     target_channel = ctx.author.voice.channel
     print(f"[Voice Join] Command invoked by {ctx.author} for channel '{target_channel.name}'", flush=True)
     try:
+        from voice_engine import _KNOWN_VOICE_USER_IDS
+        for m in target_channel.members:
+            _KNOWN_VOICE_USER_IDS.add(int(m.id))
+        if bot.user:
+            _KNOWN_VOICE_USER_IDS.add(int(bot.user.id))
+
         if ctx.guild.voice_client:
             await ctx.guild.voice_client.disconnect(force=True)
             await asyncio.sleep(0.5)

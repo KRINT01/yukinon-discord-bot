@@ -53,8 +53,11 @@ logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.ERROR)
 OPUS_SILENCE_FRAME = b"\xf8\xff\xfe"
 PCM_SILENCE_20MS = b"\x00" * 3840
 
+# Host constants split to prevent chat/markdown auto-linkers from mangling URLs
+GTRANS_HOST = "translate." + "googleapis.com"
+GROQ_API_HOST = "api." + "groq.com"
+
 _NATIVE_DPY_VOICE_WS_RECEIVED = _dpy_gateway.DiscordVoiceWebSocket.received_message
-_NATIVE_DPY_VOICE_WS_BINARY = getattr(_dpy_gateway.DiscordVoiceWebSocket, "received_binary_message", None)
 
 try:
     from discord.ext import voice_recv
@@ -65,7 +68,7 @@ try:
     _ORIG_VR_HOOK = getattr(_vr_gateway, "hook", None)
     _ORIG_DECODE_PACKET = _vr_opus.PacketDecoder._decode_packet
     _DAVE_LOG_TS = 0.0
-    _KNOWN_VOICE_USER_IDS: set[str] = set()
+    _KNOWN_VOICE_USER_IDS: set[int] = set()
 
     def _bridge_conn_to_vc(ws):
         """Bridges discord.py 2.7's VoiceConnectionState (ws._connection) to VoiceRecvClient."""
@@ -88,32 +91,29 @@ try:
 
     def _sync_dave_recognized_users_sync(ws, conn, vc):
         """
-        Synchronously registers all voice channel human member IDs onto VoiceConnectionState / WebSocket
-        BEFORE op=27 (DAVE_MLS_PROPOSALS) without recursively calling received_message.
+        Registers all voice channel member IDs ( strictly as ints ) onto VoiceConnectionState
+        BEFORE op=27 (DAVE_MLS_PROPOSALS) so davey accepts every member's MLS Add proposal.
         """
-        user_id_strs = set(_KNOWN_VOICE_USER_IDS)
+        uid_ints = set(_KNOWN_VOICE_USER_IDS)
         if vc is not None and getattr(vc, "channel", None):
             for m in vc.channel.members:
-                user_id_strs.add(str(m.id))
+                uid_ints.add(int(m.id))
         if state.bot is not None and getattr(state.bot, "user", None):
-            user_id_strs.add(str(state.bot.user.id))
+            uid_ints.add(int(state.bot.user.id))
 
-        if not user_id_strs:
+        if not uid_ints:
             return
 
-        uid_ints = {int(u) for u in user_id_strs if u.isdigit()}
         for target_obj in (conn, ws):
             if target_obj is None:
                 continue
             for k, v in list(getattr(target_obj, "__dict__", {}).items()):
-                if isinstance(v, set):
+                if isinstance(v, set) and ("user" in k.lower() or "client" in k.lower() or "dave" in k.lower()):
                     try:
                         if any(isinstance(x, str) for x in v):
-                            v.update(user_id_strs)
-                        elif any(isinstance(x, int) for x in v):
-                            v.update(uid_ints)
+                            v.update(str(u) for u in uid_ints)
                         else:
-                            v.update(user_id_strs)
+                            # Default to int set (required by davey PyO3 Rust bindings)
                             v.update(uid_ints)
                     except Exception:
                         pass
@@ -149,7 +149,10 @@ try:
             if b_op in (25, 27):
                 _sync_dave_recognized_users_sync(self, conn, vc)
             print(f"[DAVE WS Binary] Received binary MLS frame (op={b_op}, len={len(msg)}B)", flush=True)
-            await _NATIVE_DPY_VOICE_WS_RECEIVED(self, msg)
+            try:
+                await _NATIVE_DPY_VOICE_WS_RECEIVED(self, msg)
+            except Exception as e:
+                print(f"[DAVE WS Binary Error] op={b_op} {type(e).__name__}: {e}", flush=True)
 
             dave_s = getattr(conn, "dave_session", None) if conn is not None else None
             if dave_s is not None and b_op in (25, 27, 29, 30):
@@ -168,12 +171,12 @@ try:
                 print(f"[DAVE WS JSON] Transition event op={op} d={data}", flush=True)
             if isinstance(data, dict):
                 uid_val = data.get("user_id")
-                if uid_val:
-                    _KNOWN_VOICE_USER_IDS.add(str(uid_val))
+                if uid_val and str(uid_val).isdigit():
+                    _KNOWN_VOICE_USER_IDS.add(int(uid_val))
                 if isinstance(data.get("user_ids"), list):
                     for u in data["user_ids"]:
-                        if u:
-                            _KNOWN_VOICE_USER_IDS.add(str(u))
+                        if u and str(u).isdigit():
+                            _KNOWN_VOICE_USER_IDS.add(int(u))
 
                 if vc is not None and hasattr(vc, "_add_ssrc"):
                     if op == 5 and uid_val and data.get("ssrc") is not None:
@@ -190,25 +193,13 @@ try:
                             pass
 
             await _NATIVE_DPY_VOICE_WS_RECEIVED(self, msg)
-            if op in (4, 5, 11, 12):
+            if op in (2, 4, 5, 11, 12):
                 _sync_dave_recognized_users_sync(self, conn, vc)
             return
 
         await _NATIVE_DPY_VOICE_WS_RECEIVED(self, msg)
 
     _dpy_gateway.DiscordVoiceWebSocket.received_message = _dpy27_dave_compatible_received_message
-
-    if _NATIVE_DPY_VOICE_WS_BINARY is not None:
-        async def _dpy27_dave_compatible_binary_message(self, msg: bytes):
-            self._hook = _safe_vr_hook
-            conn, vc = _bridge_conn_to_vc(self)
-            b_op = msg[2] if len(msg) > 2 else -1
-            if b_op in (25, 27):
-                _sync_dave_recognized_users_sync(self, conn, vc)
-            print(f"[DAVE WS Binary] Received binary MLS frame (op={b_op}, len={len(msg)}B)", flush=True)
-            await _NATIVE_DPY_VOICE_WS_BINARY(self, msg)
-
-        _dpy_gateway.DiscordVoiceWebSocket.received_binary_message = _dpy27_dave_compatible_binary_message
 
     def _safe_dave_decode_packet(self, packet):
         global _DAVE_LOG_TS
@@ -309,8 +300,8 @@ async def _fallback_google_tts_with_yukino_pitch(
     headers = {"User-Agent": "Mozilla/5.0"}
     session = get_http_session()
     for chunk in _split_tts_chunks(spoken_text, max_len=180):
-        tts_url = clean_url(
-            f"{HTTPS}[translate.googleapis.com/translate_tts](https://translate.googleapis.com/translate_tts)"
+        tts_url = (
+            f"{HTTPS}{GTRANS_HOST}/translate_tts"
             f"?ie=UTF-8&client=tw-ob&tl={lang_code}&q={quote_plus(chunk)}"
         )
         async with session.get(
@@ -377,7 +368,7 @@ async def synthesize_tts_mp3_bytes(text: str) -> bytes:
                     return f.read()
         except Exception as e:
             state.edge_tts_cooldown_until = time.time() + 600
-            print(f"edge-tts blocked/failed ({e}); cooling down 10m & using Google TTS + FFmpeg Yukino filter...")
+            print(f"edge-tts blocked/failed ({e}); cooling down 10m & using Google TTS + FFmpeg Yukino filter...", flush=True)
         finally:
             try:
                 os.remove(mp3_path)
@@ -395,7 +386,7 @@ async def speak_in_voice_channel(guild: discord.Guild, text: str, fallback_chann
 
     mp3_bytes = await synthesize_tts_mp3_bytes(spoken_text)
     if not mp3_bytes:
-        print("TTS synthesis returned empty audio bytes.")
+        print("TTS synthesis returned empty audio bytes.", flush=True)
         return
 
     if not guild or not guild.voice_client or not guild.voice_client.is_connected():
@@ -420,18 +411,19 @@ async def speak_in_voice_channel(guild: discord.Guild, text: str, fallback_chann
 
             def _after_play(err):
                 if err:
-                    print(f"FFmpeg voice playback error: {err}")
+                    print(f"FFmpeg voice playback error: {err}", flush=True)
                 try:
                     os.remove(mp3_path)
                 except OSError:
                     pass
                 loop.call_soon_threadsafe(done_event.set)
 
+            print(f"[Voice TTS] Playing {len(mp3_bytes)} bytes in '{vc.channel.name}'...", flush=True)
             audio_source = discord.FFmpegPCMAudio(mp3_path, options="-vn -loglevel warning")
             vc.play(audio_source, after=_after_play)
             await asyncio.wait_for(done_event.wait(), timeout=60)
         except Exception as e:
-            print(f"TTS voice channel playback error: {e}")
+            print(f"TTS voice channel playback error: {e}", flush=True)
             try:
                 os.remove(mp3_path)
             except OSError:
@@ -450,7 +442,7 @@ def transcribe_wav_bytes_google_sync(wav_bytes: bytes) -> str:
         except Exception:
             return ""
     except Exception as e:
-        print(f"Google STT error: {e}")
+        print(f"Google STT error: {e}", flush=True)
         return ""
 
 
@@ -471,7 +463,7 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
             form.add_field("temperature", "0")
             form.add_field("response_format", "verbose_json")
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-            stt_url = clean_url(f"{HTTPS}[api.groq.com/openai/v1/audio/transcriptions](https://api.groq.com/openai/v1/audio/transcriptions)")
+            stt_url = f"{HTTPS}{GROQ_API_HOST}/openai/v1/audio/transcriptions"
             session = get_http_session()
             async with session.post(
                 stt_url, headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=25)
@@ -488,7 +480,8 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
                         if no_speech > 0.40 or avg_logprob < -0.75 or comp_ratio > 2.1:
                             print(
                                 f"[Voice VAD Filter] Dropped noise segment '{seg_text}' "
-                                f"(no_speech={no_speech:.2f}, logprob={avg_logprob:.2f}, comp={comp_ratio:.2f})"
+                                f"(no_speech={no_speech:.2f}, logprob={avg_logprob:.2f}, comp={comp_ratio:.2f})",
+                                flush=True,
                             )
                             continue
                         if seg_text:
@@ -499,7 +492,7 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
                         return txt
                     return ""
         except Exception as e:
-            print(f"Groq Whisper STT error: {e}")
+            print(f"Groq Whisper STT error (falling back to Google STT): {e}", flush=True)
 
     return await asyncio.to_thread(transcribe_wav_bytes_google_sync, wav_bytes)
 
@@ -522,12 +515,12 @@ async def handle_spoken_voice_command(
         or NOISE_HALLUCINATION_REGEX.search(cleaned)
     ):
         return
-    print(f"[Voice STT] {speaker_name} spoke: '{cleaned}' (wake_word_required={voice_wake_word_enabled[guild.id]})")
+    print(f"[Voice STT] {speaker_name} spoke: '{cleaned}' (wake_word_required={voice_wake_word_enabled[guild.id]})", flush=True)
 
     lower_txt = cleaned.lower()
     if voice_wake_word_enabled[guild.id]:
         if not any(lower_txt.startswith(w) or w in lower_txt[:22] for w in VOICE_WAKE_WORDS):
-            print(f"[Voice STT] Ignored '{cleaned}' (no wake word detected; use !wakeword off to disable).")
+            print(f"[Voice STT] Ignored '{cleaned}' (no wake word detected; use !wakeword off to disable).", flush=True)
             return
 
     answer, _ = await query_local_ollama_chat(

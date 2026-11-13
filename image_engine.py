@@ -155,8 +155,9 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
     # Tier 1: Keyless Google Translate NMT
     t0 = time.monotonic()
     try:
-        gt_url = clean_url(
-            f"{HTTPS}[translate.googleapis.com/translate_a/single](https://translate.googleapis.com/translate_a/single)"
+        gtrans_host = "translate." + "googleapis.com"
+        gt_url = (
+            f"{HTTPS}{gtrans_host}/translate_a/single"
             f"?client=gtx&sl=th&tl=en&dt=t&q={quote_plus(raw_prompt)}"
         )
         session = get_http_session()
