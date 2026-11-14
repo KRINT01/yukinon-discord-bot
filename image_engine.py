@@ -668,8 +668,8 @@ def _wrap_text_to_pixel_width(
     max_width: int,
     allow_midword_split: bool = False,
 ) -> list[str]:
-    has_spaces = " " in text
-    words = text.split(" ") if has_spaces else [text]
+    is_thai_text = bool(THAI_CHAR_REGEX.search(text))
+    words = text.split(" ") if (" " in text or not is_thai_text) else [text]
     lines = []
     current = ""
 
@@ -685,7 +685,8 @@ def _wrap_text_to_pixel_width(
                 lines.append(current)
                 current = ""
             wbbox = draw.textbbox((0, 0), word, font=font)
-            if (wbbox[2] - wbbox[0]) <= max_width or (has_spaces and not allow_midword_split):
+            # Never split English/Latin words mid-word unless allow_midword_split is True (smallest fallback font)
+            if (wbbox[2] - wbbox[0]) <= max_width or (not is_thai_text and not allow_midword_split):
                 current = word
             else:
                 chunk = ""
@@ -719,59 +720,19 @@ def _clean_single_bubble_lobe_fast(
     cx = (x1 + x2) // 2
     cy = (y1 + y2) // 2
 
-    # 1. Compute strict Voronoi / midpoint bounds against nearby peer bubbles so compound lobes never bleed together
-    vor_x1 = max(0, x1 - max(18, int(box_w * 0.28)))
-    vor_y1 = max(0, y1 - max(14, int(box_h * 0.18)))
-    vor_x2 = min(width, x2 + max(18, int(box_w * 0.28)))
-    vor_y2 = min(height, y2 + max(14, int(box_h * 0.18)))
-
-    for ox1, oy1, ox2, oy2 in other_peer_boxes:
-        ocx = (ox1 + ox2) // 2
-        ocy = (oy1 + oy2) // 2
-        dx = abs(cx - ocx)
-        dy = abs(cy - ocy)
-        # Only clamp against peer bubbles that are close enough to interact
-        if dx > (box_w + (ox2 - ox1)) and dy > (box_h + (oy2 - oy1)):
-            continue
-
-        # Determine primary separation axis between this lobe and the peer lobe
-        h_gap = max(ox1 - x2, x1 - ox2)
-        v_gap = max(oy1 - y2, y1 - oy2)
-        if v_gap >= h_gap:
-            if cy < ocy:
-                mid_y = (min(y2, oy2) + max(y1, oy1)) // 2 if v_gap < 0 else (y2 + oy1) // 2
-                vor_y2 = min(vor_y2, max(y1 + 12, mid_y - 3))
-            else:
-                mid_y = (min(y2, oy2) + max(y1, oy1)) // 2 if v_gap < 0 else (y1 + oy2) // 2
-                vor_y1 = max(vor_y1, min(y2 - 12, mid_y + 3))
-        else:
-            if cx < ocx:
-                mid_x = (min(x2, ox2) + max(x1, ox1)) // 2 if h_gap < 0 else (x2 + ox1) // 2
-                vor_x2 = min(vor_x2, max(x1 + 12, mid_x - 3))
-            else:
-                mid_x = (min(x2, ox2) + max(x1, ox1)) // 2 if h_gap < 0 else (x1 + ox2) // 2
-                vor_x1 = max(vor_x1, min(x2 - 12, mid_x + 3))
-
-    # Clamp original text box to Voronoi territory
-    cx1 = max(vor_x1, min(x1, vor_x2 - 10))
-    cy1 = max(vor_y1, min(y1, vor_y2 - 10))
-    cx2 = min(vor_x2, max(x2, cx1 + 10))
-    cy2 = min(vor_y2, max(y2, cy1 + 10))
-
-    # 2. Erase ONLY the Japanese characters inside (cx1, cy1, cx2, cy2) while preserving bubble borders & outside art
-    erase_pad = 4
-    ex1 = max(vor_x1, cx1 - erase_pad)
-    ey1 = max(vor_y1, cy1 - erase_pad)
-    ex2 = min(vor_x2, cx2 + erase_pad)
-    ey2 = min(vor_y2, cy2 + erase_pad)
+    # 1. FIRST: Erase the full original Japanese text box (with a +6px right margin for vertical rightmost columns like 'ああ')
+    # BEFORE applying Voronoi layout clamping, so right-edge Japanese characters are never left behind!
+    ex1 = max(0, x1 - 4)
+    ey1 = max(0, y1 - 4)
+    ex2 = min(width, x2 + 6)
+    ey2 = min(height, y2 + 4)
     ew = max(4, ex2 - ex1)
     eh = max(4, ey2 - ey1)
 
     sub_gray = base_gray.crop((ex1, ey1, ex2, ey2))
-    # Create a mask of dark pixels (text + any border touching the edge of the tight box)
-    dark_mask = sub_gray.point(lambda p: 255 if p < 210 else 0)
+    dark_mask = sub_gray.point(lambda p: 255 if p < 212 else 0)
 
-    # Flood-fill dark pixels that touch the outer 1px perimeter AND belong to thick bubble borders/hair
+    # Protect only continuous outer bubble borders touching the 1px perimeter
     border_connected = dark_mask.copy()
     for bx in range(ew):
         if border_connected.getpixel((bx, 0)) == 255:
@@ -784,43 +745,96 @@ def _clean_single_bubble_lobe_fast(
         if border_connected.getpixel((ew - 1, by)) == 255:
             ImageDraw.floodfill(border_connected, (ew - 1, by), 128)
 
-    # Erase all interior text pixels (dark pixels not connected to the outer border, plus slightly dilated)
     text_only_mask = border_connected.point(lambda p: 255 if p == 255 else 0)
-    # Also erase any remaining dark pixels strictly inside the inner 85% core of the text box
+    # Guarantee the core text area (including the right-side first column) is wiped clean
     inner_m = ImageDraw.Draw(text_only_mask)
-    ix1, iy1 = max(2, int(ew * 0.06)), max(2, int(eh * 0.06))
-    ix2, iy2 = min(ew - 3, int(ew * 0.94)), min(eh - 3, int(eh * 0.94))
+    ix1, iy1 = max(2, int(ew * 0.04)), max(2, int(eh * 0.05))
+    ix2, iy2 = min(ew - 2, int(ew * 0.96)), min(eh - 2, int(eh * 0.95))
     if ix2 > ix1 and iy2 > iy1:
         inner_m.rectangle([ix1, iy1, ix2, iy2], fill=255)
 
     white_patch = Image.new("RGB", (ew, eh), (255, 255, 255))
     img.paste(white_patch, (ex1, ey1), mask=text_only_mask)
 
-    # 3. Measure safe horizontal white width inside (vor_x1..vor_x2) around the vertical center of the bubble
-    # so horizontal English words can utilize wider bubble space without touching the black border
-    mid_y_start = cy1 + int((cy2 - cy1) * 0.20)
-    mid_y_end = cy1 + int((cy2 - cy1) * 0.80)
+    # 2. Compute Voronoi midpoint bounds against nearby peer bubbles for text placement
+    max_expand_x = max(16, int(box_w * 0.24))
+    max_expand_y = max(12, int(box_h * 0.16))
+    vor_x1 = max(0, x1 - max_expand_x)
+    vor_y1 = max(0, y1 - max_expand_y)
+    vor_x2 = min(width, x2 + max_expand_x)
+    vor_y2 = min(height, y2 + max_expand_y)
+
+    has_close_peer = False
+    for ox1, oy1, ox2, oy2 in other_peer_boxes:
+        ocx = (ox1 + ox2) // 2
+        ocy = (oy1 + oy2) // 2
+        dx = abs(cx - ocx)
+        dy = abs(cy - ocy)
+        if dx > (box_w + (ox2 - ox1)) and dy > (box_h + (oy2 - oy1)):
+            continue
+        has_close_peer = True
+
+        h_gap = max(ox1 - x2, x1 - ox2)
+        v_gap = max(oy1 - y2, y1 - oy2)
+        if v_gap >= h_gap:
+            if cy < ocy:
+                mid_y = (min(y2, oy2) + max(y1, oy1)) // 2 if v_gap < 0 else (y2 + oy1) // 2
+                vor_y2 = min(vor_y2, max(y1 + 12, mid_y - 2))
+            else:
+                mid_y = (min(y2, oy2) + max(y1, oy1)) // 2 if v_gap < 0 else (y1 + oy2) // 2
+                vor_y1 = max(vor_y1, min(y2 - 12, mid_y + 2))
+        else:
+            if cx < ocx:
+                mid_x = (min(x2, ox2) + max(x1, ox1)) // 2 if h_gap < 0 else (x2 + ox1) // 2
+                vor_x2 = min(vor_x2, max(x1 + 12, mid_x - 2))
+            else:
+                mid_x = (min(x2, ox2) + max(x1, ox1)) // 2 if h_gap < 0 else (x1 + ox2) // 2
+                vor_x1 = max(vor_x1, min(x2 - 12, mid_x + 2))
+
+    cx1 = max(vor_x1, min(x1, vor_x2 - 10))
+    cy1 = max(vor_y1, min(y1, vor_y2 - 10))
+    cx2 = min(vor_x2, max(x2, cx1 + 10))
+    cy2 = min(vor_y2, max(y2, cy1 + 10))
+
+    # 3. Scan the CLEANED image (not base_gray) from the horizontal center of the box outward
+    # and enforce symmetric expansion so double-bubble text never drifts to the left!
+    cleaned_gray = img.convert("L")
+    mid_y_start = cy1 + int((cy2 - cy1) * 0.22)
+    mid_y_end = cy1 + int((cy2 - cy1) * 0.78)
     safe_lefts = []
     safe_rights = []
     for sy in range(mid_y_start, max(mid_y_start + 1, mid_y_end), max(2, (mid_y_end - mid_y_start) // 6 or 1)):
         if not (0 <= sy < height):
             continue
-        lx = cx1
-        while lx > vor_x1 and base_gray.getpixel((lx - 1, sy)) >= 215:
+        lx = cx
+        while lx > vor_x1 and cleaned_gray.getpixel((lx - 1, sy)) >= 210:
             lx -= 1
-        rx = cx2
-        while rx < vor_x2 and base_gray.getpixel((rx, sy)) >= 215:
+        rx = cx
+        while rx < vor_x2 and cleaned_gray.getpixel((rx, sy)) >= 210:
             rx += 1
         safe_lefts.append(lx)
         safe_rights.append(rx)
 
     if safe_lefts and safe_rights:
-         safe_l = sorted(safe_lefts)[len(safe_lefts) // 2] + 5
-         safe_r = sorted(safe_rights)[len(safe_rights) // 2] - 5
-         tx1 = max(vor_x1 + 3, min(cx1, safe_l))
-         tx2 = min(vor_x2 - 3, max(cx2, safe_r))
+        wall_l = sorted(safe_lefts)[len(safe_lefts) // 2] + 5
+        wall_r = sorted(safe_rights)[len(safe_rights) // 2] - 5
+        # Keep expansion symmetric around the true bubble center so left expansion never pulls text left
+        avail_left = max(0, cx - wall_l)
+        avail_right = max(0, wall_r - cx)
+        sym_half = min(avail_left, avail_right)
+        if sym_half >= (box_w // 2):
+            tx1 = cx - sym_half
+            tx2 = cx + sym_half
+        else:
+            tx1 = max(vor_x1 + 4, min(cx1, wall_l))
+            tx2 = min(vor_x2 - 4, max(cx2, wall_r))
     else:
         tx1, tx2 = cx1, cx2
+
+    # Subtle +5px rightward optical balance for double bubbles so text sits dead-center in the lobe
+    if has_close_peer and (tx2 + 5) < vor_x2:
+        tx1 += 5
+        tx2 += 5
 
     ty1 = max(vor_y1 + 2, cy1)
     ty2 = min(vor_y2 - 2, cy2)
@@ -911,7 +925,6 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
         )
         prepared_renders.append([tx1, ty1, tx2, ty2, fg_text, stroke_col, trans_text])
 
-    # De-overlap all layout boxes so adjacent/compound bubbles never collide
     prepared_renders = _resolve_box_collisions(prepared_renders, min_gap=6)
 
     draw = ImageDraw.Draw(img)
@@ -1025,7 +1038,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
             src_txt = re.sub(r"\s+", " ", (b.get("source_text") or "")).strip()
             tr_txt = re.sub(r"\s+", " ", (b.get("translated_text") or "")).strip()
             if tr_txt:
-                transcript_lines.append(f"**{idx}. [{speaker}]** `{src_txt}`\n> **{tr_txt}**")
+                transcript_lines.append(f"**[{idx}] [{speaker}]** `{src_txt}`\n   ↳ **{tr_txt}**")
 
         transcript_text = "\n".join(transcript_lines)
 
