@@ -366,27 +366,58 @@ THAI_DAY_NUMBER_WORDS = {
 }
 
 
+def _format_colloquial_thai_time(hh: int, mm: int) -> str:
+    """Converts 24-hour (hh, mm) into natural everyday spoken Thai time."""
+    if hh == 0:
+        hour_phrase = "เที่ยงคืน"
+    elif 1 <= hh <= 5:
+        hour_phrase = f"ตี{THAI_DAY_NUMBER_WORDS[hh]}"
+    elif 6 <= hh <= 11:
+        hour_phrase = f"{THAI_DAY_NUMBER_WORDS[hh]}โมงเช้า"
+    elif hh == 12:
+        hour_phrase = "เที่ยง"
+    elif hh == 13:
+        hour_phrase = "บ่ายโมง"
+    elif 14 <= hh <= 15:
+        hour_phrase = f"บ่าย{THAI_DAY_NUMBER_WORDS[hh - 12]}โมง"
+    elif 16 <= hh <= 18:
+        hour_phrase = f"{THAI_DAY_NUMBER_WORDS[hh - 12]}โมงเย็น"
+    else:
+        # 19:00 (หนึ่งทุ่ม) to 23:00 (ห้าทุ่ม)
+        hour_phrase = f"{THAI_DAY_NUMBER_WORDS[hh - 18]}ทุ่ม"
+
+    if mm == 0:
+        if hh in (0, 12):
+            return f"{hour_phrase}ตรง"
+        return hour_phrase
+    if mm == 30:
+        return f"{hour_phrase}ครึ่ง"
+    return f"{hour_phrase} {mm} นาที"
+
+
 def _normalize_thai_dates_and_times_for_tts(text: str) -> str:
     """
-    Prevents Thai TTS engines from reading 'วันศุกร์ที่ 13 พฤศจิกายน' as 'วันศุกร์ที่ วันที่ 13 พฤศจิกายน'
-    by converting the day number after 'ที่' into Thai words and expanding HH:MM น. into natural spoken time.
+    Converts formal dates/times into natural conversational Thai speech:
+    - Strips parenthetical '(ค.ศ. 2026)' and '(เวลาประเทศไทย UTC+7)'
+    - Strips 'พ.ศ.' / 'พุทธศักราช' so '14 พฤศจิกายน พ.ศ. 2569' reads as 'สิบสี่ พฤศจิกายน 2569'
+    - Converts '02:35 น.' -> 'ตีสอง 35 นาที', '00:00 น.' -> 'เที่ยงคืนตรง', '22:30 น.' -> 'สี่ทุ่มครึ่ง'
     """
-    # 1. Remove parenthetical ISO date explanations like (ค.ศ. 2026-11-13) or (เวลาประเทศไทย UTC+7)
+    # 1. Remove parenthetical ISO/CE date and timezone notes
     s = re.sub(r"\(\s*ค\.ศ\.[^)]*\)", " ", text)
+    s = re.sub(r"\(\s*B\.E\.[^)]*\)", " ", s)
     s = re.sub(r"\(\s*เวลาประเทศไทย[^)]*\)", " ", s)
 
-    # 2. Expand time '22:33 น.' or '22:33' -> '22 นาฬิกา 33 นาที'
+    # 2. Convert 24-hour time 'HH:MM น.' (or 'เวลา HH:MM') into natural colloquial Thai time
     def _time_repl(m):
         hh = int(m.group(1))
         mm = int(m.group(2))
-        if mm == 0:
-            return f" {hh} นาฬิกา "
-        return f" {hh} นาฬิกา {mm} นาที "
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return f" {_format_colloquial_thai_time(hh, mm)} "
+        return m.group(0)
 
     s = re.sub(r"\b(\d{1,2}):(\d{2})\s*(?:น\.)?", _time_repl, s)
 
-    # 3. Convert 'ที่ <1-31>' (e.g. 'วันศุกร์ที่ 13' or 'วันที่ 13') into Thai words ('วันศุกร์ที่สิบสาม')
-    # so the TTS engine's '<number> <month>' auto-expander never inserts a second 'วันที่'
+    # 3. Convert 'ที่ <1-31>' into Thai words ('วันเสาร์ที่สิบสี่') so TTS never inserts an extra 'วันที่'
     def _day_num_repl(m):
         prefix = m.group(1)
         day_int = int(m.group(2))
@@ -395,8 +426,8 @@ def _normalize_thai_dates_and_times_for_tts(text: str) -> str:
 
     s = re.sub(r"(ที่)\s*(\d{1,2})\b", _day_num_repl, s)
 
-    # 4. Expand 'พ.ศ.' for smoother speech
-    s = re.sub(r"พ\.ศ\.\s*(\d{4})", r"พุทธศักราช \1", s)
+    # 4. Drop 'พ.ศ.' / 'พุทธศักราช' so the year is read naturally as '2569'
+    s = re.sub(r"(?:พ\.ศ\.|พุทธศักราช)\s*(\d{4})", r"\1", s)
     return s
 
 
@@ -405,7 +436,6 @@ def clean_text_for_speech(text: str) -> str:
     cleaned = re.sub(r"```[\s\S]*?```", " รายละเอียดของโค้ดฉันส่งไว้ให้ในแชทแล้วค่ะ ", cleaned)
     cleaned = URL_REGEX.sub(" ลิงก์อ้างอิงอยู่ในแชทแล้วค่ะ ", cleaned)
     cleaned = _normalize_thai_dates_and_times_for_tts(cleaned)
-    # Strip parentheses, quotes, and markdown symbols so TTS cadence never slows down or stutters
     cleaned = re.sub(r"[\(\)\*\_\~\`\#\>|\[\]\"\']", " ", cleaned)
     cleaned = re.sub(r"[\U00010000-\U0010ffff]", "", cleaned)
     return re.sub(r"\s+", " ", cleaned).strip()[:450]
@@ -472,8 +502,8 @@ async def _fallback_google_tts_with_yukino_pitch(spoken_text: str, lang_code: st
     if not raw_mp3_parts:
         return b""
 
-    # Locked constant tempo (1.06x) with subtle pitch refinement so speed never fluctuates between replies
-    steady_af = "asetrate=24000*1.04,aresample=48000,atempo=1.02"
+    # Sped up to atempo=1.15 (~1.20x total with asetrate=1.04) so Google TTS matches natural speaking speed
+    steady_af = "asetrate=24000*1.04,aresample=48000,atempo=1.15"
     try:
         return await asyncio.to_thread(_master_tts_audio_sync, bytes(raw_mp3_parts), steady_af)
     except Exception:
