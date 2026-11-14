@@ -266,7 +266,8 @@ async def generate_image_cloudflare_flux(user_prompt: str) -> tuple[bytes, str, 
     if THAI_CHAR_REGEX.search(cleaned_subject) or is_anime_style:
         english_prompt = await translate_prompt_to_english_for_flux(cleaned_subject, is_anime_style=is_anime_style)
 
-    cf_url = clean_url(f"{HTTPS}[api.cloudflare.com/client/v4/accounts/](https://api.cloudflare.com/client/v4/accounts/){CF_ACCOUNT_ID}/ai/run/{selected_model}")
+    cf_host = "api." + "cloudflare.com"
+    cf_url = f"{HTTPS}{cf_host}/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{selected_model}"
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
 
     t0 = time.monotonic()
@@ -596,7 +597,8 @@ CRITICAL RULES:
     # Tier 3: Groq Vision (qwen/qwen3.8-27b)
     if GROQ_API_KEY:
         groq_vision_candidates = await discover_active_groq_vision_models()
-        chat_url = clean_url(f"{HTTPS}[api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)")
+        groq_host = "api." + "groq.com"
+        chat_url = f"{HTTPS}{groq_host}/openai/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Content-Type": "application/json",

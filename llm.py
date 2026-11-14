@@ -14,6 +14,7 @@ from config import (
     GROQ_CODE_MODEL,
     GROQ_SEARCH_MODEL,
     GROQ_CHAT_FALLBACK_MODEL,
+    GROQ_VISION_FALLBACK_MODEL,
     OLLAMA_BASE_URL,
     ACTIVE_CODE_MODEL,
     PROMPT_INJECTION_REGEX,
@@ -52,8 +53,109 @@ from search_engine import (
 GEMINI_MODEL_HINT_REGEX = re.compile(r"models/([a-zA-Z0-9._-]+)")
 GEMINI_EXCLUDED_SUBSTRINGS = ("image", "lite", "tts", "audio", "live", "embedding", "aqa", "bison", "gecko")
 
-# Tracks 60-second cooldowns per Groq model ID so a 429 on one model immediately switches to the next
+# Excludes STT, TTS, and safety/moderation classifiers returned by GET https://api.groq.com/openai/v1/models
+GROQ_EXCLUDED_SUBSTRINGS = (
+    "whisper", "orpheus", "guard", "safeguard", "tts", "audio", "embed", "moderation", "playai"
+)
+
+# Per-model cooldowns & 1-hour live catalog cache for Groq /openai/v1/models
 _GROQ_MODEL_COOLDOWN_UNTIL: dict[str, float] = {}
+_GROQ_AVAILABLE_MODELS_CACHE: list[str] = []
+_GROQ_MODELS_LAST_FETCH_TS: float = 0.0
+
+
+async def discover_available_groq_models(force_refresh: bool = False) -> list[str]:
+    """
+    Queries GET https://api.groq.com/openai/v1/models to discover the exact active chat models
+    available to this GROQ_API_KEY, caching the list for 1 hour (3600s).
+    """
+    global _GROQ_AVAILABLE_MODELS_CACHE, _GROQ_MODELS_LAST_FETCH_TS
+    if not GROQ_API_KEY:
+        return []
+
+    now = time.time()
+    if (
+        not force_refresh
+        and _GROQ_AVAILABLE_MODELS_CACHE
+        and (now - _GROQ_MODELS_LAST_FETCH_TS < 3600.0)
+    ):
+        return _GROQ_AVAILABLE_MODELS_CACHE
+
+    groq_host = "api." + "groq.com"
+    models_url = f"{HTTPS}{groq_host}/openai/v1/models"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    try:
+        session = get_http_session()
+        async with session.get(models_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                payload = await resp.json()
+                discovered = []
+                for item in payload.get("data") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("active") is False:
+                        continue
+                    m_id = str(item.get("id") or "").strip()
+                    if not m_id:
+                        continue
+                    if any(bad in m_id.lower() for bad in GROQ_EXCLUDED_SUBSTRINGS):
+                        continue
+                    discovered.append(m_id)
+                if discovered:
+                    _GROQ_AVAILABLE_MODELS_CACHE = discovered
+                    _GROQ_MODELS_LAST_FETCH_TS = now
+                    api_log(f"Groq (Models Discovery) -> {len(discovered)} active chat models: {discovered}")
+                    return discovered
+    except Exception as e:
+        print(f"Groq model auto-discovery warning: {e}")
+
+    return _GROQ_AVAILABLE_MODELS_CACHE
+
+
+async def get_groq_search_and_chat_candidates() -> list[str]:
+    """
+    Returns ordered Groq model candidates for Search/Fact-Checking/Chat while strictly
+    EXCLUDING GROQ_CODE_MODEL (openai/gpt-oss-120b) so coding rate limits are preserved.
+    """
+    live_models = await discover_available_groq_models()
+    preferred_order = [
+        state.active_groq_search_model,
+        GROQ_SEARCH_MODEL,
+        "openai/gpt-oss-20b",
+        "qwen/qwen3.8-27b",
+        GROQ_CHAT_FALLBACK_MODEL,
+    ]
+    candidates = []
+    # 1. Add preferred models that are confirmed present in live_models (or all if discovery hasn't run)
+    for mod in preferred_order:
+        if not mod or mod == GROQ_CODE_MODEL:
+            continue
+        if (not live_models or mod in live_models) and mod not in candidates:
+            candidates.append(mod)
+
+    # 2. Append any other discovered live chat models (except GROQ_CODE_MODEL) as self-healing backups
+    for mod in live_models:
+        if mod != GROQ_CODE_MODEL and mod not in candidates:
+            candidates.append(mod)
+
+    return candidates
+
+
+async def discover_active_groq_vision_models() -> list[str]:
+    live_models = await discover_available_groq_models()
+    preferred = [
+        state.active_groq_vision_model,
+        GROQ_VISION_FALLBACK_MODEL,
+        "qwen/qwen3.8-27b",
+    ]
+    out = []
+    for mod in preferred:
+        if mod and (not live_models or mod in live_models) and mod not in out:
+            out.append(mod)
+    return out or ["qwen/qwen3.8-27b"]
 
 
 async def _discover_active_gemini_flash_model() -> list[str]:
@@ -184,7 +286,8 @@ async def call_gemini_chat_messages(
         "contents": contents,
         "generationConfig": {
             "temperature": temperature,
-            "maxOutputTokens": 2048,
+            "maxOutputTokens": 4096,
+            "thinkingConfig": {"thinkingBudget": 512},
         },
     }
     if sys_parts:
@@ -199,23 +302,13 @@ async def call_gemini_chat_messages(
     return ""
 
 
-async def discover_active_groq_vision_models() -> list[str]:
-    candidates = [
-        state.active_groq_vision_model,
-        "qwen/qwen3.8-27b",
-    ]
-    seen = set()
-    return [x for x in candidates if x and not (x in seen or seen.add(x))]
-
-
 async def call_cloudflare_vision_chat(
     prompt_text: str, mime_type: str, b64_img: str, max_tokens: int = 3072, purpose: str = "Vision"
 ) -> str:
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
         return ""
-    cf_chat_url = clean_url(
-        f"{HTTPS}api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1/chat/completions"
-    )
+    cf_host = "api." + "cloudflare.com"
+    cf_chat_url = f"{HTTPS}{cf_host}/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {CF_API_TOKEN}",
         "Content-Type": "application/json",
@@ -264,10 +357,16 @@ async def call_cloudflare_vision_chat(
 async def call_groq_chat(
     messages: list, groq_model: str, temperature: float, is_coding: bool = False, purpose: str = "Chat"
 ) -> str:
-    if not GROQ_API_KEY:
+    if not GROQ_API_KEY or not groq_model:
         return ""
     now = time.time()
     if now < _GROQ_MODEL_COOLDOWN_UNTIL.get(groq_model, 0.0):
+        return ""
+
+    # Verify against live discovered models so we never send a request to a non-existent/Enterprise model
+    live_models = await discover_available_groq_models()
+    if live_models and groq_model not in live_models:
+        _GROQ_MODEL_COOLDOWN_UNTIL[groq_model] = now + 3600.0
         return ""
 
     headers = {
@@ -275,17 +374,18 @@ async def call_groq_chat(
         "Content-Type": "application/json",
     }
 
-    # Use 8192 max_tokens ONLY for coding; use 2048 for chat/search so we don't trip Groq's Free Tier TPM limit!
     groq_payload = {
         "model": groq_model,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": 8192 if is_coding else 2048,
     }
-    if "gpt-oss" in groq_model and is_coding:
-        groq_payload["reasoning_effort"] = "high"
+    if "gpt-oss" in groq_model:
+        # Use 'high' reasoning for coding (120b) and 'low' for fast search/chat (20b) to save TPM quota
+        groq_payload["reasoning_effort"] = "high" if is_coding else "low"
 
-    chat_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/chat/completions")
+    groq_host = "api." + "groq.com"
+    chat_url = f"{HTTPS}{groq_host}/openai/v1/chat/completions"
     t0 = time.monotonic()
     session = get_http_session()
     async with session.post(
@@ -296,13 +396,18 @@ async def call_groq_chat(
             g_data = await resp.json()
             content = g_data["choices"][0]["message"]["content"] or ""
             content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+            if not is_coding and groq_model != GROQ_CODE_MODEL:
+                state.active_groq_search_model = groq_model
             api_log(f"Groq ({purpose}) -> {groq_model} 200 OK ({elapsed:.2f}s)")
             return content
         else:
             err_txt = await resp.text()
             if resp.status == 429:
-                # Cooldown this specific Groq model for 60s so we don't double-call it
                 _GROQ_MODEL_COOLDOWN_UNTIL[groq_model] = time.time() + 60.0
+            elif resp.status in (404, 400):
+                _GROQ_MODEL_COOLDOWN_UNTIL[groq_model] = time.time() + 3600.0
+                # Trigger a fresh discovery on 404 in case Groq updated its model catalog
+                await discover_available_groq_models(force_refresh=True)
             api_log(f"Groq ({purpose}) -> {groq_model} HTTP {resp.status} ({elapsed:.2f}s): {err_txt[:120]}")
     return ""
 
@@ -393,7 +498,6 @@ async def query_local_ollama_chat(
         or RECENCY_INTENT_REGEX.search(prompt)
     )
 
-    # Track and retrieve the persistent conversation topic for this channel (e.g. 'PSO2 NGS')
     active_topic = update_and_get_channel_topic(prompt, channel_id=channel_id)
     topic_anchor_note = (
         f"\n### [หัวข้อหลักที่กำลังสนทนาอยู่ต่อเนื่องในห้องแชทนี้ (Active Conversation Topic)]:\n"
@@ -449,7 +553,7 @@ async def query_local_ollama_chat(
             f"[คำสั่งระบบสำหรับการตรวจสอบข้อเท็จจริง (Fact-Check Arbitrator Mode — หัวข้อ: {active_topic or 'ตามบริบทสนทนา'})]:\n"
             "1. ผู้ใช้กำลังโต้แย้งหรือชี้ข้อผิดพลาดในคำตอบก่อนหน้าของคุณ (เช่น อาวุธของคลาส บริษัทผู้พัฒนา ปีที่เปิดให้บริการ หรือเนื้อเรื่อง)\n"
             "2. ตรวจสอบกับหลักฐานใน `<untrusted_web_search_results>` ด้านบนอย่างตรงไปตรงมา:\n"
-            "   - หากคำตอบก่อนหน้าของคุณมีข้อมูลที่แต่งขึ้นเองหรือผิดพลาดจริง (เช่น เผลอใส่อาวุธที่ไม่มีในคลาสนั้น หรืออ้างอิงชื่อบริษัทผิด): จงยอมรับอย่างตรงไปตรงมาและแก้ไขเฉพาะจุดที่ผิดให้ถูกต้องตามหลักฐานทันที\n"
+            "   - หากคำตอบก่อนหน้าของคุณมีข้อมูลที่แต่งขึ้นเองหรือผิดพลาดจริง: จงยอมรับอย่างตรงไปตรงมาและแก้ไขเฉพาะจุดที่ผิดให้ถูกต้องตามหลักฐานทันที\n"
             "   - หากหลักฐานจากการค้นหายืนยันว่าสิ่งที่คุณพูดถูกต้องอยู่แล้วและผู้ใช้เข้าใจผิดเอง: จงยืนยันตามข้อเท็จจริงจากผลการค้นหา\n"
             "3. ห้ามเบี่ยงประเด็นไปอธิบายประวัติของบริษัทที่ไม่เกี่ยวข้อง และห้ามใช้คำลงท้ายว่า 'ครับ' เด็ดขาด (คุณคือผู้หญิง ให้ใช้ 'ค่ะ'/'นะคะ' เท่านั้น)"
         )
@@ -489,15 +593,17 @@ async def query_local_ollama_chat(
                 })
         messages.append({"role": "user", "content": user_content})
 
-        # PATH A: Coding -> Strictly use GROQ_CODE_MODEL (openai/gpt-oss-120b), fallback to Modal Coder
+        # PATH A: Coding -> Strictly use GROQ_CODE_MODEL (openai/gpt-oss-120b), then dynamically discovered backups, then Modal Coder
         if is_coding:
             if GROQ_API_KEY:
-                try:
-                    ans = await call_groq_chat(messages, GROQ_CODE_MODEL, temperature, is_coding=True, purpose="Code")
-                    if ans:
-                        return ans
-                except Exception as e:
-                    print(f"Groq coding fallback to Modal GPU Ollama: {e}")
+                code_candidates = [GROQ_CODE_MODEL] + await get_groq_search_and_chat_candidates()
+                for c_mod in code_candidates:
+                    try:
+                        ans = await call_groq_chat(messages, c_mod, temperature, is_coding=True, purpose="Code")
+                        if ans:
+                            return ans
+                    except Exception as e:
+                        print(f"Groq coding ({c_mod}) warning: {e}")
             try:
                 ans = await call_modal_ollama_chat(messages, ACTIVE_CODE_MODEL, temperature, purpose="Code")
                 if ans:
@@ -505,15 +611,17 @@ async def query_local_ollama_chat(
             except Exception as e:
                 print(f"Modal GPU coding error: {e}")
 
-        # PATH B: Search / Fact-Check / Game & Knowledge Queries -> Use dedicated 70B/Gemini/32B models (NOT gpt-oss-120b!)
+        # PATH B: Search / Fact-Check / Knowledge Queries -> Use dynamically discovered Groq models (openai/gpt-oss-20b / qwen3.8-27b) + Gemini Flash
         if prefer_high_knowledge_llm and not is_coding:
             target_temp = 0.2 if (did_search or is_user_correction) else temperature
-            # Tier 1: Groq Dedicated Search Model (llama-3.3-70b-versatile)
+
+            # Tier 1: Dynamically discovered Groq Search Models (openai/gpt-oss-20b, qwen/qwen3.8-27b; NEVER gpt-oss-120b)
             if GROQ_API_KEY:
-                for g_search_mod in (GROQ_SEARCH_MODEL, "qwen/qwen3-32b"):
+                groq_search_candidates = await get_groq_search_and_chat_candidates()
+                for g_mod in groq_search_candidates:
                     try:
                         ans = await call_groq_chat(
-                            messages, g_search_mod, target_temp, is_coding=False, purpose="FactSearchChat"
+                            messages, g_mod, target_temp, is_coding=False, purpose="FactSearchChat"
                         )
                         if ans:
                             return ans
@@ -542,6 +650,15 @@ async def query_local_ollama_chat(
         except Exception as e:
             print(f"Modal GPU chat fallback to Groq/Gemini: {e}")
 
+        if GROQ_API_KEY:
+            for g_mod in await get_groq_search_and_chat_candidates():
+                try:
+                    ans = await call_groq_chat(messages, g_mod, temperature, is_coding=False, purpose="ChatFallback")
+                    if ans:
+                        return ans
+                except Exception:
+                    continue
+
         if GEMINI_API_KEY:
             try:
                 ans = await call_gemini_chat_messages(messages, temperature=temperature, purpose="ChatFallback")
@@ -550,21 +667,13 @@ async def query_local_ollama_chat(
             except Exception:
                 pass
 
-        if GROQ_API_KEY:
-            try:
-                ans = await call_groq_chat(messages, GROQ_CHAT_FALLBACK_MODEL, temperature, is_coding=False)
-                if ans:
-                    return ans
-            except Exception as e:
-                print(f"Groq chat fallback error: {e}")
-
         return "ระบบประมวลผลไม่สามารถเชื่อมต่อได้ชั่วคราวค่ะ กรุณาลองใหม่อีกครั้งนะคะ"
 
     raw_answer = await _run_inference_pass(working_prompt)
 
-    # Check if the LLM emitted [SEARCH: ...] and execute the search before sanitizing
+    # Allow 1 agentic [SEARCH: ...] refinement pass even if an initial broad pre-search already ran!
     search_tag_match = AGENTIC_SEARCH_TAG_REGEX.search(raw_answer)
-    if allow_agentic_search and not did_search and search_tag_match:
+    if allow_agentic_search and search_tag_match:
         agent_query = search_tag_match.group(1).strip()[:180]
         extra_search_block = await asyncio.to_thread(run_safe_web_search_sync, agent_query)
         if extra_search_block:
@@ -572,7 +681,7 @@ async def query_local_ollama_chat(
             prefer_high_knowledge_llm = True
             working_prompt = (
                 f"{working_prompt}\n\n{extra_search_block}\n\n"
-                "(ตอบคำถามโดยตรงตามข้อมูลผลการค้นหาด้านบน ห้ามพิมพ์แท็ก [SEARCH: ...] เด็ดขาด)"
+                "(ได้รับข้อมูลค้นหาเพิ่มเติมครบถ้วนแล้ว จงตอบคำถามของผู้ใช้โดยตรงตามข้อมูลด้านบน ห้ามพิมพ์แท็ก [SEARCH: ...] หรือ [IMAGE: ...] อีกเด็ดขาด)"
             )
             raw_answer = await _run_inference_pass(working_prompt)
 

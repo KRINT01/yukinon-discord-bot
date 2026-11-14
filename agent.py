@@ -33,6 +33,7 @@ from llm import (
     call_gemini_generate_content_self_healing,
     call_modal_ollama_chat,
     query_local_ollama_chat,
+    get_groq_search_and_chat_candidates,
 )
 from media_context import (
     extract_youtube_id,
@@ -170,17 +171,20 @@ async def execute_agent_skill(
         return f"[Tool Execution Error in `{t_name}`: {type(e).__name__}: {e}]"
 
 
+# In agent.py, add `get_groq_search_and_chat_candidates` to `from llm import (...)`
+
 async def _call_agent_planner_llm(messages: list) -> str:
-    """Uses Groq LPU (gpt-oss-120b), Gemini Flash, or Modal Ollama to decide the next tool action."""
+    """Uses dynamically discovered Groq models (gpt-oss-20b / qwen3.8-27b), Gemini Flash, or Modal Ollama."""
     if GROQ_API_KEY:
-        try:
-            res = await call_groq_chat(
-                messages, GROQ_CHAT_FALLBACK_MODEL, temperature=0.1, is_coding=False, purpose="AgentPlanner"
-            )
-            if res:
-                return res
-        except Exception:
-            pass
+        for g_mod in await get_groq_search_and_chat_candidates():
+            try:
+                res = await call_groq_chat(
+                    messages, g_mod, temperature=0.1, is_coding=False, purpose="AgentPlanner"
+                )
+                if res:
+                    return res
+            except Exception:
+                continue
 
     if GEMINI_API_KEY:
         try:

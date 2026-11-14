@@ -19,14 +19,13 @@ HTTP = "http" + "://"
 
 
 def clean_url(url: str) -> str:
-    """Safeguard: strips any accidental [url](url) or %5B...%5D Markdown formatting at runtime."""
+    """Safeguard: unwraps any accidental [url](url) Markdown links in-place while preserving path/query suffixes."""
     if not url:
         return ""
     s = url.strip()
-    m = re.search(r"\]\((https?://[^)\s]+)\)", s)
-    if m:
-        return m.group(1).strip()
-    s = re.sub(r"^\[\vert{}\]$", "", s)
+    s = re.sub(r"\[[^\]]+\]\((https?://[^)\s]+)\)", r"\1", s)
+    s = re.sub(r"^(https?://)+", r"\1", s, flags=re.IGNORECASE)
+    s = re.sub(r"^\[|\]$", "", s)
     return s.strip()
 
 
@@ -51,8 +50,8 @@ ACTIVE_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "scb10x/typhoon-ocr1.5-3b
 # Groq Free LPU API Settings
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_CODE_MODEL = os.getenv("GROQ_CODE_MODEL", "openai/gpt-oss-120b")
-GROQ_SEARCH_MODEL = os.getenv("GROQ_SEARCH_MODEL", "llama-3.3-70b-versatile")
-GROQ_CHAT_FALLBACK_MODEL = os.getenv("GROQ_CHAT_FALLBACK_MODEL", "llama-3.3-70b-versatile")
+GROQ_SEARCH_MODEL = os.getenv("GROQ_SEARCH_MODEL", "openai/gpt-oss-20b")
+GROQ_CHAT_FALLBACK_MODEL = os.getenv("GROQ_CHAT_FALLBACK_MODEL", "openai/gpt-oss-20b")
 GROQ_VISION_FALLBACK_MODEL = os.getenv("GROQ_VISION_FALLBACK_MODEL", "qwen/qwen3.8-27b")
 GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3")
 
@@ -119,6 +118,7 @@ class RuntimeState:
         self.http_session: aiohttp.ClientSession | None = None
         self.has_voice_recv: bool = False
         self.active_gemini_model: str = GEMINI_SEARCH_MODEL
+        self.active_groq_search_model: str = GROQ_SEARCH_MODEL
         self.active_groq_vision_model: str = GROQ_VISION_FALLBACK_MODEL
         self.gemini_grounding_cooldown_until: float = 0.0
         self.edge_tts_cooldown_until: float = 0.0
@@ -366,7 +366,7 @@ OWNER_NAME_STRIP_REGEX = re.compile(
 )
 URL_REGEX = re.compile(r"https?://[^\s<>\'\"]+")
 AGENTIC_SEARCH_TAG_REGEX = re.compile(r"\[SEARCH:\s*(.+?)\]", re.IGNORECASE)
-AGENTIC_IMAGE_TAG_REGEX = re.compile(r"\[IMAGE:\s*(.+?)\]", re.IGNORECASE)
+AGENTIC_IMAGE_TAG_REGEX = re.compile(r"^\s*\[IMAGE:\s*(.+?)\]", re.IGNORECASE)
 
 CODE_INTENT_PATTERN = re.compile(
     r"(```|\b(python|java|javascript|typescript|react|vue|nextjs|nodejs|js|ts|jsx|tsx|rust|golang|c\+\+|"

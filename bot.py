@@ -125,6 +125,7 @@ def _collect_health_metrics() -> dict:
             "fast_model": ACTIVE_FAST_MODEL,
             "code_model": GROQ_CODE_MODEL if GROQ_API_KEY else ACTIVE_CODE_MODEL,
             "groq_enabled": bool(GROQ_API_KEY),
+            "groq_search_model": state.active_groq_search_model if GROQ_API_KEY else None,
             "groq_vision_model": state.active_groq_vision_model if GROQ_API_KEY else None,
             "cloudflare_enabled": bool(CF_API_TOKEN and CF_ACCOUNT_ID),
             "cloudflare_image_model": CF_IMAGE_MODEL if CF_API_TOKEN else None,
@@ -169,7 +170,7 @@ async def handle_root(request: web.Request) -> web.Response:
         <hr style="border: 0; border-top: 1px solid #e5e7eb; margin: 16px 0;">
         <p><b>Autonomous Agent / OpenClaw:</b> {"Connected" if OPENCLAW_GATEWAY_URL else "Internal 8-Skill Agent Active (OpenClaw Gateway on Standby)"}</p>
         <p><b>Modal GPU Ollama:</b> {"Configured" if ai['modal_ollama_configured'] else "Not Configured"} (Fast: <code>{ai['fast_model']}</code>)</p>
-        <p><b>Groq LPU Acceleration:</b> {"Enabled (Code: <code>" + GROQ_CODE_MODEL + "</code> | Vision: <code>" + str(ai['groq_vision_model']) + "</code>)" if ai['groq_enabled'] else "Disabled"}</p>
+        <p><b>Groq LPU Acceleration:</b> {"Enabled (Code: <code>" + GROQ_CODE_MODEL + "</code> | Search: <code>" + str(ai['groq_search_model']) + "</code> | Vision: <code>" + str(ai['groq_vision_model']) + "</code>)" if ai['groq_enabled'] else "Disabled"}</p>
         <p><b>Cloudflare Workers AI:</b> {"Enabled (Image: <code>" + str(ai['cloudflare_image_model']) + "</code> | Vision: <code>" + str(ai['cloudflare_vision_model']) + "</code>)" if ai['cloudflare_enabled'] else "Disabled"}</p>
         <p><b>Google AI Studio:</b> {"Enabled (<code>" + str(ai['gemini_active_model']) + "</code>)" + gemini_cd_note if ai['gemini_enabled'] else "Disabled"}</p>
         <p><b>Uptime:</b> {m['uptime_human']} ({m['uptime_sec']}s)</p>
@@ -310,11 +311,16 @@ async def on_message(message: discord.Message):
         )
         reply_target = message if use_reply else None
 
-        # 4. If the LLM itself emitted an agentic [IMAGE: ...] tag, generate the image and reply
+        # 4. If the LLM emitted a leading [IMAGE: ...] tag on an image-related request, generate the image
         img_tag_match = AGENTIC_IMAGE_TAG_REGEX.search(answer)
-        if img_tag_match and CF_ACCOUNT_ID and CF_API_TOKEN:
+        if (
+            img_tag_match
+            and CF_ACCOUNT_ID
+            and CF_API_TOKEN
+            and re.search(r"(รูป|ภาพ|วาด|เจน|สร้าง|image|picture|draw|art|photo)", clean_prompt, re.IGNORECASE)
+        ):
             await send_generated_image_to_channel(
-                message.channel, clean_prompt or img_tag_match.group(1).strip(), reply_to=message
+                message.channel, img_tag_match.group(1).strip(), reply_to=message
             )
             return
 
