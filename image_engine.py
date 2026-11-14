@@ -519,6 +519,7 @@ async def extract_and_translate_manga_bubbles(
     b64_img = await asyncio.to_thread(_prepare_manga_image_for_vision, raw_bytes)
     mime_type = "image/jpeg"
 
+    # Restored exact prompt from the near-perfect image_2b2c02.png run
     manga_system_instruction = f"""
 You are a professional Manga, Manhwa, and Comic Localizer.
 Analyze the entire image visually (character expressions, action, speaker relationships, and panel layout)
@@ -526,22 +527,19 @@ and translate ALL speech bubbles (including short exclamations like '!' or 'Huh?
 
 CRITICAL RULES:
 1. Reading Order: Order the bubbles strictly in traditional Japanese Manga reading order (Top-to-Bottom, Right-to-Left across panels).
-2. ONE Entry Per Bubble Lobe (NEVER Split Columns of the Same Lobe!):
-   - Japanese speech bubbles contain multiple vertical columns of text read right-to-left. You MUST combine all vertical columns inside the same bubble lobe into ONE single `bubbles` entry with ONE complete sentence in `translated_text` and ONE `box_2d` covering all columns in that lobe.
-   - NEVER split a single sentence or a single bubble lobe's columns into two separate entries (e.g., never put the first half of a sentence in one entry and the last word in another entry).
-   - Only output separate entries when a compound/double bubble has two visually distinct ovals/lobes separated by a pinched neck.
-3. In-Context Localization: Adapt Japanese/Korean/Chinese idioms, pronouns, tone, and emotion so the dialogue sounds completely natural in {target_lang_name} while fitting inside a speech bubble. Do NOT use double quotes inside `translated_text` (use single quotes if needed).
-4. Speech Bubble Bounding Boxes (`box_2d`):
-   - Provide `box_2d` as `[ymin, xmin, ymax, xmax]` normalized from 0 to 1000 tightly covering the entire Japanese text block of that bubble lobe.
-5. Return ONLY valid JSON matching this exact structure (every bubble MUST have a non-empty `translated_text`):
+2. In-Context Localization: Adapt Japanese/Korean/Chinese idioms, pronouns, tone, and emotion so the dialogue sounds completely natural in {target_lang_name} while fitting inside a speech bubble. Do NOT use double quotes inside `translated_text` (use single quotes if needed).
+3. Speech Bubble Bounding Boxes (`box_2d`):
+   - For each speech bubble, provide `box_2d` as `[ymin, xmin, ymax, xmax]` normalized from 0 to 1000.
+   - `box_2d` must tightly cover the Japanese text block inside that specific bubble lobe (if a double bubble has two lobes, output each lobe as its own separate bubble entry covering only that lobe's text).
+4. Return ONLY valid JSON matching this exact structure (every bubble MUST have a non-empty `translated_text`):
 {{
   "summary": "Brief 1-sentence scene context",
   "bubbles": [
     {{
       "id": 1,
       "speaker_or_note": "Character / SFX / Narration",
-      "source_text": "Complete original Japanese text in this bubble lobe",
-      "translated_text": "Complete natural {target_lang_name} translation for this bubble lobe",
+      "source_text": "Original Japanese text",
+      "translated_text": "Natural {target_lang_name} translation",
       "box_2d": [ymin, xmin, ymax, xmax]
     }}
   ]
@@ -563,7 +561,7 @@ CRITICAL RULES:
                 }
             ],
             "generationConfig": {
-                "temperature": 0.0,
+                "temperature": 0.1,
                 "responseMimeType": "application/json",
                 "thinkingConfig": {"thinkingBudget": 0},
             },
@@ -628,7 +626,7 @@ CRITICAL RULES:
                             ],
                         }
                     ],
-                    "temperature": 0.0,
+                    "temperature": 0.1,
                     "max_tokens": 4096,
                 }
                 async with session.post(
@@ -705,6 +703,56 @@ def _wrap_text_to_pixel_width(
     if current:
         lines.append(current)
     return lines
+
+
+def _fix_reversed_rtl_double_bubble(
+    pixel_boxes: list[tuple[int, int, int, int, str]],
+    base_gray: Image.Image,
+) -> list[tuple[int, int, int, int, str]]:
+    """
+    Safety net for horizontal double bubbles (like Bubble #4 'Nazono...?' and Bubble #5 'Ah, you mean...'):
+    If the Vision model ever places Bubble #4 to the LEFT of Bubble #5 inside the left lobe while leaving
+    the right lobe unboxed, detects the unboxed right lobe and restores #4 to the right lobe and #5 to the left lobe.
+    """
+    width, height = base_gray.size
+    boxes = [list(b) for b in pixel_boxes]
+    for i in range(len(boxes) - 1):
+        x1_a, y1_a, x2_a, y2_a, txt_a = boxes[i]
+        x1_b, y1_b, x2_b, y2_b, txt_b = boxes[i + 1]
+
+        # Check if i and i+1 share the same vertical band
+        v_overlap = min(y2_a, y2_b) - max(y1_a, y1_b)
+        min_h = max(1, min(y2_a - y1_a, y2_b - y1_b))
+        if v_overlap < min_h * 0.5:
+            continue
+
+        cx_a = (x1_a + x2_a) // 2
+        cx_b = (x1_b + x2_b) // 2
+        # If bubble i (earlier in RTL reading order) was placed to the LEFT of bubble i+1 (later in RTL order)
+        # and they are close horizontally (inside the same double bubble)
+        if cx_a < cx_b and (cx_b - cx_a) < int(width * 0.22):
+            # Look immediately to the right of x2_b for an unboxed right-hand bubble lobe containing dark text
+            probe_x1 = min(width - 4, x2_b + 8)
+            probe_x2 = min(width - 2, x2_b + int(width * 0.14))
+            probe_y1 = max(0, min(y1_a, y1_b))
+            probe_y2 = min(height, max(y2_a, y2_b))
+            if probe_x2 - probe_x1 >= 18:
+                sub = base_gray.crop((probe_x1, probe_y1, probe_x2, probe_y2))
+                hist = sub.histogram()
+                total_px = max(1, (probe_x2 - probe_x1) * (probe_y2 - probe_y1))
+                white_ratio = sum(hist[215:]) / total_px
+                dark_ratio = sum(hist[:180]) / total_px
+                # If there is a white lobe on the right with Japanese text inside it
+                if white_ratio >= 0.45 and 0.02 <= dark_ratio <= 0.40:
+                    # Merge the left lobe for bubble i+1, and place bubble i in the right lobe
+                    boxes[i + 1][0] = min(x1_a, x1_b)
+                    boxes[i + 1][1] = min(y1_a, y1_b)
+                    boxes[i + 1][2] = max(x2_a, x2_b)
+                    boxes[i + 1][3] = max(y2_a, y2_b)
+
+                    boxes[i][0] = probe_x1
+                    boxes[i][2] = probe_x2 - 4
+    return [tuple(b) for b in boxes]
 
 
 def _merge_same_lobe_column_splits(
@@ -792,10 +840,11 @@ def _clean_single_bubble_lobe_fast(
     cx = (x1 + x2) // 2
     cy = (y1 + y2) // 2
 
-    # 1. Compute strict Voronoi / midpoint bounds against nearby peer bubbles so compound lobes never bleed together
-    vor_x1 = max(0, x1 - max(18, int(box_w * 0.28)))
+    # 1. Compute Voronoi midpoint bounds against nearby peer bubbles.
+    # Limit left expansion to 12% while allowing 28% right expansion so text never drifts left!
+    vor_x1 = max(0, x1 - max(10, int(box_w * 0.12)))
     vor_y1 = max(0, y1 - max(14, int(box_h * 0.18)))
-    vor_x2 = min(width, x2 + max(18, int(box_w * 0.28)))
+    vor_x2 = min(width, x2 + max(20, int(box_w * 0.28)))
     vor_y2 = min(height, y2 + max(14, int(box_h * 0.18)))
 
     has_close_peer = False
@@ -830,10 +879,12 @@ def _clean_single_bubble_lobe_fast(
     cx2 = min(vor_x2, max(x2, cx1 + 10))
     cy2 = min(vor_y2, max(y2, cy1 + 10))
 
-    # 2. Erase Japanese characters inside (cx1, cy1, cx2, cy2) with +8px right-margin for rightmost vertical columns ('ああ')
+    # 2. Erase Japanese characters inside the lobe.
+    # Extend ex2 all the way to vor_x2 on the right so short rightmost columns (like 'ああ' in Bubble #5)
+    # sit completely inside the crop window (not touching ew-1) and get erased cleanly as floating islands!
     ex1 = max(vor_x1, cx1 - 4)
-    ey1 = max(vor_y1, cy1 - 4)
-    ex2 = min(width, max(vor_x2, x2) + 6) if not has_close_peer else min(vor_x2, cx2 + 8)
+    ey1 = max(vor_y1, cy1 - 6)
+    ex2 = vor_x2
     ey2 = min(vor_y2, cy2 + 4)
     ew = max(4, ex2 - ex1)
     eh = max(4, ey2 - ey1)
@@ -841,6 +892,7 @@ def _clean_single_bubble_lobe_fast(
     sub_gray = base_gray.crop((ex1, ey1, ex2, ey2))
     dark_mask = sub_gray.point(lambda p: 255 if p < 210 else 0)
 
+    # Flood-fill dark pixels touching the outer 1px perimeter so bubble borders/hair are 100% protected
     border_connected = dark_mask.copy()
     for bx in range(ew):
         if border_connected.getpixel((bx, 0)) == 255:
@@ -854,16 +906,22 @@ def _clean_single_bubble_lobe_fast(
             ImageDraw.floodfill(border_connected, (ew - 1, by), 128)
 
     text_only_mask = border_connected.point(lambda p: 255 if p == 255 else 0)
+    # Keep the forced inner core strictly inside the original (cx1..cx2) text box
     inner_m = ImageDraw.Draw(text_only_mask)
-    ix1, iy1 = max(2, int(ew * 0.05)), max(2, int(eh * 0.06))
-    ix2, iy2 = min(ew - 2, int(ew * 0.96)), min(eh - 3, int(eh * 0.94))
+    core_w = max(4, cx2 - cx1)
+    core_h = max(4, cy2 - cy1)
+    ix1 = max(2, (cx1 - ex1) + int(core_w * 0.06))
+    iy1 = max(2, (cy1 - ey1) + int(core_h * 0.06))
+    ix2 = min(ew - 3, (cx1 - ex1) + int(core_w * 0.94))
+    iy2 = min(eh - 3, (cy1 - ey1) + int(core_h * 0.94))
     if ix2 > ix1 and iy2 > iy1:
         inner_m.rectangle([ix1, iy1, ix2, iy2], fill=255)
 
     white_patch = Image.new("RGB", (ew, eh), (255, 255, 255))
     img.paste(white_patch, (ex1, ey1), mask=text_only_mask)
 
-    # 3. Proven horizontal width measurement from image_2b2c02.png
+    # 3. Measure safe horizontal white width on the CLEANED image (so erased 'ああ' / furigana don't block rx)
+    cleaned_gray = img.convert("L")
     mid_y_start = cy1 + int((cy2 - cy1) * 0.20)
     mid_y_end = cy1 + int((cy2 - cy1) * 0.80)
     safe_lefts = []
@@ -872,10 +930,10 @@ def _clean_single_bubble_lobe_fast(
         if not (0 <= sy < height):
             continue
         lx = cx1
-        while lx > vor_x1 and base_gray.getpixel((lx - 1, sy)) >= 215:
+        while lx > vor_x1 and cleaned_gray.getpixel((lx - 1, sy)) >= 215:
             lx -= 1
         rx = cx2
-        while rx < vor_x2 and base_gray.getpixel((rx, sy)) >= 215:
+        while rx < vor_x2 and cleaned_gray.getpixel((rx, sy)) >= 215:
             rx += 1
         safe_lefts.append(lx)
         safe_rights.append(rx)
@@ -888,10 +946,11 @@ def _clean_single_bubble_lobe_fast(
     else:
         tx1, tx2 = cx1, cx2
 
-    # Gentle +4px rightward optical shift for double bubbles so text sits centered in the lobe
-    if has_close_peer and (tx2 + 4) <= vor_x2:
-        tx1 += 4
-        tx2 += 4
+    # Nudge double-bubble text +6px to the right so it sits dead-center in the lobe
+    if has_close_peer:
+        shift_r = min(6, max(0, (vor_x2 - 2) - tx2))
+        tx1 += shift_r
+        tx2 += shift_r
 
     ty1 = max(vor_y1 + 2, cy1)
     ty2 = min(vor_y2 - 2, cy2)
@@ -968,8 +1027,7 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
         y2 = min(height, int((ymax / 1000.0) * height))
         raw_pixel_boxes.append((x1, y1, x2, y2, b["translated_text"].strip()))
 
-    # Merge any same-lobe vertical column splits before cleaning and rendering
-    pixel_boxes = _merge_same_lobe_column_splits(raw_pixel_boxes, base_gray)
+    pixel_boxes = _fix_reversed_rtl_double_bubble(raw_pixel_boxes, base_gray)
 
     prepared_renders = []
     for i, (x1, y1, x2, y2, trans_text) in enumerate(pixel_boxes):
@@ -1089,14 +1147,14 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
         ]
         if scene_summary:
             clean_sum = re.sub(r"\s+", " ", scene_summary).strip()
-            transcript_lines.append(f"-# *บริบทของฉาก: {clean_sum}*")
+            transcript_lines.append(f"-# *บริบทของฉาก: {clean_sum}*\n")
 
         for idx, b in enumerate(bubbles, 1):
             speaker = re.sub(r"\s+", " ", (b.get("speaker_or_note") or f"ช่องคำพูด {idx}")).strip()
             src_txt = re.sub(r"\s+", " ", (b.get("source_text") or "")).strip()
             tr_txt = re.sub(r"\s+", " ", (b.get("translated_text") or "")).strip()
             if tr_txt:
-                transcript_lines.append(f"**[{idx}] [{speaker}]** `{src_txt}`\n   ↳ **{tr_txt}**")
+                transcript_lines.append(f"`[{idx}]` **[{speaker}]** `{src_txt}`\n   ↳ **{tr_txt}**")
 
         transcript_text = "\n".join(transcript_lines)
 
