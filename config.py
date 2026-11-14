@@ -51,7 +51,8 @@ ACTIVE_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "scb10x/typhoon-ocr1.5-3b
 # Groq Free LPU API Settings
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_CODE_MODEL = os.getenv("GROQ_CODE_MODEL", "openai/gpt-oss-120b")
-GROQ_CHAT_FALLBACK_MODEL = os.getenv("GROQ_CHAT_FALLBACK_MODEL", "openai/gpt-oss-120b")
+GROQ_SEARCH_MODEL = os.getenv("GROQ_SEARCH_MODEL", "llama-3.3-70b-versatile")
+GROQ_CHAT_FALLBACK_MODEL = os.getenv("GROQ_CHAT_FALLBACK_MODEL", "llama-3.3-70b-versatile")
 GROQ_VISION_FALLBACK_MODEL = os.getenv("GROQ_VISION_FALLBACK_MODEL", "qwen/qwen3.8-27b")
 GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3")
 
@@ -147,6 +148,8 @@ def get_modal_headers() -> dict:
 
 # Rolling per-channel conversation memory (stores last 6 user/assistant turns = 12 messages)
 channel_memory = defaultdict(lambda: deque(maxlen=12))
+# Stores the primary topic/subject anchor per channel so shortened names (e.g., 'PSO2 NGS' -> 'NGS') never lose context
+channel_active_topic = {}
 # Stores the most recent file/code attachment per channel (30-min TTL)
 channel_last_attachment = {}
 # Persistent in-memory notes per channel for Autonomous Agent mode
@@ -291,29 +294,28 @@ ANIME_MANGA_QUERY_REGEX = re.compile(
     re.IGNORECASE,
 )
 GAME_QUERY_REGEX = re.compile(
-    r"(เกม|สตีม|ราคาเกม|สเปคเกม|เนื้อเรื่องเกม|คลาส|อาชีพในเกม|สกิล|อาวุธ|บิลด์|เมต้า|เซิร์ฟ|ค่ายเกม|"
+    r"(เกม|สตีม|ราคาเกม|สเปคเกม|เนื้อเรื่องเกม|เนื้อเรื่องของเกม|คลาส|อาชีพในเกม|สกิล|อาวุธ|บิลด์|เมต้า|เซิร์ฟ|ค่ายเกม|"
+    r"เปิดมากี่ปี|เปิดมาจะ|ภาคแรก|ภาคล่าสุด|"
     r"\b(?:game|steam|gameplay|release\s+date|dlc|mmorpg|rpg|pso2|ngs|genshin|honkai|valorant|elden\s+ring|"
     r"monster\s+hunter|final\s+fantasy|ff14|rov|dota|lol|overwatch|tier\s*list|build|classes)\b)",
     re.IGNORECASE,
 )
 
-# Detects queries asking for the latest/current state as of today's date
 RECENCY_INTENT_REGEX = re.compile(
-    r"(ล่าสุด|ตอนนี้|ปัจจุบัน|วันนี้|ปีนี้|เดือนนี้|ยุคนี้|ใหม่ล่าสุด|อัปเดต|เวอร์ชันล่าสุด|รุ่นล่าสุด|"
+    r"(ล่าสุด|ตอนนี้|ปัจจุบัน|วันนี้|ปีนี้|เดือนนี้|ยุคนี้|ใหม่ล่าสุด|อัปเดต|เวอร์ชันล่าสุด|รุ่นล่าสุด|ไปถึงไหนแล้ว|"
     r"\b(?:latest|current|currently|right\s+now|nowadays|this\s+year|up\s+to\s+date|newest|recent|meta)\b)",
     re.IGNORECASE,
 )
 
-# Detects when the user disputes, challenges, or corrects the bot's factual claims
 USER_CORRECTION_PATTERN = re.compile(
-    r"(ไม่มี(?:คลาส|ตัวละคร|ระบบ|ในเกม|จริง)|ไม่มีสัก|คนละเกม|คนละเรื่อง|ข้อมูลผิด|มั่ว|ผิดทั้งหมด|เข้าใจผิด|"
+    r"(ไม่มี(?:คลาส|ตัวละคร|ระบบ|ในเกม|จริง)|ไม่มีสัก|ไม่เคยมี|คนละเกม|คนละเรื่อง|ข้อมูลผิด|มั่ว|ผิดทั้งหมด|เข้าใจผิด|"
     r"ไม่ใช่(?:คลาส|เกม|เรื่อง|ของ|แบบนั้น|สักหน่อย)|ไปเอาข้อมูล.*มาจากไหน|ลองบอกชื่อเต็ม|ยึดติดกับข้อมูล|"
-    r"ที่ถูก(?:ต้อง)?คือ|จริงๆ\s*แล้วมันคือ|เช็คข้อมูลใหม่|ค้นข้อมูลดูใหม่|"
+    r"ยังผิดอยู่|ไม่ได้สาระ|พยายามหาข้อมูล|โหมดทดลองอะไรกัน|มาจากไหนก่อน|เกมเป็นของ|ที่ถูก(?:ต้อง)?คือ|"
+    r"จริงๆ\s*แล้ว(?:ข้อมูล|มัน)|เช็คข้อมูลใหม่|ค้นข้อมูลดูใหม่|ลองเช็คดู|"
     r"\b(?:that'?s\s+wrong|you'?re\s+wrong|incorrect|hallucinating|wrong\s+game|no\s+such|fact\s*check)\b)",
     re.IGNORECASE,
 )
 
-# Universal Factual & Web Search Trigger (Covers General Knowledge, Tech, People, Places, Finance, News, etc.)
 WEB_SEARCH_INTENT_PATTERN = re.compile(
     r"(\b(latest|current news|breaking news|price of|release date|who won|stock price|bitcoin price|"
     r"search the web|look up|google|wikipedia|wiki|what do you think (?:of|about) the news|"
@@ -322,8 +324,8 @@ WEB_SEARCH_INTENT_PATTERN = re.compile(
     r"ข่าวล่าสุด|ข่าววันนี้|ข่าวเรื่อง|กับข่าว|ราคาทอง|ราคาบิตคอยน์|ราคาหุ้น|ค้นหาข้อมูล|หาข้อมูล|เสิร์ช|"
     r"อัปเดตล่าสุด|ผลการแข่งขัน|กระแสเรื่อง|ดราม่าเรื่อง|วิกิ|wikipedia|"
     r"มีคลาสอะไรบ้าง|เล่นคลาสอะไรดี|มีอาชีพอะไรบ้าง|มีตัวละครอะไรบ้าง|ชื่อเต็มของ|ของค่ายไหน|ใครพัฒนา|พัฒนาโดย|"
-    r"คือเกมอะไร|คือเรื่องอะไร|เนื้อเรื่องเป็นยังไง|คือใคร|คืออะไร|อยู่ที่ไหน|เปิดเมื่อไหร่|วางจำหน่ายเมื่อไหร่|"
-    r"สเปค|รุ่นไหนดี|เวอร์ชันล่าสุด|คนปัจจุบันคือใคร|ราคาเท่าไหร่|ข้อมูลของ|ประวัติของ|สรุปเรื่อง)",
+    r"คือเกมอะไร|คือเรื่องอะไร|เนื้อเรื่องเป็นยังไง|เนื้อเรื่อง.*ไปถึงไหน|สรุปเนื้อเรื่อง|คือใคร|คืออะไร|อยู่ที่ไหน|"
+    r"เปิดเมื่อไหร่|เปิดมากี่ปี|วางจำหน่ายเมื่อไหร่|สเปค|รุ่นไหนดี|เวอร์ชันล่าสุด|คนปัจจุบันคือใคร|ราคาเท่าไหร่|ข้อมูลของ|ประวัติของ|สรุปเรื่อง)",
     re.IGNORECASE,
 )
 PURE_DATETIME_PATTERN = re.compile(

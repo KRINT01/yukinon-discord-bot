@@ -497,6 +497,7 @@ async def ask_code(ctx, *, prompt: str = "วิเคราะห์โค้�
 async def clear_memory(ctx):
     channel_memory.pop(ctx.channel.id, None)
     channel_last_attachment.pop(ctx.channel.id, None)
+    config.channel_active_topic.pop(ctx.channel.id, None)
     await ctx.send("ล้างประวัติการสนทนาและไฟล์ที่ค้างอยู่ในห้องแชทนี้เรียบร้อยแล้วค่ะ")
 
 

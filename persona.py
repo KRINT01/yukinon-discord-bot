@@ -64,9 +64,9 @@ def sanitize_yukino_output(text: str, user_prompt: str = "", speaker_user=None, 
     """
     1) Strips any leaked [SEARCH: ...] or [REACT: ...] tags so raw tool tags never appear in Discord chat.
     2) Removes accidental Chinese characters (e.g., 才行) leaked by Qwen3 unless the prompt is CJK.
-    3) Replaces out-of-character casual Thai particles ('จ้า', 'จ๊ะ', 'จ้ะ', 'นะจ๊ะ') with 'ค่ะ'/'นะคะ'.
-    4) Enforces pronoun rules: never outputs owner's name (replaces with 'นาย'), strips 'คุณ' before any user's name,
-       while allowing standalone sarcastic 'คุณ'.
+    3) Enforces female particles: replaces male 'ครับ'/'นะครับ'/'คับ' and casual 'จ้า'/'จ๊ะ'/'เบื่ออ่ะ' with 'ค่ะ'/'นะคะ'.
+    4) Strips out-of-character emojis (🙈, 😢, 😔, 😊, ✅, ❌, 👉, 🔍).
+    5) Enforces pronoun rules: never outputs owner's name (replaces with 'นาย'), strips 'คุณ' before any user's name.
     """
     if not text:
         return ""
@@ -80,7 +80,12 @@ def sanitize_yukino_output(text: str, user_prompt: str = "", speaker_user=None, 
     if not CJK_LEAK_REGEX.search(user_prompt):
         cleaned = CJK_LEAK_REGEX.sub("", cleaned)
 
-    # 3. Fix out-of-character Thai endings ('นะจ๊ะ', 'เลยจ้า', 'จ้า', 'จ๊ะ', 'จ้ะ')
+    # 3. Fix out-of-character male particles ('นะครับ', 'ครับ', 'คับ') & casual endings ('จ้า', 'จ๊ะ', 'โอเคคะ', 'เบื่ออ่ะ')
+    cleaned = re.sub(r"นะครับ(?=$|[\s\n\r.!?\)\]\"'])", "นะคะ", cleaned)
+    cleaned = re.sub(r"ครับผม(?=$|[\s\n\r.!?\)\]\"'])", "ค่ะ", cleaned)
+    cleaned = re.sub(r"(?:ครับ|คับ)(?=$|[\s\n\r.!?\)\]\"'])", "ค่ะ", cleaned)
+    cleaned = re.sub(r"โอเคคะ", "เข้าใจแล้วค่ะ", cleaned)
+    cleaned = re.sub(r"เบื่ออ่ะ", "รำคาญใจนะคะ", cleaned)
     cleaned = re.sub(r"นะคะ\s*(?:จ๊ะ|จ้า|จ้ะ)", "นะคะ", cleaned)
     cleaned = re.sub(r"นะ\s*(?:จ๊ะ|จ้า|จ้ะ)", "นะคะ", cleaned)
     cleaned = re.sub(r"เลย\s*(?:จ้า|จ๊ะ|จ้ะ)", "เลยค่ะ", cleaned)
@@ -99,14 +104,14 @@ def sanitize_yukino_output(text: str, user_prompt: str = "", speaker_user=None, 
     # Strip 'คุณ' if used before a Discord @mention
     cleaned = re.sub(r"คุณ\s*(?=<@)", "", cleaned)
 
-    # Strip awkward 'สวัสดีค่ะ คุณ' robotic openings and unnatural 4B repetition tics
+    # 5. Strip awkward openings, 4B repetition tics, and out-of-character ChatGPT emojis
     cleaned = re.sub(r"^สวัสดีค่ะ\s*(?:คุณ|นาย)?\s*(?=\n|\r|\d+\.)", "", cleaned).lstrip()
     cleaned = re.sub(r"สวัสดีค่ะ\s*คุณ\s*(?=\n|\r)", "สวัสดีค่ะ\n", cleaned)
     cleaned = re.sub(r"นี่เอง\s*สินะ(?:คะ)?", "ค่ะ", cleaned)
     cleaned = re.sub(r"(?:นะคะ|ค่ะ|นะ)\s*สินะ(?:คะ)?", "นะคะ", cleaned)
     cleaned = re.sub(r"เร็ว\s*ๆ\s*ก่อนสินะ", "ดูนะคะ", cleaned)
     cleaned = re.sub(r"\n*แล้วนายจะเลือกอะไรดีล่ะคะ\??\s*[😊🙂✨]*\s*$", "", cleaned).strip()
-    cleaned = re.sub(r"[😊😄😁🥰]+", "", cleaned).strip()
+    cleaned = re.sub(r"[😊😄😁🥰🙈🙉🙊😢😭😔😞✅❌👉🔍]+", "", cleaned).strip()
     return re.sub(r"  +", " ", cleaned).strip()
 
 
