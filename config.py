@@ -291,7 +291,39 @@ ANIME_MANGA_QUERY_REGEX = re.compile(
     re.IGNORECASE,
 )
 GAME_QUERY_REGEX = re.compile(
-    r"(เกม|สตีม|ราคาเกม|สเปคเกม|เนื้อเรื่องเกม|\bgame\b|\bsteam\b|\bgameplay\b|\brelease\s+date\b|\bdlc\b)",
+    r"(เกม|สตีม|ราคาเกม|สเปคเกม|เนื้อเรื่องเกม|คลาส|อาชีพในเกม|สกิล|อาวุธ|บิลด์|เมต้า|เซิร์ฟ|ค่ายเกม|"
+    r"\b(?:game|steam|gameplay|release\s+date|dlc|mmorpg|rpg|pso2|ngs|genshin|honkai|valorant|elden\s+ring|"
+    r"monster\s+hunter|final\s+fantasy|ff14|rov|dota|lol|overwatch|tier\s*list|build|classes)\b)",
+    re.IGNORECASE,
+)
+
+# Detects queries asking for the latest/current state as of today's date
+RECENCY_INTENT_REGEX = re.compile(
+    r"(ล่าสุด|ตอนนี้|ปัจจุบัน|วันนี้|ปีนี้|เดือนนี้|ยุคนี้|ใหม่ล่าสุด|อัปเดต|เวอร์ชันล่าสุด|รุ่นล่าสุด|"
+    r"\b(?:latest|current|currently|right\s+now|nowadays|this\s+year|up\s+to\s+date|newest|recent|meta)\b)",
+    re.IGNORECASE,
+)
+
+# Detects when the user disputes, challenges, or corrects the bot's factual claims
+USER_CORRECTION_PATTERN = re.compile(
+    r"(ไม่มี(?:คลาส|ตัวละคร|ระบบ|ในเกม|จริง)|ไม่มีสัก|คนละเกม|คนละเรื่อง|ข้อมูลผิด|มั่ว|ผิดทั้งหมด|เข้าใจผิด|"
+    r"ไม่ใช่(?:คลาส|เกม|เรื่อง|ของ|แบบนั้น|สักหน่อย)|ไปเอาข้อมูล.*มาจากไหน|ลองบอกชื่อเต็ม|ยึดติดกับข้อมูล|"
+    r"ที่ถูก(?:ต้อง)?คือ|จริงๆ\s*แล้วมันคือ|เช็คข้อมูลใหม่|ค้นข้อมูลดูใหม่|"
+    r"\b(?:that'?s\s+wrong|you'?re\s+wrong|incorrect|hallucinating|wrong\s+game|no\s+such|fact\s*check)\b)",
+    re.IGNORECASE,
+)
+
+# Universal Factual & Web Search Trigger (Covers General Knowledge, Tech, People, Places, Finance, News, etc.)
+WEB_SEARCH_INTENT_PATTERN = re.compile(
+    r"(\b(latest|current news|breaking news|price of|release date|who won|stock price|bitcoin price|"
+    r"search the web|look up|google|wikipedia|wiki|what do you think (?:of|about) the news|"
+    r"what classes|which class|tier list|best build|who developed|who made|who is the current|"
+    r"what is the latest version|specs of|specification|review of|where is|when did|how much is)\b|"
+    r"ข่าวล่าสุด|ข่าววันนี้|ข่าวเรื่อง|กับข่าว|ราคาทอง|ราคาบิตคอยน์|ราคาหุ้น|ค้นหาข้อมูล|หาข้อมูล|เสิร์ช|"
+    r"อัปเดตล่าสุด|ผลการแข่งขัน|กระแสเรื่อง|ดราม่าเรื่อง|วิกิ|wikipedia|"
+    r"มีคลาสอะไรบ้าง|เล่นคลาสอะไรดี|มีอาชีพอะไรบ้าง|มีตัวละครอะไรบ้าง|ชื่อเต็มของ|ของค่ายไหน|ใครพัฒนา|พัฒนาโดย|"
+    r"คือเกมอะไร|คือเรื่องอะไร|เนื้อเรื่องเป็นยังไง|คือใคร|คืออะไร|อยู่ที่ไหน|เปิดเมื่อไหร่|วางจำหน่ายเมื่อไหร่|"
+    r"สเปค|รุ่นไหนดี|เวอร์ชันล่าสุด|คนปัจจุบันคือใคร|ราคาเท่าไหร่|ข้อมูลของ|ประวัติของ|สรุปเรื่อง)",
     re.IGNORECASE,
 )
 PURE_DATETIME_PATTERN = re.compile(
@@ -345,12 +377,5 @@ CODE_INTENT_PATTERN = re.compile(
 WEATHER_INTENT_PATTERN = re.compile(
     r"(\b(weather|forecast|rain|raining|temperature|humidity|pm2\.5|storm)\b|"
     r"ฝนตก|ฝนจะตก|พยากรณ์อากาศ|สภาพอากาศ|อากาศวันนี้|อากาศตอนนี้|อุณหภูมิ|ค่าฝุ่น|ร้อนไหม|หนาวไหม)",
-    re.IGNORECASE
-)
-WEB_SEARCH_INTENT_PATTERN = re.compile(
-    r"(\b(latest|current news|breaking news|price of|release date|who won|stock price|bitcoin price|"
-    r"search the web|look up|google|what do you think (?:of|about) the news)\b|"
-    r"ข่าวล่าสุด|ข่าววันนี้|ข่าวเรื่อง|กับข่าว|ราคาทอง|ราคาบิตคอยน์|ราคาหุ้น|ค้นหาข้อมูล|หาข้อมูล|เสิร์ช|"
-    r"อัปเดตล่าสุด|ผลการแข่งขัน|กระแสเรื่อง|ดราม่าเรื่อง)",
     re.IGNORECASE
 )

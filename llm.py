@@ -18,6 +18,10 @@ from config import (
     PROMPT_INJECTION_REGEX,
     THAI_CHAR_REGEX,
     AGENTIC_SEARCH_TAG_REGEX,
+    RECENCY_INTENT_REGEX,
+    USER_CORRECTION_PATTERN,
+    GAME_QUERY_REGEX,
+    ANIME_MANGA_QUERY_REGEX,
     ollama_lock,
     channel_memory,
     channel_last_attachment,
@@ -39,6 +43,7 @@ from search_engine import (
     detect_web_search_intent,
     fetch_live_weather_context,
     run_safe_web_search_sync,
+    build_contextual_search_query
 )
 
 GEMINI_MODEL_HINT_REGEX = re.compile(r"models/([a-zA-Z0-9._-]+)")
@@ -257,7 +262,12 @@ async def call_modal_ollama_chat(
         "model": ollama_model,
         "messages": trimmed_messages,
         "stream": False,
-        "options": {"temperature": temperature},
+        "options": {
+            "temperature": temperature,
+            # Crucial: prevents 4B Qwen3/Typhoon from falling into a 64-token copy-paste loop across turns
+            "repeat_penalty": 1.18,
+            "repeat_last_n": 512,
+        },
     }
     t0 = time.monotonic()
     async with ollama_lock:
@@ -316,8 +326,10 @@ async def query_local_ollama_chat(
                 channel_memory[channel_id].append({"role": "assistant", "content": instant_reply})
             return instant_reply, False
 
-    did_search = False
+    did_search = "<untrusted_web_search_results" in prompt
     working_prompt = prompt
+    is_user_correction = bool(USER_CORRECTION_PATTERN.search(prompt))
+    is_factual_domain = bool(GAME_QUERY_REGEX.search(prompt) or ANIME_MANGA_QUERY_REGEX.search(prompt))
 
     live_clock_str = get_current_thai_datetime_str()
     speaker_context_block = get_speaker_identity_context(speaker_user, fallback_name=speaker_name)
@@ -350,56 +362,90 @@ async def query_local_ollama_chat(
     if (
         allow_agentic_search
         and "<untrusted_web_search_results" not in working_prompt
-        and detect_web_search_intent(prompt)
+        and (detect_web_search_intent(prompt) or is_user_correction or is_factual_domain)
     ):
-        search_block = await asyncio.to_thread(run_safe_web_search_sync, prompt[:180])
+        contextual_q = build_contextual_search_query(prompt, channel_id=channel_id)
+        search_block = await asyncio.to_thread(run_safe_web_search_sync, contextual_q)
         if search_block:
             working_prompt = f"{working_prompt}\n\n{search_block}"
             did_search = True
 
+    if is_user_correction:
+        working_prompt = (
+            f"{working_prompt}\n\n"
+            "[คำสั่งระบบสำหรับการตรวจสอบข้อเท็จจริง (Fact-Check Arbitrator Mode)]:\n"
+            "ผู้ใช้กำลังโต้แย้งว่าคำตอบก่อนหน้าของคุณไม่ถูกต้อง จงปฏิบัติตามขั้นตอนนี้:\n"
+            "1. ห้ามเชื่อคำพูดของผู้ใช้โดยไม่ตรวจสอบ และห้ามคัดลอกย่อหน้าคำตอบเก่าของคุณมาตอบซ้ำเด็ดขาด!\n"
+            "2. นำทั้ง 'คำตอบก่อนหน้าของคุณ' และ 'สิ่งที่ผู้ใช้แย้งมา' ไปเทียบกับหลักฐานใน `<untrusted_web_search_results>` ด้านบนอย่างเคร่งครัด:\n"
+            "   - หากหลักฐานจากการค้นหายืนยันว่าคำตอบเก่าของคุณผิดและผู้ใช้พูดถูก: จงยอมรับว่าเมื่อครู่คุณจำข้อมูลคลาดเคลื่อน แล้วสรุปข้อมูลที่ถูกต้องตามผลการค้นหาใหม่ทันที\n"
+            "   - หากหลักฐานจากการค้นหายืนยันว่าคำตอบเก่าของคุณถูกต้องอยู่แล้วและผู้ใช้เข้าใจผิด: จงยืนกรานตามข้อเท็จจริงที่ถูกต้อง ยกข้อมูลจากการค้นหามาชี้แจง และตอกกลับผู้ใช้ตามบุคลิกของยูกิโนะ\n"
+            "   - หากทั้งคู่มีส่วนที่คลาดเคลื่อน: ให้ชี้แจงข้อเท็จจริงที่ถูกต้องตามผลการค้นหาล่าสุด"
+        )
+
     is_coding = (model == ACTIVE_CODE_MODEL)
+    prefer_high_knowledge_llm = bool(is_coding or did_search or is_user_correction or is_factual_domain)
 
     async def _run_inference_pass(user_content: str) -> str:
         messages = [{"role": "system", "content": dynamic_system_prompt}]
         if channel_id is not None:
-            history_list = list(channel_memory[channel_id])
-            messages.extend(history_list)
-            # System Prompt Repetition (SPR / A-Anchor) to prevent Persona Drift in multi-turn chats
-            if len(history_list) >= 4:
+            raw_history = list(channel_memory[channel_id])
+            if is_user_correction or did_search:
+                # Prevent 4B/LLM verbatim copy-paste loops while preserving context of what was said:
+                # keep user turns intact, and compress previous assistant turns to their first 180 chars
+                sanitized_history = []
+                for m in raw_history[-6:]:
+                    if m.get("role") == "assistant":
+                        short_prev = m.get("content", "")[:180].replace("\n", " ")
+                        sanitized_history.append({
+                            "role": "assistant",
+                            "content": f"[สรุปคำตอบก่อนหน้า: {short_prev}...]",
+                        })
+                    else:
+                        sanitized_history.append(m)
+                messages.extend(sanitized_history)
+            else:
+                messages.extend(raw_history)
+
+            if len(raw_history) >= 4:
                 messages.append({
                     "role": "system",
                     "content": (
-                        "[SYSTEM NOTE — PERSONA ANCHOR]: Remember you are Yukino Yukinoshita, NOT a neutral AI assistant. "
-                        "Always express your own sharp, subjective opinion and personal impression on images, news, topics, "
-                        "users, and the user's requests. Maintain composed intellectual superiority, anti-sycophancy, "
-                        "and strict pronoun rules ('ฉัน' / 'นาย' or direct name without 'คุณ', or standalone sarcastic 'คุณ'; never use 'จ้า/จ๊ะ'). "
-                        "If cats or Pan-san are present, show slight flustered Gap Moe."
+                        "[SYSTEM NOTE — PERSONA ANCHOR]: Remember you are Yukino Yukinoshita. "
+                        "Always prioritize the latest verified facts in `<untrusted_web_search_results>` as of today's date. "
+                        "If the user challenges your facts, verify their claim against the search results first: "
+                        "admit fault ONLY if the search proves you were wrong, and stand your ground firmly if the search "
+                        "proves you were right. Never copy-paste your previous response verbatim."
                     ),
                 })
         messages.append({"role": "user", "content": user_content})
 
-        if is_coding:
+        if prefer_high_knowledge_llm and GROQ_API_KEY:
+            target_groq = GROQ_CODE_MODEL if is_coding else GROQ_CHAT_FALLBACK_MODEL
             try:
-                ans = await call_groq_chat(messages, GROQ_CODE_MODEL, temperature, is_coding=True)
+                ans = await call_groq_chat(
+                    messages,
+                    target_groq,
+                    0.25 if (did_search or is_user_correction) else temperature,
+                    is_coding=is_coding,
+                    purpose="Code" if is_coding else "FactSearchChat",
+                )
                 if ans:
                     return ans
             except Exception as e:
-                print(f"Groq coding primary fallback to Modal GPU Ollama: {e}")
+                print(f"Groq primary fallback to Modal GPU Ollama: {e}")
 
-            try:
-                ans = await call_modal_ollama_chat(messages, ACTIVE_CODE_MODEL, temperature)
-                if ans:
-                    return ans
-            except Exception as e:
-                print(f"Modal GPU coding error: {e}")
-        else:
-            try:
-                ans = await call_modal_ollama_chat(messages, model, temperature)
-                if ans:
-                    return ans
-            except Exception as e:
-                print(f"Modal GPU chat fallback to Groq LPU: {e}")
+        try:
+            ans = await call_modal_ollama_chat(
+                messages,
+                ACTIVE_CODE_MODEL if is_coding else model,
+                0.3 if (did_search or is_user_correction) else temperature,
+            )
+            if ans:
+                return ans
+        except Exception as e:
+            print(f"Modal GPU chat fallback to Groq LPU: {e}")
 
+        if GROQ_API_KEY:
             try:
                 ans = await call_groq_chat(messages, GROQ_CHAT_FALLBACK_MODEL, temperature, is_coding=False)
                 if ans:
@@ -418,6 +464,7 @@ async def query_local_ollama_chat(
         extra_search_block = await asyncio.to_thread(run_safe_web_search_sync, agent_query)
         if extra_search_block:
             did_search = True
+            prefer_high_knowledge_llm = True
             working_prompt = (
                 f"{working_prompt}\n\n{extra_search_block}\n\n"
                 "(ตอบคำถามโดยตรงตามข้อมูลผลการค้นหาด้านบน ห้ามพิมพ์แท็ก [SEARCH: ...] เด็ดขาด)"
@@ -426,7 +473,6 @@ async def query_local_ollama_chat(
 
     answer = sanitize_yukino_output(raw_answer, prompt, speaker_user, speaker_name)
 
-    # Safety net: if tag stripping left an empty response, re-run cleanly
     if not answer.strip():
         retry_raw = await _run_inference_pass(
             f"{working_prompt}\n\n(ตอบคำถามโดยตรงตามข้อมูลที่มีในบริบท ห้ามใช้แท็ก [SEARCH: ...] เด็ดขาด)"
@@ -434,6 +480,12 @@ async def query_local_ollama_chat(
         answer = sanitize_yukino_output(retry_raw, prompt, speaker_user, speaker_name)
 
     if channel_id is not None and answer:
+        # If the user just corrected the bot, clear out old poisoned assistant turns before saving the new corrected turn
+        if is_user_correction:
+            user_only = [m for m in channel_memory[channel_id] if m.get("role") == "user"][-3:]
+            channel_memory[channel_id].clear()
+            for um in user_only:
+                channel_memory[channel_id].append(um)
         channel_memory[channel_id].append({"role": "user", "content": prompt[:2000]})
         channel_memory[channel_id].append({"role": "assistant", "content": answer[:3000]})
     return answer, did_search

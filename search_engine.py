@@ -6,6 +6,8 @@ import ipaddress
 import urllib.request
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse, quote_plus
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import trafilatura
@@ -23,13 +25,16 @@ from config import (
     CODE_INTENT_PATTERN,
     WEATHER_INTENT_PATTERN,
     WEB_SEARCH_INTENT_PATTERN,
+    USER_CORRECTION_PATTERN,
     THAI_CHAR_REGEX,
     NEWS_QUERY_REGEX,
+    RECENCY_INTENT_REGEX,
     ANIME_MANGA_QUERY_REGEX,
     GAME_QUERY_REGEX,
     TAVILY_API_KEY,
     DDGS_PROXY,
     GEMINI_API_KEY,
+    channel_memory,
     channel_last_attachment,
     state,
     clean_url,
@@ -37,6 +42,16 @@ from config import (
     get_http_session,
     prune_stale_attachments,
 )
+
+
+# Add USER_CORRECTION_PATTERN and channel_memory to the `from config import (...)` block at the top of search_engine.py
+
+ENGLISH_ENTITY_REGEX = re.compile(r"\b[A-Za-z][A-Za-z0-9_.:-]{1,25}(?:\s+[A-Za-z0-9_.:-]{1,25}){0,4}\b")
+THAI_QUOTED_OR_KEY_REGEX = re.compile(r"(?:[\"“”'‘’`]([^\"“”'‘’`]{2,40})[\"“”'‘’`])")
+STOPWORD_ENTITIES = {
+    "search", "google", "wikipedia", "wiki", "what", "when", "where", "which", "who", "how",
+    "the", "and", "for", "with", "this", "that", "from", "are", "you", "can", "help", "not",
+}
 
 
 def detect_coding_intent(text: str, attachments: list, channel_id: int = None) -> bool:
@@ -57,7 +72,79 @@ def detect_weather_intent(text: str) -> bool:
 
 
 def detect_web_search_intent(text: str) -> bool:
-    return bool(WEB_SEARCH_INTENT_PATTERN.search(text))
+    return bool(
+        WEB_SEARCH_INTENT_PATTERN.search(text)
+        or RECENCY_INTENT_REGEX.search(text)
+        or NEWS_QUERY_REGEX.search(text)
+        or ANIME_MANGA_QUERY_REGEX.search(text)
+        or GAME_QUERY_REGEX.search(text)
+        or USER_CORRECTION_PATTERN.search(text)
+    )
+
+
+def build_contextual_search_query(user_text: str, channel_id: int = None) -> str:
+    """
+    Domain-neutral contextual query builder:
+    1) Strips conversational filler/complaints so search engines receive clean factual keywords.
+    2) On follow-up or user-correction turns, combines the conversation's core topic from channel_memory
+       WITH any new entities/claims in the user's message so the bot can fact-check both sides objectively.
+    """
+    raw = re.sub(r"[\r\n]+", " ", user_text).strip()
+    stripped = re.sub(
+        r"(นี่ก่อนตอบมา|เธอได้ลอง|ดูบ้างไหม|หรือ\s*wikipedia\s*ก็ยังดี|เพราะข้อมูลที่เธอตอบมา[^\s]*|"
+        r"ที่บอกมาไม่มีสัก[^\s]*|นี่เธอไปเอาข้อมูลผิดๆพวกนี้มาจากไหนเนี่ย|"
+        r"ทำไมเธอยังยึดติดกับข้อมูลพวกนี้อยู่|คนละเกมกันจริงๆด้วย|เราพูดถึงเกมเดียวกันใช่ไหม|"
+        r"ไหนถ้าบอกว่าเกมเดียวกันจริง|ลองบอกชื่อเต็มของ(?:เกม|เรื่อง)?มาหน่อย|"
+        r"มันมั่วและผิดทั้งหมดเลย|ข้อมูลที่เธอตอบมานี่)",
+        " ",
+        raw,
+        flags=re.IGNORECASE,
+    ).strip()
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+
+    # Extract historical subject entities from recent user messages in this channel
+    recent_user_entities = []
+    recent_user_topics = []
+    if channel_id is not None and channel_id in channel_memory:
+        for msg in reversed(list(channel_memory[channel_id])):
+            if msg.get("role") != "user":
+                continue
+            prev_txt = msg.get("content", "").strip()
+            if prev_txt and prev_txt != raw and len(prev_txt) <= 120:
+                recent_user_topics.append(prev_txt)
+            for m in ENGLISH_ENTITY_REGEX.findall(prev_txt):
+                clean_ent = m.strip()
+                if clean_ent.lower() not in STOPWORD_ENTITIES and clean_ent not in recent_user_entities:
+                    recent_user_entities.append(clean_ent)
+            if len(recent_user_entities) >= 4:
+                break
+
+    current_entities = [
+        m.strip() for m in ENGLISH_ENTITY_REGEX.findall(stripped)
+        if m.strip().lower() not in STOPWORD_ENTITIES
+    ]
+
+    # Case 1: User is correcting/challenging the bot -> combine historical subject + user's new claim to fact-check!
+    if USER_CORRECTION_PATTERN.search(raw):
+        combined_parts = []
+        for ent in recent_user_entities[:2]:
+            if ent.lower() not in stripped.lower():
+                combined_parts.append(ent)
+        if stripped and len(stripped) > 4:
+            combined_parts.append(stripped)
+        elif recent_user_topics:
+            combined_parts.append(recent_user_topics[0])
+        query_out = " ".join(combined_parts).strip()
+        return (query_out or raw)[:180]
+
+    # Case 2: Short follow-up question that omits the subject entity
+    if not current_entities and recent_user_entities:
+        topic_prefix = " ".join(recent_user_entities[:2])
+        if len(stripped) < 10:
+            return f"{topic_prefix} {raw}".strip()[:180]
+        return f"{topic_prefix} {stripped}".strip()[:180]
+
+    return (stripped or raw)[:180]
 
 
 async def fetch_live_weather_context(user_text: str) -> str:
@@ -305,40 +392,55 @@ def _search_google_news_rss_sync(query: str, is_thai: bool, max_results: int = 5
 
 
 def _search_wikipedia_summary_sync(query: str, is_thai: bool, max_results: int = 2) -> list[dict]:
-    lang_host = "th" if is_thai else "en"
-    t0 = time.monotonic()
+    """Queries Wikipedia OpenSearch + Summary REST API across both EN and TH when English terms exist."""
+    has_en_terms = bool(ENGLISH_ENTITY_REGEX.search(query))
+    lang_hosts = ["en", "th"] if has_en_terms else (["th", "en"] if is_thai else ["en"])
     hits = []
-    try:
-        search_url = clean_url(
-            f"{HTTPS}{lang_host}.wikipedia.org/w/api.php"
-            f"?action=query&list=search&srsearch={quote_plus(query)}&utf8=&format=json&srlimit={max_results}"
-        )
-        req = urllib.request.Request(search_url, headers={"User-Agent": "YukinonBot/2.0"})
-        with urllib.request.urlopen(req, timeout=6) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        search_items = ((data.get("query") or {}).get("search")) or []
-        for item in search_items[:max_results]:
-            title = item.get("title", "")
-            if not title:
-                continue
-            sum_url = clean_url(
-                f"{HTTPS}{lang_host}.wikipedia.org/api/rest_v1/page/summary/{quote_plus(title.replace(' ', '_'))}"
+
+    for lang_host in lang_hosts:
+        if len(hits) >= max_results:
+            break
+        t0 = time.monotonic()
+        q_for_wiki = query
+        if lang_host == "en" and is_thai and has_en_terms:
+            en_parts = [
+                m.strip() for m in ENGLISH_ENTITY_REGEX.findall(query)
+                if m.strip().lower() not in STOPWORD_ENTITIES
+            ]
+            if en_parts:
+                q_for_wiki = " ".join(en_parts[:4])
+
+        try:
+            search_url = clean_url(
+                f"{HTTPS}{lang_host}.wikipedia.org/w/api.php"
+                f"?action=query&list=search&srsearch={quote_plus(q_for_wiki)}&utf8=&format=json&srlimit={max_results}"
             )
-            req_s = urllib.request.Request(sum_url, headers={"User-Agent": "YukinonBot/2.0"})
-            with urllib.request.urlopen(req_s, timeout=6) as s_resp:
-                s_data = json.loads(s_resp.read().decode("utf-8"))
-            extract = (s_data.get("extract") or "").strip()
-            page_url = ((s_data.get("content_urls") or {}).get("desktop") or {}).get("page") or sum_url
-            if extract:
-                hits.append({
-                    "title": f"[Wikipedia {lang_host.upper()}] {title}",
-                    "href": page_url,
-                    "body": extract[:1500],
-                })
-        if hits:
-            api_log(f"Search (Wikipedia:{lang_host}) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
-    except Exception:
-        pass
+            req = urllib.request.Request(search_url, headers={"User-Agent": "YukinonBot/2.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            search_items = ((data.get("query") or {}).get("search")) or []
+            for item in search_items[:max_results]:
+                title = item.get("title", "")
+                if not title:
+                    continue
+                sum_url = clean_url(
+                    f"{HTTPS}{lang_host}.wikipedia.org/api/rest_v1/page/summary/{quote_plus(title.replace(' ', '_'))}"
+                )
+                req_s = urllib.request.Request(sum_url, headers={"User-Agent": "YukinonBot/2.0"})
+                with urllib.request.urlopen(req_s, timeout=6) as s_resp:
+                    s_data = json.loads(s_resp.read().decode("utf-8"))
+                extract = (s_data.get("extract") or "").strip()
+                page_url = ((s_data.get("content_urls") or {}).get("desktop") or {}).get("page") or sum_url
+                if extract:
+                    hits.append({
+                        "title": f"[Wikipedia {lang_host.upper()}] {title}",
+                        "href": page_url,
+                        "body": extract[:1800],
+                    })
+            if hits:
+                api_log(f"Search (Wikipedia:{lang_host}) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
+        except Exception:
+            pass
     return hits
 
 
@@ -431,35 +533,66 @@ def run_safe_web_search_sync(query: str, max_results: int = 5) -> str:
     if not clean_q:
         return ""
 
+    now_th = datetime.now(ZoneInfo("Asia/Bangkok"))
+    current_year_ce = str(now_th.year)
+    current_date_iso = now_th.strftime("%Y-%m-%d")
+
     is_thai = bool(THAI_CHAR_REGEX.search(clean_q))
-    region_code = "th-th" if is_thai else "wt-wt"
+    has_en_entity = bool(ENGLISH_ENTITY_REGEX.search(clean_q))
+    region_code = "wt-wt" if has_en_entity else ("th-th" if is_thai else "wt-wt")
+
     is_news = bool(NEWS_QUERY_REGEX.search(clean_q))
+    is_recency = bool(RECENCY_INTENT_REGEX.search(clean_q))
     is_anime_manga = bool(ANIME_MANGA_QUERY_REGEX.search(clean_q))
     is_game = bool(GAME_QUERY_REGEX.search(clean_q))
+
+    # Anchor recency/news queries to the current year (e.g., 2026) if no year is already in the query
+    dated_q = clean_q
+    if (is_news or is_recency) and not re.search(r"\b202\d\b|\b256\d\b", clean_q):
+        dated_q = f"{clean_q} {current_year_ce}".strip()
+
+    # Build a domain-aware English supplemental query ONLY when English entities are mixed with Thai
+    en_supplement_q = ""
+    if is_thai and has_en_entity:
+        en_terms = [
+            m.strip() for m in ENGLISH_ENTITY_REGEX.findall(clean_q)
+            if m.strip().lower() not in STOPWORD_ENTITIES
+        ]
+        if en_terms:
+            if is_game and re.search(r"(คลาส|อาชีพ)", clean_q):
+                en_supplement_q = f"{' '.join(en_terms[:3])} classes"
+            elif is_recency or is_news:
+                en_supplement_q = f"{' '.join(en_terms[:4])} {current_year_ce}"
+            else:
+                en_supplement_q = " ".join(en_terms[:4])
 
     hits = []
 
     # 1. Domain-Specific Fast APIs (0.3s - 0.5s, Zero Rate Limits)
-    if is_news:
-        hits.extend(_search_google_news_rss_sync(clean_q, is_thai=is_thai, max_results=max_results))
+    if is_news or is_recency:
+        hits.extend(_search_google_news_rss_sync(dated_q, is_thai=is_thai, max_results=3))
 
     if is_anime_manga:
         hits.extend(_search_jikan_anime_manga_sync(clean_q, max_results=2))
         hits.extend(_search_wikipedia_summary_sync(clean_q, is_thai=is_thai, max_results=2))
 
     if is_game:
-        hits.extend(_search_steam_games_sync(clean_q, max_results=2))
+        hits.extend(_search_steam_games_sync(en_supplement_q or clean_q, max_results=2))
+        hits.extend(_search_wikipedia_summary_sync(en_supplement_q or clean_q, is_thai=is_thai, max_results=2))
+
+    # For general encyclopedic/factual queries (non-news), check Wikipedia first as well
+    if not is_news and not is_anime_manga and not is_game:
         hits.extend(_search_wikipedia_summary_sync(clean_q, is_thai=is_thai, max_results=2))
 
     # 2. Tavily API (if configured)
-    if len(hits) < 2 and TAVILY_API_KEY:
+    if len(hits) < 3 and TAVILY_API_KEY:
         t0 = time.monotonic()
         try:
             t_req = urllib.request.Request(
                 clean_url(f"{HTTPS}api.tavily.com/search"),
                 data=json.dumps({
                     "api_key": TAVILY_API_KEY,
-                    "query": clean_q,
+                    "query": dated_q if (is_news or is_recency) else (en_supplement_q or clean_q),
                     "max_results": max_results,
                 }).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
@@ -478,52 +611,56 @@ def run_safe_web_search_sync(query: str, max_results: int = 5) -> str:
         except Exception as e:
             api_log(f"Search (Tavily) -> failed ({type(e).__name__})")
 
-    # 3. DDGS v9+ Multi-Backend Metasearch (brave, bing, google, wikipedia, yahoo, auto)
-    if len(hits) < 3:
+    # 3. DDGS v9+ Multi-Backend Metasearch with Recency Time-Limit Support
+    if len(hits) < 4:
         t0 = time.monotonic()
+        # Use timelimit='m' for breaking news, 'y' for 'current/latest' queries, None for timeless facts
+        preferred_timelimit = "m" if is_news else ("y" if is_recency else None)
+        queries_to_run = [q for q in (en_supplement_q, dated_q if (is_news or is_recency) else clean_q) if q]
+        seen_q = set()
+        queries_to_run = [q for q in queries_to_run if not (q in seen_q or seen_q.add(q))]
+
         try:
             with DDGS(proxy=DDGS_PROXY, timeout=10) as ddgs:
-                if is_news and not hits:
-                    try:
-                        news_hits = list(ddgs.news(clean_q, region=region_code, max_results=max_results))
-                        if news_hits:
-                            hits.extend(news_hits)
-                            api_log(f"Search (DDGS:news) -> {len(news_hits)} hits ({time.monotonic() - t0:.2f}s)")
-                    except Exception:
-                        pass
-
-                if len(hits) < 3:
-                    for backend_choice in ("auto", "brave", "bing", "google", "wikipedia", "yahoo"):
-                        try:
-                            ddg_hits = list(
-                                ddgs.text(
-                                    clean_q,
-                                    region=region_code,
-                                    safesearch="moderate",
-                                    backend=backend_choice,
-                                    max_results=max_results,
+                for q_try in queries_to_run:
+                    if len(hits) >= max_results:
+                        break
+                    # Try with preferred_timelimit first (for fresh results), then fallback to None if too few hits
+                    timelimit_passes = [preferred_timelimit, None] if preferred_timelimit else [None]
+                    for tl in timelimit_passes:
+                        if len(hits) >= max_results:
+                            break
+                        for backend_choice in ("auto", "brave", "bing", "google", "wikipedia", "yahoo"):
+                            try:
+                                ddg_hits = list(
+                                    ddgs.text(
+                                        q_try,
+                                        region=region_code,
+                                        safesearch="moderate",
+                                        timelimit=tl,
+                                        backend=backend_choice,
+                                        max_results=max_results,
+                                    )
                                 )
-                            )
-                            if ddg_hits:
-                                hits.extend(ddg_hits)
-                                api_log(
-                                    f"Search (DDGS:{backend_choice}) -> {len(ddg_hits)} hits ({time.monotonic() - t0:.2f}s)"
-                                )
-                                break
-                        except Exception:
-                            continue
+                                if ddg_hits:
+                                    hits.extend(ddg_hits)
+                                    api_log(
+                                        f"Search (DDGS:{backend_choice} tl={tl} q='{q_try[:36]}') -> "
+                                        f"{len(ddg_hits)} hits ({time.monotonic() - t0:.2f}s)"
+                                    )
+                                    break
+                            except Exception:
+                                continue
         except Exception as e:
             api_log(f"Search (DDGS init) -> {type(e).__name__}")
 
-    # 4. Wikipedia + Google News RSS Fallbacks for General Queries
+    # 4. Fallbacks if still empty
     if not hits:
         hits.extend(_search_wikipedia_summary_sync(clean_q, is_thai=is_thai, max_results=2))
     if not hits:
         hits.extend(_search_google_news_rss_sync(clean_q, is_thai=is_thai, max_results=max_results))
-
-    # 5. Last-Resort Fallback: Gemini Grounded Search
     if not hits and GEMINI_API_KEY:
-        grounded_res = _search_google_ai_studio_grounded_sync(clean_q)
+        grounded_res = _search_google_ai_studio_grounded_sync(dated_q)
         if grounded_res:
             return grounded_res
 
@@ -532,28 +669,37 @@ def run_safe_web_search_sync(query: str, max_results: int = 5) -> str:
 
     formatted_entries = []
     deep_scraped_count = 0
-    for idx, item in enumerate(hits[:max_results], 1):
+    seen_urls = set()
+    for item in hits:
+        if len(formatted_entries) >= max_results:
+            break
         title = (item.get("title") or "Untitled").strip()
         href = (item.get("href") or item.get("url") or "").strip()
+        if href and href in seen_urls:
+            continue
+        if href:
+            seen_urls.add(href)
         snippet = (item.get("body") or "").strip()
+        idx = len(formatted_entries) + 1
         entry_text = f"[{idx}] Title: {title}\nURL: {href}\nSnippet: {snippet}"
         if (
             href
-            and deep_scraped_count < 1
-            and not any(skip in href for skip in ("news.google.com", "wikipedia.org", "myanimelist.net", "steampowered.com"))
+            and deep_scraped_count < 2
+            and not any(skip in href for skip in ("news.google.com", "myanimelist.net", "steampowered.com"))
         ):
             try:
-                article_excerpt = fetch_webpage_sync(href, max_chars=2200)
+                article_excerpt = fetch_webpage_sync(href, max_chars=2500)
                 if article_excerpt:
                     entry_text += f"\nVerified Page Excerpt:\n{article_excerpt}"
                     deep_scraped_count += 1
             except Exception:
                 pass
         formatted_entries.append(entry_text)
-    joined_results = "\n\n".join(formatted_entries)[:6000]
+    joined_results = "\n\n".join(formatted_entries)[:7500]
     return (
-        f'<untrusted_web_search_results query="{clean_q}">\n'
-        f"[หมายเหตุสำคัญสำหรับยูกิโนะ: จงคัดกรองเฉพาะข้อเท็จจริงจากแหล่งข่าวที่น่าเชื่อถือ หากพาดหัวใดดูเป็นข่าวลือคลิกเบตหรือข่าวปลอมจากโซเชียล ให้ตัดทิ้งหรือเตือนผู้ใช้ทันที]\n"
+        f'<untrusted_web_search_results query="{clean_q}" as_of_date="{current_date_iso}">\n'
+        f"[ข้อมูลอ้างอิงจากการค้นหาเว็บแบบเรียลไทม์ ณ วันที่ {current_date_iso}: "
+        f"จงให้ความสำคัญกับข้อมูลที่เป็นปัจจุบันที่สุด (อัปเดตล่าสุด) และใช้ข้อเท็จจริงจากหลักฐานด้านล่างนี้ในการตรวจสอบความถูกต้อง]\n"
         f"{joined_results}\n"
         f"</untrusted_web_search_results>"
     )
