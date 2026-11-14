@@ -526,19 +526,22 @@ and translate ALL speech bubbles (including short exclamations like '!' or 'Huh?
 
 CRITICAL RULES:
 1. Reading Order: Order the bubbles strictly in traditional Japanese Manga reading order (Top-to-Bottom, Right-to-Left across panels).
-2. In-Context Localization: Adapt Japanese/Korean/Chinese idioms, pronouns, tone, and emotion so the dialogue sounds completely natural in {target_lang_name} while fitting inside a speech bubble. Do NOT use double quotes inside `translated_text` (use single quotes if needed).
-3. Speech Bubble Bounding Boxes (`box_2d`):
-   - For each speech bubble, provide `box_2d` as `[ymin, xmin, ymax, xmax]` normalized from 0 to 1000.
-   - `box_2d` must tightly cover the Japanese text block inside that specific bubble lobe (if a double bubble has two lobes, output each lobe as its own separate bubble entry covering only that lobe's text).
-4. Return ONLY valid JSON matching this exact structure (every bubble MUST have a non-empty `translated_text`):
+2. ONE Entry Per Bubble Lobe (NEVER Split Columns of the Same Lobe!):
+   - Japanese speech bubbles contain multiple vertical columns of text read right-to-left. You MUST combine all vertical columns inside the same bubble lobe into ONE single `bubbles` entry with ONE complete sentence in `translated_text` and ONE `box_2d` covering all columns in that lobe.
+   - NEVER split a single sentence or a single bubble lobe's columns into two separate entries (e.g., never put the first half of a sentence in one entry and the last word in another entry).
+   - Only output separate entries when a compound/double bubble has two visually distinct ovals/lobes separated by a pinched neck.
+3. In-Context Localization: Adapt Japanese/Korean/Chinese idioms, pronouns, tone, and emotion so the dialogue sounds completely natural in {target_lang_name} while fitting inside a speech bubble. Do NOT use double quotes inside `translated_text` (use single quotes if needed).
+4. Speech Bubble Bounding Boxes (`box_2d`):
+   - Provide `box_2d` as `[ymin, xmin, ymax, xmax]` normalized from 0 to 1000 tightly covering the entire Japanese text block of that bubble lobe.
+5. Return ONLY valid JSON matching this exact structure (every bubble MUST have a non-empty `translated_text`):
 {{
   "summary": "Brief 1-sentence scene context",
   "bubbles": [
     {{
       "id": 1,
       "speaker_or_note": "Character / SFX / Narration",
-      "source_text": "Original Japanese text",
-      "translated_text": "Natural {target_lang_name} translation",
+      "source_text": "Complete original Japanese text in this bubble lobe",
+      "translated_text": "Complete natural {target_lang_name} translation for this bubble lobe",
       "box_2d": [ymin, xmin, ymax, xmax]
     }}
   ]
@@ -560,7 +563,7 @@ CRITICAL RULES:
                 }
             ],
             "generationConfig": {
-                "temperature": 0.1,
+                "temperature": 0.0,
                 "responseMimeType": "application/json",
                 "thinkingConfig": {"thinkingBudget": 0},
             },
@@ -625,7 +628,7 @@ CRITICAL RULES:
                             ],
                         }
                     ],
-                    "temperature": 0.1,
+                    "temperature": 0.0,
                     "max_tokens": 4096,
                 }
                 async with session.post(
@@ -685,7 +688,6 @@ def _wrap_text_to_pixel_width(
                 lines.append(current)
                 current = ""
             wbbox = draw.textbbox((0, 0), word, font=font)
-            # Never split English/Latin words mid-word unless allow_midword_split is True (smallest fallback font)
             if (wbbox[2] - wbbox[0]) <= max_width or (not is_thai_text and not allow_midword_split):
                 current = word
             else:
@@ -705,6 +707,76 @@ def _wrap_text_to_pixel_width(
     return lines
 
 
+def _merge_same_lobe_column_splits(
+    pixel_boxes: list[tuple[int, int, int, int, str]],
+    base_gray: Image.Image,
+) -> list[tuple[int, int, int, int, str]]:
+    """
+    Safety net: if the Vision LLM accidentally splits two vertical Japanese columns inside the
+    SAME single bubble lobe into separate entries (e.g. 'I will participate in the war for the' + 'throne!!'),
+    merges their bounding boxes and text so they never get drawn on top of each other.
+    """
+    if len(pixel_boxes) <= 1:
+        return pixel_boxes
+
+    width, height = base_gray.size
+    boxes = [list(b) for b in pixel_boxes]
+    merged_flags = [False] * len(boxes)
+    out = []
+
+    for i in range(len(boxes)):
+        if merged_flags[i]:
+            continue
+        x1, y1, x2, y2, txt = boxes[i]
+
+        for j in range(i + 1, len(boxes)):
+            if merged_flags[j]:
+                continue
+            ox1, oy1, ox2, oy2, otxt = boxes[j]
+
+            # 1. Check vertical overlap: columns of the same single bubble share roughly the same vertical band
+            v_overlap = min(y2, oy2) - max(y1, oy1)
+            min_h = max(1, min(y2 - y1, oy2 - oy1))
+            if v_overlap < min_h * 0.55:
+                continue
+
+            # 2. Check horizontal proximity: columns inside the same bubble either overlap or have a tiny gap (<= 12px)
+            h_gap = max(ox1 - x2, x1 - ox2)
+            if h_gap > 12:
+                continue
+
+            # 3. Verify no dark bubble border line separates their centers horizontally
+            cy_mid = (max(y1, oy1) + min(y2, oy2)) // 2
+            cx_a = (x1 + x2) // 2
+            cx_b = (ox1 + ox2) // 2
+            scan_x1, scan_x2 = min(cx_a, cx_b), max(cx_a, cx_b)
+            # Check if there is a pinched double-bubble neck at the horizontal midpoint between the two boxes
+            mid_x = (min(x2, ox2) + max(x1, ox1)) // 2
+            if 0 <= mid_x < width and 0 <= cy_mid < height:
+                # Measure vertical white span at mid_x to ensure this isn't two separate ovals of a double bubble
+                top_y = cy_mid
+                while top_y > 0 and base_gray.getpixel((mid_x, top_y - 1)) >= 195:
+                    top_y -= 1
+                bot_y = cy_mid
+                while bot_y < height - 1 and base_gray.getpixel((mid_x, bot_y + 1)) >= 195:
+                    bot_y += 1
+                neck_h = bot_y - top_y
+                if neck_h < max(y2 - y1, oy2 - oy1) * 0.85:
+                    # Pinched neck detected -> two distinct lobes (like Bubble #4 and #5), do NOT merge!
+                    continue
+
+            # Merge j into i (in reading order)
+            x1 = min(x1, ox1)
+            y1 = min(y1, oy1)
+            x2 = max(x2, ox2)
+            y2 = max(y2, oy2)
+            txt = f"{txt} {otxt}".strip()
+            merged_flags[j] = True
+
+        out.append((x1, y1, x2, y2, txt))
+    return out
+
+
 def _clean_single_bubble_lobe_fast(
     img: Image.Image,
     base_gray: Image.Image,
@@ -720,49 +792,11 @@ def _clean_single_bubble_lobe_fast(
     cx = (x1 + x2) // 2
     cy = (y1 + y2) // 2
 
-    # 1. FIRST: Erase the full original Japanese text box (with a +6px right margin for vertical rightmost columns like 'ああ')
-    # BEFORE applying Voronoi layout clamping, so right-edge Japanese characters are never left behind!
-    ex1 = max(0, x1 - 4)
-    ey1 = max(0, y1 - 4)
-    ex2 = min(width, x2 + 6)
-    ey2 = min(height, y2 + 4)
-    ew = max(4, ex2 - ex1)
-    eh = max(4, ey2 - ey1)
-
-    sub_gray = base_gray.crop((ex1, ey1, ex2, ey2))
-    dark_mask = sub_gray.point(lambda p: 255 if p < 212 else 0)
-
-    # Protect only continuous outer bubble borders touching the 1px perimeter
-    border_connected = dark_mask.copy()
-    for bx in range(ew):
-        if border_connected.getpixel((bx, 0)) == 255:
-            ImageDraw.floodfill(border_connected, (bx, 0), 128)
-        if border_connected.getpixel((bx, eh - 1)) == 255:
-            ImageDraw.floodfill(border_connected, (bx, eh - 1), 128)
-    for by in range(eh):
-        if border_connected.getpixel((0, by)) == 255:
-            ImageDraw.floodfill(border_connected, (0, by), 128)
-        if border_connected.getpixel((ew - 1, by)) == 255:
-            ImageDraw.floodfill(border_connected, (ew - 1, by), 128)
-
-    text_only_mask = border_connected.point(lambda p: 255 if p == 255 else 0)
-    # Guarantee the core text area (including the right-side first column) is wiped clean
-    inner_m = ImageDraw.Draw(text_only_mask)
-    ix1, iy1 = max(2, int(ew * 0.04)), max(2, int(eh * 0.05))
-    ix2, iy2 = min(ew - 2, int(ew * 0.96)), min(eh - 2, int(eh * 0.95))
-    if ix2 > ix1 and iy2 > iy1:
-        inner_m.rectangle([ix1, iy1, ix2, iy2], fill=255)
-
-    white_patch = Image.new("RGB", (ew, eh), (255, 255, 255))
-    img.paste(white_patch, (ex1, ey1), mask=text_only_mask)
-
-    # 2. Compute Voronoi midpoint bounds against nearby peer bubbles for text placement
-    max_expand_x = max(16, int(box_w * 0.24))
-    max_expand_y = max(12, int(box_h * 0.16))
-    vor_x1 = max(0, x1 - max_expand_x)
-    vor_y1 = max(0, y1 - max_expand_y)
-    vor_x2 = min(width, x2 + max_expand_x)
-    vor_y2 = min(height, y2 + max_expand_y)
+    # 1. Compute strict Voronoi / midpoint bounds against nearby peer bubbles so compound lobes never bleed together
+    vor_x1 = max(0, x1 - max(18, int(box_w * 0.28)))
+    vor_y1 = max(0, y1 - max(14, int(box_h * 0.18)))
+    vor_x2 = min(width, x2 + max(18, int(box_w * 0.28)))
+    vor_y2 = min(height, y2 + max(14, int(box_h * 0.18)))
 
     has_close_peer = False
     for ox1, oy1, ox2, oy2 in other_peer_boxes:
@@ -779,62 +813,85 @@ def _clean_single_bubble_lobe_fast(
         if v_gap >= h_gap:
             if cy < ocy:
                 mid_y = (min(y2, oy2) + max(y1, oy1)) // 2 if v_gap < 0 else (y2 + oy1) // 2
-                vor_y2 = min(vor_y2, max(y1 + 12, mid_y - 2))
+                vor_y2 = min(vor_y2, max(y1 + 12, mid_y - 3))
             else:
                 mid_y = (min(y2, oy2) + max(y1, oy1)) // 2 if v_gap < 0 else (y1 + oy2) // 2
-                vor_y1 = max(vor_y1, min(y2 - 12, mid_y + 2))
+                vor_y1 = max(vor_y1, min(y2 - 12, mid_y + 3))
         else:
             if cx < ocx:
                 mid_x = (min(x2, ox2) + max(x1, ox1)) // 2 if h_gap < 0 else (x2 + ox1) // 2
-                vor_x2 = min(vor_x2, max(x1 + 12, mid_x - 2))
+                vor_x2 = min(vor_x2, max(x1 + 12, mid_x - 3))
             else:
                 mid_x = (min(x2, ox2) + max(x1, ox1)) // 2 if h_gap < 0 else (x1 + ox2) // 2
-                vor_x1 = max(vor_x1, min(x2 - 12, mid_x + 2))
+                vor_x1 = max(vor_x1, min(x2 - 12, mid_x + 3))
 
     cx1 = max(vor_x1, min(x1, vor_x2 - 10))
     cy1 = max(vor_y1, min(y1, vor_y2 - 10))
     cx2 = min(vor_x2, max(x2, cx1 + 10))
     cy2 = min(vor_y2, max(y2, cy1 + 10))
 
-    # 3. Scan the CLEANED image (not base_gray) from the horizontal center of the box outward
-    # and enforce symmetric expansion so double-bubble text never drifts to the left!
-    cleaned_gray = img.convert("L")
-    mid_y_start = cy1 + int((cy2 - cy1) * 0.22)
-    mid_y_end = cy1 + int((cy2 - cy1) * 0.78)
+    # 2. Erase Japanese characters inside (cx1, cy1, cx2, cy2) with +8px right-margin for rightmost vertical columns ('ああ')
+    ex1 = max(vor_x1, cx1 - 4)
+    ey1 = max(vor_y1, cy1 - 4)
+    ex2 = min(width, max(vor_x2, x2) + 6) if not has_close_peer else min(vor_x2, cx2 + 8)
+    ey2 = min(vor_y2, cy2 + 4)
+    ew = max(4, ex2 - ex1)
+    eh = max(4, ey2 - ey1)
+
+    sub_gray = base_gray.crop((ex1, ey1, ex2, ey2))
+    dark_mask = sub_gray.point(lambda p: 255 if p < 210 else 0)
+
+    border_connected = dark_mask.copy()
+    for bx in range(ew):
+        if border_connected.getpixel((bx, 0)) == 255:
+            ImageDraw.floodfill(border_connected, (bx, 0), 128)
+        if border_connected.getpixel((bx, eh - 1)) == 255:
+            ImageDraw.floodfill(border_connected, (bx, eh - 1), 128)
+    for by in range(eh):
+        if border_connected.getpixel((0, by)) == 255:
+            ImageDraw.floodfill(border_connected, (0, by), 128)
+        if border_connected.getpixel((ew - 1, by)) == 255:
+            ImageDraw.floodfill(border_connected, (ew - 1, by), 128)
+
+    text_only_mask = border_connected.point(lambda p: 255 if p == 255 else 0)
+    inner_m = ImageDraw.Draw(text_only_mask)
+    ix1, iy1 = max(2, int(ew * 0.05)), max(2, int(eh * 0.06))
+    ix2, iy2 = min(ew - 2, int(ew * 0.96)), min(eh - 3, int(eh * 0.94))
+    if ix2 > ix1 and iy2 > iy1:
+        inner_m.rectangle([ix1, iy1, ix2, iy2], fill=255)
+
+    white_patch = Image.new("RGB", (ew, eh), (255, 255, 255))
+    img.paste(white_patch, (ex1, ey1), mask=text_only_mask)
+
+    # 3. Proven horizontal width measurement from image_2b2c02.png
+    mid_y_start = cy1 + int((cy2 - cy1) * 0.20)
+    mid_y_end = cy1 + int((cy2 - cy1) * 0.80)
     safe_lefts = []
     safe_rights = []
     for sy in range(mid_y_start, max(mid_y_start + 1, mid_y_end), max(2, (mid_y_end - mid_y_start) // 6 or 1)):
         if not (0 <= sy < height):
             continue
-        lx = cx
-        while lx > vor_x1 and cleaned_gray.getpixel((lx - 1, sy)) >= 210:
+        lx = cx1
+        while lx > vor_x1 and base_gray.getpixel((lx - 1, sy)) >= 215:
             lx -= 1
-        rx = cx
-        while rx < vor_x2 and cleaned_gray.getpixel((rx, sy)) >= 210:
+        rx = cx2
+        while rx < vor_x2 and base_gray.getpixel((rx, sy)) >= 215:
             rx += 1
         safe_lefts.append(lx)
         safe_rights.append(rx)
 
     if safe_lefts and safe_rights:
-        wall_l = sorted(safe_lefts)[len(safe_lefts) // 2] + 5
-        wall_r = sorted(safe_rights)[len(safe_rights) // 2] - 5
-        # Keep expansion symmetric around the true bubble center so left expansion never pulls text left
-        avail_left = max(0, cx - wall_l)
-        avail_right = max(0, wall_r - cx)
-        sym_half = min(avail_left, avail_right)
-        if sym_half >= (box_w // 2):
-            tx1 = cx - sym_half
-            tx2 = cx + sym_half
-        else:
-            tx1 = max(vor_x1 + 4, min(cx1, wall_l))
-            tx2 = min(vor_x2 - 4, max(cx2, wall_r))
+        safe_l = sorted(safe_lefts)[len(safe_lefts) // 2] + 5
+        safe_r = sorted(safe_rights)[len(safe_rights) // 2] - 5
+        tx1 = max(vor_x1 + 3, min(cx1, safe_l))
+        tx2 = min(vor_x2 - 3, max(cx2, safe_r))
     else:
         tx1, tx2 = cx1, cx2
 
-    # Subtle +5px rightward optical balance for double bubbles so text sits dead-center in the lobe
-    if has_close_peer and (tx2 + 5) < vor_x2:
-        tx1 += 5
-        tx2 += 5
+    # Gentle +4px rightward optical shift for double bubbles so text sits centered in the lobe
+    if has_close_peer and (tx2 + 4) <= vor_x2:
+        tx1 += 4
+        tx2 += 4
 
     ty1 = max(vor_y1 + 2, cy1)
     ty2 = min(vor_y2 - 2, cy2)
@@ -898,7 +955,7 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
     base_gray = img.convert("L")
     width, height = img.size
 
-    pixel_boxes = []
+    raw_pixel_boxes = []
     for b in valid_boxes:
         ymin, xmin, ymax, xmax = [float(v) for v in b["box_2d"]]
         if ymin > ymax:
@@ -909,7 +966,10 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
         y1 = max(0, int((ymin / 1000.0) * height))
         x2 = min(width, int((xmax / 1000.0) * width))
         y2 = min(height, int((ymax / 1000.0) * height))
-        pixel_boxes.append((x1, y1, x2, y2, b["translated_text"].strip()))
+        raw_pixel_boxes.append((x1, y1, x2, y2, b["translated_text"].strip()))
+
+    # Merge any same-lobe vertical column splits before cleaning and rendering
+    pixel_boxes = _merge_same_lobe_column_splits(raw_pixel_boxes, base_gray)
 
     prepared_renders = []
     for i, (x1, y1, x2, y2, trans_text) in enumerate(pixel_boxes):
@@ -923,9 +983,7 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
         tx1, ty1, tx2, ty2, fg_text, stroke_col = _clean_single_bubble_lobe_fast(
             img, base_gray, other_boxes, x1, y1, x2, y2
         )
-        prepared_renders.append([tx1, ty1, tx2, ty2, fg_text, stroke_col, trans_text])
-
-    prepared_renders = _resolve_box_collisions(prepared_renders, min_gap=6)
+        prepared_renders.append((tx1, ty1, tx2, ty2, fg_text, stroke_col, trans_text))
 
     draw = ImageDraw.Draw(img)
     for tx1, ty1, tx2, ty2, fg_text, stroke_col, trans_text in prepared_renders:
