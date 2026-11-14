@@ -668,10 +668,9 @@ def _wrap_text_to_pixel_width(
     max_width: int,
     allow_midword_split: bool = False,
 ) -> list[str]:
-    # Treat all non-Thai (English/Latin) strings—including single words like 'Nazono...?'—as word-wrapped
-    # so the font sizer steps down 1-2pt instead of breaking 'Nazono...?' into 'Nazon' / 'o...?'
-    has_spaces = (" " in text) or not bool(THAI_CHAR_REGEX.search(text))
-    words = text.split(" ") if " " in text else [text]
+    has_spaces = " " in text
+    is_thai_text = bool(THAI_CHAR_REGEX.search(text))
+    words = text.split(" ") if has_spaces else [text]
     lines = []
     current = ""
 
@@ -687,7 +686,8 @@ def _wrap_text_to_pixel_width(
                 lines.append(current)
                 current = ""
             wbbox = draw.textbbox((0, 0), word, font=font)
-            if (wbbox[2] - wbbox[0]) <= max_width or (has_spaces and not allow_midword_split):
+            # Keep single English words (like 'Nazono...?') intact until font size steps down
+            if (wbbox[2] - wbbox[0]) <= max_width or (not is_thai_text and not allow_midword_split):
                 current = word
             else:
                 chunk = ""
@@ -706,48 +706,6 @@ def _wrap_text_to_pixel_width(
     return lines
 
 
-def _merge_overlapping_same_bubble_boxes(
-    pixel_boxes: list[tuple[int, int, int, int, str]],
-) -> list[tuple[int, int, int, int, str]]:
-    """
-    Prevents the overlap seen in image_1f7480.jpg when Gemini occasionally splits vertical
-    columns of the SAME bubble into overlapping boxes, while never touching separate double-bubble lobes.
-    """
-    if len(pixel_boxes) <= 1:
-        return pixel_boxes
-
-    boxes = [list(b) for b in pixel_boxes]
-    merged = [False] * len(boxes)
-    result = []
-
-    for i in range(len(boxes)):
-        if merged[i]:
-            continue
-        x1, y1, x2, y2, txt = boxes[i]
-        for j in range(i + 1, len(boxes)):
-            if merged[j]:
-                continue
-            ox1, oy1, ox2, oy2, otxt = boxes[j]
-
-            # Only merge if the two raw boxes physically overlap in BOTH X and Y (same bubble split)
-            ov_x = min(x2, ox2) - max(x1, ox1)
-            ov_y = min(y2, oy2) - max(y1, oy1)
-            min_w = max(1, min(x2 - x1, ox2 - ox1))
-            min_h = max(1, min(y2 - y1, oy2 - oy1))
-
-            if ov_x >= -(min_w * 0.08) and ov_y >= (min_h * 0.45):
-                x1 = min(x1, ox1)
-                y1 = min(y1, oy1)
-                x2 = max(x2, ox2)
-                y2 = max(y2, oy2)
-                if otxt.lower() not in txt.lower():
-                    txt = f"{txt} {otxt}".strip()
-                merged[j] = True
-
-        result.append((x1, y1, x2, y2, txt))
-    return result
-
-
 def _clean_single_bubble_lobe_fast(
     img: Image.Image,
     base_gray: Image.Image,
@@ -756,30 +714,29 @@ def _clean_single_bubble_lobe_fast(
     y1: int,
     x2: int,
     y2: int,
-) -> tuple[int, int, int, int, tuple[int, int, int], tuple[int, int, int]]:
+) -> tuple[int, int, int, int, tuple[int, int, int], tuple[int, int, int], bool]:
     width, height = img.size
     box_w = max(10, x2 - x1)
     box_h = max(10, y2 - y1)
     cx = (x1 + x2) // 2
     cy = (y1 + y2) // 2
 
-    # 1. Compute strict Voronoi / midpoint bounds against nearby peer bubbles.
-    # Reduced left expansion (0.08 instead of 0.28) so double-bubble text shifts slightly to the right!
-    vor_x1 = max(0, x1 - max(6, int(box_w * 0.08)))
+    # 1. Compute strict Voronoi / midpoint bounds (exact logic from image_1fc660.jpg)
+    vor_x1 = max(0, x1 - max(18, int(box_w * 0.28)))
     vor_y1 = max(0, y1 - max(14, int(box_h * 0.18)))
-    vor_x2 = min(width, x2 + max(20, int(box_w * 0.30)))
+    vor_x2 = min(width, x2 + max(18, int(box_w * 0.28)))
     vor_y2 = min(height, y2 + max(14, int(box_h * 0.18)))
 
+    has_close_peer = False
     for ox1, oy1, ox2, oy2 in other_peer_boxes:
         ocx = (ox1 + ox2) // 2
         ocy = (oy1 + oy2) // 2
         dx = abs(cx - ocx)
         dy = abs(cy - ocy)
-        # Only clamp against peer bubbles that are close enough to interact
         if dx > (box_w + (ox2 - ox1)) and dy > (box_h + (oy2 - oy1)):
             continue
+        has_close_peer = True
 
-        # Determine primary separation axis between this lobe and the peer lobe
         h_gap = max(ox1 - x2, x1 - ox2)
         v_gap = max(oy1 - y2, y1 - oy2)
         if v_gap >= h_gap:
@@ -803,19 +760,18 @@ def _clean_single_bubble_lobe_fast(
     cx2 = min(vor_x2, max(x2, cx1 + 10))
     cy2 = min(vor_y2, max(y2, cy1 + 10))
 
-    # 2. Erase ONLY the Japanese characters inside (cx1, cy1, cx2, cy2) while preserving bubble borders & outside art
-    # Uses +8px on the right (ex2) and 0.97 inner core width so rightmost characters like 'ああ' in Bubble #5 are wiped
-    ex1 = max(vor_x1, cx1 - 4)
-    ey1 = max(vor_y1, cy1 - 4)
-    ex2 = min(vor_x2, cx2 + 8)
-    ey2 = min(vor_y2, cy2 + 4)
+    # 2. Erase ONLY the Japanese characters inside (cx1, cy1, cx2, cy2) (exact bounds from image_1fc660.jpg)
+    erase_pad = 4
+    ex1 = max(vor_x1, cx1 - erase_pad)
+    ey1 = max(vor_y1, cy1 - erase_pad)
+    ex2 = min(vor_x2, cx2 + erase_pad)
+    ey2 = min(vor_y2, cy2 + erase_pad)
     ew = max(4, ex2 - ex1)
     eh = max(4, ey2 - ey1)
 
     sub_gray = base_gray.crop((ex1, ey1, ex2, ey2))
     dark_mask = sub_gray.point(lambda p: 255 if p < 210 else 0)
 
-    # Flood-fill dark pixels that touch the outer 1px perimeter AND belong to thick bubble borders/hair
     border_connected = dark_mask.copy()
     for bx in range(ew):
         if border_connected.getpixel((bx, 0)) == 255:
@@ -830,16 +786,40 @@ def _clean_single_bubble_lobe_fast(
 
     text_only_mask = border_connected.point(lambda p: 255 if p == 255 else 0)
     inner_m = ImageDraw.Draw(text_only_mask)
-    ix1, iy1 = max(2, int(ew * 0.05)), max(2, int(eh * 0.05))
-    ix2, iy2 = min(ew - 2, int(ew * 0.97)), min(eh - 3, int(eh * 0.95))
+    ix1, iy1 = max(2, int(ew * 0.06)), max(2, int(eh * 0.06))
+    ix2, iy2 = min(ew - 3, int(ew * 0.94)), min(eh - 3, int(eh * 0.94))
     if ix2 > ix1 and iy2 > iy1:
         inner_m.rectangle([ix1, iy1, ix2, iy2], fill=255)
 
     white_patch = Image.new("RGB", (ew, eh), (255, 255, 255))
     img.paste(white_patch, (ex1, ey1), mask=text_only_mask)
 
-    # 3. Measure safe horizontal white width inside (vor_x1..vor_x2) around the vertical center of the bubble
-    cleaned_gray = img.convert("L")
+    # 2b. Safe floating-character cleanup on the right strip (cx2 .. cx2 + 16) to wipe 'ああ' in Bubble #5
+    # ONLY erases small disconnected character islands surrounded by white; never uses inner_m.rectangle!
+    rx_strip_end = min(vor_x2, cx2 + 16)
+    if rx_strip_end > ex2 + 2:
+        sx1 = max(vor_x1, cx2 - 2)
+        sy1 = ey1
+        sx2 = rx_strip_end
+        sy2 = ey2
+        sw, sh = sx2 - sx1, sy2 - sy1
+        if sw >= 4 and sh >= 8:
+            s_gray = base_gray.crop((sx1, sy1, sx2, sy2))
+            s_dark = s_gray.point(lambda p: 255 if p < 210 else 0)
+            for bx in range(sw):
+                if s_dark.getpixel((bx, 0)) == 255:
+                    ImageDraw.floodfill(s_dark, (bx, 0), 128)
+                if s_dark.getpixel((bx, sh - 1)) == 255:
+                    ImageDraw.floodfill(s_dark, (bx, sh - 1), 128)
+            for by in range(sh):
+                if s_dark.getpixel((0, by)) == 255:
+                    ImageDraw.floodfill(s_dark, (0, by), 128)
+                if s_dark.getpixel((sw - 1, by)) == 255:
+                    ImageDraw.floodfill(s_dark, (sw - 1, by), 128)
+            s_mask = s_dark.point(lambda p: 255 if p == 255 else 0)
+            img.paste(Image.new("RGB", (sw, sh), (255, 255, 255)), (sx1, sy1), mask=s_mask)
+
+    # 3. Measure safe horizontal white width on base_gray (exact logic from image_1fc660.jpg)
     mid_y_start = cy1 + int((cy2 - cy1) * 0.20)
     mid_y_end = cy1 + int((cy2 - cy1) * 0.80)
     safe_lefts = []
@@ -848,10 +828,10 @@ def _clean_single_bubble_lobe_fast(
         if not (0 <= sy < height):
             continue
         lx = cx1
-        while lx > vor_x1 and cleaned_gray.getpixel((lx - 1, sy)) >= 215:
+        while lx > vor_x1 and base_gray.getpixel((lx - 1, sy)) >= 215:
             lx -= 1
         rx = cx2
-        while rx < vor_x2 and cleaned_gray.getpixel((rx, sy)) >= 215:
+        while rx < vor_x2 and base_gray.getpixel((rx, sy)) >= 215:
             rx += 1
         safe_lefts.append(lx)
         safe_rights.append(rx)
@@ -866,7 +846,7 @@ def _clean_single_bubble_lobe_fast(
 
     ty1 = max(vor_y1 + 2, cy1)
     ty2 = min(vor_y2 - 2, cy2)
-    return tx1, ty1, tx2, ty2, (15, 15, 15), (255, 255, 255)
+    return tx1, ty1, tx2, ty2, (15, 15, 15), (255, 255, 255), has_close_peer
 
 
 def _resolve_box_collisions(
@@ -892,7 +872,6 @@ def _resolve_box_collisions(
                 acx, acy = (ax1 + ax2) // 2, (ay1 + ay2) // 2
                 bcx, bcy = (bx1 + bx2) // 2, (by1 + by2) // 2
 
-                # Separate along the axis where centers are further apart relative to box size
                 if abs(acy - bcy) >= abs(acx - bcx) * 0.8:
                     mid_y = (min(ay2, by2) + max(ay1, by1)) // 2
                     if acy <= bcy:
@@ -926,7 +905,7 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
     base_gray = img.convert("L")
     width, height = img.size
 
-    raw_pixel_boxes = []
+    pixel_boxes = []
     for b in valid_boxes:
         ymin, xmin, ymax, xmax = [float(v) for v in b["box_2d"]]
         if ymin > ymax:
@@ -937,10 +916,7 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
         y1 = max(0, int((ymin / 1000.0) * height))
         x2 = min(width, int((xmax / 1000.0) * width))
         y2 = min(height, int((ymax / 1000.0) * height))
-        raw_pixel_boxes.append((x1, y1, x2, y2, b["translated_text"].strip()))
-
-    # Merge any duplicate/overlapping column splits inside the same bubble before cleaning
-    pixel_boxes = _merge_overlapping_same_bubble_boxes(raw_pixel_boxes)
+        pixel_boxes.append((x1, y1, x2, y2, b["translated_text"].strip()))
 
     prepared_renders = []
     for i, (x1, y1, x2, y2, trans_text) in enumerate(pixel_boxes):
@@ -951,16 +927,16 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
             for j, (ox1, oy1, ox2, oy2, _) in enumerate(pixel_boxes)
             if j != i
         ]
-        tx1, ty1, tx2, ty2, fg_text, stroke_col = _clean_single_bubble_lobe_fast(
+        tx1, ty1, tx2, ty2, fg_text, stroke_col, has_close_peer = _clean_single_bubble_lobe_fast(
             img, base_gray, other_boxes, x1, y1, x2, y2
         )
-        prepared_renders.append([tx1, ty1, tx2, ty2, fg_text, stroke_col, trans_text])
+        prepared_renders.append([tx1, ty1, tx2, ty2, fg_text, stroke_col, trans_text, has_close_peer])
 
     # De-overlap all layout boxes so adjacent/compound bubbles never collide
     prepared_renders = _resolve_box_collisions(prepared_renders, min_gap=6)
 
     draw = ImageDraw.Draw(img)
-    for tx1, ty1, tx2, ty2, fg_text, stroke_col, trans_text in prepared_renders:
+    for tx1, ty1, tx2, ty2, fg_text, stroke_col, trans_text, has_close_peer in prepared_renders:
         box_w = max(20, tx2 - tx1)
         box_h = max(16, ty2 - ty1)
         usable_w = max(18, int(box_w * 0.94))
@@ -976,7 +952,7 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
         for fsize in range(start_font_size, 7, -1):
             font = _load_manga_font(fsize, is_thai=is_thai_text)
             wrapped = _wrap_text_to_pixel_width(
-                draw, trans_text, font, usable_w, allow_midword_split=(fsize <= 8)
+                draw, trans_text, font, usable_w, allow_midword_split=(fsize <= 9)
             )
             sample_bbox = draw.textbbox((0, 0), sample_probe, font=font)
             lh = max(fsize + 2, int((sample_bbox[3] - sample_bbox[1]) * 1.18))
@@ -993,11 +969,13 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
 
         total_text_h = line_height * len(chosen_lines)
         curr_y = ty1 + max(0, (box_h - total_text_h) // 2)
+        # Subtle +4px rightward optical offset for double bubbles without altering box bounds
+        x_nudge = 4 if has_close_peer else 0
 
         for ln in chosen_lines:
             lbbox = draw.textbbox((0, 0), ln, font=chosen_font)
             lw = lbbox[2] - lbbox[0]
-            curr_x = tx1 + max(0, (box_w - lw) // 2) - lbbox[0]
+            curr_x = tx1 + max(0, (box_w - lw) // 2) - lbbox[0] + x_nudge
             draw.text(
                 (curr_x, curr_y - lbbox[1]),
                 ln,
