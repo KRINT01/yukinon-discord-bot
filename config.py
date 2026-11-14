@@ -1,8 +1,11 @@
 import os
 import re
+import sys
 import time
 import asyncio
 import ipaddress
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from collections import defaultdict, deque
 import aiohttp
 import discord
@@ -30,8 +33,10 @@ def clean_url(url: str) -> str:
 
 
 def api_log(msg: str):
-    """Minimal single-line API logger with immediate stdout flush for Render logs."""
-    print(f"[API] {msg}", flush=True)
+    """Writes API telemetry directly to unbuffered sys.stderr so Render never delays or drops log lines."""
+    ts = datetime.now(ZoneInfo("Asia/Bangkok")).strftime("%H:%M:%S")
+    sys.stderr.write(f"[{ts}] [API] {msg}\n")
+    sys.stderr.flush()
 
 
 # Load environment credentials and model defaults

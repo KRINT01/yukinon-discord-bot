@@ -100,9 +100,26 @@ def update_and_get_channel_topic(user_text: str, channel_id: int = None) -> str:
         channel_active_topic.pop(channel_id, None)
         existing = None
 
-    is_corr = bool(USER_CORRECTION_PATTERN.search(user_text))
+    # 1. If a YouTube Video Title was extracted in the context block, use it as the topic!
+    yt_title_m = re.search(r"Video Title:\s*(.+)", user_text)
+    if yt_title_m:
+        yt_title = re.sub(
+            r"\s*[|_—–-]\s*(?:Release Date Trailer|Official Trailer|Trailer|PV|Teaser).*",
+            "",
+            yt_title_m.group(1),
+            flags=re.IGNORECASE,
+        ).strip()[:70]
+        if yt_title:
+            channel_active_topic[channel_id] = {"topic": yt_title, "timestamp": now}
+            return yt_title
+
+    # 2. Strip attached context blocks and raw URLs before scanning for English entities
+    question_only = user_text.split("=== YouTube Video Information")[0].split("<untrusted_web_search_results")[0]
+    text_without_urls = re.sub(r"https?://\S+", " ", question_only)
+
+    is_corr = bool(USER_CORRECTION_PATTERN.search(text_without_urls))
     en_matches = [
-        m.strip() for m in ENGLISH_ENTITY_REGEX.findall(user_text)
+        m.strip() for m in ENGLISH_ENTITY_REGEX.findall(text_without_urls)
         if m.strip().lower() not in STOPWORD_ENTITIES
     ]
 
@@ -128,7 +145,7 @@ def update_and_get_channel_topic(user_text: str, channel_id: int = None) -> str:
             channel_active_topic[channel_id] = {"topic": combined_t[:80], "timestamp": now}
             return combined_t[:80]
 
-    # Otherwise, scan the earliest user message in channel_memory for the root topic
+    # Otherwise, keep existing topic or scan earliest user message in channel_memory (with URLs stripped)
     if existing:
         existing["timestamp"] = now
         return existing.get("topic", "")
@@ -137,8 +154,9 @@ def update_and_get_channel_topic(user_text: str, channel_id: int = None) -> str:
         for msg in list(channel_memory[channel_id]):
             if msg.get("role") != "user":
                 continue
+            hist_clean = re.sub(r"https?://\S+", " ", msg.get("content", ""))
             first_ents = [
-                m.strip() for m in ENGLISH_ENTITY_REGEX.findall(msg.get("content", ""))
+                m.strip() for m in ENGLISH_ENTITY_REGEX.findall(hist_clean)
                 if m.strip().lower() not in STOPWORD_ENTITIES
             ]
             if first_ents:
@@ -151,25 +169,25 @@ def update_and_get_channel_topic(user_text: str, channel_id: int = None) -> str:
 def build_contextual_search_query(user_text: str, channel_id: int = None) -> str:
     """
     Builds a clean, topic-anchored search query:
-    1) Resolves shortened abbreviations (e.g. 'NGS' -> 'PSO2 NGS') using the channel's active topic anchor.
-    2) Translates common Thai sub-topic questions (เนื้อเรื่อง, คลาส, อาวุธ, ค่ายเกม) into high-recall search keywords
-       when the subject is an English title/game/anime.
-    3) Keeps queries concise (under 12 words) so DDGS and Wikipedia never return 0 hits due to long conversational sentences.
+    1) Extracts YouTube titles / active topics while stripping raw URLs (so 'youtu.be' is never searched).
+    2) Resolves shortened abbreviations (e.g. 'NGS' -> 'PSO2 NGS') using the channel's active topic anchor.
+    3) Translates common Thai sub-topic questions (เนื้อเรื่อง, คลาส, อาวุธ, ค่ายเกม) into high-recall search keywords.
     """
-    raw = re.sub(r"[\r\n]+", " ", user_text).strip()
-    active_topic = update_and_get_channel_topic(raw, channel_id=channel_id)
+    active_topic = update_and_get_channel_topic(user_text, channel_id=channel_id)
+
+    question_only = user_text.split("=== YouTube Video Information")[0].split("<untrusted_web_search_results")[0]
+    raw = re.sub(r"https?://\S+", " ", question_only)
+    raw = re.sub(r"[\r\n]+", " ", raw).strip()
 
     en_in_msg = [
         m.strip() for m in ENGLISH_ENTITY_REGEX.findall(raw)
         if m.strip().lower() not in STOPWORD_ENTITIES
     ]
 
-    # Anchor to active_topic if missing or shortened (e.g. user wrote 'NGS' when active_topic is 'PSO2 NGS')
     subject_prefix = active_topic
     if not subject_prefix and en_in_msg:
         subject_prefix = en_in_msg[0]
 
-    # Map Thai sub-topic intents to high-precision English/Thai search facets when an English subject is active
     if subject_prefix and ENGLISH_ENTITY_REGEX.search(subject_prefix):
         base_subj = re.sub(r"[()]", " ", subject_prefix).strip()
         facets = []
@@ -177,14 +195,15 @@ def build_contextual_search_query(user_text: str, channel_id: int = None) -> str
             facets.append("story plot episodes summary wiki")
         if re.search(r"(คลาส|อาชีพ|เล่นคลาสอะไร|classes|class)", raw, re.IGNORECASE):
             facets.append("all classes weapons list wiki")
-        if re.search(r"(อาวุธ|ค้อน|ธนู|ดาบ|ปืน|weapon|weapons)", raw, re.IGNORECASE):
+        if re.search(r"(อาวุธ|เวท|ธนู|ดาบ|ปืน|weapon|weapons)", raw, re.IGNORECASE):
             facets.append("class weapons list wiki")
         if re.search(r"(ของค่ายไหน|ใครพัฒนา|พัฒนาโดย|เกมเป็นของ|มาจากไหนก่อน|developer|publisher|sega)", raw, re.IGNORECASE):
             facets.append("developer publisher release date")
         if re.search(r"(เปิดมากี่ปี|เปิดมาจะ|เปิดเมื่อไหร่|โหมดทดลอง|release\s+date|year)", raw, re.IGNORECASE):
             facets.append("release date year official")
+        if re.search(r"(น่าเล่นไหม|สนุกไหม|รีวิว|ระบบเกม|เป็นยังไง|review|gameplay|worth\s+playing)", raw, re.IGNORECASE):
+            facets.append("steam gameplay review features")
 
-        # Include up to 2 specific English terms from the user's current message (e.g. 'PlatinumGames SEGA' or 'Summoner Slayer')
         extra_en = [
             e for e in en_in_msg
             if e.lower() not in base_subj.lower() and len(e) > 2
@@ -194,7 +213,6 @@ def build_contextual_search_query(user_text: str, channel_id: int = None) -> str
             q_parts = [base_subj] + extra_en + facets
             return re.sub(r"\s+", " ", " ".join(q_parts)).strip()[:140]
 
-    # General Thai or English query: strip conversational filler/complaints so search engine gets clean keywords
     stripped = re.sub(
         r"(นี่ก่อนตอบมา|เธอได้ลอง|ดูบ้างไหม|หรือ\s*wikipedia\s*ก็ยังดี|เพราะข้อมูลที่เธอตอบมา.*|"
         r"ดูเป็นคำตอบที่ไม่ค่อยช่วยเท่าไหร่เลยนะ|นี่เธอพยายามหาข้อมูลมาสรุปแล้วจริงๆเหรอ|"

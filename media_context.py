@@ -226,11 +226,12 @@ def fetch_youtube_context_sync(
     except Exception:
         pass
 
-    # Layer 4: Supplemental Web Search if both transcript and description are sparse
+    # Layer 4: Supplemental Web Search whenever a video has no/minimal spoken transcript (e.g. game trailers / PVs)
     search_enrichment = ""
-    if len(transcript_text) < 80 and len(description) < 80 and title:
+    if len(transcript_text) < 120 and title:
+        clean_title_for_search = re.sub(r"[|_—–-]\s*(?:Release Date Trailer|Official Trailer|Trailer|PV|Teaser).*", "", title, flags=re.IGNORECASE).strip()
         try:
-            search_enrichment = run_safe_web_search_sync(f"{title} {author}".strip(), max_results=3)
+            search_enrichment = run_safe_web_search_sync(f"{clean_title_for_search or title} {author}".strip(), max_results=4)
         except Exception:
             pass
 

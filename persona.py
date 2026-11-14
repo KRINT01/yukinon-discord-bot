@@ -112,6 +112,9 @@ def sanitize_yukino_output(text: str, user_prompt: str = "", speaker_user=None, 
     cleaned = re.sub(r"เร็ว\s*ๆ\s*ก่อนสินะ", "ดูนะคะ", cleaned)
     cleaned = re.sub(r"\n*แล้วนายจะเลือกอะไรดีล่ะคะ\??\s*[😊🙂✨]*\s*$", "", cleaned).strip()
     cleaned = re.sub(r"[😊😄😁🥰🙈🙉🙊😢😭😔😞✅❌👉🔍]+", "", cleaned).strip()
+    cleaned = re.sub(r"ของคุณเอง", "ของนายเอง", cleaned)
+    cleaned = re.sub(r"ถ้าคุณ(?:ชอบ|ต้องการ|สนใจ|อยาก)", "ถ้านายชอบ", cleaned)
+    cleaned = re.sub(r"(?:^|\n)\s*\**\s*สรุป\s*:\**\s*", "\n\n", cleaned)
     return re.sub(r"  +", " ", cleaned).strip()
 
 
