@@ -437,25 +437,38 @@ async def _search_tracemoe_async(raw_bytes: bytes, mime_type: str) -> str:
     return ""
 
 
-def _compress_image_for_vision_ocr_sync(raw_bytes: bytes) -> tuple[str, str]:
-    """Resizes large PNG/WebP images to <=1280px JPEG so Vision APIs never throw HTTP 500 or timeout."""
-    from PIL import Image
+def _compress_image_for_vision_ocr_sync(raw_bytes: bytes) -> tuple[str, str, bool]:
+    """
+    Resizes large PNG/WebP images to <=1280px JPEG and detects whether the image is color
+    (so trace.moe anime search is skipped on black-and-white manga pages).
+    Returns (b64_jpeg, mime_type, is_color_image).
+    """
+    from PIL import Image, ImageStat
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     img.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+
+    # Check color saturation in HSV space (manga pages have mean saturation < 12)
+    hsv_stat = ImageStat.Stat(img.convert("HSV"))
+    mean_saturation = hsv_stat.mean[1] if len(hsv_stat.mean) > 1 else 0.0
+    is_color_image = (mean_saturation >= 14.0)
+
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=90)
     img.close()
-    return base64.b64encode(buf.getvalue()).decode("utf-8"), "image/jpeg"
+    return base64.b64encode(buf.getvalue()).decode("utf-8"), "image/jpeg", is_color_image
 
 
 async def extract_image_via_transient_ocr(
     raw_bytes: bytes, filename: str, run_source_lookup: bool = True
 ) -> str:
     try:
-        b64_img, mime_type = await asyncio.to_thread(_compress_image_for_vision_ocr_sync, raw_bytes)
+        b64_img, mime_type, is_color_img = await asyncio.to_thread(
+            _compress_image_for_vision_ocr_sync, raw_bytes
+        )
     except Exception:
         b64_img = base64.b64encode(raw_bytes).decode("utf-8")
         mime_type = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
+        is_color_img = True
 
     ocr_prompt = (
         "Analyze this image thoroughly for Yukino Yukinoshita so she can identify its exact source, "
@@ -463,7 +476,7 @@ async def extract_image_via_transient_ocr(
         "Provide your output in 3 concise sections:\n"
         "1. [Identification & Origin]:\n"
         "   - If Illustration/Anime/Manga: State the Series/Character ONLY if you are 100% certain. "
-        "NEVER guess random famous series if unsure! Describe the visual scene, expressions, composition, and any cats or pandas.\n"
+        "NEVER guess random famous series (like Fairy Tail or Black Clover) if unsure! Describe the visual scene, expressions, composition, and any cats or pandas.\n"
         "   - If Real-World Photo/Product/Hardware: Identify the Brand, Product Line, Model Name/Number, and distinguishing physical features (camera layout, buttons, logos).\n"
         "2. [Verbatim OCR Text]: Transcribe ALL visible text (Thai, Japanese, English) verbatim. "
         "Pay close attention to Thai tone marks (วรรณยุกต์), vowels (สระ), and visually similar consonants "
@@ -474,27 +487,19 @@ async def extract_image_via_transient_ocr(
 
     reverse_tasks = []
     if run_source_lookup:
-        reverse_tasks = [
-            asyncio.create_task(_search_saucenao_async(raw_bytes, filename)),
-            asyncio.create_task(_search_tracemoe_async(raw_bytes, mime_type)),
-        ]
+        reverse_tasks.append(asyncio.create_task(_search_saucenao_async(raw_bytes, filename)))
+        # Only query trace.moe on color images (prevents false anime matches on B&W manga pages!)
+        if is_color_img:
+            reverse_tasks.append(asyncio.create_task(_search_tracemoe_async(raw_bytes, mime_type)))
 
     vision_result = ""
 
-    # Tier 1: Google AI Studio Gemma 4 Vision (gemma-4-26b-a4b-it / 31b-it)
-    gemma_ocr = await call_gemma_ai_studio_vision(
-        ocr_prompt, mime_type, b64_img, timeout_sec=20, purpose="Image OCR Tier 1"
-    )
-    if gemma_ocr:
-        vision_result = gemma_ocr
+    # Tier 1: Cloudflare Workers AI Vision (@cf/google/gemma-4-26b-a4b-it — ~4.5s, 10K Neurons/day)
+    cf_ocr = await call_cloudflare_vision_chat(ocr_prompt, mime_type, b64_img, purpose="Image OCR Tier 1 CF")
+    if cf_ocr:
+        vision_result = cf_ocr
 
-    # Tier 2: Cloudflare Workers AI Vision (@cf/google/gemma-4-26b-a4b-it)
-    if not vision_result:
-        cf_ocr = await call_cloudflare_vision_chat(ocr_prompt, mime_type, b64_img, purpose="Image OCR Tier 2")
-        if cf_ocr:
-            vision_result = cf_ocr
-
-    # Tier 3: Groq LPU Vision (qwen/qwen3.8-27b)
+    # Tier 2: Groq LPU Vision (qwen/qwen3.8-27b — ~2.1s)
     if not vision_result and GROQ_API_KEY:
         groq_candidates = await discover_active_groq_vision_models()
         groq_host = "api." + "groq.com"
@@ -531,12 +536,20 @@ async def extract_image_via_transient_ocr(
                         content = g_data["choices"][0]["message"]["content"].strip()
                         content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
                         if content:
-                            api_log(f"Image OCR (Tier 3 Groq) -> {g_mod} 200 OK ({elapsed:.2f}s)")
+                            api_log(f"Image OCR (Tier 2 Groq) -> {g_mod} 200 OK ({elapsed:.2f}s)")
                             vision_result = content
                             break
-                    api_log(f"Image OCR (Tier 3 Groq) -> {g_mod} HTTP {resp.status}; fallback to Tier 4")
+                    api_log(f"Image OCR (Tier 2 Groq) -> {g_mod} HTTP {resp.status}; fallback to Tier 3")
             except Exception as e:
-                api_log(f"Image OCR (Tier 3 Groq) -> {g_mod} failed ({type(e).__name__}); fallback to Tier 4")
+                api_log(f"Image OCR (Tier 2 Groq) -> {g_mod} failed ({type(e).__name__}); fallback to Tier 3")
+
+    # Tier 3: Google AI Studio Gemma 4 Vision (fast 10s timeout backup)
+    if not vision_result:
+        gemma_ocr = await call_gemma_ai_studio_vision(
+            ocr_prompt, mime_type, b64_img, timeout_sec=10, purpose="Image OCR Tier 3"
+        )
+        if gemma_ocr:
+            vision_result = gemma_ocr
 
     # Tier 4: Modal T4 GPU (scb10x/typhoon-ocr1.5-3b)
     if not vision_result:
@@ -572,8 +585,8 @@ async def extract_image_via_transient_ocr(
     out_parts = []
     if reverse_tasks:
         rev_results = await asyncio.gather(*reverse_tasks, return_exceptions=True)
-        saucenao_txt = rev_results[0] if isinstance(rev_results[0], str) else ""
-        tracemoe_txt = rev_results[1] if isinstance(rev_results[1], str) else ""
+        saucenao_txt = rev_results[0] if (len(rev_results) > 0 and isinstance(rev_results[0], str)) else ""
+        tracemoe_txt = rev_results[1] if (len(rev_results) > 1 and isinstance(rev_results[1], str)) else ""
 
         if saucenao_txt:
             out_parts.append(saucenao_txt)
