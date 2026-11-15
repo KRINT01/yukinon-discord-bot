@@ -7,7 +7,6 @@ import asyncio
 import discord
 
 from config import (
-    ENGLISH_ENTITY_REGEX if hasattr(__import__("config"), "ENGLISH_ENTITY_REGEX") else None,
     GAME_QUERY_REGEX,
     ANIME_MANGA_QUERY_REGEX,
     CODE_INTENT_PATTERN,
@@ -124,7 +123,6 @@ async def backup_user_profiles_to_discord(force: bool = False):
         _DIRTY_SINCE_LAST_BACKUP = False
         payload_bytes = json.dumps(user_profiles, ensure_ascii=False, indent=2).encode("utf-8")
 
-        # Delete previous backup messages from the bot in that channel to keep it clean
         async for old_msg in ch.history(limit=10):
             if old_msg.author.id == bot.user.id:
                 try:
@@ -175,7 +173,6 @@ def record_user_interaction(
     profile["interaction_count"] = int(profile.get("interaction_count", 0)) + 1
     profile["last_seen"] = now_str
 
-    # 1. Detect general & active topics
     favs = list(profile.get("favorite_topics") or [])
     if channel_id and channel_id in channel_active_topic:
         act_t = channel_active_topic[channel_id].get("topic", "").strip()
@@ -188,7 +185,6 @@ def record_user_interaction(
 
     profile["favorite_topics"] = favs[-8:]
 
-    # 2. Save short snippet of what they talked about (excluding pure greetings)
     clean_q = re.sub(r"\s+", " ", user_prompt).strip()
     if len(clean_q) > 6:
         recents = list(profile.get("recent_topics") or [])
@@ -197,7 +193,6 @@ def record_user_interaction(
             recents.append(snippet)
         profile["recent_topics"] = recents[-4:]
 
-    # 3. Save any explicit personal preference/fact extracted by the LLM via [MEMO: ...]
     if learned_memo:
         notes = list(profile.get("custom_notes") or [])
         clean_memo = learned_memo.strip()[:120]
@@ -269,15 +264,14 @@ def resolve_user_mentions_and_build_dossier(
         is_target_owner = is_owner_user(member) if member else (prof.get("is_owner", False) if prof else False)
 
         if is_target_owner:
-            # Never put the owner's actual name into the prompt so Yukino never speaks his name!
             readable_tag = "@[คู่หูชมรมบริการ / ผู้สร้างของฉัน]"
             resolved_text = re.sub(rf"<@!?{uid_str}>", readable_tag, resolved_text)
             favs = ", ".join((prof or {}).get("favorite_topics") or ["การเขียนโค้ด", "เกม", "เทคโนโลยี"])
             notes = "; ".join((prof or {}).get("custom_notes") or [])
-            Asking_about_self = (speaker_user and str(getattr(speaker_user, "id", "")) == uid_str)
+            asking_about_self = (speaker_user and str(getattr(speaker_user, "id", "")) == uid_str)
             dossier_entries.append(
                 f"- ข้อมูลของ {readable_tag}: เขาคือคู่หูคนสำคัญในชมรมบริการและผู้ดูแลของฉันเองค่ะ "
-                f"{'(ซึ่งก็คือตัวนายที่กำลังถามฉันอยู่นี่แหละ!)' if Asking_about_self else ''} "
+                f"{'(ซึ่งก็คือตัวนายที่กำลังถามฉันอยู่นี่แหละ!)' if asking_about_self else ''} "
                 f"ความสนใจของเขาคือ: {favs}"
                 + (f" | บันทึกเพิ่มเติม: {notes}" if notes else "")
                 + "\n  [กฎเหล็ก: ห้ามเอ่ยหรือพิมพ์ชื่อจริงของเขาเด็ดขาด ให้พูดถึงเขาในฐานะ 'นาย' (หากเขาถามเอง) หรือ 'เขา / คู่หูชมรมบริการของฉัน' (หากคนอื่นถามถึง)]"
