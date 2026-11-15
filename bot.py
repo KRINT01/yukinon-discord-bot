@@ -41,6 +41,8 @@ from config import (
     voice_wake_word_enabled,
     state,
     davey,
+    agent_notes_store,
+    release_unused_memory,
     prune_stale_attachments,
     close_http_session,
 )
@@ -499,12 +501,60 @@ async def ask_code(ctx, *, prompt: str = "วิเคราะห์โค้�
         await send_chunked_response(ctx, answer, reply_to=ctx.message)
 
 
+# In bot.py, add `release_unused_memory` and `agent_notes_store` to `from config import (...)`
+
+
+@bot.command(name="status", aliases=["stat", "ping", "ram"])
+async def status_command(ctx):
+    m = _collect_health_metrics()
+    d = m["discord"]
+    mem = m["memory"]
+
+    ping_str = f"{d['gateway_ping_ms']} ms" if d["gateway_ping_ms"] is not None else "N/A"
+    active_topics_count = len(getattr(config, "channel_active_topic", {}))
+    notes_count = sum(len(v) for v in getattr(config, "agent_notes_store", {}).values())
+
+    await ctx.send(
+        f"❄️ **สถานะระบบ (Yukinon System Status)**\n"
+        f"- **เวลาปัจจุบัน:** `{m['system_time_th']}`\n"
+        f"- **Uptime:** `{m['uptime_human']}` | **Ping:** `{ping_str}`\n"
+        f"- **Container RAM:** `{mem['bot_ram_mb']} MB / {mem['render_limit_mb']} MB ({mem['ram_usage_pct']}%)`\n"
+        f"- **Cached Contexts:** `{mem['active_chat_channels']}` แชท | "
+        f"`{mem['cached_attachments']}` ไฟล์แนบ | "
+        f"`{active_topics_count}` หัวข้อสนทนา | "
+        f"`{notes_count}` บันทึกช่วยจำ"
+    )
+
+
 @bot.command(name="clear")
-async def clear_memory(ctx):
-    channel_memory.pop(ctx.channel.id, None)
-    channel_last_attachment.pop(ctx.channel.id, None)
-    config.channel_active_topic.pop(ctx.channel.id, None)
-    await ctx.send("ล้างประวัติการสนทนาและไฟล์ที่ค้างอยู่ในห้องแชทนี้เรียบร้อยแล้วค่ะ")
+async def clear_memory(ctx, scope: str = ""):
+    if scope.strip().lower() == "all":
+        channel_memory.clear()
+        channel_last_attachment.clear()
+        if hasattr(config, "channel_active_topic"):
+            config.channel_active_topic.clear()
+        if hasattr(config, "agent_notes_store"):
+            config.agent_notes_store.clear()
+        scope_label = "ทุกห้องแชท"
+    else:
+        channel_memory.pop(ctx.channel.id, None)
+        channel_last_attachment.pop(ctx.channel.id, None)
+        if hasattr(config, "channel_active_topic"):
+            config.channel_active_topic.pop(ctx.channel.id, None)
+        if hasattr(config, "agent_notes_store"):
+            config.agent_notes_store.pop(ctx.channel.id, None)
+        scope_label = "ห้องแชทนี้"
+
+    before_mb, after_mb = release_unused_memory()
+    freed_mb = round(max(0.0, before_mb - after_mb), 1)
+    ram_note = (
+        f"คืนพื้นที่ RAM `{before_mb} MB` → `{after_mb} MB` (ลดลง `{freed_mb} MB`)"
+        if freed_mb > 0
+        else f"RAM ปัจจุบัน: `{after_mb} MB / 512 MB`"
+    )
+    await ctx.send(
+        f"🧹 ล้างประวัติการสนทนา ไฟล์แนบ และคืนค่าหน่วยความจำของ**{scope_label}**เรียบร้อยแล้วค่ะ ({ram_note})"
+    )
 
 
 @bot.command(name="calc")

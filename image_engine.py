@@ -28,6 +28,7 @@ from config import (
     clean_url,
     api_log,
     get_http_session,
+    release_unused_memory,
 )
 from llm import (
     call_gemini_generate_content_self_healing,
@@ -105,14 +106,24 @@ def split_discord_message_smart(text: str, max_len: int = 1900) -> list[str]:
 
 
 async def _send_or_reply(
-    target_channel, reply_to: discord.Message | None, content: str = None, file: discord.File = None
+    target_channel,
+    reply_to: discord.Message | None,
+    content: str = None,
+    file: discord.File = None,
+    files: list[discord.File] = None,
 ):
+    kwargs = {"content": content}
+    if files:
+        kwargs["files"] = files
+    elif file is not None:
+        kwargs["file"] = file
+
     if reply_to is not None:
         try:
-            return await reply_to.reply(content=content, file=file, mention_author=False)
+            return await reply_to.reply(**kwargs, mention_author=False)
         except Exception:
             pass
-    return await target_channel.send(content=content, file=file)
+    return await target_channel.send(**kwargs)
 
 
 async def send_chunked_response(
@@ -436,6 +447,166 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
             "box_2d": norm_box,
         })
     return valid
+
+
+def _parse_manga_pages_batch_json(
+    raw_text: str, expected_pages: int
+) -> list[tuple[list[dict], str]]:
+    """
+    Parses a multi-page batch JSON response:
+    {"pages": [{"page_index": 1, "summary": "...", "bubbles": [...]}, ...]}
+    Also seamlessly handles single-page {"summary": "...", "bubbles": [...]} responses.
+    """
+    if not raw_text:
+        return [([], "") for _ in range(expected_pages)]
+
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", raw_text).strip()
+    cleaned = re.sub(r"^```(?:json)?|```$", "", cleaned).strip()
+    json_match = re.search(r"\{[\s\S]*\}", cleaned)
+    target = json_match.group(0) if json_match else cleaned
+
+    parsed = None
+    for candidate_str in (
+        target,
+        re.sub(
+            r",\s*([}\]])",
+            r"\1",
+            re.sub(r'(["\d\]}])\s*\n(\s*["{])', r"\1,\n\2", target),
+        ),
+    ):
+        try:
+            parsed = json.loads(candidate_str)
+            break
+        except Exception:
+            continue
+
+    if isinstance(parsed, dict):
+        # Case A: Multi-page "pages" array returned
+        raw_pages = parsed.get("pages")
+        if isinstance(raw_pages, list) and raw_pages:
+            results = [([], "") for _ in range(expected_pages)]
+            for idx, p_obj in enumerate(raw_pages):
+                if not isinstance(p_obj, dict):
+                    continue
+                p_idx = int(p_obj.get("page_index") or (idx + 1)) - 1
+                if not (0 <= p_idx < expected_pages):
+                    p_idx = min(idx, expected_pages - 1)
+                bubbles = _normalize_and_validate_bubbles(p_obj.get("bubbles") or [])
+                summary = str(p_obj.get("summary") or "").strip()
+                results[p_idx] = (bubbles, summary)
+            if any(b for b, _ in results):
+                return results
+
+        # Case B: Single-page {"bubbles": [...]} format returned
+        if expected_pages == 1 and "bubbles" in parsed:
+            bubbles = _normalize_and_validate_bubbles(parsed.get("bubbles") or [])
+            summary = str(parsed.get("summary") or "").strip()
+            return [(bubbles, summary)]
+
+    # Fallback for 1-page regex extraction
+    if expected_pages == 1:
+        b, s = _parse_manga_bubbles_json(raw_text)
+        return [(b, s)]
+
+    return [([], "") for _ in range(expected_pages)]
+
+
+async def extract_and_translate_manga_pages_batch(
+    pages_input: list[tuple[bytes, str]], target_lang_name: str
+) -> list[tuple[list[dict], str]]:
+    """
+    Translates 1 to 10 manga pages in a SINGLE multimodal API request to conserve RPD quota.
+    pages_input: list of (raw_bytes, filename)
+    Returns: list of (bubbles, scene_summary) corresponding to each page in order.
+    """
+    num_pages = len(pages_input)
+    if num_pages == 0:
+        return []
+
+    b64_pages = []
+    for raw_b, fname in pages_input:
+        b64_str = await asyncio.to_thread(_prepare_manga_image_for_vision, raw_b)
+        b64_pages.append((b64_str, fname))
+
+    mime_type = "image/jpeg"
+
+    manga_batch_instruction = f"""
+You are a professional Manga, Manhwa, and Comic Localizer.
+You are given {num_pages} sequential manga page image(s) (labeled PAGE 1 to PAGE {num_pages}).
+Analyze all pages in order so character names, pronouns, tone, and ongoing dialogue stay consistent across pages,
+and translate ALL speech bubbles on every page into natural, idiomatic {target_lang_name}.
+
+CRITICAL RULES:
+1. Reading Order: Within each page, order the bubbles strictly in traditional Japanese Manga reading order (Top-to-Bottom, Right-to-Left across panels).
+2. In-Context Localization: Adapt Japanese/Korean/Chinese idioms, pronouns, tone, and emotion so the dialogue sounds completely natural in {target_lang_name} while fitting inside a speech bubble. Do NOT use double quotes inside `translated_text` (use single quotes if needed).
+3. Speech Bubble Bounding Boxes (`box_2d`):
+   - For each speech bubble on a page, provide `box_2d` as `[ymin, xmin, ymax, xmax]` normalized from 0 to 1000 relative to THAT page's dimensions.
+   - `box_2d` must tightly cover the Japanese text block inside that specific bubble lobe (if a double bubble has two lobes, output each lobe as its own separate bubble entry covering only that lobe's text).
+4. Return ONLY valid JSON matching this exact structure for all {num_pages} page(s):
+{{
+  "pages": [
+    {{
+      "page_index": 1,
+      "summary": "Brief 1-sentence scene context for Page 1",
+      "bubbles": [
+        {{
+          "id": 1,
+          "speaker_or_note": "Character / SFX / Narration",
+          "source_text": "Original Japanese text",
+          "translated_text": "Natural {target_lang_name} translation",
+          "box_2d": [ymin, xmin, ymax, xmax]
+        }}
+      ]
+    }}
+  ]
+}}
+""".strip()
+
+    # Tier 1: Google AI Studio (gemini-3-flash-preview) — All pages in 1 single RPD request!
+    if GEMINI_API_KEY:
+        parts = [{"text": manga_batch_instruction}]
+        for idx, (b64_img, fname) in enumerate(b64_pages, 1):
+            parts.append({"text": f"=== PAGE {idx} ({fname}) ==="})
+            parts.append({"inlineData": {"mimeType": mime_type, "data": b64_img}})
+
+        gemini_payload = {
+            "contents": [{"parts": parts}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 8192,
+                "responseMimeType": "application/json",
+                "thinkingConfig": {"thinkingBudget": 0},
+            },
+        }
+        # Scale timeout with page count (e.g. 30s for 1 page, up to 90s for 10 pages)
+        timeout_sec = min(90, 22 + (8 * num_pages))
+        try:
+            data = await call_gemini_generate_content_self_healing(
+                gemini_payload, timeout_sec=timeout_sec, purpose=f"MangaBatch({num_pages}p)"
+            )
+            if data:
+                resp_parts = (
+                    ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                )
+                raw_json_str = "\n".join(p.get("text", "") for p in resp_parts if p.get("text")).strip()
+                batch_results = _parse_manga_pages_batch_json(raw_json_str, num_pages)
+                if any(bubbles for bubbles, _ in batch_results):
+                    total_b = sum(len(b) for b, _ in batch_results)
+                    print(
+                        f"[Manga Vision Batch] Completed {num_pages} page(s) in 1 request via Tier 1 Gemini "
+                        f"({state.active_gemini_model}) - {total_b} total bubbles",
+                        flush=True,
+                    )
+                    return batch_results
+        except Exception as e:
+            print(f"Gemini Manga Batch Vision warning: {e}", flush=True)
+
+    # Fallback: If Tier 1 Gemini is unavailable/quota-exhausted, process per-page via Tier 2/3 (Cloudflare / Groq)
+    fallback_results = []
+    for raw_b, fname in pages_input:
+        b, s = await extract_and_translate_manga_bubbles(raw_b, fname, target_lang_name)
+        fallback_results.append((b, s))
+    return fallback_results
 
 
 def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
@@ -1084,6 +1255,8 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
 
     out_io = io.BytesIO()
     img.save(out_io, format="PNG", optimize=True)
+    img.close()
+    base_gray.close()
     return out_io.getvalue()
 
 
@@ -1103,67 +1276,93 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
     if not image_attachments:
         await channel.send(
             "กรุณาแนบรูปภาพหน้ามังงะหรือข้อความที่ต้องการให้แปลมาด้วยนะคะ "
-            "(เช่น แนบรูปพร้อมพิมพ์ `!manga en` เพื่อแปลเป็นภาษาอังกฤษ หรือ `!manga th` เพื่อแปลเป็นภาษาไทยค่ะ)"
+            "(สามารถแนบพร้อมกันหลายหน้าในข้อความเดียวได้เลยค่ะ เช่น แนบ 5 หน้าพร้อมพิมพ์ `!manga en` หรือ `!manga th`)"
         )
         return
 
     _, target_lang_name = _detect_target_translation_lang(user_prompt)
-    att = image_attachments[0]
+    # Discord allows up to 10 attachments per message
+    target_attachments = image_attachments[:10]
+    num_pages = len(target_attachments)
 
     async with channel.typing():
-        raw_bytes = await att.read()
-        bubbles, scene_summary = await extract_and_translate_manga_bubbles(
-            raw_bytes, att.filename, target_lang_name
+        pages_input = []
+        for att in target_attachments:
+            raw_b = await att.read()
+            pages_input.append((raw_b, att.filename))
+
+        batch_results = await extract_and_translate_manga_pages_batch(
+            pages_input, target_lang_name
         )
 
-        if not bubbles and scene_summary:
-            await send_chunked_response(
-                channel,
-                f"**📖 คำแปลข้อความจากภาพ ({target_lang_name}):**\n\n{scene_summary}",
-                reply_to=msg,
-            )
-            return
-
-        if not bubbles:
+        if not any(bubbles or summary for bubbles, summary in batch_results):
             await _send_or_reply(
                 channel,
                 msg,
-                content="ไม่สามารถตรวจจับข้อความในภาพนี้ได้ค่ะ กรุณาตรวจสอบว่าภาพมีความคมชัดนะคะ",
+                content="ไม่สามารถตรวจจับข้อความในภาพที่แนบมาได้ค่ะ กรุณาตรวจสอบว่าภาพมีความคมชัดนะคะ",
             )
             return
 
-        transcript_lines = [
-            f"**📖 คำแปลมังงะตามลำดับช่องอ่าน ขวาไปซ้าย ({target_lang_name}):**"
-        ]
-        if scene_summary:
-            clean_sum = re.sub(r"\s+", " ", scene_summary).strip()
-            transcript_lines.append(f"-# *บริบทของฉาก: {clean_sum}*")
+        header_title = (
+            f"**📖 คำแปลมังงะ {num_pages} หน้า ตามลำดับช่องอ่าน ขวาไปซ้าย ({target_lang_name}):**"
+            if num_pages > 1
+            else f"**📖 คำแปลมังงะตามลำดับช่องอ่าน ขวาไปซ้าย ({target_lang_name}):**"
+        )
+        transcript_lines = [header_title]
+        discord_files = []
 
-        for idx, b in enumerate(bubbles, 1):
-            speaker = re.sub(r"\s+", " ", (b.get("speaker_or_note") or f"ช่องคำพูด {idx}")).strip()
-            src_txt = re.sub(r"\s+", " ", (b.get("source_text") or "")).strip()
-            tr_txt = re.sub(r"\s+", " ", (b.get("translated_text") or "")).strip()
-            if tr_txt:
-                # Use [#idx] badge format so Discord's Markdown parser never resets numbering to '1.'
-                transcript_lines.append(f"**[#{idx} | {speaker}]** `{src_txt}`\n   ↳ **{tr_txt}**")
+        for page_idx, ((raw_bytes, fname), (bubbles, scene_summary)) in enumerate(
+            zip(pages_input, batch_results), 1
+        ):
+            if num_pages > 1:
+                transcript_lines.append(f"\n__**📄 หน้าที่ {page_idx}/{num_pages} (`{fname}`)**__")
+            if scene_summary:
+                clean_sum = re.sub(r"\s+", " ", scene_summary).strip()
+                transcript_lines.append(f"-# *บริบทของฉาก: {clean_sum}*")
+
+            if not bubbles:
+                transcript_lines.append("*(ไม่พบช่องคำพูดในหน้านี้)*")
+                continue
+
+            for idx, b in enumerate(bubbles, 1):
+                speaker = re.sub(r"\s+", " ", (b.get("speaker_or_note") or f"ช่องคำพูด {idx}")).strip()
+                src_txt = re.sub(r"\s+", " ", (b.get("source_text") or "")).strip()
+                tr_txt = re.sub(r"\s+", " ", (b.get("translated_text") or "")).strip()
+                if tr_txt:
+                    transcript_lines.append(f"**[#{idx} | {speaker}]** `{src_txt}`\n   ↳ **{tr_txt}**")
+
+            try:
+                rendered_png = await asyncio.to_thread(
+                    render_translated_manga_image_sync, raw_bytes, bubbles
+                )
+                if rendered_png:
+                    base_name = os.path.splitext(fname)[0]
+                    discord_files.append(
+                        discord.File(
+                            io.BytesIO(rendered_png),
+                            filename=f"translated_p{page_idx}_{base_name}.png",
+                        )
+                    )
+            except Exception as e:
+                print(f"Manga page {page_idx} rendering fallback to text-only: {e}", flush=True)
 
         transcript_text = "\n".join(transcript_lines)
 
-        rendered_png = None
-        try:
-            rendered_png = await asyncio.to_thread(
-                render_translated_manga_image_sync, raw_bytes, bubbles
-            )
-        except Exception as e:
-            print(f"Manga image rendering fallback to text-only: {e}")
-
-        if rendered_png:
-            base_name = os.path.splitext(att.filename)[0]
-            discord_file = discord.File(io.BytesIO(rendered_png), filename=f"translated_{base_name}.png")
+        if discord_files:
             if len(transcript_text) <= 1950:
-                await _send_or_reply(channel, msg, content=transcript_text, file=discord_file)
+                await _send_or_reply(channel, msg, content=transcript_text, files=discord_files)
             else:
-                await _send_or_reply(channel, msg, file=discord_file)
+                await _send_or_reply(channel, msg, files=discord_files)
                 await send_chunked_response(channel, transcript_text, reply_to=None)
         else:
             await send_chunked_response(channel, transcript_text, reply_to=msg)
+
+        for df in discord_files:
+            try:
+                df.close()
+            except Exception:
+                pass
+        discord_files.clear()
+        pages_input.clear()
+        rendered_png = raw_bytes = raw_b = None
+        release_unused_memory()

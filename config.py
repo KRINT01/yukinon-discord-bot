@@ -1,7 +1,9 @@
 import os
 import re
+import gc
 import sys
 import time
+import ctypes
 import asyncio
 import ipaddress
 from datetime import datetime
@@ -172,6 +174,30 @@ def prune_stale_attachments(ttl_sec: int = 1800):
     ]
     for cid in stale_ids:
         channel_last_attachment.pop(cid, None)
+
+
+def release_unused_memory() -> tuple[float, float]:
+    """
+    Forces Python's garbage collector and Linux glibc (malloc_trim) to immediately
+    return freed heap memory (such as Pillow manga buffers) back to the OS kernel.
+    Returns (before_mb, after_mb).
+    """
+    import psutil
+
+    proc = psutil.Process(os.getpid())
+    before_mb = round(proc.memory_info().rss / (1024 ** 2), 1)
+
+    prune_stale_attachments()
+    gc.collect()
+
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except Exception:
+        pass
+
+    after_mb = round(proc.memory_info().rss / (1024 ** 2), 1)
+    return before_mb, after_mb
 
 
 # --- Shared Constants & Compiled Regex Patterns ---
