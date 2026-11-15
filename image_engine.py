@@ -938,17 +938,20 @@ def _compute_voronoi_lobe_bounds(
     cx = (x1 + x2) // 2
     cy = (y1 + y2) // 2
 
-    vor_x1 = max(0, x1 - max(52, int(box_w * 0.75)))
-    vor_y1 = max(0, y1 - max(44, int(box_h * 0.60)))
-    vor_x2 = min(width, x2 + max(52, int(box_w * 0.75)))
-    vor_y2 = min(height, y2 + max(44, int(box_h * 0.60)))
+    # Allow generous search reach (up to 95px) in unobstructed directions so boxes pushed aside by
+    # giant SFX (like 'リンゴーン' next to '私は別に――') still capture the entire speech bubble,
+    # while clamping strictly at the midpoint toward any neighboring speech bubble!
+    vor_x1 = max(0, x1 - max(95, int(box_w * 1.15)))
+    vor_y1 = max(0, y1 - max(52, int(box_h * 0.65)))
+    vor_x2 = min(width, x2 + max(95, int(box_w * 1.15)))
+    vor_y2 = min(height, y2 + max(52, int(box_h * 0.65)))
 
     for ox1, oy1, ox2, oy2 in other_peer_boxes:
         ocx = (ox1 + ox2) // 2
         ocy = (oy1 + oy2) // 2
         dx = abs(cx - ocx)
         dy = abs(cy - ocy)
-        if dx > (box_w + (ox2 - ox1)) * 1.25 and dy > (box_h + (oy2 - oy1)) * 1.25:
+        if dx > (box_w + (ox2 - ox1)) * 1.35 and dy > (box_h + (oy2 - oy1)) * 1.35:
             continue
 
         h_gap = max(ox1 - x2, x1 - ox2)
@@ -977,37 +980,31 @@ def _find_best_enclosed_white_bubble(
     ry1_rel: int,
     rx2_rel: int,
     ry2_rel: int,
+    has_kanji_kana: bool = True,
 ) -> Image.Image | None:
     """
-    Searches for a true enclosed white speech-bubble interior (p >= 232) overlapping or immediately
-    adjacent to (rx1_rel, ry1_rel, rx2_rel, ry2_rel).
-    - Rejects any white component that leaks across the outer window boundary (open background/speedlines)
-      or has gray screentone inside it (hair/face/clothes), preventing 100% of white noise artifacts!
-    - Picks the enclosed bubble lobe with the largest overlap + area so double-bubbles (like Panel 3)
-      always select the main text bubble instead of a tiny side lobe, and slightly shifted boxes
-      (like '私は別に――') snap back onto the real bubble!
+    Searches for a true enclosed white speech-bubble interior (p >= 232).
+    - When `has_kanji_kana=True`, requires the 3px-eroded interior of the candidate bubble to contain
+      at least 28 pixels of dark Japanese text ink (p < 205), which 100% rejects empty white cheeks/faces!
     """
     ww, wh = sub_gray.size
     if ww < 12 or wh < 12:
         return None
 
-    # Seal 1px anti-aliased gaps in bubble outlines while keeping pure white interiors (p >= 232)
     bin_white = sub_gray.point(lambda p: 255 if p >= 232 else 0)
+    dark_ink_map = sub_gray.point(lambda p: 255 if p < 205 else 0)
     visited = Image.new("L", (ww, wh), 0)
 
     bw = max(8, rx2_rel - rx1_rel)
     bh = max(8, ry2_rel - ry1_rel)
 
-    # Candidate seed points: grid inside (rx1_rel..rx2_rel) PLUS horizontal search (+/- 36px)
-    # in case Gemini's box_2d drifted slightly onto adjacent hair/cheek
     seed_candidates = []
     for fy in (0.25, 0.50, 0.75, 0.15, 0.85):
         sy = max(2, min(wh - 3, int(ry1_rel + bh * fy)))
         for fx in (0.50, 0.30, 0.70, 0.15, 0.85):
             sx = max(2, min(ww - 3, int(rx1_rel + bw * fx)))
             seed_candidates.append((sx, sy))
-        # Horizontal snap probes just left and right of the box
-        for extra_dx in (-16, 16, -32, 32, -46, 46):
+        for extra_dx in (-18, 18, -36, 36, -56, 56, -75, 75):
             sx_ext = rx1_rel + extra_dx if extra_dx < 0 else rx2_rel + extra_dx
             if 2 <= sx_ext < ww - 2:
                 seed_candidates.append((sx_ext, sy))
@@ -1022,7 +1019,6 @@ def _find_best_enclosed_white_bubble(
         work = bin_white.copy()
         ImageDraw.floodfill(work, (sx, sy), 128)
         comp = work.point(lambda p: 255 if p == 128 else 0)
-        # Mark visited so we never evaluate the same connected component twice
         visited = ImageChops.lighter(visited, comp)
 
         c_bbox = comp.getbbox()
@@ -1033,8 +1029,6 @@ def _find_best_enclosed_white_bubble(
         if cw < 18 or ch < 18:
             continue
 
-        # Check how many outer window edges this white component touches.
-        # If it touches >= 2 opposite edges broadly, it is open background/speedlines, NOT an enclosed bubble!
         edge_touches = 0
         if cx1 <= 1:
             edge_touches += 1
@@ -1047,29 +1041,250 @@ def _find_best_enclosed_white_bubble(
         if edge_touches >= 3 or (cx1 <= 1 and cx2 >= ww - 1) or (cy1 <= 1 and cy2 >= wh - 1):
             continue
 
-        # Fill enclosed holes (the Japanese characters inside this white component) using a 2px moat
         padded = Image.new("L", (ww + 4, wh + 4), 0)
         padded.paste(comp, (2, 2))
         ImageDraw.floodfill(padded, (0, 0), 128)
         holes = padded.crop((2, 2, ww + 2, wh + 2)).point(lambda p: 255 if p == 0 else 0)
         filled = ImageChops.lighter(comp, holes)
 
-        # Verify purity: a real speech bubble is predominantly pure white paper (comp area >= 55% of filled area)
         comp_area = sum(1 for p in comp.crop(c_bbox).getdata() if p > 0)
         filled_area = max(1, sum(1 for p in filled.crop(c_bbox).getdata() if p > 0))
-        if comp_area < 220 or (comp_area / filled_area) < 0.52:
+        if comp_area < 220 or (comp_area / filled_area) < 0.50:
             continue
 
-        # Score by overlap with (rx1_rel, ry1_rel, rx2_rel, ry2_rel) + bubble area
+        # CRITICAL: If the bubble's source_text has kanji/kana (not just '……'), the 3px-eroded interior
+        # MUST contain real dark Japanese text strokes (rejects empty white cheeks/skin!)
+        safe_inner_3px = filled.filter(ImageFilter.MinFilter(7))
+        inner_ink = ImageChops.darker(dark_ink_map, safe_inner_3px)
+        inner_ink_px = sum(1 for p in inner_ink.crop(c_bbox).getdata() if p > 0)
+        if has_kanji_kana and inner_ink_px < 28:
+            continue
+
         ov_x = max(0, min(cx2, rx2_rel) - max(cx1, rx1_rel))
         ov_y = max(0, min(cy2, ry2_rel) - max(cy1, ry1_rel))
         overlap_area = ov_x * ov_y
-        score = (overlap_area * 3.0) + (filled_area * 0.4)
+        score = (overlap_area * 2.5) + (inner_ink_px * 4.0) + (filled_area * 0.25)
         if score > best_score:
             best_score = score
             best_filled = filled
 
     return best_filled
+
+
+def _clean_and_locate_white_paper_text_column(
+    img: Image.Image,
+    sub_gray: Image.Image,
+    wx1: int,
+    wy1: int,
+    rx1_rel: int,
+    ry1_rel: int,
+    rx2_rel: int,
+    ry2_rel: int,
+) -> tuple[int, int, int, int] | None:
+    """
+    Handles speech bubbles whose outer black border is broken by overlapping SFX (such as 'リンゴーン'
+    breaking the left border of '私は別に――') or spiky open borders ('Hmph!'):
+    1) Finds all interior dark character islands (p < 228) that do NOT touch the window perimeter
+       and are surrounded by pure white bubble paper (p >= 238, rejecting gray screentone hair/clothes).
+    2) Clusters those character islands into the dominant Japanese text column (e.g. '私は別に――'),
+       ignoring any tiny stray facial dots (like a 4px nose dot on a cheek).
+    3) Erases 100% of the characters in that text column to pure white (255, 255, 255).
+    4) Scans horizontally left and right from the erased text column's center to measure the exact
+       inner walls of the speech bubble so the translated text is centered inside the bubble!
+    """
+    ww, wh = sub_gray.size
+    if ww < 12 or wh < 12:
+        return None
+
+    dark_mask = sub_gray.point(lambda p: 255 if p < 228 else 0)
+    work_dark = dark_mask.copy()
+
+    # 1. Flood-fill any dark contour connected to the outer 1px perimeter of the window (panel/bubble borders, hair, SFX)
+    for bx in range(ww):
+        if work_dark.getpixel((bx, 0)) == 255:
+            ImageDraw.floodfill(work_dark, (bx, 0), 128)
+        if work_dark.getpixel((bx, wh - 1)) == 255:
+            ImageDraw.floodfill(work_dark, (bx, wh - 1), 128)
+    for by in range(wh):
+        if work_dark.getpixel((0, by)) == 255:
+            ImageDraw.floodfill(work_dark, (0, by), 128)
+        if work_dark.getpixel((ww - 1, by)) == 255:
+            ImageDraw.floodfill(work_dark, (ww - 1, by), 128)
+
+    wd_px = work_dark.load()
+    sg_px = sub_gray.load()
+
+    # 2. Extract individual interior dark components via fast BFS and verify each sits on pure white paper
+    char_comps = []
+    for y in range(1, wh - 1):
+        for x in range(1, ww - 1):
+            if wd_px[x, y] != 255:
+                continue
+            wd_px[x, y] = 64
+            q = [(x, y)]
+            min_x = max_x = x
+            min_y = max_y = y
+            idx = 0
+            while idx < len(q):
+                cx, cy = q[idx]
+                idx += 1
+                if cx < min_x:
+                    min_x = cx
+                if cx > max_x:
+                    max_x = cx
+                if cy < min_y:
+                    min_y = cy
+                if cy > max_y:
+                    max_y = cy
+                for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                    if 0 <= nx < ww and 0 <= ny < wh and wd_px[nx, ny] == 255:
+                        wd_px[nx, ny] = 64
+                        q.append((nx, ny))
+
+            count = len(q)
+            cw = max_x - min_x + 1
+            ch = max_y - min_y + 1
+            # Single kanji/kana/punctuation or vertical dash '――' bounds
+            if count < 2 or cw > 56 or ch > 96 or (cw > 44 and ch > 44):
+                continue
+
+            # Check the 3px surrounding background ring: must be predominantly pure white bubble paper (>= 238)
+            bg_white = 0
+            bg_gray = 0
+            bx1 = max(0, min_x - 3)
+            by1 = max(0, min_y - 3)
+            bx2 = min(ww - 1, max_x + 3)
+            by2 = min(wh - 1, max_y + 3)
+            for sy in range(by1, by2 + 1):
+                for sx in range(bx1, bx2 + 1):
+                    val = sg_px[sx, sy]
+                    if val >= 238:
+                        bg_white += 1
+                    elif 135 <= val < 228:
+                        bg_gray += 1
+
+            total_bg = bg_white + bg_gray
+            if total_bg < 6 or (bg_white / total_bg) < 0.74:
+                continue
+
+            char_comps.append({
+                "pts": q,
+                "bbox": (min_x, min_y, max_x + 1, max_y + 1),
+                "count": count,
+            })
+
+    if not char_comps:
+        return None
+
+    # 3. Cluster character components that belong to the same speech bubble (within 28px X and 34px Y)
+    n_c = len(char_comps)
+    visited_c = [False] * n_c
+    clusters = []
+    for i in range(n_c):
+        if visited_c[i]:
+            continue
+        visited_c[i] = True
+        cluster_indices = [i]
+        queue_c = [i]
+        while queue_c:
+            curr_i = queue_c.pop()
+            ax1, ay1, ax2, ay2 = char_comps[curr_i]["bbox"]
+            for j in range(n_c):
+                if visited_c[j]:
+                    continue
+                bx1, by1, bx2, by2 = char_comps[j]["bbox"]
+                gap_x = max(0, max(ax1 - bx2, bx1 - ax2))
+                gap_y = max(0, max(ay1 - by2, by1 - ay2))
+                if gap_x <= 28 and gap_y <= 34:
+                    visited_c[j] = True
+                    cluster_indices.append(j)
+                    queue_c.append(j)
+        clusters.append(cluster_indices)
+
+    # Score each cluster by total dark text ink pixels (and proximity to rx1_rel..rx2_rel)
+    raw_cx = (rx1_rel + rx2_rel) // 2
+    raw_cy = (ry1_rel + ry2_rel) // 2
+    best_cluster = None
+    best_cl_score = -1.0
+
+    for cl in clusters:
+        total_ink = sum(char_comps[idx]["count"] for idx in cl)
+        cl_x1 = min(char_comps[idx]["bbox"][0] for idx in cl)
+        cl_y1 = min(char_comps[idx]["bbox"][1] for idx in cl)
+        cl_x2 = max(char_comps[idx]["bbox"][2] for idx in cl)
+        cl_y2 = max(char_comps[idx]["bbox"][3] for idx in cl)
+        if total_ink < 18:
+            continue
+        cl_cx = (cl_x1 + cl_x2) // 2
+        cl_cy = (cl_y1 + cl_y2) // 2
+        dist_penalty = (abs(cl_cx - raw_cx) * 0.6) + (abs(cl_cy - raw_cy) * 0.6)
+        score = (total_ink * 2.5) - dist_penalty
+        if score > best_cl_score:
+            best_cl_score = score
+            best_cluster = (cl, cl_x1, cl_y1, cl_x2, cl_y2)
+
+    if not best_cluster:
+        return None
+
+    cl_indices, cl_x1, cl_y1, cl_x2, cl_y2 = best_cluster
+
+    # Also include any tiny punctuation/furigana component within 16px of the winning cluster's bounding box
+    erase_mask = Image.new("L", (ww, wh), 0)
+    em_px = erase_mask.load()
+    for idx, comp in enumerate(char_comps):
+        bx1, by1, bx2, by2 = comp["bbox"]
+        if (
+            idx in cl_indices
+            or (bx1 >= cl_x1 - 16 and bx2 <= cl_x2 + 16 and by1 >= cl_y1 - 16 and by2 <= cl_y2 + 16)
+        ):
+            for px_x, px_y in comp["pts"]:
+                em_px[px_x, px_y] = 255
+            cl_x1 = min(cl_x1, bx1)
+            cl_y1 = min(cl_y1, by1)
+            cl_x2 = max(cl_x2, bx2)
+            cl_y2 = max(cl_y2, by2)
+
+    # Dilate the verified text mask by 2px (MaxFilter(5)) to wipe anti-aliased gray halos around the strokes
+    dilated_text_mask = erase_mask.filter(ImageFilter.MaxFilter(5))
+    img.paste(Image.new("RGB", (ww, wh), (255, 255, 255)), (wx1, wy1), mask=dilated_text_mask)
+
+    # 4. Measure the horizontal white bubble width around the erased text column `(cl_x1..cl_x2, cl_y1..cl_y2)`
+    clean_sub = sub_gray.copy()
+    clean_sub.paste(255, (0, 0), mask=dilated_text_mask)
+    cs_px = clean_sub.load()
+
+    cl_cx = (cl_x1 + cl_x2) // 2
+    mid_y_start = cl_y1 + int((cl_y2 - cl_y1) * 0.15)
+    mid_y_end = cl_y1 + int((cl_y2 - cl_y1) * 0.85)
+    row_lefts = []
+    row_rights = []
+
+    for sy in range(mid_y_start, max(mid_y_start + 1, mid_y_end), max(2, (mid_y_end - mid_y_start) // 8 or 1)):
+        if not (0 <= sy < wh):
+            continue
+        lx = cl_cx
+        while lx > 2 and cs_px[lx - 1, sy] >= 220:
+            lx -= 1
+        rx = cl_cx
+        while rx < ww - 2 and cs_px[rx, sy] >= 220:
+            rx += 1
+        if rx - lx >= 16:
+            row_lefts.append(lx)
+            row_rights.append(rx)
+
+    if row_lefts and row_rights:
+        row_lefts.sort()
+        row_rights.sort()
+        inner_l = row_lefts[int(len(row_lefts) * 0.70)] + 5
+        inner_r = row_rights[int(len(row_rights) * 0.30)] - 5
+        # Clamp horizontal expansion to at most 28px beyond the text column on either side
+        # so an open border cannot pull the text center outside the bubble
+        inner_l = max(cl_x1 - 26, min(cl_x1, inner_l))
+        inner_r = min(cl_x2 + 26, max(cl_x2, inner_r))
+        if inner_r - inner_l >= 18:
+            return wx1 + inner_l, wy1 + cl_y1, wx1 + inner_r, wy1 + cl_y2
+
+    return wx1 + cl_x1, wy1 + cl_y1, wx1 + cl_x2, wy1 + cl_y2
 
 
 def _erase_bubble_japanese_text_and_measure_lobe(
@@ -1081,11 +1296,10 @@ def _erase_bubble_japanese_text_and_measure_lobe(
     raw_x2: int,
     raw_y2: int,
     is_dark_bubble: bool = False,
+    has_kanji_kana: bool = True,
 ) -> tuple[int, int, int, int, tuple[int, int, int], tuple[int, int, int]]:
     width, height = img.size
     x1, y1, x2, y2 = raw_x1, raw_y1, raw_x2, raw_y2
-    box_w = max(10, x2 - x1)
-    box_h = max(10, y2 - y1)
 
     vor_x1, vor_y1, vor_x2, vor_y2 = _compute_voronoi_lobe_bounds(
         width, height, x1, y1, x2, y2, other_peer_boxes
@@ -1192,15 +1406,13 @@ def _erase_bubble_japanese_text_and_measure_lobe(
         )
 
     # =========================================================================
-    # CASE B: LIGHT / WHITE BUBBLE (Black or Whispered-Gray text on White fill)
+    # CASE B: INTACT ENCLOSED WHITE SPEECH BUBBLE
     # =========================================================================
     filled_bubble = _find_best_enclosed_white_bubble(
-        sub_gray, rx1_rel, ry1_rel, rx2_rel, ry2_rel
+        sub_gray, rx1_rel, ry1_rel, rx2_rel, ry2_rel, has_kanji_kana=has_kanji_kana
     )
 
     if filled_bubble is not None:
-        # Shrink filled_bubble inward by 2px (MinFilter(5)) so the black bubble outline is 100% untouched.
-        # Inside this verified interior, erase all ink (including faint gray '……' up to p < 248)!
         safe_inner_core = filled_bubble.filter(ImageFilter.MinFilter(5))
         ink_inside_bubble = sub_gray.point(lambda p: 255 if p < 248 else 0)
         erase_mask = ImageChops.darker(
@@ -1213,7 +1425,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
         if lobe_bbox:
             lb_x1, lb_y1, lb_x2, lb_y2 = lobe_bbox
             lobe_cx = (lb_x1 + lb_x2) // 2
-            # Vertical bounds: use the middle 75% of the verified bubble lobe
             rel_y1 = max(lb_y1 + 4, min(ry1_rel, lb_y1 + int((lb_y2 - lb_y1) * 0.12)))
             rel_y2 = min(lb_y2 - 4, max(ry2_rel, lb_y1 + int((lb_y2 - lb_y1) * 0.88)))
             if rel_y2 - rel_y1 < 18:
@@ -1226,7 +1437,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
             for sy in range(mid_y_start, max(mid_y_start + 1, mid_y_end), max(2, (mid_y_end - mid_y_start) // 7 or 1)):
                 if not (0 <= sy < wh):
                     continue
-                # Scan outward from the verified bubble's horizontal center `lobe_cx`
                 lx = lobe_cx
                 while lx > lb_x1 and safe_inner_core.getpixel((lx - 1, sy)) > 128:
                     lx -= 1
@@ -1262,36 +1472,14 @@ def _erase_bubble_japanese_text_and_measure_lobe(
             )
 
     # =========================================================================
-    # CASE C: OPEN / SPIKY / BORDERLESS BUBBLE FALLBACK (Zero White Noise Outside Box!)
+    # CASE C: SFX-BROKEN BORDER ('リンゴーン' / '私は別に――') OR OPEN SPIKY BUBBLE ('Hmph!')
     # =========================================================================
-    # Only cleans isolated ink strictly inside (raw_x1, raw_y1, raw_x2, raw_y2) that is NOT connected
-    # to the outer 1px box perimeter AND only if the box sits on white paper (median >= 235).
-    pad = 4
-    ex1 = max(vor_x1, raw_x1 - pad)
-    ey1 = max(vor_y1, raw_y1 - pad)
-    ex2 = min(vor_x2, raw_x2 + pad)
-    ey2 = min(vor_y2, raw_y2 + pad)
-    ew = max(4, ex2 - ex1)
-    eh = max(4, ey2 - ey1)
-
-    core_gray = base_gray.crop((ex1, ey1, ex2, ey2))
-    sorted_px = sorted(core_gray.getdata())
-    # Verify that at least the upper-half of pixels in this box are pure white paper (>= 238)
-    # so we NEVER erase gray screentone dots on hair/faces/clothes!
-    if sorted_px and sorted_px[int(len(sorted_px) * 0.55)] >= 238:
-        core_dark = core_gray.point(lambda p: 255 if p < 244 else 0)
-        for bx in range(ew):
-            if core_dark.getpixel((bx, 0)) == 255:
-                ImageDraw.floodfill(core_dark, (bx, 0), 128)
-            if core_dark.getpixel((bx, eh - 1)) == 255:
-                ImageDraw.floodfill(core_dark, (bx, eh - 1), 128)
-        for by in range(eh):
-            if core_dark.getpixel((0, by)) == 255:
-                ImageDraw.floodfill(core_dark, (0, by), 128)
-            if core_dark.getpixel((ew - 1, by)) == 255:
-                ImageDraw.floodfill(core_dark, (ew - 1, by), 128)
-        core_isolated = core_dark.point(lambda p: 255 if p == 255 else 0).filter(ImageFilter.MaxFilter(3))
-        img.paste(Image.new("RGB", (ew, eh), (255, 255, 255)), (ex1, ey1), mask=core_isolated)
+    recovered_box = _clean_and_locate_white_paper_text_column(
+        img, sub_gray, wx1, wy1, rx1_rel, ry1_rel, rx2_rel, ry2_rel
+    )
+    if recovered_box is not None:
+        tx1, ty1, tx2, ty2 = recovered_box
+        return tx1, ty1, tx2, ty2, (15, 15, 15), (255, 255, 255)
 
     return raw_x1, raw_y1, raw_x2, raw_y2, (15, 15, 15), (255, 255, 255)
 
@@ -1351,7 +1539,7 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
     base_gray = img.convert("L")
     width, height = img.size
 
-    # Step 1: Convert normalized box_2d to pixel coordinates and detect bubble polarity (Dark vs Light)
+    # Step 1: Convert normalized box_2d to pixel coordinates, detect polarity, and check if source_text has kanji/kana
     pixel_boxes = []
     for b in valid_boxes:
         ymin, xmin, ymax, xmax = [float(v) for v in b["box_2d"]]
@@ -1364,21 +1552,31 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
         raw_x2 = min(width, int((xmax / 1000.0) * width))
         raw_y2 = min(height, int((ymax / 1000.0) * height))
         is_dark = _detect_bubble_polarity(base_gray, raw_x1, raw_y1, raw_x2, raw_y2)
+        src_txt = str(b.get("source_text") or "")
+        has_kanji_kana = bool(re.search(r"[ぁ-んァ-ヶ一-龯A-Za-z0-9]", src_txt))
         clean_tr = re.sub(r"\s+", " ", b["translated_text"]).strip()
-        pixel_boxes.append((raw_x1, raw_y1, raw_x2, raw_y2, is_dark, clean_tr))
+        pixel_boxes.append((raw_x1, raw_y1, raw_x2, raw_y2, is_dark, has_kanji_kana, clean_tr))
 
     # Step 2: Erase Japanese text (matching white or black bubble background) and measure each lobe
     prepared_renders = []
-    for i, (rx1, ry1, rx2, ry2, is_dark, trans_text) in enumerate(pixel_boxes):
+    for i, (rx1, ry1, rx2, ry2, is_dark, has_kk, trans_text) in enumerate(pixel_boxes):
         if (rx2 - rx1) < 3 or (ry2 - ry1) < 3:
             continue
         other_boxes = [
             (ox1, oy1, ox2, oy2)
-            for j, (ox1, oy1, ox2, oy2, _, _) in enumerate(pixel_boxes)
+            for j, (ox1, oy1, ox2, oy2, _, _, _) in enumerate(pixel_boxes)
             if j != i
         ]
         lx1, ly1, lx2, ly2, fg_text, stroke_col = _erase_bubble_japanese_text_and_measure_lobe(
-            img, base_gray, other_boxes, rx1, ry1, rx2, ry2, is_dark_bubble=is_dark
+            img,
+            base_gray,
+            other_boxes,
+            rx1,
+            ry1,
+            rx2,
+            ry2,
+            is_dark_bubble=is_dark,
+            has_kanji_kana=has_kk,
         )
         prepared_renders.append([lx1, ly1, lx2, ly2, fg_text, stroke_col, trans_text])
 
