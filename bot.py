@@ -260,6 +260,23 @@ async def on_message(message: discord.Message):
 
     clean_prompt = re.sub(rf"<@!?{bot.user.id}>", "", message.content).strip()
     clean_prompt = CUSTOM_EMOJI_REGEX.sub(r":\1:", clean_prompt).strip()
+
+    # If the user replies to an earlier message with ONLY @Yukinon (no new text),
+    # inherit the text/command from that earlier message!
+    if not clean_prompt and ref_msg and ref_msg.content and (not bot.user or ref_msg.author.id != bot.user.id):
+        inherited = re.sub(rf"<@!?{bot.user.id}>", "", ref_msg.content).strip()
+        inherited = CUSTOM_EMOJI_REGEX.sub(r":\1:", inherited).strip()
+        if re.match(r"^!(?:manga|translate|tl)\b", inherited, re.IGNORECASE):
+            lang_arg = re.sub(r"^!(?:manga|translate|tl)\s*", "", inherited, flags=re.IGNORECASE).strip()
+            clean_prompt = f"translate manga {lang_arg}".strip()
+        elif re.match(r"^!(?:source|sauce|whatis|วาร์ป)\b", inherited, re.IGNORECASE):
+            clean_prompt = (
+                re.sub(r"^!(?:source|sauce|whatis|วาร์ป)\s*", "", inherited, flags=re.IGNORECASE).strip()
+                or "ช่วยระบุที่มาของภาพนี้อย่างละเอียด"
+            )
+        else:
+            clean_prompt = inherited
+
     clean_prompt, mentioned_dossier = resolve_user_mentions_and_build_dossier(
         clean_prompt,
         message.guild,

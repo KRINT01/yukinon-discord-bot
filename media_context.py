@@ -769,12 +769,18 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
             except Exception as e:
                 blocks.append(f"[Web extraction error: {e}]")
 
-    # 5. Include the replied-to message's text content if the user replied to a message
+    # 5. Include the replied-to message's text content (unless it was just an old translation/bot command on an image)
     if ref_msg and ref_msg.content and ref_msg.content.strip():
-        ref_author = getattr(ref_msg.author, "display_name", "User")
-        blocks.append(
-            f"=== Replied-To Message from {ref_author} ===\n{ref_msg.content.strip()[:3000]}"
+        ref_txt = re.sub(r"<@!?\d+>", "", ref_msg.content).strip()
+        is_old_image_cmd = bool(
+            ref_msg.attachments
+            and re.search(r"(^!|แปลมังงะ|แปลรูป|แปลภาพ|แปลหน้า|\btranslate\b)", ref_txt, re.IGNORECASE)
         )
+        if ref_txt and not is_old_image_cmd:
+            ref_author = getattr(ref_msg.author, "display_name", "User")
+            blocks.append(
+                f"=== Replied-To Message from {ref_author} ===\n{ref_txt[:3000]}"
+            )
 
     joined_context = "\n\n".join(blocks)[:125000]
     prune_stale_attachments()
