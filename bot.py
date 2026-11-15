@@ -251,13 +251,14 @@ async def on_message(message: discord.Message):
     is_dm = message.guild is None
     is_ai_chan = message.channel.id in AI_CHANNEL_IDS
     is_mentioned = bot.user in message.mentions
+
     ref_msg = await resolve_referenced_message(message) if message.reference else None
-    is_reply = bool(ref_msg and ref_msg.author.id == bot.user.id)
+    is_reply = bool(ref_msg and bot.user and ref_msg.author.id == bot.user.id)
     has_audio = any(a.filename.lower().endswith(AUDIO_EXTENSIONS) for a in message.attachments)
     if not (is_dm or is_ai_chan or is_mentioned or is_reply or has_audio):
         return
 
-    clean_prompt = re.sub(rf"\<@\!?{bot.user.id}\>", "", message.content).strip()
+    clean_prompt = re.sub(rf"<@!?{bot.user.id}>", "", message.content).strip()
     clean_prompt = CUSTOM_EMOJI_REGEX.sub(r":\1:", clean_prompt).strip()
     clean_prompt, mentioned_dossier = resolve_user_mentions_and_build_dossier(
         clean_prompt,
@@ -270,7 +271,7 @@ async def on_message(message: discord.Message):
     has_image_att = any(a.filename.lower().endswith(config.IMAGE_EXTENSIONS) for a in all_msg_atts)
 
     # 0. Natural Chat "Yukipedia Mode" Trigger (Search / OCR / Translation + Critique)
-    if YUKIPEDIA\_INTENT\_PATTERN.search(clean_prompt):
+    if YUKIPEDIA_INTENT_PATTERN.search(clean_prompt):
         await process_yukipedia_request(message, clean_prompt)
         return
 
