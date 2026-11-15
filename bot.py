@@ -131,8 +131,9 @@ def _collect_health_metrics() -> dict:
             "groq_vision_model": state.active_groq_vision_model if GROQ_API_KEY else None,
             "cloudflare_enabled": bool(CF_API_TOKEN and CF_ACCOUNT_ID),
             "cloudflare_image_model": CF_IMAGE_MODEL if CF_API_TOKEN else None,
-            "cloudflare_vision_model": CF_VISION_MODEL if CF_API_TOKEN else None,
+            "cloudflare_gemma_model": CF_VISION_MODEL if CF_API_TOKEN else None,
             "gemini_enabled": bool(GEMINI_API_KEY),
+            "gemma_active_model": getattr(state, "active_gemma_model", None) if GEMINI_API_KEY else None,
             "gemini_active_model": state.active_gemini_model if GEMINI_API_KEY else None,
             "gemini_grounding_cooldown_sec": gemini_cd,
             "edge_tts_cooldown_sec": edge_cd,
@@ -171,10 +172,10 @@ async def handle_root(request: web.Request) -> web.Response:
            <b>Cached Contexts:</b> {mem['active_chat_channels']} chat(s), {mem['cached_attachments']} file(s)</p>
         <hr style="border: 0; border-top: 1px solid #e5e7eb; margin: 16px 0;">
         <p><b>Autonomous Agent / OpenClaw:</b> {"Connected" if OPENCLAW_GATEWAY_URL else "Internal 8-Skill Agent Active (OpenClaw Gateway on Standby)"}</p>
-        <p><b>Modal GPU Ollama:</b> {"Configured" if ai['modal_ollama_configured'] else "Not Configured"} (Fast: <code>{ai['fast_model']}</code>)</p>
+        <p><b>Google AI Studio:</b> {"Enabled (Gemma 4: <code>" + str(ai['gemma_active_model']) + "</code> | Gemini: <code>" + str(ai['gemini_active_model']) + "</code>)" + gemini_cd_note if ai['gemini_enabled'] else "Disabled"}</p>
+        <p><b>Cloudflare Workers AI:</b> {"Enabled (Chat & Vision: <code>" + str(ai['cloudflare_gemma_model']) + "</code> | Image: <code>" + str(ai['cloudflare_image_model']) + "</code>)" if ai['cloudflare_enabled'] else "Disabled"}</p>
         <p><b>Groq LPU Acceleration:</b> {"Enabled (Code: <code>" + GROQ_CODE_MODEL + "</code> | Search: <code>" + str(ai['groq_search_model']) + "</code> | Vision: <code>" + str(ai['groq_vision_model']) + "</code>)" if ai['groq_enabled'] else "Disabled"}</p>
-        <p><b>Cloudflare Workers AI:</b> {"Enabled (Image: <code>" + str(ai['cloudflare_image_model']) + "</code> | Vision: <code>" + str(ai['cloudflare_vision_model']) + "</code>)" if ai['cloudflare_enabled'] else "Disabled"}</p>
-        <p><b>Google AI Studio:</b> {"Enabled (<code>" + str(ai['gemini_active_model']) + "</code>)" + gemini_cd_note if ai['gemini_enabled'] else "Disabled"}</p>
+        <p><b>Modal GPU Ollama:</b> {"Configured" if ai['modal_ollama_configured'] else "Not Configured"} (Fallback: <code>{ai['fast_model']}</code>)</p>
         <p><b>Uptime:</b> {m['uptime_human']} ({m['uptime_sec']}s)</p>
     </body>
     </html>

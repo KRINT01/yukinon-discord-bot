@@ -238,24 +238,23 @@ async def _discover_active_gemini_flash_model() -> list[str]:
 
 
 async def call_gemma_ai_studio_chat(
-    messages: list, temperature: float = 0.4, max_output_tokens: int = 2048, purpose: str = "GemmaChat"
+    messages: list, temperature: float = 0.4, max_output_tokens: int = 1024, purpose: str = "GemmaChat"
 ) -> str:
     """
-    Calls Gemma 4 (gemma-4-31b-it / gemma-4-26b-a4b-it) on Google AI Studio (14.4K RPD, 30 RPM, 16K TPM).
-    Includes a 12,000-token guard so large prompts never trip the 16K TPM limit, and automatically
-    merges systemInstruction into the first user message if the endpoint rejects systemInstruction.
+    Calls Gemma 4 (gemma-4-26b-a4b-it / gemma-4-31b-it) on Google AI Studio (14.4K RPD, 30 RPM, 16K TPM).
+    Disables internal thinking bloat (thinkingBudget=0) so replies finish in ~1.2s instead of timing out,
+    and merges system instructions into the first user turn to prevent HTTP 500/400 errors.
     """
     if not GEMINI_API_KEY:
         return ""
 
-    # Respect Google AI Studio Gemma 4's 16,000 TPM limit (leave ~4K headroom for output + concurrent turns)
     est_tokens = _estimate_messages_tokens(messages)
     if est_tokens > 11500:
         api_log(f"Gemma AI Studio ({purpose}) -> skipped ({est_tokens} est tokens > 11.5K TPM guard)")
         return ""
 
     sys_parts = []
-    contents = []
+    raw_turns = []
     for m in messages:
         role = m.get("role", "user")
         txt = (m.get("content") or "").strip()
@@ -264,14 +263,35 @@ async def call_gemma_ai_studio_chat(
         if role == "system":
             sys_parts.append(txt)
         elif role == "assistant":
-            contents.append({"role": "model", "parts": [{"text": txt}]})
+            raw_turns.append(("model", txt))
         else:
-            contents.append({"role": "user", "parts": [{"text": txt}]})
+            raw_turns.append(("user", txt))
 
-    if not contents:
+    if not raw_turns:
         return ""
 
-    candidates = await discover_active_gemma_models(vision_required=False)
+    # Merge any consecutive identical roles ('user'/'user' or 'model'/'model') so v1beta never throws HTTP 500
+    contents = []
+    for r_role, r_txt in raw_turns:
+        if contents and contents[-1]["role"] == r_role:
+            contents[-1]["parts"][0]["text"] += f"\n\n{r_txt}"
+        else:
+            contents.append({"role": r_role, "parts": [{"text": r_txt}]})
+
+    # Prepend system instructions directly into the first user turn (avoids Gemma v1beta HTTP 500 on systemInstruction)
+    if sys_parts:
+        sys_joined = "\n\n".join(sys_parts)
+        if contents[0]["role"] == "user":
+            contents[0]["parts"][0]["text"] = (
+                f"[System Instructions — Follow Strictly]:\n{sys_joined}\n\n"
+                f"[User Message]:\n{contents[0]['parts'][0]['text']}"
+            )
+        else:
+            contents.insert(0, {"role": "user", "parts": [{"text": sys_joined}]})
+
+    # Prioritize gemma-4-26b-a4b-it (fast MoE) first for chat, then gemma-4-31b-it
+    discovered = await discover_active_gemma_models(vision_required=False)
+    candidates = sorted(discovered, key=lambda x: (0 if "26b" in x else 1))
     session = get_http_session()
 
     for model_id in candidates:
@@ -288,16 +308,15 @@ async def call_gemma_ai_studio_chat(
             "generationConfig": {
                 "temperature": temperature,
                 "maxOutputTokens": max_output_tokens,
+                "thinkingConfig": {"thinkingBudget": 0},
             },
         }
-        if sys_parts:
-            payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(sys_parts)}]}
 
         for attempt in range(2):
             t0 = time.monotonic()
             try:
                 async with session.post(
-                    url, json=payload, timeout=aiohttp.ClientTimeout(total=25)
+                    url, json=payload, timeout=aiohttp.ClientTimeout(total=18)
                 ) as resp:
                     status = resp.status
                     body_text = await resp.text()
@@ -306,35 +325,32 @@ async def call_gemma_ai_studio_chat(
                 if status == 200:
                     data = json.loads(body_text)
                     parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-                    out = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+                    # Filter out any internal 'thought' parts if returned by Gemma 4
+                    text_parts = [
+                        p.get("text", "") for p in parts
+                        if p.get("text") and not p.get("thought", False)
+                    ]
+                    out = "\n".join(text_parts).strip()
                     out = re.sub(r"<think>[\s\S]*?</think>", "", out).strip()
+                    out = re.sub(r"<\|thought\|>[\s\S]*?<\|/thought\|>", "", out).strip()
                     if out:
                         state.active_gemma_model = model_id
                         api_log(f"Gemma AI Studio ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
                         return out
 
-                # If the Gemma endpoint rejects systemInstruction on attempt 0, merge it into the first user message
-                if status == 400 and "systemInstruction" in payload and attempt == 0:
-                    sys_joined = "\n\n".join(sys_parts)
-                    merged_contents = json.loads(json.dumps(contents))
-                    if merged_contents and merged_contents[0]["role"] == "user":
-                        merged_contents[0]["parts"][0]["text"] = (
-                            f"[System Instructions]:\n{sys_joined}\n\n[User Message]:\n"
-                            + merged_contents[0]["parts"][0]["text"]
-                        )
-                    else:
-                        merged_contents.insert(0, {"role": "user", "parts": [{"text": sys_joined}]})
-                    payload.pop("systemInstruction", None)
-                    payload["contents"] = merged_contents
+                # If thinkingConfig is rejected on attempt 0, pop it and retry immediately
+                if status in (400, 500) and "thinkingConfig" in payload.get("generationConfig", {}) and attempt == 0:
+                    payload["generationConfig"].pop("thinkingConfig", None)
                     continue
 
                 if status == 429:
                     _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 60.0
-                elif status == 404:
-                    _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 3600.0
+                elif status in (404, 500):
+                    _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 300.0
                 api_log(f"Gemma AI Studio ({purpose}) -> {model_id} HTTP {status} ({elapsed:.2f}s)")
                 break
             except Exception as e:
+                _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 120.0
                 api_log(f"Gemma AI Studio ({purpose}) -> {model_id} failed ({type(e).__name__})")
                 break
 
@@ -525,11 +541,11 @@ async def call_gemini_chat_messages(
 
 
 async def call_cloudflare_gemma_chat(
-    messages: list, temperature: float = 0.4, max_tokens: int = 2048, purpose: str = "CFGemmaChat"
+    messages: list, temperature: float = 0.4, max_tokens: int = 1024, purpose: str = "CFGemmaChat"
 ) -> str:
     """
     Utilizes Cloudflare Workers AI's 10,000 free daily Neurons on @cf/google/gemma-4-26b-a4b-it
-    for fast text chat, search synthesis, and agent planning.
+    with thinking disabled so responses return in ~1.5s-3s without timing out.
     """
     global _CF_GEMMA_COOLDOWN_UNTIL
     if not CF_ACCOUNT_ID or not CF_API_TOKEN or time.time() < _CF_GEMMA_COOLDOWN_UNTIL:
@@ -541,17 +557,29 @@ async def call_cloudflare_gemma_chat(
         "Authorization": f"Bearer {CF_API_TOKEN}",
         "Content-Type": "application/json",
     }
+    # Instruct Gemma 4 not to emit long reasoning chains
+    cf_messages = []
+    for idx, m in enumerate(messages):
+        if idx == 0 and m.get("role") == "system":
+            cf_messages.append({
+                "role": "system",
+                "content": m.get("content", "") + "\n\n[CRITICAL: Answer directly and concisely. Do NOT output internal thinking steps.]",
+            })
+        else:
+            cf_messages.append(m)
+
     payload = {
         "model": CF_VISION_MODEL,
-        "messages": messages,
+        "messages": cf_messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     t0 = time.monotonic()
     try:
         session = get_http_session()
         async with session.post(
-            cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=25)
+            cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=15)
         ) as resp:
             elapsed = time.monotonic() - t0
             if resp.status == 200:
@@ -568,6 +596,7 @@ async def call_cloudflare_gemma_chat(
                 _CF_GEMMA_COOLDOWN_UNTIL = time.time() + 300.0
             api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} HTTP {resp.status} ({elapsed:.2f}s)")
     except Exception as e:
+        _CF_GEMMA_COOLDOWN_UNTIL = time.time() + 120.0
         api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} failed ({type(e).__name__})")
     return ""
 
@@ -797,13 +826,19 @@ async def query_local_ollama_chat(
             f"[ไฟล์อ้างอิงล่าสุดในห้องแชทนี้ (ใช้ประกอบการตอบหากคำถามต่อเนื่องกัน)]:\n{cached_ctx}"
         )
 
-    if allow_agentic_search and detect_weather_intent(prompt):
-        weather_block = await fetch_live_weather_context(prompt)
+    is_weather_query = allow_agentic_search and detect_weather_intent(prompt, channel_id=channel_id)
+    if is_weather_query:
+        weather_block = await fetch_live_weather_context(prompt, channel_id=channel_id)
         if weather_block:
-            working_prompt = f"{working_prompt}\n\n{weather_block}"
+            working_prompt = (
+                f"{working_prompt}\n\n{weather_block}\n"
+                "[หมายเหตุ: ใช้ข้อมูลพยากรณ์อากาศและแนวโน้มรายชั่วโมงด้านบนตอบโดยตรง (พกร่ม/เสื้อกันฝน) ห้ามแต่งตัวเลขหรือทิศทางลมขึ้นมาเอง]"
+            )
 
+    # Skip redundant 11s web search if this is a weather query that already has <live_weather_report>!
     if (
         allow_agentic_search
+        and not is_weather_query
         and "<untrusted_web_search_results" not in working_prompt
         and (detect_web_search_intent(prompt, channel_id=channel_id) or is_user_correction or is_factual_domain)
     ):
@@ -926,40 +961,40 @@ async def query_local_ollama_chat(
                 except Exception as e:
                     print(f"Gemini FactSearchChat fallback warning: {e}")
 
-        # PATH C: Casual Chat & Voice Chat ->
-        # 1) Google AI Studio Gemma 4 (31B/26B, 14.4K RPD, ~1.5s latency, zero Modal cold start!)
-        # 2) Cloudflare Workers AI Gemma 4 (26B MoE, 10K Neurons/day)
-        # 3) Modal GPU Ollama (scb10x/typhoon2.5-qwen3-4b)
-        # 4) Groq Fallback
-        chat_temp = 0.25 if (did_search or is_user_correction) else temperature
+        # PATH C: Casual Chat, Weather & Voice Chat ->
+        # 1) Google AI Studio Gemma 4 (26B/31B, thinkingBudget=0 -> ~1.2s!)
+        # 2) Cloudflare Workers AI Gemma 4 (26B MoE)
+        # 3) Groq LPU (openai/gpt-oss-20b / qwen3.8-27b -> ~0.5s!)
+        # 4) Modal GPU Ollama (scb10x/typhoon2.5-qwen3-4b)
+        chat_temp = 0.25 if (did_search or is_user_correction or is_weather_query) else temperature
 
         ans = await call_gemma_ai_studio_chat(
-            messages, temperature=chat_temp, max_output_tokens=1536, purpose="Chat"
+            messages, temperature=chat_temp, max_output_tokens=1024, purpose="Chat"
         )
         if ans:
             return ans
 
         ans = await call_cloudflare_gemma_chat(
-            messages, temperature=chat_temp, max_tokens=1536, purpose="Chat"
+            messages, temperature=chat_temp, max_tokens=1024, purpose="Chat"
         )
         if ans:
             return ans
+
+        if GROQ_API_KEY:
+            for g_mod in await get_groq_search_and_chat_candidates():
+                try:
+                    ans = await call_groq_chat(messages, g_mod, chat_temp, is_coding=False, purpose="ChatFallback")
+                    if ans:
+                        return ans
+                except Exception:
+                    continue
 
         try:
             ans = await call_modal_ollama_chat(messages, model, chat_temp, purpose="Chat")
             if ans:
                 return ans
         except Exception as e:
-            print(f"Modal GPU chat fallback to Groq: {e}")
-
-        if GROQ_API_KEY:
-            for g_mod in await get_groq_search_and_chat_candidates():
-                try:
-                    ans = await call_groq_chat(messages, g_mod, temperature, is_coding=False, purpose="ChatFallback")
-                    if ans:
-                        return ans
-                except Exception:
-                    continue
+            print(f"Modal GPU chat error: {e}")
 
         return "ระบบประมวลผลไม่สามารถเชื่อมต่อได้ชั่วคราวค่ะ กรุณาลองใหม่อีกครั้งนะคะ"
 

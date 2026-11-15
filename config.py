@@ -162,6 +162,8 @@ channel_memory = defaultdict(lambda: deque(maxlen=12))
 channel_active_topic = {}
 # Stores the most recent file/code attachment per channel (30-min TTL)
 channel_last_attachment = {}
+# Stores the most recent live weather report per channel (30-min TTL) for follow-up questions
+channel_last_weather = {}
 # Persistent in-memory notes per channel for Autonomous Agent mode
 agent_notes_store = defaultdict(list)
 # False = reply to all speech in voice channel; True = require wake word ("ยูกิโนะ", etc.)
@@ -412,6 +414,7 @@ CODE_INTENT_PATTERN = re.compile(
 )
 WEATHER_INTENT_PATTERN = re.compile(
     r"(\b(weather|forecast|rain|raining|temperature|humidity|pm2\.5|storm)\b|"
-    r"ฝนตก|ฝนจะตก|พยากรณ์อากาศ|สภาพอากาศ|อากาศวันนี้|อากาศตอนนี้|อุณหภูมิ|ค่าฝุ่น|ร้อนไหม|หนาวไหม)",
-    re.IGNORECASE
+    r"ฝนตก|ฝนจะตก|จะตกไหม|จะตกมั้ย|ตกไหม|ตกมั้ย|ตกกี่โมง|หยุดตก|พกร่ม|ฟ้าครึ้ม|แดดออก|"
+    r"พยากรณ์อากาศ|สภาพอากาศ|อากาศวันนี้|อากาศตอนนี้|อากาศช่วง|อุณหภูมิ|ค่าฝุ่น|ร้อนไหม|หนาวไหม)",
+    re.IGNORECASE,
 )

@@ -37,6 +37,7 @@ from config import (
     channel_memory,
     channel_active_topic,
     channel_last_attachment,
+    channel_last_weather,
     state,
     clean_url,
     api_log,
@@ -63,10 +64,6 @@ def detect_coding_intent(text: str, attachments: list, channel_id: int = None) -
         if channel_last_attachment[channel_id].get("is_code"):
             return True
     return False
-
-
-def detect_weather_intent(text: str) -> bool:
-    return bool(WEATHER_INTENT_PATTERN.search(text))
 
 
 def detect_web_search_intent(text: str, channel_id: int = None) -> bool:
@@ -229,17 +226,41 @@ def build_contextual_search_query(user_text: str, channel_id: int = None) -> str
     return (stripped or subject_prefix or raw)[:140]
 
 
-async def fetch_live_weather_context(user_text: str) -> str:
+# Add `channel_last_weather` to `from config import (...)` at the top of search_engine.py
+
+
+def detect_weather_intent(text: str, channel_id: int = None) -> bool:
+    if WEATHER_INTENT_PATTERN.search(text):
+        return True
+    # If weather was fetched in this channel within the last 20 minutes and the user asks a time-of-day follow-up
+    if channel_id and channel_id in channel_last_weather:
+        if time.time() - channel_last_weather[channel_id].get("timestamp", 0) < 1200:
+            if re.search(r"(ช่วงเช้า|ตอนเช้า|ช่วงบ่าย|ตอนบ่าย|ช่วงเย็น|ตอนเย็น|กลางคืน|ดึก|คืนนี้|พรุ่งนี้|กี่โมง)", text):
+                return True
+    return False
+
+
+async def fetch_live_weather_context(user_text: str, channel_id: int = None) -> str:
     lat = DEFAULT_WEATHER_LAT
     lon = DEFAULT_WEATHER_LON
     loc_display = DEFAULT_WEATHER_CITY
     wttr_query = f"{lat},{lon}"
+    custom_loc_requested = False
 
     for th_key, (k_lat, k_lon, k_disp, k_wttr) in THAI_LOCATION_COORDS.items():
         if th_key in user_text:
             lat, lon, loc_display, wttr_query = k_lat, k_lon, k_disp, k_wttr
+            custom_loc_requested = True
             break
 
+    # Reuse cached weather report if fetched within the last 10 minutes for the same location
+    if not custom_loc_requested and channel_id and channel_id in channel_last_weather:
+        cached_w = channel_last_weather[channel_id]
+        if time.time() - cached_w.get("timestamp", 0) < 600 and cached_w.get("report"):
+            api_log(f"Weather (Cached) -> {loc_display} (reused recent report)")
+            return cached_w["report"]
+
+    # Tier 1: Open-Meteo High-Resolution Forecast
     t0 = time.monotonic()
     try:
         om_url = clean_url(
@@ -251,7 +272,7 @@ async def fetch_live_weather_context(user_text: str) -> str:
             "&timezone=Asia%2FBangkok&forecast_days=1"
         )
         session = get_http_session()
-        async with session.get(om_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+        async with session.get(om_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
             if resp.status == 200:
                 om = await resp.json()
                 api_log(f"Weather (Tier 1 Open-Meteo) -> {loc_display} ({lat},{lon}) 200 OK ({time.monotonic() - t0:.2f}s)")
@@ -281,24 +302,28 @@ async def fetch_live_weather_context(user_text: str) -> str:
                         f"- เวลา {time_label} น.: {temp_v}°C | โอกาสฝนตก {prob_v}% ({desc_v})"
                     )
 
-                return (
+                report = (
                     f'<live_weather_report location="{loc_display}" coordinates="{lat},{lon}">\n'
                     f"พื้นที่พยากรณ์: {loc_display} (พิกัด {lat}, {lon})\n"
                     f"สภาพอากาศปัจจุบัน: {curr_desc} | อุณหภูมิ: {c.get('temperature_2m')}°C (รู้สึกเหมือน {c.get('apparent_temperature')}°C)\n"
                     f"ความชื้นสัมพัทธ์: {c.get('relative_humidity_2m')}% | ลม: {c.get('wind_speed_10m')} km/h | ปริมาณฝนขณะนี้: {c.get('precipitation')} มม.\n"
                     f"อุณหภูมิต่ำสุด-สูงสุดวันนี้: {t_min}°C ถึง {t_max}°C | โอกาสเกิดฝนตกสูงสุดของวันนี้: {rain_prob_max}%\n"
-                    f"แนวโน้มรายชั่วโมงวันนี้:\n" + "\n".join(hourly_lines) + "\n"
+                    f"แนวโน้มรายชั่วโมงวันนี้ (เช้า/บ่าย/เย็น/กลางคืน):\n" + "\n".join(hourly_lines) + "\n"
                     f"</live_weather_report>"
                 )
+                if channel_id:
+                    channel_last_weather[channel_id] = {"report": report, "timestamp": time.time()}
+                return report
     except Exception as e:
         api_log(f"Weather (Tier 1 Open-Meteo) -> failed ({type(e).__name__}); falling back to wttr.in")
 
+    # Tier 2 Fallback: wttr.in (Now includes full 3-hour hourly breakdown for evening/night questions!)
     t1 = time.monotonic()
     url = clean_url(f"{HTTPS}wttr.in/{wttr_query}?format=j1&lang=th")
     try:
         session = get_http_session()
         async with session.get(
-            url, headers={"User-Agent": "curl/8.5.0"}, timeout=aiohttp.ClientTimeout(total=8)
+            url, headers={"User-Agent": "curl/8.5.0"}, timeout=aiohttp.ClientTimeout(total=6)
         ) as resp:
             raw_text = await resp.text()
             if resp.status == 200 and raw_text.lstrip().startswith("{"):
@@ -318,13 +343,30 @@ async def fetch_live_weather_context(user_text: str) -> str:
 
                 rain_chances = [int(h.get("chanceofrain", 0)) for h in hourly if "chanceofrain" in h]
                 max_rain_chance = max(rain_chances) if rain_chances else 0
-                return (
+
+                hourly_lines = []
+                for h_item in hourly:
+                    raw_tm = str(h_item.get("time", "0")).zfill(4)
+                    hh_str = f"{raw_tm[:2]}:{raw_tm[2:]}"
+                    h_temp = h_item.get("tempC", "?")
+                    h_rain = h_item.get("chanceofrain", "0")
+                    h_desc_list = h_item.get("lang_th") or h_item.get("weatherDesc") or [{"value": "ปกติ"}]
+                    h_desc = h_desc_list[0].get("value", "ปกติ").strip()
+                    hourly_lines.append(
+                        f"- เวลา {hh_str} น.: {h_temp}°C | โอกาสฝนตก {h_rain}% ({h_desc})"
+                    )
+
+                report = (
                     f'<live_weather_report location="{loc_display}">\n'
                     f"สภาพอากาศปัจจุบัน ({loc_display}): {cond_desc}\n"
                     f"อุณหภูมิปัจจุบัน: {temp_c}°C (รู้สึกเหมือน {feels_c}°C) | ความชื้น: {humidity}% | น้ำฝน: {precip_mm} มม.\n"
                     f"โอกาสเกิดฝนตกสูงสุดของวันนี้: {max_rain_chance}%\n"
+                    f"แนวโน้มรายชั่วโมงวันนี้ (เช้า/บ่าย/เย็น/กลางคืน):\n" + "\n".join(hourly_lines) + "\n"
                     f"</live_weather_report>"
                 )
+                if channel_id:
+                    channel_last_weather[channel_id] = {"report": report, "timestamp": time.time()}
+                return report
     except Exception as e:
         api_log(f"Weather (Tier 2 wttr.in) -> failed ({type(e).__name__})")
     return ""
