@@ -625,7 +625,7 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
             raw_bytes = await att.read()
             fname = att.filename.lower()
             if fname.endswith(AUDIO_EXTENSIONS):
-                wav_bytes = await asyncio.to_thread(convert_audio_bytes_to_wav\_sync, raw_bytes)
+                wav_bytes = await asyncio.to_thread(convert_audio_bytes_to_wav_sync, raw_bytes)
                 spoken_txt = await transcribe_wav_bytes_hybrid(wav_bytes)
                 if spoken_txt:
                     voice_clip_transcripts.append(spoken_txt)
