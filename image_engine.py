@@ -419,8 +419,8 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
             or item.get("text")
             or ""
         )
-        tr_txt = str(tr_txt).strip()
-        src_txt = str(src_txt).strip()
+        tr_txt = re.sub(r"\s+", " ", str(tr_txt)).strip()
+        src_txt = re.sub(r"\s+", " ", str(src_txt)).strip()
         if not tr_txt:
             continue
 
@@ -863,9 +863,10 @@ def _wrap_text_to_pixel_width(
     max_width: int,
     allow_midword_split: bool = False,
 ) -> list[str]:
-    is_thai = bool(THAI_CHAR_REGEX.search(text))
-    has_spaces = " " in text
-    words = text.split(" ") if has_spaces else [text]
+    clean_text = re.sub(r"\s+", " ", text).strip()
+    is_thai = bool(THAI_CHAR_REGEX.search(clean_text))
+    has_spaces = " " in clean_text
+    words = clean_text.split(" ") if has_spaces else [clean_text]
     lines = []
     current = ""
 
@@ -881,7 +882,6 @@ def _wrap_text_to_pixel_width(
                 lines.append(current)
                 current = ""
             wbbox = draw.textbbox((0, 0), word, font=font)
-            # Never split English/Latin words mid-word unless allow_midword_split is True (even for 1-word strings like 'Nazono...?')
             if (wbbox[2] - wbbox[0]) <= max_width or (not is_thai and not allow_midword_split):
                 current = word
             else:
@@ -1002,15 +1002,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
     raw_y2: int,
     is_dark_bubble: bool = False,
 ) -> tuple[int, int, int, int, tuple[int, int, int], tuple[int, int, int]]:
-    """
-    Handles BOTH:
-    - Case A: Dark / Black speech bubbles (`is_dark_bubble=True`):
-      Erases white/light Japanese text & furigana using the bubble's exact dark background shade,
-      and returns white text `(248, 248, 248)` with a black stroke `(12, 12, 12)`.
-    - Case B: Light / White speech bubbles (`is_dark_bubble=False`):
-      Uses multi-point vertical spine seeding + direct interior text cleaning so bottom kanji/furigana
-      (like 法 まほう) are 100% erased without leaking into hair/speedlines, and returns black text on white stroke.
-    """
     width, height = img.size
     box_w = max(10, x2 - x1)
     box_h = max(10, y2 - y1)
@@ -1033,39 +1024,37 @@ def _erase_bubble_japanese_text_and_measure_lobe(
     if is_dark_bubble:
         core_crop = base_gray.crop((max(0, raw_x1), max(0, raw_y1), min(width, raw_x2), min(height, raw_y2)))
         core_pixels = sorted(core_crop.getdata())
-        # Use 25th-percentile dark pixel value as the exact dark background fill shade of this bubble
-        bg_shade = int(core_pixels[len(core_pixels) // 4]) if core_pixels else 18
-        bg_shade = max(8, min(55, bg_shade))
+        # Use 10th-percentile dark pixel value so pure black bubbles stay pure black without gray ghosting
+        bg_shade = int(core_pixels[len(core_pixels) // 10]) if core_pixels else 10
+        bg_shade = max(4, min(38, bg_shade))
         dark_fill_rgb = (bg_shade, bg_shade, bg_shade)
-        fg_text_rgb = (248, 248, 248)
-        stroke_rgb = (12, 12, 12)
+        fg_text_rgb = (250, 250, 250)
+        stroke_rgb = (10, 10, 10)
 
-        # Find the connected dark bubble body around the text box
         bin_dark_bg = sub_gray.point(lambda p: 255 if p <= 115 else 0)
         ImageDraw.Draw(bin_dark_bg).rectangle([0, 0, ww - 1, wh - 1], outline=0)
 
-        # Seed along the vertical spine of the text box
         seeded_dark = 0
-        ry1_rel = max(2, raw_y1 - wy1)
-        ry2_rel = min(wh - 3, raw_y2 - wy1)
-        for frac in (0.20, 0.35, 0.50, 0.65, 0.80):
+        ry1_rel = max(2, min(y1, raw_y1) - wy1)
+        ry2_rel = min(wh - 3, max(y2, raw_y2) - wy1)
+        for frac in (0.18, 0.34, 0.50, 0.66, 0.82):
             sy = int(ry1_rel + (ry2_rel - ry1_rel) * frac)
             for dx in (0, -6, 6, -12, 12, -18, 18):
                 sx = max(2, min(ww - 3, rel_cx + dx))
-                if bin_dark_bg.getpixel((sx, sy)) == 255:
+                if 2 <= sx < ww - 2 and 2 <= sy < wh - 2 and bin_dark_bg.getpixel((sx, sy)) == 255:
                     ImageDraw.floodfill(bin_dark_bg, (sx, sy), 128)
                     seeded_dark += 1
 
-        # Erase all white/gray Japanese text & furigana inside the bubble's text area (clamped to Voronoi)
-        tx_clean_x1 = max(2, min(x1, raw_x1) - 10 - wx1)
-        tx_clean_y1 = max(2, min(y1, raw_y1) - 10 - wy1)
-        tx_clean_x2 = min(ww - 2, max(x2, raw_x2) + 10 - wx1)
-        tx_clean_y2 = min(wh - 2, max(y2, raw_y2) + 10 - wy1)
+        tx_clean_x1 = max(2, min(x1, raw_x1) - 12 - wx1)
+        tx_clean_y1 = max(2, min(y1, raw_y1) - 12 - wy1)
+        tx_clean_x2 = min(ww - 2, max(x2, raw_x2) + 12 - wx1)
+        tx_clean_y2 = min(wh - 2, max(y2, raw_y2) + 12 - wy1)
 
         text_box_mask = Image.new("L", (ww, wh), 0)
         ImageDraw.Draw(text_box_mask).rectangle(
             [tx_clean_x1, tx_clean_y1, tx_clean_x2, tx_clean_y2], fill=255
         )
+        filled_dark_bubble = None
         if seeded_dark > 0:
             dark_paper = bin_dark_bg.point(lambda p: 255 if p == 128 else 0)
             padded_d = Image.new("L", (ww + 4, wh + 4), 0)
@@ -1073,31 +1062,67 @@ def _erase_bubble_japanese_text_and_measure_lobe(
             ImageDraw.floodfill(padded_d, (0, 0), 128)
             enclosed_white = padded_d.crop((2, 2, ww + 2, wh + 2)).point(lambda p: 255 if p == 0 else 0)
             filled_dark_bubble = ImageChops.lighter(dark_paper, enclosed_white)
-            text_box_mask = ImageChops.lighter(
-                text_box_mask,
-                ImageChops.darker(filled_dark_bubble, text_box_mask),
-            )
+            text_box_mask = ImageChops.lighter(text_box_mask, filled_dark_bubble)
 
-        # Any pixel brighter than bg_shade + 18 inside text_box_mask is white text or its anti-aliased glow
-        bright_ink = sub_gray.point(lambda p: 255 if p > (bg_shade + 18) else 0)
+        # Erase all pixels brighter than bg_shade + 8 inside the dark bubble so no gray kanji shadows remain
+        bright_ink = sub_gray.point(lambda p: 255 if p > (bg_shade + 8) else 0)
         erase_mask_dark = ImageChops.darker(
             bright_ink.filter(ImageFilter.MaxFilter(5)),
             text_box_mask,
         )
         img.paste(Image.new("RGB", (ww, wh), dark_fill_rgb), (wx1, wy1), mask=erase_mask_dark)
 
-        # Layout box for dark bubble: use the union of raw box and ink box with a small horizontal margin
-        lx1 = max(vor_x1 + 4, min(x1, raw_x1) - 4)
-        lx2 = min(vor_x2 - 4, max(x2, raw_x2) + 4)
-        ly1 = max(vor_y1 + 4, min(y1, raw_y1))
-        ly2 = min(vor_y2 - 4, max(y2, raw_y2))
+        # Measure full usable horizontal width of filled_dark_bubble so text in wide black bubbles isn't cramped
+        if filled_dark_bubble is not None:
+            d_bbox = filled_dark_bubble.getbbox()
+            if d_bbox:
+                db_x1, db_y1, db_x2, db_y2 = d_bbox
+                rel_y1 = max(db_y1 + 6, min(ry1_rel, (db_y1 + ry1_rel) // 2))
+                rel_y2 = min(db_y2 - 6, max(ry2_rel, (db_y2 + ry2_rel) // 2))
+                if rel_y2 - rel_y1 < 20:
+                    rel_y1, rel_y2 = db_y1 + 5, db_y2 - 5
+
+                mid_y_start = rel_y1 + int((rel_y2 - rel_y1) * 0.20)
+                mid_y_end = rel_y1 + int((rel_y2 - rel_y1) * 0.80)
+                row_lefts = []
+                row_rights = []
+                for sy in range(mid_y_start, max(mid_y_start + 1, mid_y_end), max(2, (mid_y_end - mid_y_start) // 7 or 1)):
+                    if not (0 <= sy < wh):
+                        continue
+                    lx = rel_cx
+                    while lx > db_x1 and filled_dark_bubble.getpixel((lx - 1, sy)) > 128:
+                        lx -= 1
+                    rx = rel_cx
+                    while rx < db_x2 and filled_dark_bubble.getpixel((rx, sy)) > 128:
+                        rx += 1
+                    if rx - lx >= 16:
+                        row_lefts.append(lx)
+                        row_rights.append(rx)
+
+                if row_lefts and row_rights:
+                    row_lefts.sort()
+                    row_rights.sort()
+                    inner_l = row_lefts[int(len(row_lefts) * 0.65)] + 6
+                    inner_r = row_rights[int(len(row_rights) * 0.35)] - 6
+                    if inner_r - inner_l >= 24:
+                        return (
+                            wx1 + inner_l,
+                            wy1 + rel_y1,
+                            wx1 + inner_r,
+                            wy1 + rel_y2,
+                            fg_text_rgb,
+                            stroke_rgb,
+                        )
+
+        lx1 = max(vor_x1 + 4, min(x1, raw_x1) - 12)
+        lx2 = min(vor_x2 - 4, max(x2, raw_x2) + 12)
+        ly1 = max(vor_y1 + 4, min(y1, raw_y1) - 6)
+        ly2 = min(vor_y2 - 4, max(y2, raw_y2) + 6)
         return lx1, ly1, lx2, ly2, fg_text_rgb, stroke_rgb
 
     # =========================================================================
     # CASE B: LIGHT / WHITE BUBBLE (Black text on White fill)
     # =========================================================================
-    # 1. Seed flood-fill on un-eroded white pixels (p >= 200) along 5 vertical spine points of the text column
-    #    so dense kanji/furigana in the middle never block the flood-fill from reaching the bottom of the bubble!
     bin_white = sub_gray.point(lambda p: 255 if p >= 200 else 0)
     ImageDraw.Draw(bin_white).rectangle([0, 0, ww - 1, wh - 1], outline=0)
 
@@ -1116,7 +1141,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
     if seeded_white > 0:
         white_paper = bin_white.point(lambda p: 255 if p == 128 else 0)
 
-        # Find all enclosed dark holes (Japanese characters) inside white_paper using a 2px exterior moat
         padded = Image.new("L", (ww + 4, wh + 4), 0)
         padded.paste(white_paper, (2, 2))
         ImageDraw.floodfill(padded, (0, 0), 128)
@@ -1124,13 +1148,10 @@ def _erase_bubble_japanese_text_and_measure_lobe(
         interior_holes = padded.crop((2, 2, ww + 2, wh + 2)).point(lambda p: 255 if p == 0 else 0)
         filled_bubble = ImageChops.lighter(white_paper, interior_holes)
 
-        # Also directly clean any dark text/furigana strokes inside the raw text box (raw_x1..raw_x2, raw_y1..raw_y2)
-        # that lie inside the 2px-eroded interior of filled_bubble (catches bottom furigana like 法 まほう!)
         safe_inner_bubble = filled_bubble.filter(ImageFilter.MinFilter(5))
         dark_in_window = sub_gray.point(lambda p: 255 if p < 220 else 0)
         core_text_pixels = ImageChops.darker(dark_in_window, safe_inner_bubble)
 
-        # Furthermore, clean isolated dark characters strictly inside (raw_x1..raw_x2, raw_y1..raw_y2)
         rc_x1 = max(2, min(x1, raw_x1) - 4 - wx1)
         rc_y1 = max(2, min(y1, raw_y1) - 4 - wy1)
         rc_x2 = min(ww - 2, max(x2, raw_x2) + 4 - wx1)
@@ -1155,7 +1176,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
             ImageChops.lighter(interior_holes, core_text_pixels),
             raw_box_holes,
         )
-        # Dilate by 2px (MaxFilter(5)) to wipe anti-aliasing halos, clamped to filled_bubble + raw_box_holes
         allowed_erase_zone = ImageChops.lighter(filled_bubble, raw_box_holes.filter(ImageFilter.MaxFilter(3)))
         dilated_erase = ImageChops.darker(
             combined_erase.filter(ImageFilter.MaxFilter(5)),
@@ -1202,7 +1222,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
                     ty2 = wy1 + rel_y2
                     return tx1, ty1, tx2, ty2, (15, 15, 15), (255, 255, 255)
 
-    # Fallback for borderless white text
     core_x1 = max(vor_x1, min(x1, raw_x1))
     core_y1 = max(vor_y1, min(y1, raw_y1))
     core_x2 = min(vor_x2, max(x2, raw_x2))
