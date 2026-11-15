@@ -362,17 +362,18 @@ async def call_gemma_ai_studio_vision(
     mime_type: str,
     b64_img: str,
     response_mime_type: str = None,
-    timeout_sec: int = 25,
+    timeout_sec: int = 22,
     purpose: str = "GemmaVision",
 ) -> str:
     """
-    Calls multimodal Gemma 4 (gemma-4-26b-a4b-it / gemma-4-31b-it) on Google AI Studio for Vision OCR,
-    Sticker inspection, and Manga translation fallback (conserving gemini-3-flash-preview's 20 RPD).
+    Calls multimodal Gemma 4 (gemma-4-26b-a4b-it / gemma-4-31b-it) on Google AI Studio
+    with thinkingBudget=0 so vision OCR/identification completes in ~2-4s without timing out.
     """
     if not GEMINI_API_KEY:
         return ""
 
-    candidates = await discover_active_gemma_models(vision_required=True)
+    discovered = await discover_active_gemma_models(vision_required=True)
+    candidates = sorted(discovered, key=lambda x: (0 if "26b" in x else 1))
     session = get_http_session()
 
     for model_id in candidates:
@@ -383,7 +384,11 @@ async def call_gemma_ai_studio_vision(
             f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
             f"{model_id}:generateContent?key={GEMINI_API_KEY}"
         )
-        gen_cfg = {"temperature": 0.1, "maxOutputTokens": 4096}
+        gen_cfg = {
+            "temperature": 0.1,
+            "maxOutputTokens": 2048,
+            "thinkingConfig": {"thinkingBudget": 0},
+        }
         if response_mime_type:
             gen_cfg["responseMimeType"] = response_mime_type
 
@@ -412,23 +417,30 @@ async def call_gemma_ai_studio_vision(
                 if status == 200:
                     data = json.loads(body_text)
                     parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-                    out = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+                    text_parts = [
+                        p.get("text", "") for p in parts
+                        if p.get("text") and not p.get("thought", False)
+                    ]
+                    out = "\n".join(text_parts).strip()
                     out = re.sub(r"<think>[\s\S]*?</think>", "", out).strip()
+                    out = re.sub(r"<\|thought\|>[\s\S]*?<\|/thought\|>", "", out).strip()
                     if out:
                         api_log(f"Gemma AI Studio ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
                         return out
 
-                if status == 400 and "responseMimeType" in payload.get("generationConfig", {}) and attempt == 0:
+                if status in (400, 500) and attempt == 0:
+                    payload["generationConfig"].pop("thinkingConfig", None)
                     payload["generationConfig"].pop("responseMimeType", None)
                     continue
 
                 if status == 429:
                     _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 60.0
-                elif status == 404:
-                    _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 3600.0
+                elif status in (404, 500):
+                    _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 180.0
                 api_log(f"Gemma AI Studio ({purpose}) -> {model_id} HTTP {status} ({elapsed:.2f}s)")
                 break
             except Exception as e:
+                _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 120.0
                 api_log(f"Gemma AI Studio ({purpose}) -> {model_id} failed ({type(e).__name__})")
                 break
 
@@ -602,7 +614,7 @@ async def call_cloudflare_gemma_chat(
 
 
 async def call_cloudflare_vision_chat(
-    prompt_text: str, mime_type: str, b64_img: str, max_tokens: int = 3072, purpose: str = "Vision"
+    prompt_text: str, mime_type: str, b64_img: str, max_tokens: int = 2048, purpose: str = "Vision"
 ) -> str:
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
         return ""
@@ -617,7 +629,7 @@ async def call_cloudflare_vision_chat(
         "messages": [
             {
                 "role": "system",
-                "content": "Respond directly with the requested output. Do not generate long reasoning or thinking steps.",
+                "content": "Respond directly and concisely with the requested output. Do NOT output internal thinking steps.",
             },
             {
                 "role": "user",
@@ -629,12 +641,13 @@ async def call_cloudflare_vision_chat(
         ],
         "temperature": 0.1,
         "max_tokens": max_tokens,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     t0 = time.monotonic()
     try:
         session = get_http_session()
         async with session.post(
-            cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=22)
+            cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=18)
         ) as resp:
             elapsed = time.monotonic() - t0
             if resp.status == 200:

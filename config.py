@@ -401,8 +401,9 @@ IMAGE_GEN_INTENT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 MANGA_TRANSLATE_INTENT_PATTERN = re.compile(
-    r"(แปลมังงะ|แปลรูป|แปลภาพ|แปลการ์ตูน|แปลข้อความ|แปลหน้านี้|แปลอันนี้|ช่วยแปล|แปลเป็น|"
-    r"translate\s+(this|manga|image|panel|comic|page|to\s+))",
+    r"(แปลมังงะ|แปลรูป|แปลภาพ|แปลการ์ตูน|แปลข้อความ|แปลหน้า|แปลอันนี้|แปลพวกนี้|ช่วยแปล|แปลเป็น|"
+    r"\btranslate\b.*?\b(?:this|these|all|manga|manhwa|image|images|panel|panels|comic|page|pages|bubble|bubbles)\b|"
+    r"\btranslate\s+to\s+)",
     re.IGNORECASE,
 )
 OWNER_NAME_STRIP_REGEX = re.compile(

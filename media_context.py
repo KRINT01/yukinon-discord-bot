@@ -437,34 +437,41 @@ async def _search_tracemoe_async(raw_bytes: bytes, mime_type: str) -> str:
     return ""
 
 
+def _compress_image_for_vision_ocr_sync(raw_bytes: bytes) -> tuple[str, str]:
+    """Resizes large PNG/WebP images to <=1280px JPEG so Vision APIs never throw HTTP 500 or timeout."""
+    from PIL import Image
+    img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    img.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    img.close()
+    return base64.b64encode(buf.getvalue()).decode("utf-8"), "image/jpeg"
+
+
 async def extract_image_via_transient_ocr(
     raw_bytes: bytes, filename: str, run_source_lookup: bool = True
 ) -> str:
-    b64_img = base64.b64encode(raw_bytes).decode("utf-8")
-    fname_lower = filename.lower()
-    if fname_lower.endswith(".png"):
-        mime_type = "image/png"
-    elif fname_lower.endswith(".webp"):
-        mime_type = "image/webp"
-    else:
-        mime_type = "image/jpeg"
+    try:
+        b64_img, mime_type = await asyncio.to_thread(_compress_image_for_vision_ocr_sync, raw_bytes)
+    except Exception:
+        b64_img = base64.b64encode(raw_bytes).decode("utf-8")
+        mime_type = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
 
     ocr_prompt = (
         "Analyze this image thoroughly for Yukino Yukinoshita so she can identify its exact source, "
         "read any text, and give her sharp personal critique.\n"
         "Provide your output in 3 concise sections:\n"
-        "1. [Identification & Origin]: Identify what type of image this is:\n"
-        "   - If Illustration/Anime/Manga: State the likely Franchise/Series, Character name(s), Artist signature/handle (if visible), and Manga Title/Chapter clues.\n"
-        "   - If Real-World Photo/Product/Hardware: Identify the exact Brand, Product Line, Model Name/Number (e.g., phone model, espresso machine, scale model kit, audio gear), and distinguishing physical features (camera layout, buttons, logos).\n"
-        "   - Visual Scene & Details: Describe the scene, expressions, environment, aesthetic quality, composition, any cats or pandas, and any notable, messy, or amusing details.\n"
-        "2. [Verbatim OCR Text]: Transcribe ALL visible text (Thai, Japanese, English) verbatim.\n"
-        "   Pay close attention to Thai tone marks (วรรณยุกต์), vowels (สระ), and visually similar consonants "
+        "1. [Identification & Origin]:\n"
+        "   - If Illustration/Anime/Manga: State the Series/Character ONLY if you are 100% certain. "
+        "NEVER guess random famous series if unsure! Describe the visual scene, expressions, composition, and any cats or pandas.\n"
+        "   - If Real-World Photo/Product/Hardware: Identify the Brand, Product Line, Model Name/Number, and distinguishing physical features (camera layout, buttons, logos).\n"
+        "2. [Verbatim OCR Text]: Transcribe ALL visible text (Thai, Japanese, English) verbatim. "
+        "Pay close attention to Thai tone marks (วรรณยุกต์), vowels (สระ), and visually similar consonants "
         "(ก/ภ/ถ, ข/ช, ค/ด/ต, พ/ผ/ฝ/ฟ, ร/ธ), and note if the original text contains any spelling errors.\n"
-        "3. [WEB_VERIFY_QUERY]: On the very last line, if the image is a manga page, anime, artwork, or physical product/device whose exact chapter/model/source can be verified via Google Search, output:\n"
-        "   `[WEB_VERIFY_QUERY: <best 4-8 word search query using exact Japanese/English quotes, character names, or product model features>]`"
+        "3. [WEB_VERIFY_QUERY]: On the very last line, if the image is a manga page or product whose source/model should be looked up via Google Search, output:\n"
+        "   `[WEB_VERIFY_QUERY: <exact verbatim Japanese/English quote from the image OR exact visible product markings — NEVER put a guessed series name here>]`"
     )
 
-    # Run Reverse Image Search (SauceNAO / trace.moe) concurrently with Vision OCR when source lookup is enabled
     reverse_tasks = []
     if run_source_lookup:
         reverse_tasks = [
@@ -474,14 +481,14 @@ async def extract_image_via_transient_ocr(
 
     vision_result = ""
 
-    # Tier 1: Google AI Studio Gemma 4 Vision (gemma-4-26b-a4b-it / 31b-it — 14.4K RPD)
+    # Tier 1: Google AI Studio Gemma 4 Vision (gemma-4-26b-a4b-it / 31b-it)
     gemma_ocr = await call_gemma_ai_studio_vision(
-        ocr_prompt, mime_type, b64_img, timeout_sec=25, purpose="Image OCR Tier 1"
+        ocr_prompt, mime_type, b64_img, timeout_sec=20, purpose="Image OCR Tier 1"
     )
     if gemma_ocr:
         vision_result = gemma_ocr
 
-    # Tier 2: Cloudflare Workers AI Vision (@cf/google/gemma-4-26b-a4b-it — 10K Neurons/day)
+    # Tier 2: Cloudflare Workers AI Vision (@cf/google/gemma-4-26b-a4b-it)
     if not vision_result:
         cf_ocr = await call_cloudflare_vision_chat(ocr_prompt, mime_type, b64_img, purpose="Image OCR Tier 2")
         if cf_ocr:
@@ -512,10 +519,10 @@ async def extract_image_via_transient_ocr(
                         }
                     ],
                     "temperature": 0.0,
-                    "max_tokens": 4096,
+                    "max_tokens": 3072,
                 }
                 async with session.post(
-                    chat_url, headers=headers, json=groq_vision_payload, timeout=aiohttp.ClientTimeout(total=35)
+                    chat_url, headers=headers, json=groq_vision_payload, timeout=aiohttp.ClientTimeout(total=25)
                 ) as resp:
                     elapsed = time.monotonic() - t0
                     if resp.status == 200:
@@ -571,7 +578,6 @@ async def extract_image_via_transient_ocr(
         if saucenao_txt:
             out_parts.append(saucenao_txt)
         else:
-            # If SauceNAO had no match (or no API key set), try keyless IQDB for anime/illustration matches
             iqdb_txt = await _search_iqdb_keyless_async(raw_bytes, filename)
             if iqdb_txt:
                 out_parts.append(iqdb_txt)
@@ -580,10 +586,9 @@ async def extract_image_via_transient_ocr(
             out_parts.append(tracemoe_txt)
 
     if vision_result:
-        out_parts.append(f"=== Vision Analysis & OCR ===\n{vision_result}")
+        clean_vis = re.sub(r"\[WEB_VERIFY_QUERY:\s*[^\]]+?\]", "", vision_result, flags=re.IGNORECASE).strip()
+        out_parts.append(f"=== Vision Analysis & OCR ===\n{clean_vis}")
 
-        # If Vision emitted a [WEB_VERIFY_QUERY: ...] tag and reverse search didn't already give a Pixiv match,
-        # run a fast web search to verify the exact Manga Title/Chapter or Product Model!
         q_match = re.search(r"\[WEB_VERIFY_QUERY:\s*([^\]]+?)\s*\]", vision_result, re.IGNORECASE)
         if run_source_lookup and q_match:
             verify_q = q_match.group(1).strip()[:120]

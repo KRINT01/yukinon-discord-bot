@@ -274,8 +274,12 @@ async def on_message(message: discord.Message):
         await process_yukipedia_request(message, clean_prompt)
         return
 
-    # 1. Natural Chat Manga / Image Translation Trigger
-    if MANGA_TRANSLATE_INTENT_PATTERN.search(clean_prompt):
+    has_image_att = any(a.filename.lower().endswith(config.IMAGE_EXTENSIONS) for a in message.attachments)
+
+    # 1. Natural Chat Manga / Image Translation Trigger (handles 1 to 10 pages in a single batch)
+    if MANGA_TRANSLATE_INTENT_PATTERN.search(clean_prompt) or (
+        has_image_att and re.search(r"(แปล|\btranslate\b|\btl\b)", clean_prompt, re.IGNORECASE)
+    ):
         await process_manga_translation_request(message, clean_prompt)
         return
 
