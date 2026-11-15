@@ -71,6 +71,8 @@ CF_VISION_MODEL = os.getenv("CF_VISION_MODEL", "@cf/google/gemma-4-26b-a4b-it").
 # Google AI Studio Free Tier
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_SEARCH_MODEL = os.getenv("GEMINI_SEARCH_MODEL", "gemini-3-flash-preview").strip()
+GEMMA_CHAT_MODEL = os.getenv("GEMMA_CHAT_MODEL", "gemma-4-31b-it").strip()
+GEMMA_VISION_MODEL = os.getenv("GEMMA_VISION_MODEL", "gemma-4-26b-a4b-it").strip()
 
 # Search & Weather Defaults (Defaulting to Thung Song Hong, Lak Si: 13.862694, 100.555222)
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
@@ -125,6 +127,7 @@ class RuntimeState:
         self.http_session: aiohttp.ClientSession | None = None
         self.has_voice_recv: bool = False
         self.active_gemini_model: str = GEMINI_SEARCH_MODEL
+        self.active_gemma_model: str = GEMMA_CHAT_MODEL
         self.active_groq_search_model: str = GROQ_SEARCH_MODEL
         self.active_groq_vision_model: str = GROQ_VISION_FALLBACK_MODEL
         self.gemini_grounding_cooldown_until: float = 0.0

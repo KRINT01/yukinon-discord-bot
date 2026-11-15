@@ -32,6 +32,9 @@ from config import (
 )
 from llm import (
     call_gemini_generate_content_self_healing,
+    call_gemma_ai_studio_chat,
+    call_gemma_ai_studio_vision,
+    call_cloudflare_gemma_chat,
     call_modal_ollama_chat,
     call_groq_chat,
     call_cloudflare_vision_chat,
@@ -206,22 +209,16 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
         {"role": "user", "content": raw_prompt},
     ]
 
-    # Tier 2: Google AI Studio
-    if GEMINI_API_KEY:
+    # Tier 2: Google AI Studio Gemma 4 (14.4K RPD) & Cloudflare Gemma 4 (10K Neurons)
+    for gemma_fn, p_label in (
+        (call_gemma_ai_studio_chat, "Prompt Translate Tier 2 AI Studio Gemma 4"),
+        (call_cloudflare_gemma_chat, "Prompt Translate Tier 2 CF Gemma 4"),
+    ):
         try:
-            g_payload = {
-                "contents": [{"parts": [{"text": f"{strict_sys_msg}\n\nThai text: {raw_prompt}"}]}],
-                "generationConfig": {"temperature": 0.0},
-            }
-            g_data = await call_gemini_generate_content_self_healing(
-                g_payload, timeout_sec=15, purpose="Prompt Translate Tier 2"
-            )
-            if g_data:
-                parts = ((g_data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-                raw_parts_text = " ".join(p.get("text", "") for p in parts if p.get("text")).strip()
-                clean_txt = raw_parts_text.strip(' "\'\n\r\t')
-                if clean_txt and not THAI_CHAR_REGEX.search(clean_txt):
-                    return f"{prefix}{clean_txt}"
+            res = await gemma_fn(trans_messages, temperature=0.0, purpose=p_label)
+            if res and not THAI_CHAR_REGEX.search(res):
+                clean_res = res.strip(' "\'\n\r\t')
+                return f"{prefix}{clean_res}"
         except Exception:
             pass
 
@@ -753,7 +750,34 @@ CRITICAL RULES:
         except Exception as e:
             print(f"Gemini Manga Vision warning: {e}")
 
-    # Tier 2: Cloudflare Workers AI (@cf/google/gemma-4-26b-a4b-it)
+    # Tier 2: Google AI Studio Gemma 4 Vision (gemma-4-26b-a4b-it — 14.4K RPD backup when Gemini 3 Flash 20 RPD is exhausted)
+    try:
+        gemma_content = await call_gemma_ai_studio_vision(
+            manga_system_instruction,
+            mime_type,
+            b64_img,
+            response_mime_type="application/json",
+            timeout_sec=30,
+            purpose="MangaSingle",
+        )
+        if gemma_content:
+            bubbles, summary = _parse_manga_bubbles_json(gemma_content)
+            if bubbles:
+                has_boxes_and_text = any(
+                    isinstance(b.get("box_2d"), list)
+                    and len(b["box_2d"]) == 4
+                    and bool(b.get("translated_text"))
+                    for b in bubbles
+                )
+                if has_boxes_and_text:
+                    print(f"[Manga Vision] Completed via Tier 2 AI Studio Gemma 4 - {len(bubbles)} bubbles", flush=True)
+                    return bubbles, summary
+                fallback_bubbles_no_boxes = bubbles
+                fallback_summary = summary
+    except Exception as e:
+        print(f"AI Studio Gemma 4 Manga Vision warning: {e}", flush=True)
+
+    # Tier 3: Cloudflare Workers AI (@cf/google/gemma-4-26b-a4b-it)
     try:
         cf_content = await call_cloudflare_vision_chat(manga_system_instruction, mime_type, b64_img)
         if cf_content:
@@ -766,14 +790,14 @@ CRITICAL RULES:
                     for b in bubbles
                 )
                 if has_boxes_and_text:
-                    print(f"[Manga Vision] Completed via Tier 2 Cloudflare Gemma 4 - {len(bubbles)} bubbles")
+                    print(f"[Manga Vision] Completed via Tier 3 Cloudflare Gemma 4 - {len(bubbles)} bubbles")
                     return bubbles, summary
                 fallback_bubbles_no_boxes = bubbles
                 fallback_summary = summary
     except Exception as e:
         print(f"Cloudflare Gemma 4 Manga Vision warning: {e}")
 
-    # Tier 3: Groq Vision (qwen/qwen3.8-27b)
+    # Tier 4: Groq Vision (qwen/qwen3.8-27b)
     if GROQ_API_KEY:
         groq_vision_candidates = await discover_active_groq_vision_models()
         groq_host = "api." + "groq.com"
@@ -815,7 +839,7 @@ CRITICAL RULES:
                                 for b in bubbles
                             )
                             if has_boxes_and_text:
-                                print(f"[Manga Vision] Completed via Tier 3 Groq ({g_model}) - {len(bubbles)} bubbles")
+                                print(f"[Manga Vision] Completed via Tier 4 Groq ({g_model}) - {len(bubbles)} bubbles")
                                 return bubbles, summary
                             if not fallback_bubbles_no_boxes:
                                 fallback_bubbles_no_boxes = bubbles

@@ -31,6 +31,8 @@ from search_engine import (
 from llm import (
     call_groq_chat,
     call_gemini_generate_content_self_healing,
+    call_gemma_ai_studio_chat,
+    call_cloudflare_gemma_chat,
     call_modal_ollama_chat,
     query_local_ollama_chat,
     get_groq_search_and_chat_candidates,
@@ -171,10 +173,8 @@ async def execute_agent_skill(
         return f"[Tool Execution Error in `{t_name}`: {type(e).__name__}: {e}]"
 
 
-# In agent.py, add `get_groq_search_and_chat_candidates` to `from llm import (...)`
-
 async def _call_agent_planner_llm(messages: list) -> str:
-    """Uses dynamically discovered Groq models (gpt-oss-20b / qwen3.8-27b), Gemini Flash, or Modal Ollama."""
+    """Uses Groq (gpt-oss-20b / qwen3.8-27b), AI Studio Gemma 4, Cloudflare Gemma 4, or Modal Ollama."""
     if GROQ_API_KEY:
         for g_mod in await get_groq_search_and_chat_candidates():
             try:
@@ -186,23 +186,13 @@ async def _call_agent_planner_llm(messages: list) -> str:
             except Exception:
                 continue
 
-    if GEMINI_API_KEY:
-        try:
-            joined = "\n\n".join(f"[{m['role'].upper()}]:\n{m['content']}" for m in messages)
-            g_payload = {
-                "contents": [{"parts": [{"text": joined}]}],
-                "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"},
-            }
-            g_data = await call_gemini_generate_content_self_healing(
-                g_payload, timeout_sec=20, purpose="AgentPlanner"
-            )
-            if g_data:
-                parts = ((g_data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-                txt = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
-                if txt:
-                    return txt
-        except Exception:
-            pass
+    res = await call_gemma_ai_studio_chat(messages, temperature=0.1, max_output_tokens=1024, purpose="AgentPlanner")
+    if res:
+        return res
+
+    res = await call_cloudflare_gemma_chat(messages, temperature=0.1, max_tokens=1024, purpose="AgentPlanner")
+    if res:
+        return res
 
     return await call_modal_ollama_chat(messages, ACTIVE_FAST_MODEL, temperature=0.1, purpose="AgentPlanner")
 

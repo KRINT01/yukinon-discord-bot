@@ -7,6 +7,8 @@ import aiohttp
 from config import (
     HTTPS,
     GEMINI_API_KEY,
+    GEMMA_CHAT_MODEL,
+    GEMMA_VISION_MODEL,
     CF_ACCOUNT_ID,
     CF_API_TOKEN,
     CF_VISION_MODEL,
@@ -53,22 +55,28 @@ from search_engine import (
 GEMINI_MODEL_HINT_REGEX = re.compile(r"models/([a-zA-Z0-9._-]+)")
 GEMINI_EXCLUDED_SUBSTRINGS = ("image", "lite", "tts", "audio", "live", "embedding", "aqa", "bison", "gecko")
 
-# Excludes STT, TTS, and safety/moderation classifiers returned by GET https://api.groq.com/openai/v1/models
 GROQ_EXCLUDED_SUBSTRINGS = (
     "whisper", "orpheus", "guard", "safeguard", "tts", "audio", "embed", "moderation", "playai"
 )
 
-# Per-model cooldowns & 1-hour live catalog cache for Groq /openai/v1/models
+# Per-model cooldowns & 1-hour live catalog caches
 _GROQ_MODEL_COOLDOWN_UNTIL: dict[str, float] = {}
 _GROQ_AVAILABLE_MODELS_CACHE: list[str] = []
 _GROQ_MODELS_LAST_FETCH_TS: float = 0.0
 
+_AI_STUDIO_MODEL_COOLDOWN_UNTIL: dict[str, float] = {}
+_GEMMA_AVAILABLE_MODELS_CACHE: list[str] = []
+_GEMMA_MODELS_LAST_FETCH_TS: float = 0.0
+_CF_GEMMA_COOLDOWN_UNTIL: float = 0.0
+
+
+def _estimate_messages_tokens(messages: list) -> int:
+    """Rough token estimator (~3 chars per token for mixed Thai/English) to respect Gemma 4's 16K TPM limit."""
+    total_chars = sum(len(m.get("content") or "") for m in messages)
+    return total_chars // 3
+
 
 async def discover_available_groq_models(force_refresh: bool = False) -> list[str]:
-    """
-    Queries GET https://api.groq.com/openai/v1/models to discover the exact active chat models
-    available to this GROQ_API_KEY, caching the list for 1 hour (3600s).
-    """
     global _GROQ_AVAILABLE_MODELS_CACHE, _GROQ_MODELS_LAST_FETCH_TS
     if not GROQ_API_KEY:
         return []
@@ -94,14 +102,10 @@ async def discover_available_groq_models(force_refresh: bool = False) -> list[st
                 payload = await resp.json()
                 discovered = []
                 for item in payload.get("data") or []:
-                    if not isinstance(item, dict):
-                        continue
-                    if item.get("active") is False:
+                    if not isinstance(item, dict) or item.get("active") is False:
                         continue
                     m_id = str(item.get("id") or "").strip()
-                    if not m_id:
-                        continue
-                    if any(bad in m_id.lower() for bad in GROQ_EXCLUDED_SUBSTRINGS):
+                    if not m_id or any(bad in m_id.lower() for bad in GROQ_EXCLUDED_SUBSTRINGS):
                         continue
                     discovered.append(m_id)
                 if discovered:
@@ -116,10 +120,6 @@ async def discover_available_groq_models(force_refresh: bool = False) -> list[st
 
 
 async def get_groq_search_and_chat_candidates() -> list[str]:
-    """
-    Returns ordered Groq model candidates for Search/Fact-Checking/Chat while strictly
-    EXCLUDING GROQ_CODE_MODEL (openai/gpt-oss-120b) so coding rate limits are preserved.
-    """
     live_models = await discover_available_groq_models()
     preferred_order = [
         state.active_groq_search_model,
@@ -129,14 +129,12 @@ async def get_groq_search_and_chat_candidates() -> list[str]:
         GROQ_CHAT_FALLBACK_MODEL,
     ]
     candidates = []
-    # 1. Add preferred models that are confirmed present in live_models (or all if discovery hasn't run)
     for mod in preferred_order:
         if not mod or mod == GROQ_CODE_MODEL:
             continue
         if (not live_models or mod in live_models) and mod not in candidates:
             candidates.append(mod)
 
-    # 2. Append any other discovered live chat models (except GROQ_CODE_MODEL) as self-healing backups
     for mod in live_models:
         if mod != GROQ_CODE_MODEL and mod not in candidates:
             candidates.append(mod)
@@ -156,6 +154,52 @@ async def discover_active_groq_vision_models() -> list[str]:
         if mod and (not live_models or mod in live_models) and mod not in out:
             out.append(mod)
     return out or ["qwen/qwen3.8-27b"]
+
+
+async def discover_active_gemma_models(vision_required: bool = False) -> list[str]:
+    """
+    Discovers active Gemma 4 models on Google AI Studio (14.4K RPD, 30 RPM, 16K TPM).
+    For vision tasks, prioritizes gemma-4-26b-a4b-it (multimodal MoE) and gemma-4-31b-it.
+    """
+    global _GEMMA_AVAILABLE_MODELS_CACHE, _GEMMA_MODELS_LAST_FETCH_TS
+    default_list = (
+        [GEMMA_VISION_MODEL, "gemma-4-26b-a4b-it", "gemma-4-31b-it"]
+        if vision_required
+        else [state.active_gemma_model, GEMMA_CHAT_MODEL, "gemma-4-31b-it", "gemma-4-26b-a4b-it"]
+    )
+    if not GEMINI_API_KEY:
+        return list(dict.fromkeys(x for x in default_list if x))
+
+    now = time.time()
+    if not _GEMMA_AVAILABLE_MODELS_CACHE or (now - _GEMMA_MODELS_LAST_FETCH_TS >= 3600.0):
+        list_url = clean_url(
+            f"{HTTPS}generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
+        )
+        try:
+            session = get_http_session()
+            async with session.get(list_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    found = []
+                    for m in data.get("models") or []:
+                        name = (m.get("name") or "").replace("models/", "")
+                        lower_name = name.lower()
+                        methods = m.get("supportedGenerationMethods") or []
+                        if "generateContent" in methods and "gemma-4" in lower_name:
+                            found.append(name)
+                    if found:
+                        _GEMMA_AVAILABLE_MODELS_CACHE = found
+                        _GEMMA_MODELS_LAST_FETCH_TS = now
+                        api_log(f"Google AI Studio (Gemma Discovery) -> {found}")
+        except Exception:
+            pass
+
+    candidates = []
+    for mod in default_list + _GEMMA_AVAILABLE_MODELS_CACHE:
+        if mod and mod not in candidates:
+            if not _GEMMA_AVAILABLE_MODELS_CACHE or mod in _GEMMA_AVAILABLE_MODELS_CACHE:
+                candidates.append(mod)
+    return candidates or list(dict.fromkeys(x for x in default_list if x))
 
 
 async def _discover_active_gemini_flash_model() -> list[str]:
@@ -191,6 +235,188 @@ async def _discover_active_gemini_flash_model() -> list[str]:
 
     seen = set()
     return [x for x in candidates if x and not (x in seen or seen.add(x))]
+
+
+async def call_gemma_ai_studio_chat(
+    messages: list, temperature: float = 0.4, max_output_tokens: int = 2048, purpose: str = "GemmaChat"
+) -> str:
+    """
+    Calls Gemma 4 (gemma-4-31b-it / gemma-4-26b-a4b-it) on Google AI Studio (14.4K RPD, 30 RPM, 16K TPM).
+    Includes a 12,000-token guard so large prompts never trip the 16K TPM limit, and automatically
+    merges systemInstruction into the first user message if the endpoint rejects systemInstruction.
+    """
+    if not GEMINI_API_KEY:
+        return ""
+
+    # Respect Google AI Studio Gemma 4's 16,000 TPM limit (leave ~4K headroom for output + concurrent turns)
+    est_tokens = _estimate_messages_tokens(messages)
+    if est_tokens > 11500:
+        api_log(f"Gemma AI Studio ({purpose}) -> skipped ({est_tokens} est tokens > 11.5K TPM guard)")
+        return ""
+
+    sys_parts = []
+    contents = []
+    for m in messages:
+        role = m.get("role", "user")
+        txt = (m.get("content") or "").strip()
+        if not txt:
+            continue
+        if role == "system":
+            sys_parts.append(txt)
+        elif role == "assistant":
+            contents.append({"role": "model", "parts": [{"text": txt}]})
+        else:
+            contents.append({"role": "user", "parts": [{"text": txt}]})
+
+    if not contents:
+        return ""
+
+    candidates = await discover_active_gemma_models(vision_required=False)
+    session = get_http_session()
+
+    for model_id in candidates:
+        now = time.time()
+        if now < _AI_STUDIO_MODEL_COOLDOWN_UNTIL.get(model_id, 0.0):
+            continue
+
+        url = clean_url(
+            f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
+            f"{model_id}:generateContent?key={GEMINI_API_KEY}"
+        )
+        payload = {
+            "contents": json.loads(json.dumps(contents)),
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": max_output_tokens,
+            },
+        }
+        if sys_parts:
+            payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(sys_parts)}]}
+
+        for attempt in range(2):
+            t0 = time.monotonic()
+            try:
+                async with session.post(
+                    url, json=payload, timeout=aiohttp.ClientTimeout(total=25)
+                ) as resp:
+                    status = resp.status
+                    body_text = await resp.text()
+                elapsed = time.monotonic() - t0
+
+                if status == 200:
+                    data = json.loads(body_text)
+                    parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                    out = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+                    out = re.sub(r"<think>[\s\S]*?</think>", "", out).strip()
+                    if out:
+                        state.active_gemma_model = model_id
+                        api_log(f"Gemma AI Studio ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
+                        return out
+
+                # If the Gemma endpoint rejects systemInstruction on attempt 0, merge it into the first user message
+                if status == 400 and "systemInstruction" in payload and attempt == 0:
+                    sys_joined = "\n\n".join(sys_parts)
+                    merged_contents = json.loads(json.dumps(contents))
+                    if merged_contents and merged_contents[0]["role"] == "user":
+                        merged_contents[0]["parts"][0]["text"] = (
+                            f"[System Instructions]:\n{sys_joined}\n\n[User Message]:\n"
+                            + merged_contents[0]["parts"][0]["text"]
+                        )
+                    else:
+                        merged_contents.insert(0, {"role": "user", "parts": [{"text": sys_joined}]})
+                    payload.pop("systemInstruction", None)
+                    payload["contents"] = merged_contents
+                    continue
+
+                if status == 429:
+                    _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 60.0
+                elif status == 404:
+                    _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 3600.0
+                api_log(f"Gemma AI Studio ({purpose}) -> {model_id} HTTP {status} ({elapsed:.2f}s)")
+                break
+            except Exception as e:
+                api_log(f"Gemma AI Studio ({purpose}) -> {model_id} failed ({type(e).__name__})")
+                break
+
+    return ""
+
+
+async def call_gemma_ai_studio_vision(
+    prompt_text: str,
+    mime_type: str,
+    b64_img: str,
+    response_mime_type: str = None,
+    timeout_sec: int = 25,
+    purpose: str = "GemmaVision",
+) -> str:
+    """
+    Calls multimodal Gemma 4 (gemma-4-26b-a4b-it / gemma-4-31b-it) on Google AI Studio for Vision OCR,
+    Sticker inspection, and Manga translation fallback (conserving gemini-3-flash-preview's 20 RPD).
+    """
+    if not GEMINI_API_KEY:
+        return ""
+
+    candidates = await discover_active_gemma_models(vision_required=True)
+    session = get_http_session()
+
+    for model_id in candidates:
+        if time.time() < _AI_STUDIO_MODEL_COOLDOWN_UNTIL.get(model_id, 0.0):
+            continue
+
+        url = clean_url(
+            f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
+            f"{model_id}:generateContent?key={GEMINI_API_KEY}"
+        )
+        gen_cfg = {"temperature": 0.1, "maxOutputTokens": 4096}
+        if response_mime_type:
+            gen_cfg["responseMimeType"] = response_mime_type
+
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt_text},
+                        {"inlineData": {"mimeType": mime_type, "data": b64_img}},
+                    ]
+                }
+            ],
+            "generationConfig": gen_cfg,
+        }
+
+        for attempt in range(2):
+            t0 = time.monotonic()
+            try:
+                async with session.post(
+                    url, json=payload, timeout=aiohttp.ClientTimeout(total=timeout_sec)
+                ) as resp:
+                    status = resp.status
+                    body_text = await resp.text()
+                elapsed = time.monotonic() - t0
+
+                if status == 200:
+                    data = json.loads(body_text)
+                    parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                    out = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+                    out = re.sub(r"<think>[\s\S]*?</think>", "", out).strip()
+                    if out:
+                        api_log(f"Gemma AI Studio ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
+                        return out
+
+                if status == 400 and "responseMimeType" in payload.get("generationConfig", {}) and attempt == 0:
+                    payload["generationConfig"].pop("responseMimeType", None)
+                    continue
+
+                if status == 429:
+                    _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 60.0
+                elif status == 404:
+                    _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 3600.0
+                api_log(f"Gemma AI Studio ({purpose}) -> {model_id} HTTP {status} ({elapsed:.2f}s)")
+                break
+            except Exception as e:
+                api_log(f"Gemma AI Studio ({purpose}) -> {model_id} failed ({type(e).__name__})")
+                break
+
+    return ""
 
 
 async def call_gemini_generate_content_self_healing(
@@ -259,10 +485,6 @@ async def call_gemini_generate_content_self_healing(
 async def call_gemini_chat_messages(
     messages: list, temperature: float = 0.25, purpose: str = "FactSearchChat"
 ) -> str:
-    """
-    Runs standard Gemini generateContent (WITHOUT the rate-limited google_search tool)
-    to synthesize verified search results and roleplay responses accurately.
-    """
     if not GEMINI_API_KEY:
         return ""
     sys_parts = []
@@ -299,6 +521,54 @@ async def call_gemini_chat_messages(
         out = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
         out = re.sub(r"<think>[\s\S]*?</think>", "", out).strip()
         return out
+    return ""
+
+
+async def call_cloudflare_gemma_chat(
+    messages: list, temperature: float = 0.4, max_tokens: int = 2048, purpose: str = "CFGemmaChat"
+) -> str:
+    """
+    Utilizes Cloudflare Workers AI's 10,000 free daily Neurons on @cf/google/gemma-4-26b-a4b-it
+    for fast text chat, search synthesis, and agent planning.
+    """
+    global _CF_GEMMA_COOLDOWN_UNTIL
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN or time.time() < _CF_GEMMA_COOLDOWN_UNTIL:
+        return ""
+
+    cf_host = "api." + "cloudflare.com"
+    cf_chat_url = f"{HTTPS}{cf_host}/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": CF_VISION_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    t0 = time.monotonic()
+    try:
+        session = get_http_session()
+        async with session.post(
+            cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=25)
+        ) as resp:
+            elapsed = time.monotonic() - t0
+            if resp.status == 200:
+                data = await resp.json()
+                choices = data.get("choices") or []
+                if choices:
+                    msg_obj = choices[0].get("message") or {}
+                    content = msg_obj.get("content") or ""
+                    content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+                    if content:
+                        api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
+                        return content
+            elif resp.status == 429:
+                _CF_GEMMA_COOLDOWN_UNTIL = time.time() + 300.0
+            api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} HTTP {resp.status} ({elapsed:.2f}s)")
+    except Exception as e:
+        api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} failed ({type(e).__name__})")
     return ""
 
 
@@ -363,7 +633,6 @@ async def call_groq_chat(
     if now < _GROQ_MODEL_COOLDOWN_UNTIL.get(groq_model, 0.0):
         return ""
 
-    # Verify against live discovered models so we never send a request to a non-existent/Enterprise model
     live_models = await discover_available_groq_models()
     if live_models and groq_model not in live_models:
         _GROQ_MODEL_COOLDOWN_UNTIL[groq_model] = now + 3600.0
@@ -381,7 +650,6 @@ async def call_groq_chat(
         "max_tokens": 8192 if is_coding else 2048,
     }
     if "gpt-oss" in groq_model:
-        # Use 'high' reasoning for coding (120b) and 'low' for fast search/chat (20b) to save TPM quota
         groq_payload["reasoning_effort"] = "high" if is_coding else "low"
 
     groq_host = "api." + "groq.com"
@@ -406,7 +674,6 @@ async def call_groq_chat(
                 _GROQ_MODEL_COOLDOWN_UNTIL[groq_model] = time.time() + 60.0
             elif resp.status in (404, 400):
                 _GROQ_MODEL_COOLDOWN_UNTIL[groq_model] = time.time() + 3600.0
-                # Trigger a fresh discovery on 404 in case Groq updated its model catalog
                 await discover_available_groq_models(force_refresh=True)
             api_log(f"Groq ({purpose}) -> {groq_model} HTTP {resp.status} ({elapsed:.2f}s): {err_txt[:120]}")
     return ""
@@ -464,7 +731,6 @@ async def query_local_ollama_chat(
     speaker_user=None,
     speaker_name: str = "",
 ) -> tuple[str, bool]:
-    # 1. Direct Prompt Injection / Jailbreak Guardrail (In-Character Counterattack)
     if PROMPT_INJECTION_REGEX.search(prompt[:600]):
         is_thai_input = bool(THAI_CHAR_REGEX.search(prompt))
         if is_thai_input:
@@ -593,7 +859,7 @@ async def query_local_ollama_chat(
                 })
         messages.append({"role": "user", "content": user_content})
 
-        # PATH A: Coding -> Strictly use GROQ_CODE_MODEL (openai/gpt-oss-120b), then dynamically discovered backups, then Modal Coder
+        # PATH A: Coding -> 1) Groq gpt-oss-120b, 2) AI Studio Gemma 4 (if <=11.5K tok), 3) Cloudflare Gemma 4, 4) Modal Coder
         if is_coding:
             if GROQ_API_KEY:
                 code_candidates = [GROQ_CODE_MODEL] + await get_groq_search_and_chat_candidates()
@@ -604,6 +870,15 @@ async def query_local_ollama_chat(
                             return ans
                     except Exception as e:
                         print(f"Groq coding ({c_mod}) warning: {e}")
+
+            ans = await call_gemma_ai_studio_chat(messages, temperature=temperature, max_output_tokens=4096, purpose="Code")
+            if ans:
+                return ans
+
+            ans = await call_cloudflare_gemma_chat(messages, temperature=temperature, max_tokens=4096, purpose="Code")
+            if ans:
+                return ans
+
             try:
                 ans = await call_modal_ollama_chat(messages, ACTIVE_CODE_MODEL, temperature, purpose="Code")
                 if ans:
@@ -611,11 +886,14 @@ async def query_local_ollama_chat(
             except Exception as e:
                 print(f"Modal GPU coding error: {e}")
 
-        # PATH B: Search / Fact-Check / Knowledge Queries -> Use dynamically discovered Groq models (openai/gpt-oss-20b / qwen3.8-27b) + Gemini Flash
+        # PATH B: Search / Fact-Check / Knowledge Queries ->
+        # 1) Groq (gpt-oss-20b / qwen3.8-27b)
+        # 2) Google AI Studio Gemma 4 (14.4K RPD, 16K TPM guard)
+        # 3) Cloudflare Workers AI Gemma 4 (10K Neurons/day)
+        # 4) Gemini 3 Flash (conserved 20 RPD backup for >11.5K token contexts)
         if prefer_high_knowledge_llm and not is_coding:
             target_temp = 0.2 if (did_search or is_user_correction) else temperature
 
-            # Tier 1: Dynamically discovered Groq Search Models (openai/gpt-oss-20b, qwen/qwen3.8-27b; NEVER gpt-oss-120b)
             if GROQ_API_KEY:
                 groq_search_candidates = await get_groq_search_and_chat_candidates()
                 for g_mod in groq_search_candidates:
@@ -628,7 +906,18 @@ async def query_local_ollama_chat(
                     except Exception:
                         continue
 
-            # Tier 2: Google AI Studio (gemini-3-flash-preview standard generateContent)
+            ans = await call_gemma_ai_studio_chat(
+                messages, temperature=target_temp, max_output_tokens=2048, purpose="FactSearchChat"
+            )
+            if ans:
+                return ans
+
+            ans = await call_cloudflare_gemma_chat(
+                messages, temperature=target_temp, max_tokens=2048, purpose="FactSearchChat"
+            )
+            if ans:
+                return ans
+
             if GEMINI_API_KEY:
                 try:
                     ans = await call_gemini_chat_messages(messages, temperature=target_temp, purpose="FactSearchChat")
@@ -637,18 +926,31 @@ async def query_local_ollama_chat(
                 except Exception as e:
                     print(f"Gemini FactSearchChat fallback warning: {e}")
 
-        # PATH C: Casual Conversational Chat (or final fallback) -> Modal GPU Ollama (scb10x/typhoon2.5-qwen3-4b)
+        # PATH C: Casual Chat & Voice Chat ->
+        # 1) Google AI Studio Gemma 4 (31B/26B, 14.4K RPD, ~1.5s latency, zero Modal cold start!)
+        # 2) Cloudflare Workers AI Gemma 4 (26B MoE, 10K Neurons/day)
+        # 3) Modal GPU Ollama (scb10x/typhoon2.5-qwen3-4b)
+        # 4) Groq Fallback
+        chat_temp = 0.25 if (did_search or is_user_correction) else temperature
+
+        ans = await call_gemma_ai_studio_chat(
+            messages, temperature=chat_temp, max_output_tokens=1536, purpose="Chat"
+        )
+        if ans:
+            return ans
+
+        ans = await call_cloudflare_gemma_chat(
+            messages, temperature=chat_temp, max_tokens=1536, purpose="Chat"
+        )
+        if ans:
+            return ans
+
         try:
-            ans = await call_modal_ollama_chat(
-                messages,
-                model,
-                0.25 if (did_search or is_user_correction) else temperature,
-                purpose="Chat",
-            )
+            ans = await call_modal_ollama_chat(messages, model, chat_temp, purpose="Chat")
             if ans:
                 return ans
         except Exception as e:
-            print(f"Modal GPU chat fallback to Groq/Gemini: {e}")
+            print(f"Modal GPU chat fallback to Groq: {e}")
 
         if GROQ_API_KEY:
             for g_mod in await get_groq_search_and_chat_candidates():
@@ -659,19 +961,10 @@ async def query_local_ollama_chat(
                 except Exception:
                     continue
 
-        if GEMINI_API_KEY:
-            try:
-                ans = await call_gemini_chat_messages(messages, temperature=temperature, purpose="ChatFallback")
-                if ans:
-                    return ans
-            except Exception:
-                pass
-
         return "ระบบประมวลผลไม่สามารถเชื่อมต่อได้ชั่วคราวค่ะ กรุณาลองใหม่อีกครั้งนะคะ"
 
     raw_answer = await _run_inference_pass(working_prompt)
 
-    # Allow 1 agentic [SEARCH: ...] refinement pass even if an initial broad pre-search already ran!
     search_tag_match = AGENTIC_SEARCH_TAG_REGEX.search(raw_answer)
     if allow_agentic_search and search_tag_match:
         agent_query = search_tag_match.group(1).strip()[:180]

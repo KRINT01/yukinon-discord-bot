@@ -38,6 +38,7 @@ from persona import TYPHOON_OCR_PROMPT
 from search_engine import fetch_webpage_sync, run_safe_web_search_sync
 from llm import (
     discover_active_groq_vision_models,
+    call_gemma_ai_studio_vision,
     call_cloudflare_vision_chat,
     call_gemini_generate_content_self_healing,
 )
@@ -276,10 +277,23 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
         "(ก/ภ/ถ, ข/ช, ค/ด/ต, พ/ผ/ฝ/ฟ, ร/ธ), and note if the original text contains any spelling errors."
     )
 
-    # Tier 1: Groq LPU Vision (qwen/qwen3.8-27b)
+    # Tier 1: Google AI Studio Gemma 4 Vision (gemma-4-26b-a4b-it / 31b-it — 14.4K RPD!)
+    gemma_ocr = await call_gemma_ai_studio_vision(
+        ocr_prompt, mime_type, b64_img, timeout_sec=25, purpose="Image OCR Tier 1"
+    )
+    if gemma_ocr:
+        return gemma_ocr
+
+    # Tier 2: Cloudflare Workers AI Vision (@cf/google/gemma-4-26b-a4b-it — 10K Neurons/day)
+    cf_ocr = await call_cloudflare_vision_chat(ocr_prompt, mime_type, b64_img, purpose="Image OCR Tier 2")
+    if cf_ocr:
+        return cf_ocr
+
+    # Tier 3: Groq LPU Vision (qwen/qwen3.8-27b)
     if GROQ_API_KEY:
         groq_candidates = await discover_active_groq_vision_models()
-        chat_url = clean_url(f"{HTTPS}api.groq.com/openai/v1/chat/completions")
+        groq_host = "api." + "groq.com"
+        chat_url = f"{HTTPS}{groq_host}/openai/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Content-Type": "application/json",
@@ -312,38 +326,11 @@ async def extract_image_via_transient_ocr(raw_bytes: bytes, filename: str) -> st
                         content = g_data["choices"][0]["message"]["content"].strip()
                         content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
                         if content:
-                            api_log(f"Image OCR (Tier 1 Groq) -> {g_mod} 200 OK ({elapsed:.2f}s)")
+                            api_log(f"Image OCR (Tier 3 Groq) -> {g_mod} 200 OK ({elapsed:.2f}s)")
                             return content
-                    api_log(f"Image OCR (Tier 1 Groq) -> {g_mod} HTTP {resp.status}; fallback to Tier 2")
+                    api_log(f"Image OCR (Tier 3 Groq) -> {g_mod} HTTP {resp.status}; fallback to Tier 4")
             except Exception as e:
-                api_log(f"Image OCR (Tier 1 Groq) -> {g_mod} failed ({type(e).__name__}); fallback to Tier 2")
-
-    # Tier 2: Cloudflare Workers AI Vision (@cf/google/gemma-4-26b-a4b-it)
-    cf_ocr = await call_cloudflare_vision_chat(ocr_prompt, mime_type, b64_img, purpose="Image OCR Tier 2")
-    if cf_ocr:
-        return cf_ocr
-
-    # Tier 3: Google AI Studio Backup (gemini-3-flash-preview)
-    if GEMINI_API_KEY:
-        g_payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {"text": ocr_prompt},
-                        {"inlineData": {"mimeType": mime_type, "data": b64_img}},
-                    ]
-                }
-            ],
-            "generationConfig": {"temperature": 0.0},
-        }
-        g_data = await call_gemini_generate_content_self_healing(
-            g_payload, timeout_sec=25, purpose="Image OCR Tier 3"
-        )
-        if g_data:
-            parts = ((g_data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-            g_text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
-            if g_text:
-                return g_text
+                api_log(f"Image OCR (Tier 3 Groq) -> {g_mod} failed ({type(e).__name__}); fallback to Tier 4")
 
     # Tier 4: Modal T4 GPU (scb10x/typhoon-ocr1.5-3b)
     payload = {
