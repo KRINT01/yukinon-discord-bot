@@ -1013,6 +1013,11 @@ async def query_local_ollama_chat(
             )
             raw_answer = await _run_inference_pass(working_prompt)
 
+    from user_memory import AGENTIC_MEMO_TAG_REGEX, record_user_interaction
+
+    memo_match = AGENTIC_MEMO_TAG_REGEX.search(raw_answer or "")
+    learned_memo = memo_match.group(1).strip() if memo_match else ""
+
     answer = sanitize_yukino_output(raw_answer, prompt, speaker_user, speaker_name)
 
     if not answer.strip():
@@ -1021,12 +1026,30 @@ async def query_local_ollama_chat(
         )
         answer = sanitize_yukino_output(retry_raw, prompt, speaker_user, speaker_name)
 
+    # Update persistent per-user profile (interaction count, favorite topics, recent questions, and LLM memo)
+    if speaker_user is not None:
+        record_user_interaction(
+            speaker_user,
+            prompt.split("\n\n")[0][:300],
+            channel_id=channel_id,
+            learned_memo=learned_memo,
+        )
+
     if channel_id is not None and answer:
         if is_user_correction:
             user_only = [m for m in channel_memory[channel_id] if m.get("role") == "user"][-3:]
             channel_memory[channel_id].clear()
             for um in user_only:
                 channel_memory[channel_id].append(um)
-        channel_memory[channel_id].append({"role": "user", "content": prompt[:2000]})
+
+        # Tag speaker identity in channel_memory so multi-user conversations never mix up who said what
+        from persona import is_owner_user
+        if is_owner_user(speaker_user):
+            speaker_tag = "[ผู้พูด: คู่หูชมรมบริการ (Owner)]"
+        else:
+            s_name = getattr(speaker_user, "display_name", "") or speaker_name or "Member"
+            speaker_tag = f"[ผู้พูด: {s_name}]"
+
+        channel_memory[channel_id].append({"role": "user", "content": f"{speaker_tag} {prompt[:1800]}"})
         channel_memory[channel_id].append({"role": "assistant", "content": answer[:3000]})
     return answer, did_search

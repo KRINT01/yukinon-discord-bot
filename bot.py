@@ -54,6 +54,11 @@ from persona import (
     FAST_SYSTEM_PROMPT,
     CODE_SYSTEM_PROMPT,
 )
+from user_memory import (
+    restore_user_profiles_from_discord,
+    resolve_user_mentions_and_build_dossier,
+    user_profiles,
+)
 from search_engine import detect_coding_intent
 from llm import query_local_ollama_chat
 from media_context import extract_all_context
@@ -232,6 +237,7 @@ async def verify_allowed_guild(ctx):
 
 @bot.event
 async def on_ready():
+    await restore_user_profiles_from_discord(bot)
     print(f"Logged in as {bot.user} on {platform.machine()} at {get_current_thai_datetime_str()}", flush=True)
 
 
@@ -256,6 +262,12 @@ async def on_message(message: discord.Message):
 
     clean_prompt = re.sub(rf"\<@\!?{bot.user.id}\>", "", message.content).strip()
     clean_prompt = CUSTOM_EMOJI_REGEX.sub(r":\1:", clean_prompt).strip()
+    clean_prompt, mentioned_dossier = resolve_user_mentions_and_build_dossier(
+        clean_prompt,
+        message.guild,
+        bot.user.id if bot.user else 0,
+        speaker_user=message.author,
+    )
 
     # 0. Natural Chat "Yukipedia Mode" Trigger (Search / OCR / Translation + Critique)
     if YUKIPEDIA_INTENT_PATTERN.search(clean_prompt):
@@ -294,7 +306,8 @@ async def on_message(message: discord.Message):
         else:
             user_request = "สวัสดี (ทักทายกลับตามธรรมชาติในสไตล์ยูกิโนะ)"
 
-        full_prompt = f"{user_request}\n\n{extracted_ctx}" if extracted_ctx else user_request
+        extra_blocks = "\n\n".join(b for b in (mentioned_dossier, extracted_ctx) if b)
+        full_prompt = f"{user_request}\n\n{extra_blocks}" if extra_blocks else user_request
         use_coder = detect_coding_intent(clean_prompt, message.attachments, message.channel.id)
         model = ACTIVE_CODE_MODEL if use_coder else ACTIVE_FAST_MODEL
         sys_prompt = CODE_SYSTEM_PROMPT if use_coder else FAST_SYSTEM_PROMPT

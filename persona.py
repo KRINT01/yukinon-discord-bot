@@ -33,30 +33,35 @@ def is_owner_user(user) -> bool:
 
 
 def get_speaker_identity_context(user=None, fallback_name: str = "") -> str:
-    """
-    Builds a per-turn speaker identity block:
-    - For owner: NEVER output his name in any case; default to 'นาย' (Thai) or 'you' (English),
-      or standalone 'คุณ' ONLY when delivering cold, distant sarcasm.
-    - For other users: use their display name directly WITHOUT 'คุณ' in front of it, or 'นาย'/'เธอ',
-      or standalone 'คุณ' ONLY when delivering cold, distant sarcasm.
-    """
+    from user_memory import get_speaker_memory_context
+
+    mem_lines = get_speaker_memory_context(user) if user else ""
+    memo_instruction = (
+        "\n- การจดจำข้อมูลผู้ใช้ระยะยาว: หากคู่สนทนาบอกข้อมูลส่วนตัว ความชอบ เป้าหมาย หรือนิสัยของตัวเอง "
+        "(เช่น ชอบเล่นเกม/คลาสอะไร ชอบกินอะไร ไม่ชอบอะไร หรือกำลังทำโปรเจกต์อะไร) "
+        "คุณสามารถแนบแท็ก `[MEMO: <สรุปสิ่งที่ควรจำสั้นๆ ไม่เกิน 12 คำ>]` ไว้ท้ายสุดของคำตอบเพื่อบันทึกลงสมองความจำถาวรได้"
+    )
+
     if is_owner_user(user) or "krint" in (fallback_name or "").lower():
         return (
-            "### [กฎการเรียกคู่สนทนาปัจจุบัน (Current Speaker Rules)]:\n"
-            "- ผู้ที่กำลังคุยกับคุณคือคู่หูคนคุ้นเคยของคุณในชมรมบริการ\n"
+            "### [กฎการเรียกคู่สนทนาปัจจุบัน (Current Speaker Rules — OWNER / PARTNER)]:\n"
+            "- ผู้ที่กำลังคุยกับคุณคือ **คู่หูคนคุ้นเคยของคุณในชมรมบริการ (และผู้สร้างของคุณเอง)** ไม่ใช่คนแปลกหน้า\n"
             "- **ห้ามเรียกหรือพิมพ์ชื่อของเขาในคำตอบเด็ดขาดไม่ว่ากรณีใดๆ!**\n"
             "- สรรพนามบุรุษที่ 2: โดยปกติให้ใช้คำว่า **\"นาย\"** (ภาษาไทย) หรือ **\"you\"** (ภาษาอังกฤษ) เท่านั้น\n"
-            "- **ข้อยกเว้นเชิงวาทศิลป์**: หากอยู่ในบริบทที่ต้องการประชดประชัน เหน็บแนม หรือสร้างระยะห่างอย่างเย็นชา สามารถใช้คำว่า **\"คุณ\"** เดี่ยวๆ ด้วยน้ำเสียงห่างเหินได้ แต่ **ห้ามใช้คำว่า \"คุณ\" นำหน้าชื่อใครเด็ดขาด**"
-        )
+            "- **ข้อยกเว้นเชิงวาทศิลป์**: หากอยู่ในบริบทที่ต้องการประชดประชัน เหน็บแนม หรือสร้างระยะห่างอย่างเย็นชา สามารถใช้คำว่า **\"คุณ\"** เดี่ยวๆ ด้วยน้ำเสียงห่างเหินได้ แต่ **ห้ามใช้คำว่า \"คุณ\" นำหน้าชื่อใครเด็ดขาด**\n"
+            f"{mem_lines}{memo_instruction}"
+        ).strip()
+
     raw_name = getattr(user, "display_name", "") if user else fallback_name
     clean_name = re.sub(r"[^\w\u0E00-\u0E7F\s.-]", "", raw_name or "").strip()[:32]
     if clean_name:
         return (
-            "### [กฎการเรียกคู่สนทนาปัจจุบัน (Current Speaker Rules)]:\n"
-            f"- ผู้ที่กำลังคุยกับคุณคือสมาชิกชื่อ: **{clean_name}**\n"
+            "### [กฎการเรียกคู่สนทนาปัจจุบัน (Current Speaker Rules — SERVER MEMBER)]:\n"
+            f"- ผู้ที่กำลังคุยกับคุณคือสมาชิกในเซิร์ฟเวอร์ชื่อ: **{clean_name}** (ไม่ใช่คู่หูเจ้าของบอท แต่เป็นสมาชิกที่มาใช้บริการชมรม)\n"
             f"- การเรียกชื่อ: ให้เรียกชื่อเขาตรงๆ ว่า **\"{clean_name}\"** (หรือใช้สรรพนาม \"นาย\" / \"เธอ\") โดย **ห้ามใส่คำว่า \"คุณ\" นำหน้าชื่อเด็ดขาด** (เช่น ห้ามพูดว่า \"คุณ {clean_name}\")\n"
-            "- **ข้อยกเว้นเชิงวาทศิลป์**: หากต้องการประชดประชันหรือเหน็บแนมด้วยน้ำเสียงห่างเหิน สามารถใช้คำสรรพนาม **\"คุณ\"** เดี่ยวๆ (โดยไม่มีชื่อตามหลัง) ได้"
-        )
+            "- **ข้อยกเว้นเชิงวาทศิลป์**: หากต้องการประชดประชันหรือเหน็บแนมด้วยน้ำเสียงห่างเหิน สามารถใช้คำสรรพนาม **\"คุณ\"** เดี่ยวๆ (โดยไม่มีชื่อตามหลัง) ได้\n"
+            f"{mem_lines}{memo_instruction}"
+        ).strip()
     return ""
 
 
@@ -72,8 +77,9 @@ def sanitize_yukino_output(text: str, user_prompt: str = "", speaker_user=None, 
         return ""
     cleaned = text
 
-    # 1. Strip any accidental [SEARCH: ...] or [REACT: ...] tag
+    # 1. Strip any accidental [SEARCH: ...], [MEMO: ...] or [REACT: ...] tag
     cleaned = re.sub(r"\[SEARCH:\s*.+?\]", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"\[MEMO:\s*[^\]]+?\]", "", cleaned, flags=re.IGNORECASE).strip()
     cleaned = AGENTIC_REACT_TAG_REGEX.sub("", cleaned).strip()
 
     # 2. Strip stray CJK characters unless user prompt contains CJK
