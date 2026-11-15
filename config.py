@@ -82,6 +82,7 @@ DEFAULT_WEATHER_LON = float(os.getenv("DEFAULT_WEATHER_LON", "100.555222"))
 
 DDGS_PROXY = os.getenv("DDGS_PROXY", "").strip() or None
 YOUTUBE_PROXY_URL = os.getenv("YOUTUBE_PROXY_URL", "").strip()
+SAUCENAO_API_KEY = os.getenv("SAUCENAO_API_KEY", "").strip()
 
 # Optional External OpenClaw Gateway Bridge (Dormant when unset)
 OPENCLAW_GATEWAY_URL = clean_url(os.getenv("OPENCLAW_GATEWAY_URL", "")).rstrip("/")
@@ -362,6 +363,13 @@ WEB_SEARCH_INTENT_PATTERN = re.compile(
     r"มีคลาสอะไรบ้าง|เล่นคลาสอะไรดี|มีอาชีพอะไรบ้าง|มีตัวละครอะไรบ้าง|ชื่อเต็มของ|ของค่ายไหน|ใครพัฒนา|พัฒนาโดย|"
     r"คือเกมอะไร|คือเรื่องอะไร|เนื้อเรื่องเป็นยังไง|เนื้อเรื่อง.*ไปถึงไหน|สรุปเนื้อเรื่อง|คือใคร|คืออะไร|อยู่ที่ไหน|"
     r"เปิดเมื่อไหร่|เปิดมากี่ปี|วางจำหน่ายเมื่อไหร่|สเปค|รุ่นไหนดี|เวอร์ชันล่าสุด|คนปัจจุบันคือใคร|ราคาเท่าไหร่|ข้อมูลของ|ประวัติของ|สรุปเรื่อง)",
+    re.IGNORECASE,
+)
+IMAGE_SOURCE_INTENT_PATTERN = re.compile(
+    r"(ขอวาร์ป|วาร์ป|หาที่มา|ที่มาของรูป|รูปนี้มาจาก|ภาพนี้มาจาก|มาจากเรื่องอะไร|เรื่องอะไร|ตอนที่เท่าไหร่|"
+    r"ใครวาด|คนวาด|ศิลปิน|ชื่อภาพ|รุ่นอะไร|ยี่ห้ออะไร|คือรุ่นไหน|คือตัวอะไร|คืออะไร|"
+    r"\b(?:source|sauce|pixiv|artist|what\s+anime|what\s+manga|which\s+chapter|what\s+episode|"
+    r"what\s+model|what\s+phone|identify\s+this|what\s+is\s+this)\b)",
     re.IGNORECASE,
 )
 PURE_DATETIME_PATTERN = re.compile(

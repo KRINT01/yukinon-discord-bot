@@ -515,7 +515,32 @@ async def ask_code(ctx, *, prompt: str = "วิเคราะห์โค้�
         await send_chunked_response(ctx, answer, reply_to=ctx.message)
 
 
-# In bot.py, add `release_unused_memory` and `agent_notes_store` to `from config import (...)`
+@bot.command(name="source", aliases=["sauce", "whatis", "วาร์ป"])
+async def source_command(ctx, *, question: str = ""):
+    async with ctx.typing():
+        ctx_text, _ = await extract_all_context(ctx.message)
+        if not ctx_text:
+            await ctx.send(
+                "กรุณาแนบรูปภาพ หรือกด Reply ที่รูปภาพที่ต้องการให้ฉันช่วยตรวจสอบที่มา/ชื่อเรื่อง/ชื่อรุ่นด้วยนะคะ "
+                "(เช่น แนบรูปพร้อมพิมพ์ `!source` หรือถามในแชทได้เลยค่ะ)"
+            )
+            return
+        user_q = question.strip() or (
+            "ช่วยระบุที่มาของภาพนี้อย่างละเอียด: "
+            "หากเป็นภาพวาด/อนิเมะ/มังงะ ให้บอกชื่อเรื่อง ชื่อตัวละคร ตอนที่/Chapter ชื่อผู้วาด และแนบลิงก์ที่มา (เช่น Pixiv/MyAnimeList/Danbooru) ถ้ามี "
+            "หากเป็นภาพถ่ายสิ่งของหรืออุปกรณ์ ให้ระบุยี่ห้อ รุ่น และรายละเอียดสำคัญของสิ่งนั้นค่ะ"
+        )
+        answer, _ = await query_local_ollama_chat(
+            f"{user_q}\n\n{ctx_text}",
+            model=ACTIVE_FAST_MODEL,
+            system_prompt=FAST_SYSTEM_PROMPT,
+            channel_id=ctx.channel.id,
+            temperature=0.2,
+            allow_agentic_search=True,
+            has_fresh_attachment=True,
+            speaker_user=ctx.author,
+        )
+        await send_chunked_response(ctx, answer, reply_to=ctx.message)
 
 
 @bot.command(name="status", aliases=["stat", "ping", "ram"])
