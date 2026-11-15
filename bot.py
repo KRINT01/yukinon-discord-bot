@@ -61,7 +61,7 @@ from user_memory import (
 )
 from search_engine import detect_coding_intent
 from llm import query_local_ollama_chat
-from media_context import extract_all_context
+from media_context import extract_all_context, resolve_referenced_message
 from image_engine import (
     send_chunked_response,
     send_generated_image_to_channel,
@@ -251,11 +251,8 @@ async def on_message(message: discord.Message):
     is_dm = message.guild is None
     is_ai_chan = message.channel.id in AI_CHANNEL_IDS
     is_mentioned = bot.user in message.mentions
-    is_reply = (
-        message.reference
-        and isinstance(message.reference.resolved, discord.Message)
-        and message.reference.resolved.author.id == bot.user.id
-    )
+    ref_msg = await resolve_referenced_message(message) if message.reference else None
+    is_reply = bool(ref_msg and ref_msg.author.id == bot.user.id)
     has_audio = any(a.filename.lower().endswith(AUDIO_EXTENSIONS) for a in message.attachments)
     if not (is_dm or is_ai_chan or is_mentioned or is_reply or has_audio):
         return
@@ -269,14 +266,15 @@ async def on_message(message: discord.Message):
         speaker_user=message.author,
     )
 
+    all_msg_atts = list(message.attachments) + (list(ref_msg.attachments) if ref_msg else [])
+    has_image_att = any(a.filename.lower().endswith(config.IMAGE_EXTENSIONS) for a in all_msg_atts)
+
     # 0. Natural Chat "Yukipedia Mode" Trigger (Search / OCR / Translation + Critique)
-    if YUKIPEDIA_INTENT_PATTERN.search(clean_prompt):
+    if YUKIPEDIA\_INTENT\_PATTERN.search(clean_prompt):
         await process_yukipedia_request(message, clean_prompt)
         return
 
-    has_image_att = any(a.filename.lower().endswith(config.IMAGE_EXTENSIONS) for a in message.attachments)
-
-    # 1. Natural Chat Manga / Image Translation Trigger (handles 1 to 10 pages in a single batch)
+    # 1. Natural Chat Manga / Image Translation Trigger (works on direct uploads AND replies to earlier images!)
     if MANGA_TRANSLATE_INTENT_PATTERN.search(clean_prompt) or (
         has_image_att and re.search(r"(แปล|\btranslate\b|\btl\b)", clean_prompt, re.IGNORECASE)
     ):

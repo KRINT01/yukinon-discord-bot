@@ -538,7 +538,9 @@ CRITICAL RULES:
 2. In-Context Localization: Adapt Japanese/Korean/Chinese idioms, pronouns, tone, and emotion so the dialogue sounds completely natural in {target_lang_name} while fitting inside a speech bubble. Do NOT use double quotes inside `translated_text` (use single quotes if needed).
 3. Speech Bubble Bounding Boxes (`box_2d`):
    - For each speech bubble on a page, provide `box_2d` as `[ymin, xmin, ymax, xmax]` normalized from 0 to 1000 relative to THAT page's dimensions.
-   - `box_2d` must tightly cover the Japanese text block inside that specific bubble lobe. NEVER merge two separate or staggered bubbles (such as adjacent black narration bubbles) into a single `box_2d` — output each bubble as its own separate entry!
+   - `box_2d` must tightly cover the entire Japanese text block (including furigana and punctuation like `…` or `！？`) inside that specific bubble lobe.
+   - DOUBLE / CONNECTED / ADJACENT BUBBLES: If a speech bubble has two or more connected lobes, OR if two bubbles (white or black) are next to each other, you MUST output EACH lobe/bubble as its own separate entry in `bubbles` with its own tight `box_2d` covering ONLY that lobe's text! NEVER merge two lobes or two adjacent bubbles into one `box_2d`.
+   - Do NOT create `box_2d` entries for large decorative sound effects (SFX like リンゴーン, むにっ, ピシ) drawn directly over background artwork outside of speech bubbles.
 4. Return ONLY valid JSON matching this exact structure for all {num_pages} page(s):
 {{
   "pages": [
@@ -697,7 +699,9 @@ CRITICAL RULES:
 2. In-Context Localization: Adapt Japanese/Korean/Chinese idioms, pronouns, tone, and emotion so the dialogue sounds completely natural in {target_lang_name} while fitting inside a speech bubble. Do NOT use double quotes inside `translated_text` (use single quotes if needed).
 3. Speech Bubble Bounding Boxes (`box_2d`):
    - For each speech bubble on a page, provide `box_2d` as `[ymin, xmin, ymax, xmax]` normalized from 0 to 1000 relative to THAT page's dimensions.
-   - `box_2d` must tightly cover the Japanese text block inside that specific bubble lobe. NEVER merge two separate or staggered bubbles (such as adjacent black narration bubbles) into a single `box_2d` — output each bubble as its own separate entry!
+   - `box_2d` must tightly cover the entire Japanese text block (including furigana and punctuation like `…` or `！？`) inside that specific bubble lobe.
+   - DOUBLE / CONNECTED / ADJACENT BUBBLES: If a speech bubble has two or more connected lobes, OR if two bubbles (white or black) are next to each other, you MUST output EACH lobe/bubble as its own separate entry in `bubbles` with its own tight `box_2d` covering ONLY that lobe's text! NEVER merge two lobes or two adjacent bubbles into one `box_2d`.
+   - Do NOT create `box_2d` entries for large decorative sound effects (SFX like リンゴーン, むにっ, ピシ) drawn directly over background artwork outside of speech bubbles.
 4. Return ONLY valid JSON matching this exact structure (every bubble MUST have a non-empty `translated_text`):
 {{
   "summary": "Brief 1-sentence scene context",
@@ -1037,7 +1041,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
         strict_dark_silhouette = closed_dark_bg.point(lambda p: 255 if p <= 68 else 0)
         ImageDraw.Draw(strict_dark_silhouette).rectangle([0, 0, ww - 1, wh - 1], outline=0)
 
-        # Keep only the connected dark bubble component(s) that overlap our text box
         ry1_rel = max(2, min(y1, raw_y1) - wy1)
         ry2_rel = min(wh - 3, max(y2, raw_y2) - wy1)
         rx1_rel = max(2, min(x1, raw_x1) - wx1)
@@ -1098,7 +1101,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
         if row_lefts and row_rights:
             row_lefts.sort()
             row_rights.sort()
-            # Use 75th-percentile inner walls + 6px inset so white text stays comfortably inside the black oval
             inner_l = row_lefts[int(len(row_lefts) * 0.75)] + 6
             inner_r = row_rights[int(len(row_rights) * 0.25)] - 6
             if inner_r - inner_l >= 22:
@@ -1391,17 +1393,21 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
 
 
 async def process_manga_translation_request(ctx_or_message, user_prompt: str):
+    from media_context import resolve_referenced_message
+
     msg = ctx_or_message.message if hasattr(ctx_or_message, "message") else ctx_or_message
     channel = ctx_or_message.channel
 
     image_attachments = [
         a for a in msg.attachments if a.filename.lower().endswith(IMAGE_EXTENSIONS)
     ]
-    if not image_attachments and msg.reference and isinstance(msg.reference.resolved, discord.Message):
-        image_attachments = [
-            a for a in msg.reference.resolved.attachments
-            if a.filename.lower().endswith(IMAGE_EXTENSIONS)
-        ]
+    if not image_attachments and msg.reference:
+        ref_msg = await resolve_referenced_message(msg)
+        if ref_msg:
+            image_attachments = [
+                a for a in ref_msg.attachments
+                if a.filename.lower().endswith(IMAGE_EXTENSIONS)
+            ]
 
     if not image_attachments:
         await channel.send(

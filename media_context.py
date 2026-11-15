@@ -616,25 +616,33 @@ async def extract_image_via_transient_ocr(
     return "\n\n".join(out_parts) if out_parts else "[OCR could not extract text from image]"
 
 
+async def resolve_referenced_message(message: discord.Message) -> discord.Message | None:
+    """
+    Safely retrieves the replied-to Discord Message even if it was sent before the bot
+    restarted/redeployed (when message.reference.resolved is None).
+    """
+    if not message.reference or not message.reference.message_id:
+        return None
+    if isinstance(message.reference.resolved, discord.Message):
+        return message.reference.resolved
+    try:
+        return await message.channel.fetch_message(message.reference.message_id)
+    except Exception:
+        return None
+
+
 async def extract_all_context(message: discord.Message) -> tuple[str, str]:
     from voice_engine import convert_audio_bytes_to_wav_sync, transcribe_wav_bytes_hybrid
 
     blocks, voice_clip_transcripts = [], []
     has_code_file = False
 
-    # Support replying to a previous message containing an image (e.g., replying 'ขอวาร์ป' or 'รุ่นอะไร')
+    # 1. Resolve replied-to message (works even for older messages sent before a bot restart!)
+    ref_msg = await resolve_referenced_message(message)
+
     target_attachments = list(message.attachments)
-    if (
-        not target_attachments
-        and message.reference
-        and isinstance(message.reference.resolved, discord.Message)
-    ):
-        ref_atts = [
-            a for a in message.reference.resolved.attachments
-            if a.filename.lower().endswith(IMAGE_EXTENSIONS)
-        ]
-        if ref_atts:
-            target_attachments = ref_atts
+    if not target_attachments and ref_msg and ref_msg.attachments:
+        target_attachments = list(ref_msg.attachments)
 
     for att in target_attachments:
         if att.size > 15 * 1024 * 1024:
@@ -682,8 +690,12 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
         except Exception as e:
             blocks.append(f"[Error reading `{att.filename}`: {e}]")
 
-    # Extract Discord Stickers (Name + Optional Vision Inspection for PNG/APNG/GIF stickers)
-    for stk in getattr(message, "stickers", []) or []:
+    # 2. Extract Discord Stickers (from current message OR replied-to message)
+    target_stickers = list(getattr(message, "stickers", []) or [])
+    if not target_stickers and ref_msg:
+        target_stickers = list(getattr(ref_msg, "stickers", []) or [])
+
+    for stk in target_stickers:
         stk_name = getattr(stk, "name", "Unknown Sticker")
         stk_fmt = str(getattr(stk, "format", "")).lower()
         stk_desc = f"User sent a Discord Sticker named: `{stk_name}`"
@@ -696,14 +708,16 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
                     if s_resp.status == 200:
                         stk_bytes = await s_resp.read()
                         if len(stk_bytes) <= 8 * 1024 * 1024:
-                            stk_vis = await extract_image_via_transient_ocr(stk_bytes, f"{stk_name}.png")
+                            stk_vis = await extract_image_via_transient_ocr(
+                                stk_bytes, f"{stk_name}.png", run_source_lookup=False
+                            )
                             if stk_vis and "[OCR could not" not in stk_vis:
                                 stk_desc += f"\nVisual/Sticker Details:\n{stk_vis}"
             except Exception as e:
                 print(f"Sticker vision note ({stk_name}): {e}")
         blocks.append(f"=== Discord Sticker ===\n{stk_desc}")
 
-    # Translate Custom Discord Emojis (<:name:id> / <a:name:id>) into readable emote names
+    # 3. Translate Custom Discord Emojis (<:name:id> / <a:name:id>)
     custom_emojis = CUSTOM_EMOJI_REGEX.findall(message.content or "")
     if custom_emojis:
         emote_names = [f":{name}:" for name, _ in custom_emojis]
@@ -712,11 +726,18 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
             f"User included custom emoji(s): {', '.join(emote_names)}"
         )
 
-    urls_in_msg = URL_REGEX.findall(message.content)[:2]
-    if urls_in_msg and not message.embeds:
+    # 4. Extract URLs (YouTube or Webpages) from current message OR replied-to message!
+    url_source_msg = message
+    urls_in_msg = URL_REGEX.findall(message.content or "")[:2]
+    if not urls_in_msg and ref_msg and ref_msg.content:
+        urls_in_msg = URL_REGEX.findall(ref_msg.content)[:2]
+        if urls_in_msg:
+            url_source_msg = ref_msg
+
+    if urls_in_msg and not url_source_msg.embeds:
         try:
-            await asyncio.sleep(1.2)
-            message = await message.channel.fetch_message(message.id)
+            await asyncio.sleep(1.0)
+            url_source_msg = await message.channel.fetch_message(url_source_msg.id)
         except Exception:
             pass
 
@@ -724,7 +745,7 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
         yt_id = extract_youtube_id(url)
         if yt_id:
             embed_info = {}
-            for emb in message.embeds:
+            for emb in url_source_msg.embeds:
                 if emb.title or emb.description or (emb.author and emb.author.name):
                     embed_info = {
                         "title": emb.title or "",
@@ -747,6 +768,13 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
                 )
             except Exception as e:
                 blocks.append(f"[Web extraction error: {e}]")
+
+    # 5. Include the replied-to message's text content if the user replied to a message
+    if ref_msg and ref_msg.content and ref_msg.content.strip():
+        ref_author = getattr(ref_msg.author, "display_name", "User")
+        blocks.append(
+            f"=== Replied-To Message from {ref_author} ===\n{ref_msg.content.strip()[:3000]}"
+        )
 
     joined_context = "\n\n".join(blocks)[:125000]
     prune_stale_attachments()
