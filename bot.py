@@ -57,6 +57,8 @@ from persona import (
 from user_memory import (
     restore_user_profiles_from_discord,
     resolve_user_mentions_and_build_dossier,
+    is_ot_command_text,
+    process_ot_request,
     user_profiles,
 )
 from search_engine import detect_coding_intent
@@ -251,11 +253,12 @@ async def on_message(message: discord.Message):
     is_dm = message.guild is None
     is_ai_chan = message.channel.id in AI_CHANNEL_IDS
     is_mentioned = bot.user in message.mentions
+    is_ot_trigger = is_ot_command_text(message.content)
 
     ref_msg = await resolve_referenced_message(message) if message.reference else None
     is_reply = bool(ref_msg and bot.user and ref_msg.author.id == bot.user.id)
     has_audio = any(a.filename.lower().endswith(AUDIO_EXTENSIONS) for a in message.attachments)
-    if not (is_dm or is_ai_chan or is_mentioned or is_reply or has_audio):
+    if not (is_dm or is_ai_chan or is_mentioned or is_reply or has_audio or is_ot_trigger):
         return
 
     clean_prompt = re.sub(rf"<@!?{bot.user.id}>", "", message.content).strip()
@@ -286,6 +289,12 @@ async def on_message(message: discord.Message):
 
     all_msg_atts = list(message.attachments) + (list(ref_msg.attachments) if ref_msg else [])
     has_image_att = any(a.filename.lower().endswith(config.IMAGE_EXTENSIONS) for a in all_msg_atts)
+
+    # 0A. Overtime (OT) Logger & Monthly Table Summarizer ('จด OT ...', 'สรุป OT', 'ลบ OT')
+    if is_ot_command_text(clean_prompt):
+        ot_reply = await process_ot_request(message, clean_prompt)
+        await send_chunked_response(message.channel, ot_reply, reply_to=message)
+        return
 
     # 0. Natural Chat "Yukipedia Mode" Trigger (Search / OCR / Translation + Critique)
     if YUKIPEDIA_INTENT_PATTERN.search(clean_prompt):
@@ -622,6 +631,15 @@ async def calc_exp(ctx, *, expr: str):
         await ctx.send(f"Result: `{SimpleEval().eval(expr)}`")
     except Exception as e:
         await ctx.send(f"Error: `{e}`")
+
+
+@bot.command(name="ot")
+async def ot_command(ctx, *, args: str = ""):
+    query = args.strip()
+    if query and not is_ot_command_text(query):
+        query = f"จด OT {query}"
+    reply = await process_ot_request(ctx.message, query or "สรุป OT")
+    await send_chunked_response(ctx, reply, reply_to=ctx.message)
 
 
 @bot.command(name="agent", aliases=["claw", "auto"])
