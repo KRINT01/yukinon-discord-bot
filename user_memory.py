@@ -49,9 +49,9 @@ def load_user_profiles_local():
         try:
             with open(USER_PROFILES_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                if isinstance(data, dict):
-                    user_profiles = data
-                    print(f"[User Memory] Loaded {len(user_profiles)} user profile(s) from local disk.", flush=True)
+            if isinstance(data, dict):
+                user_profiles = data
+                print(f"[User Memory] Loaded {len(user_profiles)} user profile(s) from local disk.", flush=True)
         except Exception as e:
             print(f"[User Memory] Local load warning: {e}", flush=True)
 
@@ -109,7 +109,6 @@ async def restore_user_profiles_from_discord(bot: discord.Client):
         except Exception as e:
             print(f"[User Memory] Cloud restore note: {e}", flush=True)
 
-    # Always scan #work channels on startup to recover any OT entries
     await recover_ot_logs_from_work_channels(bot)
 
 
@@ -248,11 +247,6 @@ def get_speaker_memory_context(user) -> str:
 def resolve_user_mentions_and_build_dossier(
     raw_text: str, guild: discord.Guild | None, bot_user_id: int, speaker_user=None
 ) -> tuple[str, str]:
-    """
-    1) Replaces raw `<@123456789>` mentions in the user's prompt with readable `@DisplayName`
-       so the LLM knows who is being referenced when asked 'รู้จัก @<User> ไหม'.
-    2) Builds a `<mentioned_users_dossier>` block with everything Yukino knows about that user.
-    """
     if not raw_text:
         return "", ""
 
@@ -333,10 +327,6 @@ def resolve_user_mentions_and_build_dossier(
 
 # ==============================================================================
 # OVERTIME (OT) TRACKER & MONTHLY TABLE SUMMARIZER
-# - Date Format: DD/MM/YYYY (Thai Buddhist Year, e.g., 16/11/2569)
-# - Time Format: Accepts HH.MM or HH:MM, records & displays as HH.MM (e.g., 18.00 - 21.00)
-# - Today (Mon-Fri): 17.00 -> Now shifted +1h to 18.00 -> (Now + 1h)
-# - Weekend (Sat-Sun) OR Backdated Date: Requires Start Time (asks if omitted!)
 # ==============================================================================
 OT_TRIGGER_REGEX = re.compile(
     r"^(?:จด|บันทึก|ลง|เพิ่ม|แก้|อัปเดต|สรุป|ดู|เช็ค|ตาราง|ยอด|ลบ|ยกเลิก)\s*(?:เวลา\s*)?ot\b",
@@ -350,15 +340,16 @@ OT_DELETE_REGEX = re.compile(
     r"^(?:ลบ|ยกเลิก)\s*(?:เวลา\s*)?ot\b",
     re.IGNORECASE,
 )
-# Matches a standalone time reply when Yukino is waiting for a weekend/backdated time
-# Supports both HH.MM and HH:MM: '09.00', '09:00', 'เริ่ม 9.30', '18.00 - 20.00', '18:00 - 20:00'
+OT_EDIT_DETAIL_ONLY_REGEX = re.compile(
+    r"^(?:แก้|อัปเดต|แก้ไข)\s*(?:รายละเอียด|งาน)?\s*(?:เวลา\s*)?ot\b",
+    re.IGNORECASE,
+)
 WEEKEND_TIME_REPLY_REGEX = re.compile(
     r"^(?:เริ่ม(?:\s*เวลา)?|ตั้งแต่(?:\s*เวลา)?)?\s*(\d{1,2})(?:[:.](\d{2}))?\s*(?:น\.?|โมง)?"
     r"(?:\s*(?:-|ถึง|to)\s*(\d{1,2})(?:[:.](\d{2}))?\s*(?:น\.?|โมง)?)?\s*(.*)$",
     re.IGNORECASE,
 )
 
-# Stores pending weekend/backdated OT requests waiting for a start/range time: {(channel_id, user_id): { ... }}
 pending_weekend_ot: dict[tuple[int, int], dict] = {}
 
 THAI_MONTH_NAME_TO_NUM = {name: idx for idx, name in enumerate(THAI_MONTHS) if idx > 0}
@@ -384,7 +375,6 @@ THAI_SHORT_WEEKDAYS = ("จ.", "อ.", "พ.", "พฤ.", "ศ.", "ส.", "อ�
 
 
 def _normalize_ot_year_ce(yy_str: str | None, default_year_ce: int) -> int:
-    """Converts a 2-digit or 4-digit Thai/CE year string into a 4-digit CE year."""
     if not yy_str:
         return default_year_ce
     y = int(yy_str)
@@ -396,15 +386,10 @@ def _normalize_ot_year_ce(yy_str: str | None, default_year_ce: int) -> int:
 
 
 def _format_date_thai_ddmmyyyy(dt: datetime) -> str:
-    """Formats a datetime as DD/MM/YYYY in Thai Buddhist Year (e.g., 05/11/2569)."""
     return f"{dt.day:02d}/{dt.month:02d}/{dt.year + 543:04d}"
 
 
 def _parse_stored_ot_date(date_str: str) -> tuple[int, int, int] | None:
-    """
-    Parses a stored OT date string ('DD/MM/YYYY' Thai/CE year or legacy 'YYYY-MM-DD')
-    into a sortable (year_ce, month, day) tuple.
-    """
     if not date_str:
         return None
     s = str(date_str).strip()
@@ -430,29 +415,18 @@ def _normalize_stored_date_to_thai_ddmmyyyy(date_str: str) -> str:
 
 
 def _format_time_dot(dt_or_str) -> str:
-    """Formats a datetime or time string as HH.MM (e.g., 18.00)."""
     if isinstance(dt_or_str, datetime):
         return dt_or_str.strftime("%H.%M")
     return str(dt_or_str).strip().replace(":", ".")
 
 
 def _extract_custom_date_from_text(text: str, default_dt: datetime) -> tuple[datetime | None, str]:
-    """
-    Detects if the user specified a custom/backdated date at the start of the OT command, such as:
-    - 'วันที่ 5 เดือน 11', 'วันที่ 5 เดือนพฤศจิกายน', 'วันที่ 5'
-    - '5 พ.ย.', '5 พย', 'วันที่ 5 พ.ย. 2569', '5 พฤศจิกายน 2569'
-    - '05/11/2569', '5/11', '05/11/2026', '5/11/69', '2026-11-05'
-    - 'เมื่อวาน', 'วานนี้'
-    Returns (parsed_datetime_or_None, remaining_text_without_date).
-    """
     s = text.strip()
 
-    # 1. 'เมื่อวาน' / 'วานนี้'
     m_yest = re.match(r"^(?:ของ)?(?:เมื่อวาน(?:นี้)?|วานนี้)\b\s*(.*)", s)
     if m_yest:
         return default_dt - timedelta(days=1), m_yest.group(1).strip()
 
-    # 2. ISO date: '2026-11-05' (with optional leading 'วันที่')
     m_iso = re.match(r"^(?:วันที่\s*)?(\d{4})-(\d{1,2})-(\d{1,2})\b\s*(.*)", s)
     if m_iso:
         yy = _normalize_ot_year_ce(m_iso.group(1), default_dt.year)
@@ -462,7 +436,6 @@ def _extract_custom_date_from_text(text: str, default_dt: datetime) -> tuple[dat
         except ValueError:
             pass
 
-    # 3. 'วันที่ 5 เดือน 11 [ปี 2569]' or 'วันที่ 5 เดือนพฤศจิกายน'
     m_wan_duan = re.match(
         rf"^(?:ของ)?วันที่\s*(\d{{1,2}})\s*เดือน(?:ที่)?\s*(\d{{1,2}}|{_MONTH_PATTERN_STR})"
         r"(?:\s*(?:ปี|พ\.ศ\.?|ค\.ศ\.?)?\s*(\d{2,4})(?!\s*[:.]\d{2}))?\s*(.*)",
@@ -479,7 +452,6 @@ def _extract_custom_date_from_text(text: str, default_dt: datetime) -> tuple[dat
         except ValueError:
             pass
 
-    # 4. Day + Thai Month name/abbreviation: '5 พ.ย.', 'วันที่ 5 พ.ย. 2569', '5 พฤศจิกายน'
     m_th_month = re.match(
         rf"^(?:(?:ของ)?วันที่\s*)?(\d{{1,2}})\s*({_MONTH_PATTERN_STR})"
         r"(?:\s*(\d{4}|\d{2})(?!\s*[:.]\d{2}))?\s*(.*)",
@@ -496,7 +468,6 @@ def _extract_custom_date_from_text(text: str, default_dt: datetime) -> tuple[dat
         except ValueError:
             pass
 
-    # 5. Slash date: '05/11/2569', '5/11', '05/11/2026', '5/11/69'
     m_slash = re.match(
         r"^(?:(?:ของ)?วันที่\s*)?(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b\s*(.*)",
         s,
@@ -510,7 +481,6 @@ def _extract_custom_date_from_text(text: str, default_dt: datetime) -> tuple[dat
         except ValueError:
             pass
 
-    # 6. 'วันที่ 5' (explicit 'วันที่ <day>' in current month, not followed by ':' or '.' time)
     m_day_only = re.match(r"^(?:ของ)?วันที่\s*(\d{1,2})(?!\s*[:.])\b\s*(.*)", s)
     if m_day_only:
         dd = int(m_day_only.group(1))
@@ -558,11 +528,58 @@ def _format_hours_human(hours_val: float) -> str:
     return f"{h} ชม. {m} นาที ({hours_val:.2f} ชม.)"
 
 
+def build_monthly_ot_summary_markdown(ot_logs: list[dict], target_year: int, target_month: int) -> str:
+    month_entries = []
+    for e in ot_logs:
+        pk = _parse_stored_ot_date(e.get("date", ""))
+        if pk and pk[0] == target_year and pk[1] == target_month:
+            month_entries.append(e)
+
+    month_entries.sort(key=lambda x: _parse_stored_ot_date(x.get("date", "")) or (0, 0, 0))
+
+    month_th = THAI_MONTHS[target_month]
+    year_be = target_year + 543
+
+    if not month_entries:
+        return (
+            f"📊 **สรุปเวลาทำ OT ประจำเดือน{month_th} พ.ศ. {year_be}**\n"
+            f"ยังไม่มีรายการบันทึก OT ในเดือน{month_th}เลยค่ะ หากวันไหนอยู่ทำงานล่วงเวลา พิมพ์ `จด OT <รายละเอียดงาน>` ทิ้งไว้ได้เลยนะคะ"
+        )
+
+    table_lines = [
+        f"📊 **ตารางสรุปเวลาทำ OT ประจำเดือน{month_th} พ.ศ. {year_be} ({target_month:02d}/{year_be})**",
+        "",
+        "| ลำดับ | วันที่ | เวลาที่บันทึก (OT) | จำนวนชั่วโมง | รายละเอียดงาน |",
+        "| :---: | :---: | :---: | :---: | :--- |",
+    ]
+    total_hours = 0.0
+    for idx, entry in enumerate(month_entries, 1):
+        d_th = _normalize_stored_date_to_thai_ddmmyyyy(entry.get("date", ""))
+        n_start = _format_time_dot(entry.get("noted_start", "18.00"))
+        n_end = _format_time_dot(entry.get("noted_end", "-"))
+        hrs = float(entry.get("hours") or 0.0)
+        total_hours += hrs
+        hrs_label = f"{int(hrs)} ชม." if hrs.is_integer() else f"{hrs:.2f} ชม."
+        det = (entry.get("detail") or "-").replace("|", "\\|")
+        table_lines.append(
+            f"| {idx} | {d_th} | {n_start} - {n_end} | {hrs_label} | {det} |"
+        )
+
+    days_count = len(month_entries)
+    avg_hours = total_hours / days_count if days_count else 0.0
+    total_human = _format_hours_human(total_hours)
+
+    table_lines.extend([
+        "",
+        "**📌 สรุปยอดรวมประจำเดือน:**",
+        f"- **จำนวนวันที่ทำ OT:** `{days_count} วัน`",
+        f"- **รวมชั่วโมง OT ทั้งสิ้น:** **`{total_human}`** (เฉลี่ยวันละ `{avg_hours:.1f} ชม.`)",
+        "-# พักผ่อนให้เพียงพอด้วยนะคะ อย่าโหมงานหนักจนเสียสุขภาพล่ะ",
+    ])
+    return "\n".join(table_lines)
+
+
 async def recover_ot_logs_from_work_channels(bot: discord.Client):
-    """
-    Self-healing fallback: scans #work channels on startup for previous Yukinon OT confirmation
-    messages so OT records survive Render redeploys even without a #yukinon-memory channel.
-    """
     recovered_count = 0
     pattern = re.compile(
         r"\[OT_RECORD:\s*uid=(\d+)\s*\|\s*date=([0-9/\-]+)\s*\|\s*"
@@ -655,7 +672,6 @@ async def _save_and_format_ot_entry(
             "detail": clean_detail,
         })
 
-    # Normalize all entries to DD/MM/YYYY (Thai Year) and HH.MM, sorted chronologically
     for entry in ot_logs:
         entry["date"] = _normalize_stored_date_to_thai_ddmmyyyy(entry.get("date", ""))
         entry["noted_start"] = _format_time_dot(entry.get("noted_start", "18.00"))
@@ -692,11 +708,6 @@ async def _save_and_format_ot_entry(
 
 
 async def process_ot_request(message: discord.Message, raw_text: str) -> str:
-    """
-    Handles logging, backdating, deleting, and summarizing Monthly Overtime (OT):
-    - Date Format: DD/MM/YYYY in Thai Buddhist Year (e.g., 16/11/2569)
-    - Time Format: Accepts HH.MM or HH:MM; records & displays as HH.MM (e.g., 18.00 - 21.00)
-    """
     global _DIRTY_SINCE_LAST_BACKUP
     user = message.author
     uid_str = str(user.id)
@@ -714,9 +725,7 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
     prof = user_profiles[uid_str]
     ot_logs: list[dict] = list(prof.get("ot_logs") or [])
 
-    # ------------------------------------------------------------------
-    # 0. HANDLE REPLY TO PENDING WEEKEND / BACKDATED START-TIME PROMPT
-    # ------------------------------------------------------------------
+    # 0. Handle reply to pending weekend/backdated prompt
     if _has_active_pending_weekend_ot(chan_id, user.id) and not OT_TRIGGER_REGEX.search(text):
         if text.lower() in ("ยกเลิก", "cancel"):
             pending_weekend_ot.pop(pending_key, None)
@@ -777,9 +786,7 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
                 time_note=note_label,
             )
 
-    # ------------------------------------------------------------------
-    # 1. DELETE OT ENTRY ('ลบ OT วันนี้', 'ลบ OT วันที่ 5 เดือน 11', 'ลบ OT 05/11/2569')
-    # ------------------------------------------------------------------
+    # 1. Delete OT entry
     if OT_DELETE_REGEX.search(text) or text.lower().startswith(("delete ", "remove ", "ลบ")):
         pending_weekend_ot.pop(pending_key, None)
         del_body = re.sub(r"^(?:ลบ|ยกเลิก|delete|remove)\s*(?:เวลา\s*)?(?:ot)?\s*", "", text, flags=re.IGNORECASE).strip()
@@ -802,9 +809,7 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
             return f"🗑️ ลบรายการบันทึก OT ของวันที่ **`{target_date_th}`** ออกให้เรียบร้อยแล้วค่ะ"
         return f"ไม่พบรายการบันทึก OT ของวันที่ **`{target_date_th}`** ในระบบค่ะ"
 
-    # ------------------------------------------------------------------
-    # 2. SUMMARIZE OT ('สรุป OT', 'ดู OT', 'ตาราง OT', or bare '!ot')
-    # ------------------------------------------------------------------
+    # 2. Summarize OT
     if not text or OT_SUMMARY_REGEX.search(text) or text.lower().startswith(("summary", "list", "table", "สรุป", "ดู", "ตาราง")):
         target_year = default_work_dt.year
         target_month = default_work_dt.month
@@ -831,58 +836,32 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
                         target_month = m_idx
                         break
 
-        month_entries = []
-        for e in ot_logs:
-            pk = _parse_stored_ot_date(e.get("date", ""))
-            if pk and pk[0] == target_year and pk[1] == target_month:
-                month_entries.append(e)
+        return build_monthly_ot_summary_markdown(ot_logs, target_year, target_month)
 
-        month_entries.sort(key=lambda x: _parse_stored_ot_date(x.get("date", "")) or (0, 0, 0))
+    # 2.5 Update description only for an existing OT date ('แก้ OT วันที่ 5 แก้ไขระบบ Report')
+    if OT_EDIT_DETAIL_ONLY_REGEX.search(text):
+        edit_body = OT_EDIT_DETAIL_ONLY_REGEX.sub("", text).strip()
+        custom_edit_dt, rem_edit = _extract_custom_date_from_text(edit_body, default_work_dt)
+        target_dt = custom_edit_dt or default_work_dt
+        has_time_in_edit = bool(re.match(r"^\d{1,2}[:.]\d{2}", rem_edit))
+        if rem_edit and not has_time_in_edit:
+            target_key = (target_dt.year, target_dt.month, target_dt.day)
+            for existing_entry in ot_logs:
+                if _parse_stored_ot_date(existing_entry.get("date", "")) == target_key:
+                    return await _save_and_format_ot_entry(
+                        prof,
+                        ot_logs,
+                        uid_str,
+                        target_dt,
+                        existing_entry.get("noted_start", "18.00"),
+                        existing_entry.get("noted_end", "20.00"),
+                        float(existing_entry.get("hours") or 1.0),
+                        rem_edit.strip(" -:"),
+                        has_new_detail=True,
+                        time_note="*(อัปเดตรายละเอียดงาน)*",
+                    )
 
-        month_th = THAI_MONTHS[target_month]
-        year_be = target_year + 543
-
-        if not month_entries:
-            return (
-                f"📊 **สรุปเวลาทำ OT ประจำเดือน{month_th} พ.ศ. {year_be}**\n"
-                f"ยังไม่มีรายการบันทึก OT ในเดือน{month_th}เลยค่ะ หากวันไหนอยู่ทำงานล่วงเวลา พิมพ์ `จด OT <รายละเอียดงาน>` ทิ้งไว้ได้เลยนะคะ"
-            )
-
-        table_lines = [
-            f"📊 **ตารางสรุปเวลาทำ OT ประจำเดือน{month_th} พ.ศ. {year_be} ({target_month:02d}/{year_be})**",
-            "",
-            "| ลำดับ | วันที่ | เวลาที่บันทึก (OT) | จำนวนชั่วโมง | รายละเอียดงาน |",
-            "| :---: | :---: | :---: | :---: | :--- |",
-        ]
-        total_hours = 0.0
-        for idx, entry in enumerate(month_entries, 1):
-            d_th = _normalize_stored_date_to_thai_ddmmyyyy(entry.get("date", ""))
-            n_start = _format_time_dot(entry.get("noted_start", "18.00"))
-            n_end = _format_time_dot(entry.get("noted_end", "-"))
-            hrs = float(entry.get("hours") or 0.0)
-            total_hours += hrs
-            hrs_label = f"{int(hrs)} ชม." if hrs.is_integer() else f"{hrs:.2f} ชม."
-            det = (entry.get("detail") or "-").replace("|", "\\|")
-            table_lines.append(
-                f"| {idx} | {d_th} | {n_start} - {n_end} | {hrs_label} | {det} |"
-            )
-
-        days_count = len(month_entries)
-        avg_hours = total_hours / days_count if days_count else 0.0
-        total_human = _format_hours_human(total_hours)
-
-        table_lines.extend([
-            "",
-            "**📌 สรุปยอดรวมประจำเดือน:**",
-            f"- **จำนวนวันที่ทำ OT:** `{days_count} วัน`",
-            f"- **รวมชั่วโมง OT ทั้งสิ้น:** **`{total_human}`** (เฉลี่ยวันละ `{avg_hours:.1f} ชม.`)",
-            "-# พักผ่อนให้เพียงพอด้วยนะคะ อย่าโหมงานหนักจนเสียสุขภาพล่ะ",
-        ])
-        return "\n".join(table_lines)
-
-    # ------------------------------------------------------------------
-    # 3. LOG / UPDATE OT ENTRY ('จด OT [วันที่] [เวลา] [รายละเอียด]')
-    # ------------------------------------------------------------------
+    # 3. Log / Update OT entry
     detail_str = re.sub(
         r"^(?:จด|บันทึก|ลง|เพิ่ม|แก้|อัปเดต)\s*(?:เวลา\s*)?ot\b\s*",
         "",
@@ -896,7 +875,7 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
     target_date_th = _format_date_thai_ddmmyyyy(work_dt)
     is_weekend = (work_dt.weekday() >= 5)
 
-    # Pattern A: Explicit start-end range in HH.MM or HH:MM (e.g. '18.00 - 20.00 แก้โปรแกรม' or '18:00 - 20:00')
+    # Pattern A: Explicit start-end range in HH.MM or HH:MM
     range_time_m = re.match(
         r"^(?:ตั้งแต่(?:\s*เวลา)?|เริ่ม(?:\s*เวลา)?)?\s*(\d{1,2})[:.](\d{2})\s*(?:น\.?)?\s*(?:-|ถึง|to)\s*(\d{1,2})[:.](\d{2})(?:\s*น\.?)?\s*(.*)",
         detail_str,
@@ -928,9 +907,7 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
             time_note=note_str,
         )
 
-    # ------------------------------------------------------------------
-    # BRANCH 3A: WEEKEND OR CUSTOM BACKDATED DATE (Requires Start Time!)
-    # ------------------------------------------------------------------
+    # Branch 3A: Weekend or custom backdated date
     if is_weekend or is_custom_date:
         wknd_start_m = re.match(
             r"^(?:เริ่ม(?:\s*เวลา)?|ตั้งแต่(?:\s*เวลา)?)\s*(\d{1,2})(?:[:.](\d{2}))?\s*(?:น\.?|โมง)?\s*(.*)",
@@ -1008,9 +985,7 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
             f"นายเริ่มทำ OT ตั้งแต่กี่โมงคะ? **(พิมพ์ตอบแค่เวลาเริ่ม เช่น `09.00` หรือช่วงเวลา `09.00 - 17.00` ได้เลยค่ะ เดี๋ยวฉันบันทึกให้ทันทีค่ะ)**"
         )
 
-    # ------------------------------------------------------------------
-    # BRANCH 3B: CURRENT WORKDAY RULE (Mon-Fri — 17.00 -> Now shifted +1h to 18.00)
-    # ------------------------------------------------------------------
+    # Branch 3B: Current workday rule (Mon-Fri: 17.00 -> Now shifted +1h to 18.00)
     explicit_hrs_m = re.match(
         r"^(\d+(?:\.\d+)?)\s*(?:ชั่วโมง|ชม\.?|hrs?\.?|hours?|h)\b\s*(.*)",
         detail_str,
@@ -1066,5 +1041,5 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
         ot_hours,
         clean_detail,
         has_new_detail=bool(detail_str.strip()),
-        time_note=f"*(เวลาเลิกจริง {actual_finish_str} น. | คิดจาก 17.00 น.)*",
+        time_note=f"*(เวลาเลิกจริง {actual_finish_str} น. | คิดจาก 17.00 - {actual_finish_str} น.)*",
     )

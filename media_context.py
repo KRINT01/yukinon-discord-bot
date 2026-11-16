@@ -24,9 +24,9 @@ from config import (
     CODE_AND_LOG_EXTENSIONS,
     PLAIN_TEXT_EXTENSIONS,
     IMAGE_EXTENSIONS,
-    IMAGE_SOURCE_INTENT_PATTERN,
     CUSTOM_EMOJI_REGEX,
     URL_REGEX,
+    STACK_TRACE_SIGNATURE_REGEX,
     ollama_lock,
     channel_last_attachment,
     state,
@@ -35,6 +35,7 @@ from config import (
     get_http_session,
     get_modal_headers,
     prune_stale_attachments,
+    release_unused_memory,
 )
 from persona import TYPHOON_OCR_PROMPT
 from search_engine import fetch_webpage_sync, run_safe_web_search_sync
@@ -42,7 +43,6 @@ from llm import (
     discover_active_groq_vision_models,
     call_gemma_ai_studio_vision,
     call_cloudflare_vision_chat,
-    call_gemini_generate_content_self_healing,
 )
 
 
@@ -103,11 +103,54 @@ def parse_docx_bytes(raw_bytes: bytes, max_chars: int = 30000) -> str:
     return "\n\n".join(parts)[:max_chars]
 
 
+def extract_key_stack_trace_windows(log_text: str, max_chars: int = 28000) -> str:
+    """
+    Intelligently extracts high-value error/exception windows from large logs so nested
+    Java/Spring Boot `Caused by:` chains, `ORA-` errors, Node.js rejections, and K8s pod
+    events are never truncated out of the middle of a file.
+    """
+    if len(log_text) <= max_chars:
+        return log_text
+
+    lines = log_text.splitlines()
+    total_lines = len(lines)
+    keep_indices: set[int] = set()
+
+    # Always keep startup/header context (first 45 lines) and latest tail (last 180 lines)
+    for i in range(min(45, total_lines)):
+        keep_indices.add(i)
+    for i in range(max(0, total_lines - 180), total_lines):
+        keep_indices.add(i)
+
+    # Scan for stack trace / exception / ORA- / K8s failure anchors and preserve surrounding frames
+    for idx, line in enumerate(lines):
+        if STACK_TRACE_SIGNATURE_REGEX.search(line) or re.search(r"\b(ERROR|FATAL|SEVERE|PANIC)\b", line):
+            start_w = max(0, idx - 6)
+            end_w = min(total_lines, idx + 28)
+            for j in range(start_w, end_w):
+                keep_indices.add(j)
+
+    sorted_idx = sorted(keep_indices)
+    out_lines = []
+    prev_i = None
+    for i in sorted_idx:
+        if prev_i is not None and i > prev_i + 1:
+            skipped = i - prev_i - 1
+            out_lines.append(f"... [ omitted {skipped} routine log line(s) ] ...")
+        out_lines.append(f"{i+1:5d} | {lines[i]}")
+        prev_i = i
+
+    assembled = "\n".join(out_lines)
+    if len(assembled) <= max_chars:
+        return assembled
+    head = assembled[:4500]
+    tail = assembled[-(max_chars - 4600):]
+    return f"{head}\n\n... [ truncated intermediate trace frames ] ...\n\n{tail}"
+
+
 def format_code_or_log_attachment(text: str, is_log: bool, max_chars: int = 120000) -> str:
-    if is_log:
-        if len(text) <= 30000:
-            return text
-        return f"{text[:4000]}\n\n... [ omitted middle log lines ] ...\n\n{text[-25000:]}"
+    if is_log or STACK_TRACE_SIGNATURE_REGEX.search(text[:8000]):
+        return extract_key_stack_trace_windows(text, max_chars=28000)
 
     lines = text.splitlines()
     numbered_lines = [f"{idx:4d} | {line}" for idx, line in enumerate(lines, 1)]
@@ -168,10 +211,10 @@ def fetch_youtube_context_sync(
                 req = urllib.request.Request(oe_endpoint, headers={"User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(req, timeout=8) as resp:
                     oe_data = json.loads(resp.read().decode("utf-8"))
-                    title = title or (oe_data.get("title") or "").strip()
-                    author = author or (oe_data.get("author_name") or "").strip()
-                    if title and author:
-                        break
+                title = title or (oe_data.get("title") or "").strip()
+                author = author or (oe_data.get("author_name") or "").strip()
+                if title and author:
+                    break
             except Exception:
                 continue
 
@@ -229,10 +272,15 @@ def fetch_youtube_context_sync(
     except Exception:
         pass
 
-    # Layer 4: Supplemental Web Search whenever a video has no/minimal spoken transcript (e.g. game trailers / PVs)
+    # Layer 4: Supplemental Web Search whenever a video has no/minimal spoken transcript
     search_enrichment = ""
     if len(transcript_text) < 120 and title:
-        clean_title_for_search = re.sub(r"[|_—–-]\s*(?:Release Date Trailer|Official Trailer|Trailer|PV|Teaser).*", "", title, flags=re.IGNORECASE).strip()
+        clean_title_for_search = re.sub(
+            r"[|_—–-]\s*(?:Release Date Trailer|Official Trailer|Trailer|PV|Teaser).*",
+            "",
+            title,
+            flags=re.IGNORECASE,
+        ).strip()
         try:
             search_enrichment = run_safe_web_search_sync(f"{clean_title_for_search or title} {author}".strip(), max_results=4)
         except Exception:
@@ -259,10 +307,6 @@ def fetch_youtube_context_sync(
 
 
 async def _search_saucenao_async(raw_bytes: bytes, filename: str) -> str:
-    """
-    Queries SauceNAO API (if SAUCENAO_API_KEY is configured) to find exact Pixiv, Twitter/X,
-    Danbooru, and MangaDex sources (including artist name, Pixiv link, and manga chapter/part).
-    """
     if not SAUCENAO_API_KEY:
         return ""
     t0 = time.monotonic()
@@ -322,14 +366,9 @@ async def _search_saucenao_async(raw_bytes: bytes, filename: str) -> str:
 
 
 async def _search_iqdb_keyless_async(raw_bytes: bytes, filename: str) -> str:
-    """
-    Keyless fallback for anime/manga illustrations: posts the image to iqdb.org
-    and extracts high-similarity (>72%) Danbooru/Yande.re/Konachan matches and source tags.
-    """
     t0 = time.monotonic()
     iqdb_url = f"{HTTPS}iqdb.org/"
     try:
-        # Resize thumbnail to <= 600px JPEG so IQDB upload is fast (<1s) and under size limits
         from PIL import Image
         img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
         img.thumbnail((600, 600), Image.Resampling.LANCZOS)
@@ -351,7 +390,6 @@ async def _search_iqdb_keyless_async(raw_bytes: bytes, filename: str) -> str:
                 return ""
             html_text = await resp.text()
 
-        # Look for 'Best match' block with similarity percentage
         if "Best match" not in html_text:
             return ""
         sim_m = re.search(r"(\d+)%\s*similarity", html_text)
@@ -382,10 +420,6 @@ async def _search_iqdb_keyless_async(raw_bytes: bytes, filename: str) -> str:
 
 
 async def _search_tracemoe_async(raw_bytes: bytes, mime_type: str) -> str:
-    """
-    Keyless Anime Screenshot Finder via trace.moe API (https://api.trace.moe/search?anilistInfo&cutBorders).
-    Identifies exact Anime Title, Episode number, and Timestamp (MM:SS) when similarity >= 87%.
-    """
     t0 = time.monotonic()
     trace_url = f"{HTTPS}api.trace.moe/search?anilistInfo&cutBorders"
     try:
@@ -438,16 +472,10 @@ async def _search_tracemoe_async(raw_bytes: bytes, mime_type: str) -> str:
 
 
 def _compress_image_for_vision_ocr_sync(raw_bytes: bytes) -> tuple[str, str, bool]:
-    """
-    Resizes large PNG/WebP images to <=1280px JPEG and detects whether the image is color
-    (so trace.moe anime search is skipped on black-and-white manga pages).
-    Returns (b64_jpeg, mime_type, is_color_image).
-    """
     from PIL import Image, ImageStat
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     img.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
 
-    # Check color saturation in HSV space (manga pages have mean saturation < 12)
     hsv_stat = ImageStat.Stat(img.convert("HSV"))
     mean_saturation = hsv_stat.mean[1] if len(hsv_stat.mean) > 1 else 0.0
     is_color_image = (mean_saturation >= 14.0)
@@ -472,13 +500,14 @@ async def extract_image_via_transient_ocr(
 
     ocr_prompt = (
         "Analyze this image thoroughly for Yukino Yukinoshita so she can identify its exact source, "
-        "read any text, and give her sharp personal critique.\n"
+        "read any text or stack trace/screenshot, and give her sharp personal critique.\n"
         "Provide your output in 3 concise sections:\n"
         "1. [Identification & Origin]:\n"
+        "   - If Code / Terminal / Stack Trace / UI Screenshot: Describe the exact error message, HTTP status, UI component, or terminal output shown.\n"
         "   - If Illustration/Anime/Manga: State the Series/Character ONLY if you are 100% certain. "
-        "NEVER guess random famous series (like Fairy Tail or Black Clover) if unsure! Describe the visual scene, expressions, composition, and any cats or pandas.\n"
-        "   - If Real-World Photo/Product/Hardware: Identify the Brand, Product Line, Model Name/Number, and distinguishing physical features (camera layout, buttons, logos).\n"
-        "2. [Verbatim OCR Text]: Transcribe ALL visible text (Thai, Japanese, English) verbatim. "
+        "NEVER guess random famous series if unsure! Describe the visual scene, expressions, composition, and any cats or pandas.\n"
+        "   - If Real-World Photo/Product/Hardware: Identify the Brand, Product Line, Model Name/Number, and distinguishing physical features.\n"
+        "2. [Verbatim OCR Text]: Transcribe ALL visible text (Thai, Japanese, English, code, error codes) verbatim. "
         "Pay close attention to Thai tone marks (วรรณยุกต์), vowels (สระ), and visually similar consonants "
         "(ก/ภ/ถ, ข/ช, ค/ด/ต, พ/ผ/ฝ/ฟ, ร/ธ), and note if the original text contains any spelling errors.\n"
         "3. [WEB_VERIFY_QUERY]: On the very last line, if the image is a manga page or product whose source/model should be looked up via Google Search, output:\n"
@@ -488,18 +517,17 @@ async def extract_image_via_transient_ocr(
     reverse_tasks = []
     if run_source_lookup:
         reverse_tasks.append(asyncio.create_task(_search_saucenao_async(raw_bytes, filename)))
-        # Only query trace.moe on color images (prevents false anime matches on B&W manga pages!)
         if is_color_img:
             reverse_tasks.append(asyncio.create_task(_search_tracemoe_async(raw_bytes, mime_type)))
 
     vision_result = ""
 
-    # Tier 1: Cloudflare Workers AI Vision (@cf/google/gemma-4-26b-a4b-it — ~4.5s, 10K Neurons/day)
+    # Tier 1: Cloudflare Workers AI Vision
     cf_ocr = await call_cloudflare_vision_chat(ocr_prompt, mime_type, b64_img, purpose="Image OCR Tier 1 CF")
     if cf_ocr:
         vision_result = cf_ocr
 
-    # Tier 2: Groq LPU Vision (qwen/qwen3.8-27b — ~2.1s)
+    # Tier 2: Groq LPU Vision
     if not vision_result and GROQ_API_KEY:
         groq_candidates = await discover_active_groq_vision_models()
         groq_host = "api." + "groq.com"
@@ -543,7 +571,7 @@ async def extract_image_via_transient_ocr(
             except Exception as e:
                 api_log(f"Image OCR (Tier 2 Groq) -> {g_mod} failed ({type(e).__name__}); fallback to Tier 3")
 
-    # Tier 3: Google AI Studio Gemma 4 Vision (fast 10s timeout backup)
+    # Tier 3: Google AI Studio Gemma 4 Vision
     if not vision_result:
         gemma_ocr = await call_gemma_ai_studio_vision(
             ocr_prompt, mime_type, b64_img, timeout_sec=10, purpose="Image OCR Tier 3"
@@ -551,7 +579,7 @@ async def extract_image_via_transient_ocr(
         if gemma_ocr:
             vision_result = gemma_ocr
 
-    # Tier 4: Modal T4 GPU (scb10x/typhoon-ocr1.5-3b)
+    # Tier 4: Modal T4 GPU
     if not vision_result:
         payload = {
             "model": ACTIVE_VISION_MODEL,
@@ -636,8 +664,9 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
 
     blocks, voice_clip_transcripts = [], []
     has_code_file = False
+    parsed_heavy_doc = False
 
-    # 1. Resolve replied-to message (works even for older messages sent before a bot restart!)
+    # 1. Resolve replied-to message
     ref_msg = await resolve_referenced_message(message)
 
     target_attachments = list(message.attachments)
@@ -658,39 +687,47 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
                     blocks.append(f"=== Transcribed Voice Message (`{att.filename}`) ===\n{spoken_txt}")
             elif fname.endswith(CODE_AND_LOG_EXTENSIONS) or fname.endswith(PLAIN_TEXT_EXTENSIONS):
                 is_log = fname.endswith(".log")
-                if fname.endswith(CODE_AND_LOG_EXTENSIONS):
+                decoded_text = raw_bytes.decode("utf-8", errors="replace")
+                if fname.endswith(CODE_AND_LOG_EXTENSIONS) or STACK_TRACE_SIGNATURE_REGEX.search(decoded_text[:4000]):
                     has_code_file = True
-                formatted_code = format_code_or_log_attachment(
-                    raw_bytes.decode("utf-8", errors="replace"), is_log=is_log
-                )
+                formatted_code = format_code_or_log_attachment(decoded_text, is_log=is_log)
+                label = "Log / Stack Trace" if (is_log or STACK_TRACE_SIGNATURE_REGEX.search(decoded_text[:4000])) else "Source File"
                 blocks.append(
-                    f"=== Complete Attached Source File: `{att.filename}` (with line numbers) ===\n"
+                    f"=== Attached {label}: `{att.filename}` ===\n"
                     f"```\n{formatted_code}\n```"
                 )
             elif fname.endswith(".xlsx"):
+                parsed_heavy_doc = True
                 blocks.append(
                     f"=== Attached Excel: `{att.filename}` ===\n"
                     + await asyncio.to_thread(parse_xlsx_bytes_to_markdown, raw_bytes)
                 )
             elif fname.endswith(".pdf"):
+                parsed_heavy_doc = True
                 blocks.append(
                     f"=== Attached PDF: `{att.filename}` ===\n"
                     + await asyncio.to_thread(parse_pdf_bytes, raw_bytes)
                 )
             elif fname.endswith(".docx"):
+                parsed_heavy_doc = True
                 blocks.append(
                     f"=== Attached Word: `{att.filename}` ===\n"
                     + await asyncio.to_thread(parse_docx_bytes, raw_bytes)
                 )
             elif fname.endswith(IMAGE_EXTENSIONS):
+                ocr_out = await extract_image_via_transient_ocr(raw_bytes, att.filename, run_source_lookup=True)
+                if STACK_TRACE_SIGNATURE_REGEX.search(ocr_out):
+                    has_code_file = True
                 blocks.append(
-                    f"=== Image Inspection & Source Lookup (`{att.filename}`) ===\n"
-                    + await extract_image_via_transient_ocr(raw_bytes, att.filename, run_source_lookup=True)
+                    f"=== Image Inspection & Source Lookup (`{att.filename}`) ===\n{ocr_out}"
                 )
         except Exception as e:
             blocks.append(f"[Error reading `{att.filename}`: {e}]")
 
-    # 2. Extract Discord Stickers (from current message OR replied-to message)
+    if parsed_heavy_doc:
+        release_unused_memory()
+
+    # 2. Extract Discord Stickers
     target_stickers = list(getattr(message, "stickers", []) or [])
     if not target_stickers and ref_msg:
         target_stickers = list(getattr(ref_msg, "stickers", []) or [])
@@ -717,7 +754,7 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
                 print(f"Sticker vision note ({stk_name}): {e}")
         blocks.append(f"=== Discord Sticker ===\n{stk_desc}")
 
-    # 3. Translate Custom Discord Emojis (<:name:id> / <a:name:id>)
+    # 3. Translate Custom Discord Emojis
     custom_emojis = CUSTOM_EMOJI_REGEX.findall(message.content or "")
     if custom_emojis:
         emote_names = [f":{name}:" for name, _ in custom_emojis]
@@ -726,7 +763,7 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
             f"User included custom emoji(s): {', '.join(emote_names)}"
         )
 
-    # 4. Extract URLs (YouTube or Webpages) from current message OR replied-to message!
+    # 4. Extract URLs (YouTube or Webpages)
     url_source_msg = message
     urls_in_msg = URL_REGEX.findall(message.content or "")[:2]
     if not urls_in_msg and ref_msg and ref_msg.content:
@@ -769,7 +806,7 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
             except Exception as e:
                 blocks.append(f"[Web extraction error: {e}]")
 
-    # 5. Include the replied-to message's text content (unless it was just an old translation/bot command on an image)
+    # 5. Include replied-to message text content
     if ref_msg and ref_msg.content and ref_msg.content.strip():
         ref_txt = re.sub(r"<@!?\d+>", "", ref_msg.content).strip()
         is_old_image_cmd = bool(
@@ -785,9 +822,11 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
     joined_context = "\n\n".join(blocks)[:125000]
     prune_stale_attachments()
     if joined_context and message.channel:
-        channel_last_attachment[message.channel.id] = {
-            "content": joined_context,
+        att_names = [a.filename for a in target_attachments] if target_attachments else ["context"]
+        channel_last_attachment[message.channel.id].append({
+            "filenames": att_names,
+            "content": joined_context[:50000],
             "is_code": has_code_file,
             "timestamp": time.time(),
-        }
+        })
     return joined_context, " ".join(voice_clip_transcripts).strip()

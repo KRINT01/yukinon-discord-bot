@@ -23,6 +23,7 @@ from config import (
     CGNAT_NETWORK,
     CODE_AND_LOG_EXTENSIONS,
     CODE_INTENT_PATTERN,
+    STACK_TRACE_SIGNATURE_REGEX,
     WEATHER_INTENT_PATTERN,
     WEB_SEARCH_INTENT_PATTERN,
     RECENCY_INTENT_REGEX,
@@ -36,13 +37,12 @@ from config import (
     GEMINI_API_KEY,
     channel_memory,
     channel_active_topic,
-    channel_last_attachment,
     channel_last_weather,
     state,
     clean_url,
     api_log,
     get_http_session,
-    prune_stale_attachments,
+    channel_has_recent_code_attachment,
 )
 
 ENGLISH_ENTITY_REGEX = re.compile(r"\b[A-Za-z][A-Za-z0-9_.:-]{1,25}(?:\s+[A-Za-z0-9_.:-]{1,25}){0,4}\b")
@@ -57,12 +57,10 @@ def detect_coding_intent(text: str, attachments: list, channel_id: int = None) -
     for att in attachments:
         if att.filename.lower().endswith(CODE_AND_LOG_EXTENSIONS):
             return True
-    if bool(CODE_INTENT_PATTERN.search(text)):
+    if bool(CODE_INTENT_PATTERN.search(text)) or bool(STACK_TRACE_SIGNATURE_REGEX.search(text)):
         return True
-    prune_stale_attachments()
-    if channel_id and channel_id in channel_last_attachment:
-        if channel_last_attachment[channel_id].get("is_code"):
-            return True
+    if channel_has_recent_code_attachment(channel_id):
+        return True
     return False
 
 
@@ -226,9 +224,6 @@ def build_contextual_search_query(user_text: str, channel_id: int = None) -> str
     return (stripped or subject_prefix or raw)[:140]
 
 
-# Add `channel_last_weather` to `from config import (...)` at the top of search_engine.py
-
-
 def detect_weather_intent(text: str, channel_id: int = None) -> bool:
     if WEATHER_INTENT_PATTERN.search(text):
         return True
@@ -317,7 +312,7 @@ async def fetch_live_weather_context(user_text: str, channel_id: int = None) -> 
     except Exception as e:
         api_log(f"Weather (Tier 1 Open-Meteo) -> failed ({type(e).__name__}); falling back to wttr.in")
 
-    # Tier 2 Fallback: wttr.in (Now includes full 3-hour hourly breakdown for evening/night questions!)
+    # Tier 2 Fallback: wttr.in
     t1 = time.monotonic()
     url = clean_url(f"{HTTPS}wttr.in/{wttr_query}?format=j1&lang=th")
     try:
@@ -548,7 +543,6 @@ def _search_wikipedia_full_extract_sync(query: str, is_thai: bool, max_results: 
                 title = item.get("title", "")
                 if not title:
                     continue
-                # Fetch full article sections (up to 4,200 chars) rather than just exintro!
                 ext_url = clean_url(
                     f"{HTTPS}{lang_host}.wikipedia.org/w/api.php"
                     f"?action=query&prop=extracts&explaintext=1&exchars=4200"
@@ -675,7 +669,6 @@ def run_safe_web_search_sync(query: str, max_results: int = 5) -> str:
     region_code = "wt-wt" if has_en_entity else ("th-th" if is_thai else "wt-wt")
 
     is_news = bool(NEWS_QUERY_REGEX.search(clean_q))
-    is_recency = bool(RECENCY_INTENT_REGEX.search(clean_q))
     is_anime_manga = bool(ANIME_MANGA_QUERY_REGEX.search(clean_q))
     is_game = bool(GAME_QUERY_REGEX.search(clean_q))
 
@@ -716,18 +709,18 @@ def run_safe_web_search_sync(query: str, max_results: int = 5) -> str:
             )
             with urllib.request.urlopen(t_req, timeout=10) as resp:
                 t_data = json.loads(resp.read().decode("utf-8"))
-                for r in t_data.get("results", []):
-                    hits.append({
-                        "title": r.get("title", ""),
-                        "href": r.get("url", ""),
-                        "body": r.get("content", ""),
-                    })
+            for r in t_data.get("results", []):
+                hits.append({
+                    "title": r.get("title", ""),
+                    "href": r.get("url", ""),
+                    "body": r.get("content", ""),
+                })
             if hits:
                 api_log(f"Search (Tavily) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
         except Exception as e:
             api_log(f"Search (Tavily) -> failed ({type(e).__name__})")
 
-    # 3. DDGS v9+ Multi-Backend Metasearch (Only use timelimit='m' for breaking news so Wiki pages are never hidden!)
+    # 3. DDGS v9+ Multi-Backend Metasearch
     if len(hits) < 5:
         t0 = time.monotonic()
         preferred_timelimit = "m" if (is_news and not is_game and not is_anime_manga) else None
@@ -786,7 +779,6 @@ def run_safe_web_search_sync(query: str, max_results: int = 5) -> str:
         snippet = (item.get("body") or "").strip()
         idx = len(formatted_entries) + 1
         entry_text = f"[{idx}] Title: {title}\nURL: {href}\nSnippet: {snippet}"
-        # Scrape up to 2 high-value wiki/article pages (up to 3,500 chars each) for exact lists/weapons/story
         if (
             href
             and deep_scraped_count < 2

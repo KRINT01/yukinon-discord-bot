@@ -1,14 +1,17 @@
 import os
 import re
 import time
+import calendar
 import asyncio
 import platform
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import psutil
 import aiohttp
 from aiohttp import web
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from simpleeval import SimpleEval
 
 import config
@@ -59,6 +62,7 @@ from user_memory import (
     resolve_user_mentions_and_build_dossier,
     is_ot_command_text,
     process_ot_request,
+    build_monthly_ot_summary_markdown,
     user_profiles,
 )
 from search_engine import detect_coding_intent
@@ -108,6 +112,7 @@ def _collect_health_metrics() -> dict:
     )
     gemini_cd = max(0, int(state.gemini_grounding_cooldown_until - now))
     edge_cd = max(0, int(state.edge_tts_cooldown_until - now))
+    cached_files_count = sum(len(q) for q in channel_last_attachment.values())
 
     return {
         "status": "ok" if rss_mb < 480 else "warning_high_memory",
@@ -127,7 +132,7 @@ def _collect_health_metrics() -> dict:
             "render_limit_mb": 512,
             "ram_usage_pct": ram_pct,
             "active_chat_channels": len(channel_memory),
-            "cached_attachments": len(channel_last_attachment),
+            "cached_attachments": cached_files_count,
         },
         "ai_backends": {
             "modal_ollama_configured": bool(OLLAMA_BASE_URL),
@@ -171,7 +176,7 @@ async def handle_root(request: web.Request) -> web.Response:
         <title>Yukinon Discord Bot - System Telemetry</title>
     </head>
     <body style="font-family: system-ui, sans-serif; max-width: 720px; margin: 36px auto; line-height: 1.6; color: #1f2937; padding: 0 16px;">
-        <h2>❄️ Yukino Yukinoshita Discord Bot (Hybrid Cloud Edition)</h2>
+        <h2>❄️ Yukino Yukinoshita Discord Bot (Enterprise & Hybrid Cloud Edition)</h2>
         <p><b>System Time (TH):</b> {m['system_time_th']}</p>
         <p><b>Discord Gateway:</b> {gw_status}</p>
         <p><b>Voice & DAVE E2EE:</b> {d['active_voice_sessions']} active session(s) | DAVE Ready: {d['dave_e2ee_ready']}{edge_cd_note}</p>
@@ -202,6 +207,46 @@ async def handle_healthz(request: web.Request) -> web.Response:
     )
 
 
+@tasks.loop(minutes=15)
+async def monthly_ot_auto_report_task():
+    """Automatically posts the monthly OT summary table at 21:00 ICT on the last day of each month."""
+    if not bot.is_ready():
+        return
+    now_th = datetime.now(ZoneInfo("Asia/Bangkok"))
+    last_day = calendar.monthrange(now_th.year, now_th.month)[1]
+    ym_key = f"{now_th.year:04d}-{now_th.month:02d}"
+
+    if now_th.day != last_day or now_th.hour < 21 or state.last_ot_auto_report_ym == ym_key:
+        return
+
+    state.last_ot_auto_report_ym = ym_key
+    target_channel = None
+    for guild in bot.guilds:
+        for ch in guild.text_channels:
+            if any(k in ch.name.lower() for k in ("work", "ot", "งาน")):
+                target_channel = ch
+                break
+        if target_channel:
+            break
+
+    if not target_channel:
+        return
+
+    for uid_str, prof in list(user_profiles.items()):
+        ot_logs = prof.get("ot_logs") or []
+        has_month_data = any(
+            (pk := (int(e["date"].split("/")[2]) - 543, int(e["date"].split("/")[1])))
+            and pk[0] == now_th.year and pk[1] == now_th.month
+            for e in ot_logs if "/" in str(e.get("date", ""))
+        )
+        if has_month_data:
+            summary_md = build_monthly_ot_summary_markdown(ot_logs, now_th.year, now_th.month)
+            await send_chunked_response(
+                target_channel,
+                f"📅 **[สรุปยอด OT อัตโนมัติประจำสิ้นเดือน]**\n{summary_md}",
+            )
+
+
 class YukinonBot(commands.Bot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -219,6 +264,8 @@ class YukinonBot(commands.Bot):
         print(f"[Render Web Service Health Server] Listening on 0.0.0.0:{PORT}", flush=True)
 
     async def close(self):
+        if monthly_ot_auto_report_task.is_running():
+            monthly_ot_auto_report_task.cancel()
         await close_http_session()
         if self.web_runner:
             await self.web_runner.cleanup()
@@ -240,6 +287,8 @@ async def verify_allowed_guild(ctx):
 @bot.event
 async def on_ready():
     await restore_user_profiles_from_discord(bot)
+    if not monthly_ot_auto_report_task.is_running():
+        monthly_ot_auto_report_task.start()
     print(f"Logged in as {bot.user} on {platform.machine()} at {get_current_thai_datetime_str()}", flush=True)
 
 
@@ -253,7 +302,11 @@ async def on_message(message: discord.Message):
     is_dm = message.guild is None
     is_ai_chan = message.channel.id in AI_CHANNEL_IDS
     is_mentioned = bot.user in message.mentions
-    is_ot_trigger = is_ot_command_text(message.content)
+    is_ot_trigger = is_ot_command_text(
+        message.content,
+        channel_id=message.channel.id,
+        user_id=message.author.id,
+    )
 
     ref_msg = await resolve_referenced_message(message) if message.reference else None
     is_reply = bool(ref_msg and bot.user and ref_msg.author.id == bot.user.id)
@@ -264,8 +317,6 @@ async def on_message(message: discord.Message):
     clean_prompt = re.sub(rf"<@!?{bot.user.id}>", "", message.content).strip()
     clean_prompt = CUSTOM_EMOJI_REGEX.sub(r":\1:", clean_prompt).strip()
 
-    # If the user replies to an earlier message with ONLY @Yukinon (no new text),
-    # inherit the text/command from that earlier message!
     if not clean_prompt and ref_msg and ref_msg.content and (not bot.user or ref_msg.author.id != bot.user.id):
         inherited = re.sub(rf"<@!?{bot.user.id}>", "", ref_msg.content).strip()
         inherited = CUSTOM_EMOJI_REGEX.sub(r":\1:", inherited).strip()
@@ -290,18 +341,18 @@ async def on_message(message: discord.Message):
     all_msg_atts = list(message.attachments) + (list(ref_msg.attachments) if ref_msg else [])
     has_image_att = any(a.filename.lower().endswith(config.IMAGE_EXTENSIONS) for a in all_msg_atts)
 
-    # 0A. Overtime (OT) Logger & Monthly Table Summarizer ('จด OT ...', 'สรุป OT', 'ลบ OT')
-    if is_ot_command_text(clean_prompt):
+    # 0A. Overtime (OT) Logger & Monthly Table Summarizer
+    if is_ot_command_text(clean_prompt, channel_id=message.channel.id, user_id=message.author.id):
         ot_reply = await process_ot_request(message, clean_prompt)
         await send_chunked_response(message.channel, ot_reply, reply_to=message)
         return
 
-    # 0. Natural Chat "Yukipedia Mode" Trigger (Search / OCR / Translation + Critique)
+    # 0. Natural Chat "Yukipedia Mode" Trigger
     if YUKIPEDIA_INTENT_PATTERN.search(clean_prompt):
         await process_yukipedia_request(message, clean_prompt)
         return
 
-    # 1. Natural Chat Manga / Image Translation Trigger (works on direct uploads AND replies to earlier images!)
+    # 1. Natural Chat Manga / Image Translation Trigger
     if MANGA_TRANSLATE_INTENT_PATTERN.search(clean_prompt) or (
         has_image_att and re.search(r"(แปล|\btranslate\b|\btl\b)", clean_prompt, re.IGNORECASE)
     ):
@@ -314,7 +365,7 @@ async def on_message(message: discord.Message):
             await send_generated_image_to_channel(message.channel, clean_prompt, reply_to=message)
         return
 
-    # 3. Fast Instant Date/Time Check (Sent normally WITHOUT Discord reply)
+    # 3. Fast Instant Date/Time Check
     if not message.attachments:
         instant_dt = try_instant_datetime_reply(clean_prompt)
         if instant_dt:
@@ -331,13 +382,13 @@ async def on_message(message: discord.Message):
             stk_names = ", ".join(s.name for s in message.stickers)
             user_request = f"(ผู้ใช้ส่งสติกเกอร์ `{stk_names}` มาให้ ช่วยตอบโต้หรือแสดงความเห็นต่อสติกเกอร์นี้ในสไตล์ยูกิโนะ)"
         elif extracted_ctx:
-            user_request = "ช่วยตรวจสอบ สรุปเนื้อหา และบอกความรู้สึกหรือความคิดเห็นของเธอต่อสิ่งที่แนบมาให้หน่อย"
+            user_request = "ช่วยตรวจสอบ วิเคราะห์จุดบกพร่องหรือหา Root Cause และสรุปแนวทางแก้ไขสำหรับสิ่งที่แนบมาให้หน่อย"
         else:
             user_request = "สวัสดี (ทักทายกลับตามธรรมชาติในสไตล์ยูกิโนะ)"
 
         extra_blocks = "\n\n".join(b for b in (mentioned_dossier, extracted_ctx) if b)
         full_prompt = f"{user_request}\n\n{extra_blocks}" if extra_blocks else user_request
-        use_coder = detect_coding_intent(clean_prompt, message.attachments, message.channel.id)
+        use_coder = detect_coding_intent(full_prompt, message.attachments, message.channel.id)
         model = ACTIVE_CODE_MODEL if use_coder else ACTIVE_FAST_MODEL
         sys_prompt = CODE_SYSTEM_PROMPT if use_coder else FAST_SYSTEM_PROMPT
         answer, _ = await query_local_ollama_chat(
@@ -356,7 +407,6 @@ async def on_message(message: discord.Message):
         )
         reply_target = message if use_reply else None
 
-        # 4. If the LLM emitted a leading [IMAGE: ...] tag on an image-related request, generate the image
         img_tag_match = AGENTIC_IMAGE_TAG_REGEX.search(answer)
         if (
             img_tag_match
@@ -405,7 +455,6 @@ async def join_voice(ctx):
             )
         )
 
-        # Wait 1.5s for binary DAVE MLS key exchange (Opcodes 25-30 & 22) to complete
         await asyncio.sleep(1.5)
 
         if HAS_VOICE_RECV and hasattr(vc, "listen"):
@@ -527,8 +576,8 @@ async def ask_fast(ctx, *, prompt: str = ""):
         await send_chunked_response(ctx, answer, reply_to=ctx.message if use_reply else None)
 
 
-@bot.command(name="code")
-async def ask_code(ctx, *, prompt: str = "วิเคราะห์โค้ดที่แนบมา"):
+@bot.command(name="code", aliases=["review", "diff", "trace"])
+async def ask_code(ctx, *, prompt: str = "วิเคราะห์โค้ดหรือ Stack Trace ที่แนบมาและระบุ Root Cause พร้อมวิธีแก้ไข"):
     async with ctx.typing():
         ctx_text, _ = await extract_all_context(ctx.message)
         answer, _ = await query_local_ollama_chat(
@@ -636,7 +685,7 @@ async def calc_exp(ctx, *, expr: str):
 @bot.command(name="ot")
 async def ot_command(ctx, *, args: str = ""):
     query = args.strip()
-    if query and not is_ot_command_text(query):
+    if query and not is_ot_command_text(query, channel_id=ctx.channel.id, user_id=ctx.author.id):
         query = f"จด OT {query}"
     reply = await process_ot_request(ctx.message, query or "สรุป OT")
     await send_chunked_response(ctx, reply, reply_to=ctx.message)

@@ -49,6 +49,80 @@ LATIN_FONT_CANDIDATES = (
     "/usr/share/fonts/truetype/tlwg/Garuda.ttf",
 )
 
+CODE_FENCE_BLOCK_REGEX = re.compile(r"```([a-zA-Z0-9_+-]*)\n([\s\S]*?)```")
+LANG_DEFAULT_EXT = {
+    "java": "Solution.java",
+    "python": "script.py",
+    "py": "script.py",
+    "javascript": "index.js",
+    "js": "index.js",
+    "typescript": "index.ts",
+    "ts": "index.ts",
+    "tsx": "Component.tsx",
+    "jsx": "Component.jsx",
+    "sql": "query.sql",
+    "plsql": "package.sql",
+    "xml": "pom.xml",
+    "yaml": "config.yaml",
+    "yml": "config.yml",
+    "json": "config.json",
+    "dockerfile": "Dockerfile",
+    "docker": "Dockerfile",
+    "bash": "script.sh",
+    "sh": "script.sh",
+    "powershell": "script.ps1",
+    "ps1": "script.ps1",
+    "html": "index.html",
+    "css": "styles.css",
+    "scss": "styles.scss",
+    "properties": "application.properties",
+    "diff": "changes.diff",
+    "patch": "changes.patch",
+}
+EXPLICIT_FILENAME_COMMENT_REGEX = re.compile(
+    r"^(?://|#|--|/\*|<!--)\s*([A-Za-z0-9_.-]+\.(?:java|py|js|ts|tsx|jsx|sql|pls|pkb|pks|xml|yaml|yml|json|sh|ps1|html|css|scss|properties|gradle|md|txt|diff|patch)|Dockerfile|docker-compose\.ya?ml|pom\.xml)\b",
+    re.IGNORECASE,
+)
+
+
+def extract_named_code_files(text: str) -> tuple[str, list[discord.File]]:
+    """
+    Extracts code blocks from long responses (>7,500 chars) and converts them into
+    downloadable source files (e.g., UserService.java, fix_index.sql) while keeping
+    the critique/explanation readable in Discord.
+    """
+    files: list[discord.File] = []
+    used_names: set[str] = set()
+
+    def _replace_block(match: re.Match) -> str:
+        lang = (match.group(1) or "").strip().lower()
+        code_body = match.group(2) or ""
+        lines = code_body.splitlines()
+        fname = None
+
+        if lines:
+            first_line = lines[0].strip()
+            m_fn = EXPLICIT_FILENAME_COMMENT_REGEX.match(first_line)
+            if m_fn:
+                fname = m_fn.group(1)
+
+        if not fname:
+            fname = LANG_DEFAULT_EXT.get(lang, f"snippet_{len(files) + 1}.txt")
+
+        base, ext = os.path.splitext(fname)
+        candidate = fname
+        counter = 2
+        while candidate.lower() in used_names:
+            candidate = f"{base}_{counter}{ext}" if ext else f"{base}_{counter}"
+            counter += 1
+        used_names.add(candidate.lower())
+
+        files.append(discord.File(io.StringIO(code_body), filename=candidate))
+        return f"📎 **[Attached Source File: `{candidate}`]**"
+
+    summary_text = CODE_FENCE_BLOCK_REGEX.sub(_replace_block, text)
+    return summary_text, files[:10]
+
 
 def split_discord_message_smart(text: str, max_len: int = 1900) -> list[str]:
     if len(text) <= 1990:
@@ -137,6 +211,27 @@ async def send_chunked_response(
         return
     target_channel = ctx_or_channel.channel if hasattr(ctx_or_channel, "channel") else ctx_or_channel
     if len(text) > 7500:
+        summary_text, code_files = extract_named_code_files(text)
+        if code_files:
+            chunks = split_discord_message_smart(summary_text, max_len=1900)
+            if len(chunks) <= 3:
+                for idx, chunk in enumerate(chunks):
+                    await _send_or_reply(
+                        target_channel,
+                        reply_to if idx == 0 else None,
+                        content=chunk,
+                        files=code_files if idx == len(chunks) - 1 else None,
+                    )
+                return
+            code_files.insert(0, discord.File(io.StringIO(text), filename=filename_fallback))
+            await _send_or_reply(
+                target_channel,
+                reply_to,
+                content="**เนื้อหาและโค้ดมีความยาวมาก ฉันแยกไฟล์ซอร์สโค้ดพร้อมฉบับเต็มแนบไว้ให้ด้านล่างนะคะ:**",
+                files=code_files[:10],
+            )
+            return
+
         await _send_or_reply(
             target_channel,
             reply_to,
@@ -210,7 +305,6 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
         {"role": "user", "content": raw_prompt},
     ]
 
-    # Tier 2: Google AI Studio Gemma 4 (14.4K RPD) & Cloudflare Gemma 4 (10K Neurons)
     for gemma_fn, p_label in (
         (call_gemma_ai_studio_chat, "Prompt Translate Tier 2 AI Studio Gemma 4"),
         (call_cloudflare_gemma_chat, "Prompt Translate Tier 2 CF Gemma 4"),
@@ -223,7 +317,6 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
         except Exception:
             pass
 
-    # Tier 3: Modal GPU Ollama
     try:
         res = await call_modal_ollama_chat(
             trans_messages, ACTIVE_FAST_MODEL, 0.0, purpose="Prompt Translate Tier 3"
@@ -234,7 +327,6 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
     except Exception:
         pass
 
-    # Tier 4: Groq LPU
     if GROQ_API_KEY:
         try:
             res = await call_groq_chat(
@@ -422,7 +514,6 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
             or ""
         )
         tr_txt = re.sub(r"\s+", " ", str(tr_txt)).strip()
-        # Remove any accidental space after hyphenated Japanese honorifics (e.g., 'Melt- san?' -> 'Melt-san?')
         tr_txt = re.sub(
             r"-\s+(san|kun|chan|sama|sensei|senpai|dono|shi)\b",
             r"-\1",
@@ -458,11 +549,6 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
 def _parse_manga_pages_batch_json(
     raw_text: str, expected_pages: int
 ) -> list[tuple[list[dict], str]]:
-    """
-    Parses a multi-page batch JSON response:
-    {"pages": [{"page_index": 1, "summary": "...", "bubbles": [...]}, ...]}
-    Also seamlessly handles single-page {"summary": "...", "bubbles": [...]} responses.
-    """
     if not raw_text:
         return [([], "") for _ in range(expected_pages)]
 
@@ -487,7 +573,6 @@ def _parse_manga_pages_batch_json(
             continue
 
     if isinstance(parsed, dict):
-        # Case A: Multi-page "pages" array returned
         raw_pages = parsed.get("pages")
         if isinstance(raw_pages, list) and raw_pages:
             results = [([], "") for _ in range(expected_pages)]
@@ -503,13 +588,11 @@ def _parse_manga_pages_batch_json(
             if any(b for b, _ in results):
                 return results
 
-        # Case B: Single-page {"bubbles": [...]} format returned
         if expected_pages == 1 and "bubbles" in parsed:
             bubbles = _normalize_and_validate_bubbles(parsed.get("bubbles") or [])
             summary = str(parsed.get("summary") or "").strip()
             return [(bubbles, summary)]
 
-    # Fallback for 1-page regex extraction
     if expected_pages == 1:
         b, s = _parse_manga_bubbles_json(raw_text)
         return [(b, s)]
@@ -520,11 +603,6 @@ def _parse_manga_pages_batch_json(
 async def extract_and_translate_manga_pages_batch(
     pages_input: list[tuple[bytes, str]], target_lang_name: str
 ) -> list[tuple[list[dict], str]]:
-    """
-    Translates 1 to 10 manga pages in a SINGLE multimodal API request to conserve RPD quota.
-    pages_input: list of (raw_bytes, filename)
-    Returns: list of (bubbles, scene_summary) corresponding to each page in order.
-    """
     num_pages = len(pages_input)
     if num_pages == 0:
         return []
@@ -570,7 +648,6 @@ CRITICAL RULES:
 }}
 """.strip()
 
-    # Tier 1: Google AI Studio (gemini-3-flash-preview) — All pages in 1 single RPD request!
     if GEMINI_API_KEY:
         parts = [{"text": manga_batch_instruction}]
         for idx, (b64_img, fname) in enumerate(b64_pages, 1):
@@ -586,7 +663,6 @@ CRITICAL RULES:
                 "thinkingConfig": {"thinkingBudget": 512},
             },
         }
-        # Scale timeout with page count (e.g. 30s for 1 page, up to 90s for 10 pages)
         timeout_sec = min(90, 22 + (8 * num_pages))
         try:
             data = await call_gemini_generate_content_self_healing(
@@ -609,7 +685,6 @@ CRITICAL RULES:
         except Exception as e:
             print(f"Gemini Manga Batch Vision warning: {e}", flush=True)
 
-    # Fallback: If Tier 1 Gemini is unavailable/quota-exhausted, process per-page via Tier 2/3 (Cloudflare / Groq)
     fallback_results = []
     for raw_b, fname in pages_input:
         b, s = await extract_and_translate_manga_bubbles(raw_b, fname, target_lang_name)
@@ -625,7 +700,6 @@ def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
     json_match = re.search(r"\{[\s\S]*\}", cleaned)
     target = json_match.group(0) if json_match else cleaned
 
-    # Stage 1: Standard json.loads
     try:
         parsed = json.loads(target)
         bubbles = _normalize_and_validate_bubbles(parsed.get("bubbles") or [])
@@ -635,7 +709,6 @@ def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
     except Exception:
         pass
 
-    # Stage 2: Repair common LLM JSON syntax errors
     try:
         repaired = target
         repaired = re.sub(r'(["\d\]}])\s*\n(\s*["{])', r"\1,\n\2", repaired)
@@ -648,7 +721,6 @@ def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
     except Exception:
         pass
 
-    # Stage 3: Regex fallback
     summary_m = re.search(r'"summary"\s*:\s*"([^"\n]+)"', target)
     summary = summary_m.group(1).strip() if summary_m else ""
 
@@ -729,7 +801,6 @@ CRITICAL RULES:
     fallback_bubbles_no_boxes = []
     fallback_summary = ""
 
-    # Tier 1: Google AI Studio (gemini-3-flash-preview)
     if GEMINI_API_KEY:
         gemini_payload = {
             "contents": [
@@ -763,7 +834,6 @@ CRITICAL RULES:
         except Exception as e:
             print(f"Gemini Manga Vision warning: {e}")
 
-    # Tier 2: Google AI Studio Gemma 4 Vision (gemma-4-26b-a4b-it — 14.4K RPD backup when Gemini 3 Flash 20 RPD is exhausted)
     try:
         gemma_content = await call_gemma_ai_studio_vision(
             manga_system_instruction,
@@ -790,7 +860,6 @@ CRITICAL RULES:
     except Exception as e:
         print(f"AI Studio Gemma 4 Manga Vision warning: {e}", flush=True)
 
-    # Tier 3: Cloudflare Workers AI (@cf/google/gemma-4-26b-a4b-it)
     try:
         cf_content = await call_cloudflare_vision_chat(manga_system_instruction, mime_type, b64_img)
         if cf_content:
@@ -810,7 +879,6 @@ CRITICAL RULES:
     except Exception as e:
         print(f"Cloudflare Gemma 4 Manga Vision warning: {e}")
 
-    # Tier 4: Groq Vision (qwen/qwen3.8-27b)
     if GROQ_API_KEY:
         groq_vision_candidates = await discover_active_groq_vision_models()
         groq_host = "api." + "groq.com"
@@ -917,10 +985,6 @@ def _wrap_text_to_pixel_width(
 def _detect_bubble_polarity(
     base_gray: Image.Image, x1: int, y1: int, x2: int, y2: int
 ) -> bool:
-    """
-    Returns True if the bubble at (x1, y1, x2, y2) is a Dark/Black bubble (white text on black fill),
-    or False if it is a Light/White bubble.
-    """
     bw = x2 - x1
     bh = y2 - y1
     if bw < 10 or bh < 10:
@@ -947,9 +1011,6 @@ def _compute_voronoi_lobe_bounds(
     cx = (x1 + x2) // 2
     cy = (y1 + y2) // 2
 
-    # Generous reach in unobstructed directions so tall bubbles ('…………', '私は別に――')
-    # and SFX-displaced boxes are 100% contained inside the window, while still clamping
-    # strictly at the midpoint between neighboring speech bubbles.
     vor_x1 = max(0, x1 - max(110, int(box_w * 1.40)))
     vor_y1 = max(0, y1 - max(115, int(box_h * 1.60)))
     vor_x2 = min(width, x2 + max(110, int(box_w * 1.40)))
@@ -991,19 +1052,10 @@ def _find_best_enclosed_white_bubble(
     ry2_rel: int,
     has_kanji_kana: bool = True,
 ) -> Image.Image | None:
-    """
-    Fast 0.5x-scale enclosed bubble finder:
-    1) Runs flood-fill candidate discovery at 0.5x resolution (4x fewer pixels -> ~15x faster on Render CPU!).
-    2) Tests both standard white (p >= 232) AND 2px-pinched white (seals thin white SFX halos like 'リンゴーン'
-       on the left border of '私は別に――').
-    3) Rejects empty white cheeks/faces by requiring `holes_area` (enclosed dark character islands inside the
-       white bubble) to be >= 22 at half-scale (~88px full-scale) whenever `has_kanji_kana=True`.
-    """
     ww, wh = sub_gray.size
     if ww < 16 or wh < 16:
         return None
 
-    # Downscale by 0.5x so pure-Python ImageDraw.floodfill runs in <1ms
     sw = max(8, ww // 2)
     sh = max(8, wh // 2)
     small_gray = sub_gray.resize((sw, sh), Image.Resampling.BILINEAR)
@@ -1015,7 +1067,6 @@ def _find_best_enclosed_white_bubble(
     s_bw = max(4, s_rx2 - s_rx1)
     s_bh = max(4, s_ry2 - s_ry1)
 
-    # Candidate seed points at 0.5x scale (inside box + horizontal probes left/right for SFX-shifted boxes)
     seed_candidates = []
     for fy in (0.50, 0.25, 0.75):
         sy = max(1, min(sh - 2, int(s_ry1 + s_bh * fy)))
@@ -1028,7 +1079,6 @@ def _find_best_enclosed_white_bubble(
                 seed_candidates.append((sx_ext, sy))
 
     base_bin = small_gray.point(lambda p: 255 if p >= 232 else 0)
-    # Pass 2 erodes white by 1px at 0.5x scale (= 2px at full scale) to pinch shut thin white SFX halos like 'リンゴーン'
     pinched_bin = base_bin.filter(ImageFilter.MinFilter(3))
 
     best_small_filled = None
@@ -1054,7 +1104,6 @@ def _find_best_enclosed_white_bubble(
             if cw < 9 or ch < 9:
                 continue
 
-            # Reject open background/speedlines that span across opposite window boundaries
             edge_touches = (
                 (1 if cx1 <= 1 else 0)
                 + (1 if cy1 <= 1 else 0)
@@ -1064,7 +1113,6 @@ def _find_best_enclosed_white_bubble(
             if edge_touches >= 3 or (cx1 <= 1 and cx2 >= sw - 1) or (cy1 <= 1 and cy2 >= sh - 1):
                 continue
 
-            # Find enclosed dark character holes inside `comp` using a 2px exterior moat
             padded = Image.new("L", (sw + 4, sh + 4), 0)
             padded.paste(comp, (2, 2))
             ImageDraw.floodfill(padded, (0, 0), 128)
@@ -1078,8 +1126,6 @@ def _find_best_enclosed_white_bubble(
             if comp_area < 55 or (comp_area / filled_area) < 0.48:
                 continue
 
-            # CRITICAL: An enclosed white cheek has almost ZERO enclosed dark holes (holes_area < 8),
-            # whereas a real speech bubble with kanji/kana ('私は別に――') has holes_area >= 18 at 0.5x scale!
             if has_kanji_kana and holes_area < 16:
                 continue
 
@@ -1087,16 +1133,14 @@ def _find_best_enclosed_white_bubble(
             ov_y = max(0, min(cy2, s_ry2) - max(cy1, s_ry1))
             overlap_area = ov_x * ov_y
 
-            # Score heavily by enclosed character holes (`holes_area`) + box overlap
             score = (overlap_area * 2.5) + (holes_area * 10.0) + (filled_area * 0.25)
             if pass_idx == 1:
-                score *= 0.92  # Prefer un-pinched pass when both find the same bubble
+                score *= 0.92
             if score > best_score:
                 best_score = score
                 best_small_filled = filled
                 best_was_pinched = (pass_idx == 1)
 
-        # If Pass 1 already found a high-confidence enclosed bubble with text holes, skip Pass 2
         if best_small_filled is not None and best_score > 450:
             break
 
@@ -1106,7 +1150,6 @@ def _find_best_enclosed_white_bubble(
     if best_was_pinched:
         best_small_filled = best_small_filled.filter(ImageFilter.MaxFilter(3))
 
-    # Upscale the winning bubble mask back to full resolution (ww, wh) and smooth edges
     full_filled = best_small_filled.resize((ww, wh), Image.Resampling.BILINEAR).point(
         lambda p: 255 if p >= 128 else 0
     )
@@ -1142,9 +1185,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
     ry2_rel = min(wh - 2, y2 - wy1)
     rel_cx = (rx1_rel + rx2_rel) // 2
 
-    # =========================================================================
-    # CASE A: DARK / BLACK BUBBLE (White text on Black/Dark fill — Never enlarges bubble!)
-    # =========================================================================
     if is_dark_bubble:
         core_crop = base_gray.crop((max(0, raw_x1), max(0, raw_y1), min(width, raw_x2), min(height, raw_y2)))
         core_pixels = sorted(core_crop.getdata())
@@ -1231,16 +1271,11 @@ def _erase_bubble_japanese_text_and_measure_lobe(
             stroke_rgb,
         )
 
-    # =========================================================================
-    # CASE B: ENCLOSED WHITE SPEECH BUBBLE (Fast 0.5x Finder + Full-Res Clean)
-    # =========================================================================
     filled_bubble = _find_best_enclosed_white_bubble(
         sub_gray, rx1_rel, ry1_rel, rx2_rel, ry2_rel, has_kanji_kana=has_kanji_kana
     )
 
     if filled_bubble is not None:
-        # Shrink inward by 2px (MinFilter(5)) so the black bubble outline is 100% preserved,
-        # and erase all ink (including faint gray '……' up to p < 248) inside the bubble!
         safe_inner_core = filled_bubble.filter(ImageFilter.MinFilter(5))
         ink_inside_bubble = sub_gray.point(lambda p: 255 if p < 248 else 0)
         erase_mask = ImageChops.darker(
@@ -1299,11 +1334,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
                 (255, 255, 255),
             )
 
-    # =========================================================================
-    # CASE C: FAST C-FILTER FALLBACK FOR OPEN / SFX-BROKEN BUBBLES ('Hmph!' / '私は別に――')
-    # =========================================================================
-    # Uses compiled C-level BoxBlur + MaxFilter to identify dark text strokes sitting on pure white
-    # bubble paper (excluding gray screentone hair/faces and thick dark SFX like 'リンゴーン').
     local_mean = sub_gray.filter(ImageFilter.BoxBlur(6))
     local_max = sub_gray.filter(ImageFilter.MaxFilter(5))
     white_paper_zone = ImageChops.darker(
@@ -1311,7 +1341,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
         local_max.point(lambda p: 255 if p >= 246 else 0),
     ).filter(ImageFilter.MinFilter(3))
 
-    # Exclude outer 2px window border
     ImageDraw.Draw(white_paper_zone).rectangle([0, 0, ww - 1, wh - 1], outline=0, width=2)
 
     dark_strokes = sub_gray.point(lambda p: 255 if p < 235 else 0)
@@ -1343,9 +1372,6 @@ def _resolve_box_collisions(
     renders: list[list],
     min_gap: int = 6,
 ) -> list[list]:
-    """
-    Guarantees that no two bubble layout boxes overlap in 2D space.
-    """
     n = len(renders)
     for _ in range(3):
         for i in range(n):
@@ -1362,7 +1388,7 @@ def _resolve_box_collisions(
                 bcx, bcy = (bx1 + bx2) // 2, (by1 + by2) // 2
 
                 if abs(acy - bcy) >= abs(acx - bcx) * 0.8:
-                    mid_y = (min(ay2, by2) + max(ay1, by1)) // 2
+                    mid_y = (min(ay2, by2) + max(ay1, oy1 if (oy1 := by1) else by1)) // 2
                     if acy <= bcy:
                         renders[i][3] = max(ay1 + 16, mid_y - (min_gap // 2))
                         renders[j][1] = min(by2 - 16, mid_y + (min_gap // 2))
@@ -1394,7 +1420,6 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
     base_gray = img.convert("L")
     width, height = img.size
 
-    # Step 1: Convert normalized box_2d to pixel coordinates, detect polarity, and check if source_text has kanji/kana
     pixel_boxes = []
     for b in valid_boxes:
         ymin, xmin, ymax, xmax = [float(v) for v in b["box_2d"]]
@@ -1412,7 +1437,6 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
         clean_tr = re.sub(r"\s+", " ", b["translated_text"]).strip()
         pixel_boxes.append((raw_x1, raw_y1, raw_x2, raw_y2, is_dark, has_kanji_kana, clean_tr))
 
-    # Step 2: Erase Japanese text (matching white or black bubble background) and measure each lobe
     prepared_renders = []
     for i, (rx1, ry1, rx2, ry2, is_dark, has_kk, trans_text) in enumerate(pixel_boxes):
         if (rx2 - rx1) < 3 or (ry2 - ry1) < 3:
@@ -1435,7 +1459,6 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
         )
         prepared_renders.append([lx1, ly1, lx2, ly2, fg_text, stroke_col, trans_text])
 
-    # Step 3: Resolve any 2D bounding-box collisions and typeset with a uniform baseline offset
     prepared_renders = _resolve_box_collisions(prepared_renders, min_gap=6)
 
     draw = ImageDraw.Draw(img)
@@ -1490,7 +1513,6 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
             curr_y += line_height
 
     out_io = io.BytesIO()
-    # Use compress_level=3 instead of optimize=True (10x faster on Render CPU!)
     img.save(out_io, format="PNG", compress_level=3)
     img.close()
     base_gray.close()
@@ -1522,7 +1544,6 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
         return
 
     _, target_lang_name = _detect_target_translation_lang(user_prompt)
-    # Discord allows up to 10 attachments per message
     target_attachments = image_attachments[:10]
     num_pages = len(target_attachments)
 
@@ -1570,7 +1591,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
                 src_txt = re.sub(r"\s+", " ", (b.get("source_text") or "")).strip()
                 tr_txt = re.sub(r"\s+", " ", (b.get("translated_text") or "")).strip()
                 if tr_txt:
-                    transcript_lines.append(f"**[#{idx} | {speaker}]** `{src_txt}`\n   ↳ **{tr_txt}**")
+                    transcript_lines.append(f"**[#{idx} | {speaker}]** `{src_txt}`\n  ↳ **{tr_txt}**")
 
             try:
                 rendered_png = await asyncio.to_thread(

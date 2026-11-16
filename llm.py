@@ -29,13 +29,12 @@ from config import (
     ollama_lock,
     channel_memory,
     channel_active_topic,
-    channel_last_attachment,
     state,
     clean_url,
     api_log,
     get_http_session,
     get_modal_headers,
-    prune_stale_attachments,
+    get_cached_channel_attachments,
 )
 from persona import (
     get_speaker_identity_context,
@@ -270,7 +269,6 @@ async def call_gemma_ai_studio_chat(
     if not raw_turns:
         return ""
 
-    # Merge any consecutive identical roles ('user'/'user' or 'model'/'model') so v1beta never throws HTTP 500
     contents = []
     for r_role, r_txt in raw_turns:
         if contents and contents[-1]["role"] == r_role:
@@ -278,7 +276,6 @@ async def call_gemma_ai_studio_chat(
         else:
             contents.append({"role": r_role, "parts": [{"text": r_txt}]})
 
-    # Prepend system instructions directly into the first user turn (avoids Gemma v1beta HTTP 500 on systemInstruction)
     if sys_parts:
         sys_joined = "\n\n".join(sys_parts)
         if contents[0]["role"] == "user":
@@ -289,7 +286,6 @@ async def call_gemma_ai_studio_chat(
         else:
             contents.insert(0, {"role": "user", "parts": [{"text": sys_joined}]})
 
-    # Prioritize gemma-4-26b-a4b-it (fast MoE) first for chat, then gemma-4-31b-it
     discovered = await discover_active_gemma_models(vision_required=False)
     candidates = sorted(discovered, key=lambda x: (0 if "26b" in x else 1))
     session = get_http_session()
@@ -320,35 +316,33 @@ async def call_gemma_ai_studio_chat(
                 ) as resp:
                     status = resp.status
                     body_text = await resp.text()
-                elapsed = time.monotonic() - t0
+                    elapsed = time.monotonic() - t0
 
-                if status == 200:
-                    data = json.loads(body_text)
-                    parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-                    # Filter out any internal 'thought' parts if returned by Gemma 4
-                    text_parts = [
-                        p.get("text", "") for p in parts
-                        if p.get("text") and not p.get("thought", False)
-                    ]
-                    out = "\n".join(text_parts).strip()
-                    out = re.sub(r"<think>[\s\S]*?</think>", "", out).strip()
-                    out = re.sub(r"<\|thought\|>[\s\S]*?<\|/thought\|>", "", out).strip()
-                    if out:
-                        state.active_gemma_model = model_id
-                        api_log(f"Gemma AI Studio ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
-                        return out
+                    if status == 200:
+                        data = json.loads(body_text)
+                        parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                        text_parts = [
+                            p.get("text", "") for p in parts
+                            if p.get("text") and not p.get("thought", False)
+                        ]
+                        out = "\n".join(text_parts).strip()
+                        out = re.sub(r"<think>[\s\S]*?</think>", "", out).strip()
+                        out = re.sub(r"<\|thought\|>[\s\S]*?<\|/thought\|>", "", out).strip()
+                        if out:
+                            state.active_gemma_model = model_id
+                            api_log(f"Gemma AI Studio ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
+                            return out
 
-                # If thinkingConfig is rejected on attempt 0, pop it and retry immediately
-                if status in (400, 500) and "thinkingConfig" in payload.get("generationConfig", {}) and attempt == 0:
-                    payload["generationConfig"].pop("thinkingConfig", None)
-                    continue
+                    if status in (400, 500) and "thinkingConfig" in payload.get("generationConfig", {}) and attempt == 0:
+                        payload["generationConfig"].pop("thinkingConfig", None)
+                        continue
 
-                if status == 429:
-                    _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 60.0
-                elif status in (404, 500):
-                    _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 300.0
-                api_log(f"Gemma AI Studio ({purpose}) -> {model_id} HTTP {status} ({elapsed:.2f}s)")
-                break
+                    if status == 429:
+                        _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 60.0
+                    elif status in (404, 500):
+                        _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 300.0
+                    api_log(f"Gemma AI Studio ({purpose}) -> {model_id} HTTP {status} ({elapsed:.2f}s)")
+                    break
             except Exception as e:
                 _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 120.0
                 api_log(f"Gemma AI Studio ({purpose}) -> {model_id} failed ({type(e).__name__})")
@@ -365,10 +359,6 @@ async def call_gemma_ai_studio_vision(
     timeout_sec: int = 22,
     purpose: str = "GemmaVision",
 ) -> str:
-    """
-    Calls multimodal Gemma 4 (gemma-4-26b-a4b-it / gemma-4-31b-it) on Google AI Studio
-    with thinkingBudget=0 so vision OCR/identification completes in ~2-4s without timing out.
-    """
     if not GEMINI_API_KEY:
         return ""
 
@@ -412,33 +402,33 @@ async def call_gemma_ai_studio_vision(
                 ) as resp:
                     status = resp.status
                     body_text = await resp.text()
-                elapsed = time.monotonic() - t0
+                    elapsed = time.monotonic() - t0
 
-                if status == 200:
-                    data = json.loads(body_text)
-                    parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-                    text_parts = [
-                        p.get("text", "") for p in parts
-                        if p.get("text") and not p.get("thought", False)
-                    ]
-                    out = "\n".join(text_parts).strip()
-                    out = re.sub(r"<think>[\s\S]*?</think>", "", out).strip()
-                    out = re.sub(r"<\|thought\|>[\s\S]*?<\|/thought\|>", "", out).strip()
-                    if out:
-                        api_log(f"Gemma AI Studio ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
-                        return out
+                    if status == 200:
+                        data = json.loads(body_text)
+                        parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                        text_parts = [
+                            p.get("text", "") for p in parts
+                            if p.get("text") and not p.get("thought", False)
+                        ]
+                        out = "\n".join(text_parts).strip()
+                        out = re.sub(r"<think>[\s\S]*?</think>", "", out).strip()
+                        out = re.sub(r"<\|thought\|>[\s\S]*?<\|/thought\|>", "", out).strip()
+                        if out:
+                            api_log(f"Gemma AI Studio ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
+                            return out
 
-                if status in (400, 500) and attempt == 0:
-                    payload["generationConfig"].pop("thinkingConfig", None)
-                    payload["generationConfig"].pop("responseMimeType", None)
-                    continue
+                    if status in (400, 500) and attempt == 0:
+                        payload["generationConfig"].pop("thinkingConfig", None)
+                        payload["generationConfig"].pop("responseMimeType", None)
+                        continue
 
-                if status == 429:
-                    _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 60.0
-                elif status in (404, 500):
-                    _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 180.0
-                api_log(f"Gemma AI Studio ({purpose}) -> {model_id} HTTP {status} ({elapsed:.2f}s)")
-                break
+                    if status == 429:
+                        _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 60.0
+                    elif status in (404, 500):
+                        _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 180.0
+                    api_log(f"Gemma AI Studio ({purpose}) -> {model_id} HTTP {status} ({elapsed:.2f}s)")
+                    break
             except Exception as e:
                 _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 120.0
                 api_log(f"Gemma AI Studio ({purpose}) -> {model_id} failed ({type(e).__name__})")
@@ -480,32 +470,32 @@ async def call_gemini_generate_content_self_healing(
             ) as resp:
                 status = resp.status
                 body_text = await resp.text()
-            elapsed = time.monotonic() - t0
+                elapsed = time.monotonic() - t0
 
-            if status == 200:
-                if state.active_gemini_model != model_id:
-                    state.active_gemini_model = model_id
-                api_log(f"Gemini ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
-                return json.loads(body_text)
+                if status == 200:
+                    if state.active_gemini_model != model_id:
+                        state.active_gemini_model = model_id
+                    api_log(f"Gemini ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
+                    return json.loads(body_text)
 
-            if status == 400 and "thinkingConfig" in body_text and attempt == 0:
-                work_payload.get("generationConfig", {}).pop("thinkingConfig", None)
-                continue
+                if status == 400 and "thinkingConfig" in body_text and attempt == 0:
+                    work_payload.get("generationConfig", {}).pop("thinkingConfig", None)
+                    continue
 
-            if status in (404, 400):
-                hint_matches = GEMINI_MODEL_HINT_REGEX.findall(body_text)
-                for hinted_model in hint_matches:
-                    if (
-                        hinted_model != model_id
-                        and hinted_model not in tried
-                        and not any(b in hinted_model.lower() for b in GEMINI_EXCLUDED_SUBSTRINGS)
-                    ):
-                        candidate_models.insert(idx, hinted_model)
-                api_log(f"Gemini ({purpose}) -> {model_id} HTTP {status}; trying next model")
-                break
-            else:
-                api_log(f"Gemini ({purpose}) -> {model_id} HTTP {status}; trying next model")
-                break
+                if status in (404, 400):
+                    hint_matches = GEMINI_MODEL_HINT_REGEX.findall(body_text)
+                    for hinted_model in hint_matches:
+                        if (
+                            hinted_model != model_id
+                            and hinted_model not in tried
+                            and not any(b in hinted_model.lower() for b in GEMINI_EXCLUDED_SUBSTRINGS)
+                        ):
+                            candidate_models.insert(idx, hinted_model)
+                    api_log(f"Gemini ({purpose}) -> {model_id} HTTP {status}; trying next model")
+                    break
+                else:
+                    api_log(f"Gemini ({purpose}) -> {model_id} HTTP {status}; trying next model")
+                    break
 
     return None
 
@@ -555,10 +545,6 @@ async def call_gemini_chat_messages(
 async def call_cloudflare_gemma_chat(
     messages: list, temperature: float = 0.4, max_tokens: int = 1024, purpose: str = "CFGemmaChat"
 ) -> str:
-    """
-    Utilizes Cloudflare Workers AI's 10,000 free daily Neurons on @cf/google/gemma-4-26b-a4b-it
-    with thinking disabled so responses return in ~1.5s-3s without timing out.
-    """
     global _CF_GEMMA_COOLDOWN_UNTIL
     if not CF_ACCOUNT_ID or not CF_API_TOKEN or time.time() < _CF_GEMMA_COOLDOWN_UNTIL:
         return ""
@@ -569,7 +555,6 @@ async def call_cloudflare_gemma_chat(
         "Authorization": f"Bearer {CF_API_TOKEN}",
         "Content-Type": "application/json",
     }
-    # Instruct Gemma 4 not to emit long reasoning chains
     cf_messages = []
     for idx, m in enumerate(messages):
         if idx == 0 and m.get("role") == "system":
@@ -698,8 +683,9 @@ async def call_groq_chat(
     chat_url = f"{HTTPS}{groq_host}/openai/v1/chat/completions"
     t0 = time.monotonic()
     session = get_http_session()
+    req_timeout = 55 if is_coding else 28
     async with session.post(
-        chat_url, headers=headers, json=groq_payload, timeout=aiohttp.ClientTimeout(total=90)
+        chat_url, headers=headers, json=groq_payload, timeout=aiohttp.ClientTimeout(total=req_timeout)
     ) as resp:
         elapsed = time.monotonic() - t0
         if resp.status == 200:
@@ -718,7 +704,7 @@ async def call_groq_chat(
                 _GROQ_MODEL_COOLDOWN_UNTIL[groq_model] = time.time() + 3600.0
                 await discover_available_groq_models(force_refresh=True)
             api_log(f"Groq ({purpose}) -> {groq_model} HTTP {resp.status} ({elapsed:.2f}s): {err_txt[:120]}")
-    return ""
+            return ""
 
 
 async def call_modal_ollama_chat(
@@ -759,7 +745,7 @@ async def call_modal_ollama_chat(
             else:
                 err_txt = await resp.text()
                 api_log(f"Modal Ollama ({purpose}) -> {ollama_model} HTTP {resp.status} ({elapsed:.2f}s): {err_txt[:120]}")
-    return ""
+                return ""
 
 
 async def query_local_ollama_chat(
@@ -826,18 +812,13 @@ async def query_local_ollama_chat(
         f"- ใช้ข้อมูลวันและเวลานี้ตอบผู้ใช้โดยตรงเมื่อถูกถามว่าวันนี้วันอะไรหรือตอนนี้กี่โมง"
     ).strip()
 
-    prune_stale_attachments()
-    if (
-        not has_fresh_attachment
-        and channel_id is not None
-        and channel_id in channel_last_attachment
-        and time.time() - channel_last_attachment[channel_id]["timestamp"] < 1800
-    ):
-        cached_ctx = channel_last_attachment[channel_id]["content"]
-        working_prompt = (
-            f"{working_prompt}\n\n"
-            f"[ไฟล์อ้างอิงล่าสุดในห้องแชทนี้ (ใช้ประกอบการตอบหากคำถามต่อเนื่องกัน)]:\n{cached_ctx}"
-        )
+    if not has_fresh_attachment and channel_id is not None:
+        cached_ctx = get_cached_channel_attachments(channel_id)
+        if cached_ctx:
+            working_prompt = (
+                f"{working_prompt}\n\n"
+                f"[ไฟล์อ้างอิงล่าสุดในห้องแชทนี้ (เรียงตามลำดับเวลา สามารถเชื่อมโยงข้ามไฟล์ได้)]:\n{cached_ctx}"
+            )
 
     is_weather_query = allow_agentic_search and detect_weather_intent(prompt, channel_id=channel_id)
     if is_weather_query:
@@ -848,7 +829,6 @@ async def query_local_ollama_chat(
                 "[หมายเหตุ: ใช้ข้อมูลพยากรณ์อากาศและแนวโน้มรายชั่วโมงด้านบนตอบโดยตรง (พกร่ม/เสื้อกันฝน) ห้ามแต่งตัวเลขหรือทิศทางลมขึ้นมาเอง]"
             )
 
-    # Skip redundant 11s web search if this is a weather query that already has <live_weather_report>!
     if (
         allow_agentic_search
         and not is_weather_query
@@ -879,6 +859,7 @@ async def query_local_ollama_chat(
 
     async def _run_inference_pass(user_content: str) -> str:
         messages = [{"role": "system", "content": dynamic_system_prompt}]
+        raw_history = []
         if channel_id is not None:
             raw_history = list(channel_memory[channel_id])
             if is_user_correction or did_search:
@@ -934,11 +915,7 @@ async def query_local_ollama_chat(
             except Exception as e:
                 print(f"Modal GPU coding error: {e}")
 
-        # PATH B: Search / Fact-Check / Knowledge Queries ->
-        # 1) Groq (gpt-oss-20b / qwen3.8-27b)
-        # 2) Google AI Studio Gemma 4 (14.4K RPD, 16K TPM guard)
-        # 3) Cloudflare Workers AI Gemma 4 (10K Neurons/day)
-        # 4) Gemini 3 Flash (conserved 20 RPD backup for >11.5K token contexts)
+        # PATH B: Search / Fact-Check / Knowledge Queries
         if prefer_high_knowledge_llm and not is_coding:
             target_temp = 0.2 if (did_search or is_user_correction) else temperature
 
@@ -974,11 +951,7 @@ async def query_local_ollama_chat(
                 except Exception as e:
                     print(f"Gemini FactSearchChat fallback warning: {e}")
 
-        # PATH C: Casual Chat, Weather & Voice Chat ->
-        # 1) Google AI Studio Gemma 4 (26B/31B, thinkingBudget=0 -> ~1.2s!)
-        # 2) Cloudflare Workers AI Gemma 4 (26B MoE)
-        # 3) Groq LPU (openai/gpt-oss-20b / qwen3.8-27b -> ~0.5s!)
-        # 4) Modal GPU Ollama (scb10x/typhoon2.5-qwen3-4b)
+        # PATH C: Casual Chat, Weather & Voice Chat
         chat_temp = 0.25 if (did_search or is_user_correction or is_weather_query) else temperature
 
         ans = await call_gemma_ai_studio_chat(
@@ -1013,8 +986,9 @@ async def query_local_ollama_chat(
 
     raw_answer = await _run_inference_pass(working_prompt)
 
+    # Allow explicit [SEARCH: ...] tag even in coding mode if the model needs official docs/versions
     search_tag_match = AGENTIC_SEARCH_TAG_REGEX.search(raw_answer)
-    if allow_agentic_search and search_tag_match:
+    if search_tag_match:
         agent_query = search_tag_match.group(1).strip()[:180]
         extra_search_block = await asyncio.to_thread(run_safe_web_search_sync, agent_query)
         if extra_search_block:
@@ -1039,7 +1013,6 @@ async def query_local_ollama_chat(
         )
         answer = sanitize_yukino_output(retry_raw, prompt, speaker_user, speaker_name)
 
-    # Update persistent per-user profile (interaction count, favorite topics, recent questions, and LLM memo)
     if speaker_user is not None:
         record_user_interaction(
             speaker_user,
@@ -1055,7 +1028,6 @@ async def query_local_ollama_chat(
             for um in user_only:
                 channel_memory[channel_id].append(um)
 
-        # Tag speaker identity in channel_memory so multi-user conversations never mix up who said what
         from persona import is_owner_user
         if is_owner_user(speaker_user):
             speaker_tag = "[ผู้พูด: คู่หูชมรมบริการ (Owner)]"

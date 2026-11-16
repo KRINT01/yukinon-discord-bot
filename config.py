@@ -133,6 +133,7 @@ class RuntimeState:
         self.active_groq_vision_model: str = GROQ_VISION_FALLBACK_MODEL
         self.gemini_grounding_cooldown_until: float = 0.0
         self.edge_tts_cooldown_until: float = 0.0
+        self.last_ot_auto_report_ym: str = ""
 
 
 state = RuntimeState()
@@ -161,8 +162,8 @@ def get_modal_headers() -> dict:
 channel_memory = defaultdict(lambda: deque(maxlen=12))
 # Stores the primary topic/subject anchor per channel so shortened names (e.g., 'PSO2 NGS' -> 'NGS') never lose context
 channel_active_topic = {}
-# Stores the most recent file/code attachment per channel (30-min TTL)
-channel_last_attachment = {}
+# Multi-file rolling attachment buffer per channel (stores up to 4 recent files/logs within 30-min TTL)
+channel_last_attachment: dict[int, deque] = defaultdict(lambda: deque(maxlen=4))
 # Stores the most recent live weather report per channel (30-min TTL) for follow-up questions
 channel_last_weather = {}
 # Persistent in-memory notes per channel for Autonomous Agent mode
@@ -174,12 +175,45 @@ voice_wake_word_enabled = defaultdict(lambda: False)
 def prune_stale_attachments(ttl_sec: int = 1800):
     """Evicts cached channel attachments older than ttl_sec (default 30 mins) to free RAM."""
     now = time.time()
-    stale_ids = [
-        cid for cid, data in list(channel_last_attachment.items())
-        if now - data.get("timestamp", 0) >= ttl_sec
-    ]
-    for cid in stale_ids:
+    empty_cids = []
+    for cid, entries in list(channel_last_attachment.items()):
+        while entries and (now - entries[0].get("timestamp", 0) >= ttl_sec):
+            entries.popleft()
+        if not entries:
+            empty_cids.append(cid)
+    for cid in empty_cids:
         channel_last_attachment.pop(cid, None)
+
+
+def get_cached_channel_attachments(channel_id: int | None, ttl_sec: int = 1800, max_total_chars: int = 85000) -> str:
+    """Returns combined recent attachments for a channel in chronological order within RAM/token bounds."""
+    if channel_id is None:
+        return ""
+    prune_stale_attachments(ttl_sec)
+    entries = list(channel_last_attachment.get(channel_id) or ())
+    if not entries:
+        return ""
+
+    selected = []
+    used_chars = 0
+    for item in reversed(entries):
+        c = item.get("content") or ""
+        if not c:
+            continue
+        if used_chars + len(c) > max_total_chars and selected:
+            break
+        selected.append(c[:max_total_chars])
+        used_chars += len(c[:max_total_chars])
+
+    selected.reverse()
+    return "\n\n".join(selected)
+
+
+def channel_has_recent_code_attachment(channel_id: int | None, ttl_sec: int = 1800) -> bool:
+    if channel_id is None:
+        return False
+    prune_stale_attachments(ttl_sec)
+    return any(item.get("is_code") for item in channel_last_attachment.get(channel_id, ()))
 
 
 def release_unused_memory() -> tuple[float, float]:
@@ -215,9 +249,10 @@ VOICE_WAKE_WORDS = (
 CODE_AND_LOG_EXTENSIONS = (
     ".java", ".py", ".js", ".ts", ".tsx", ".jsx", ".vue", ".svelte",
     ".c", ".cpp", ".h", ".hpp", ".cs", ".go", ".rs", ".php", ".rb",
-    ".kt", ".swift", ".scala", ".sql", ".sh", ".bash", ".ps1", ".json",
-    ".yaml", ".yml", ".xml", ".toml", ".ini", ".gradle", ".properties",
-    ".dockerfile", ".html", ".css", ".scss", ".log"
+    ".kt", ".swift", ".scala", ".sql", ".pls", ".plb", ".pks", ".pkb",
+    ".sh", ".bash", ".ps1", ".json", ".yaml", ".yml", ".xml", ".toml",
+    ".ini", ".gradle", ".properties", ".dockerfile", ".html", ".css",
+    ".scss", ".log", ".diff", ".patch"
 )
 PLAIN_TEXT_EXTENSIONS = (".txt", ".md", ".csv", ".rst", ".env.example")
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
@@ -409,18 +444,44 @@ MANGA_TRANSLATE_INTENT_PATTERN = re.compile(
 OWNER_NAME_STRIP_REGEX = re.compile(
     r"(?:คุณ\s*)?(?:กรินทร์|ครินท์|krint)\b", re.IGNORECASE
 )
-URL_REGEX = re.compile(r"https?://[^\s<>\'\"]+")
+URL_REGEX = re.compile(r"https?://[^\s<>'\"]+")
 AGENTIC_SEARCH_TAG_REGEX = re.compile(r"\[SEARCH:\s*(.+?)\]", re.IGNORECASE)
 AGENTIC_IMAGE_TAG_REGEX = re.compile(r"^\s*\[IMAGE:\s*(.+?)\]", re.IGNORECASE)
 
+# Enterprise & Full-Stack Engineering Intent Pattern + Stack Trace Signatures
 CODE_INTENT_PATTERN = re.compile(
-    r"(```|\b(python|java|javascript|typescript|react|vue|nextjs|nodejs|js|ts|jsx|tsx|rust|golang|c\+\+|"
-    r"sql|html|css|bash|shell|dockerfile|docker|kubernetes|systemd|regex|json|yaml|api|function|component|"
-    r"useeffect|usestate|render|button|state|props|class|def|import|async|await|bug|error|exception|"
-    r"traceback|nullpointerexception|segfault|refactor|compile|script|algorithm|leetcode|git|pip|npm|"
-    r"maven|gradle)\b|โค้ด|เขียนโปรแกรม|แก้บั๊ก|รันไม่ผ่าน|สคริปต์|ฟังก์ชัน|แก้โค้ด|ซ่อนปุ่ม|แสดงปุ่ม)",
-    re.IGNORECASE
+    r"(```|\b(python|java|maven|pom\.xml|spring|springboot|spring\s*boot|hibernate|jpa|jpql|bean|autowired|"
+    r"javascript|typescript|react|bootstrap|vue|nextjs|nodejs|node\.js|express|js|ts|jsx|tsx|"
+    r"oracle|pl/?sql|sql|stored\s*procedure|package|trigger|explain\s*plan|tablespace|index|ddl|dml|"
+    r"rust|golang|c\+\+|html|css|scss|bash|shell|dockerfile|docker|docker-compose|kubernetes|k8s|kubectl|"
+    r"helm|ingress|pod|deployment|configmap|secret|microservice|microservices|rabbitmq|kafka|redis|"
+    r"nginx|weblogic|tomcat|systemd|regex|json|yaml|yml|xml|api|rest|graphql|jwt|oauth|cors|"
+    r"function|component|useeffect|usestate|usememo|usecallback|render|button|state|props|class|def|import|"
+    r"async|await|promise|stream|optional|completablefuture|thread|deadlock|memory\s*leak|oomkilled|"
+    r"crashloopbackoff|bug|error|exception|traceback|stack\s*trace|stacktrace|caused\s*by|"
+    r"nullpointerexception|classnotfoundexception|sqlexception|beancreationexception|"
+    r"segfault|refactor|compile|build|script|algorithm|leetcode|git|diff|patch|pip|npm|yarn|gradle)\b|"
+    r"ORA-\d{4,5}|TNS-\d{4,5}|HTTP\s*[45]\d{2}|"
+    r"at\s+[a-zA-Z0-9_$.]+\([A-Za-z0-9_]+\.java:\d+\)|"
+    r"Caused\s+by:\s+[a-zA-Z0-9_.$]+|"
+    r"โค้ด|เขียนโปรแกรม|แก้บั๊ก|รันไม่ผ่าน|สคริปต์|ฟังก์ชัน|แก้โค้ด|ซ่อนปุ่ม|แสดงปุ่ม|คิวรี|ฐานข้อมูล|คอนเทนเนอร์)",
+    re.IGNORECASE,
 )
+
+STACK_TRACE_SIGNATURE_REGEX = re.compile(
+    r"(Caused\s+by:\s+[a-zA-Z0-9_.$]+|"
+    r"Exception\s+in\s+thread\s+\"[^\"]+\"|"
+    r"at\s+[a-zA-Z0-9_$.]+\([A-Za-z0-9_]+\.(?:java|kt|scala):\d+\)|"
+    r"org\.springframework\.[a-zA-Z0-9_.]+Exception|"
+    r"java\.(?:lang|sql|io|net|util)\.[a-zA-Z0-9_.]+Exception|"
+    r"ORA-\d{4,5}:|TNS-\d{4,5}:|"
+    r"Traceback\s+\(most\s+recent\s+call\s+last\):|"
+    r"UnhandledPromiseRejection|TypeError:|ReferenceError:|SyntaxError:|"
+    r"CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull|"
+    r"Back-off\s+restarting\s+failed\s+container)",
+    re.IGNORECASE,
+)
+
 WEATHER_INTENT_PATTERN = re.compile(
     r"(\b(weather|forecast|rain|raining|temperature|humidity|pm2\.5|storm)\b|"
     r"ฝนตก|ฝนจะตก|จะตกไหม|จะตกมั้ย|ตกไหม|ตกมั้ย|ตกกี่โมง|หยุดตก|พกร่ม|ฟ้าครึ้ม|แดดออก|"
