@@ -86,11 +86,6 @@ EXPLICIT_FILENAME_COMMENT_REGEX = re.compile(
 
 
 def extract_named_code_files(text: str) -> tuple[str, list[discord.File]]:
-    """
-    Extracts code blocks from long responses (>7,500 chars) and converts them into
-    downloadable source files (e.g., UserService.java, fix_index.sql) while keeping
-    the critique/explanation readable in Discord.
-    """
     files: list[discord.File] = []
     used_names: set[str] = set()
 
@@ -269,7 +264,6 @@ def _clean_conversational_image_prefix(raw_text: str) -> str:
 async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: bool = False) -> str:
     prefix = "2D anime illustration, " if is_anime_style else ""
 
-    # Tier 1: Keyless Google Translate NMT
     t0 = time.monotonic()
     try:
         gtrans_host = "translate." + "googleapis.com"
@@ -1388,7 +1382,7 @@ def _resolve_box_collisions(
                 bcx, bcy = (bx1 + bx2) // 2, (by1 + by2) // 2
 
                 if abs(acy - bcy) >= abs(acx - bcx) * 0.8:
-                    mid_y = (min(ay2, by2) + max(ay1, oy1 if (oy1 := by1) else by1)) // 2
+                    mid_y = (min(ay2, by2) + max(ay1, by1)) // 2
                     if acy <= bcy:
                         renders[i][3] = max(ay1 + 16, mid_y - (min_gap // 2))
                         renders[j][1] = min(by2 - 16, mid_y + (min_gap // 2))
@@ -1520,39 +1514,48 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
 
 
 async def process_manga_translation_request(ctx_or_message, user_prompt: str):
-    from media_context import resolve_referenced_message
+    """
+    Translates 1 to 10 manga pages from direct Discord attachments OR embedded links
+    (X/Twitter, Pixiv/phixiv, Bluesky, Discord embeds, or direct image URLs).
+    """
+    from media_context import resolve_referenced_message, collect_embedded_images_and_metadata
 
     msg = ctx_or_message.message if hasattr(ctx_or_message, "message") else ctx_or_message
     channel = ctx_or_message.channel
+    ref_msg = await resolve_referenced_message(msg) if msg.reference else None
 
     image_attachments = [
         a for a in msg.attachments if a.filename.lower().endswith(IMAGE_EXTENSIONS)
     ]
-    if not image_attachments and msg.reference:
-        ref_msg = await resolve_referenced_message(msg)
-        if ref_msg:
-            image_attachments = [
-                a for a in ref_msg.attachments
-                if a.filename.lower().endswith(IMAGE_EXTENSIONS)
-            ]
+    if not image_attachments and ref_msg:
+        image_attachments = [
+            a for a in ref_msg.attachments
+            if a.filename.lower().endswith(IMAGE_EXTENSIONS)
+        ]
 
-    if not image_attachments:
+    pages_input: list[tuple[bytes, str]] = []
+    for att in image_attachments[:10]:
+        raw_b = await att.read()
+        pages_input.append((raw_b, att.filename))
+
+    # Fallback: extract images from Embedded Links (X/Twitter, Pixiv/phixiv, Discord message.embeds)
+    if not pages_input:
+        embedded_imgs, _, _ = await collect_embedded_images_and_metadata(msg, ref_msg=ref_msg, max_images=10)
+        for emb_bytes, emb_fname, _ in embedded_imgs:
+            pages_input.append((emb_bytes, emb_fname))
+
+    if not pages_input:
         await channel.send(
-            "กรุณาแนบรูปภาพหน้ามังงะหรือข้อความที่ต้องการให้แปลมาด้วยนะคะ "
-            "(สามารถแนบพร้อมกันหลายหน้าในข้อความเดียวได้เลยค่ะ เช่น แนบ 5 หน้าพร้อมพิมพ์ `!manga en` หรือ `!manga th`)"
+            "กรุณาแนบรูปภาพหน้ามังงะ หรือวางลิงก์ที่มีรูปภาพ (เช่น X/Twitter, Pixiv/phixiv หรือลิงก์รูปภาพ) มาด้วยนะคะ "
+            "(สามารถแนบหรือวางลิงก์ที่มีหลายหน้าพร้อมกันได้เลยค่ะ เช่น พิมพ์ `!manga en` หรือ `!manga th`)"
         )
         return
 
     _, target_lang_name = _detect_target_translation_lang(user_prompt)
-    target_attachments = image_attachments[:10]
-    num_pages = len(target_attachments)
+    pages_input = pages_input[:10]
+    num_pages = len(pages_input)
 
     async with channel.typing():
-        pages_input = []
-        for att in target_attachments:
-            raw_b = await att.read()
-            pages_input.append((raw_b, att.filename))
-
         batch_results = await extract_and_translate_manga_pages_batch(
             pages_input, target_lang_name
         )
@@ -1561,7 +1564,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
             await _send_or_reply(
                 channel,
                 msg,
-                content="ไม่สามารถตรวจจับข้อความในภาพที่แนบมาได้ค่ะ กรุณาตรวจสอบว่าภาพมีความคมชัดนะคะ",
+                content="ไม่สามารถตรวจจับข้อความในภาพที่แนบมาหรือจากลิงก์ได้ค่ะ กรุณาตรวจสอบว่าภาพมีความคมชัดนะคะ",
             )
             return
 
@@ -1626,5 +1629,5 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
                 pass
         discord_files.clear()
         pages_input.clear()
-        rendered_png = raw_bytes = raw_b = None
+        rendered_png = raw_bytes = None
         release_unused_memory()

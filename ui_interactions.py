@@ -10,6 +10,7 @@ from config import (
     ACTIVE_CODE_MODEL,
     IMAGE_EXTENSIONS,
     THAI_MONTHS,
+    URL_REGEX,
     get_cached_channel_attachments,
 )
 from persona import (
@@ -18,7 +19,11 @@ from persona import (
     YUKIPEDIA_SYSTEM_PROMPT,
 )
 from llm import query_local_ollama_chat
-from media_context import extract_all_context, format_code_or_log_attachment
+from media_context import (
+    extract_all_context,
+    format_code_or_log_attachment,
+    extract_image_via_transient_ocr,
+)
 from image_engine import (
     send_chunked_response,
     process_manga_translation_request,
@@ -42,14 +47,61 @@ def get_previous_month_info(now_th: datetime) -> tuple[int, int, str]:
     return y_ce, m_num, f"{THAI_MONTHS[m_num]} พ.ศ. {y_ce + 543}"
 
 
+class AutoDisappearingView(discord.ui.View):
+    """
+    Base View that automatically removes its buttons from the Discord message
+    (or deletes the standalone button footer message) when `timeout` expires,
+    and releases its message reference to keep Render 512MB RAM clean.
+    """
+
+    def __init__(self, timeout: float = 300.0):
+        super().__init__(timeout=timeout)
+        self.message: discord.Message | discord.InteractionMessage | None = None
+        self.delete_message_on_timeout: bool = False
+
+    async def on_timeout(self) -> None:
+        msg = self.message
+        self.message = None
+        if msg is None:
+            return
+        try:
+            if self.delete_message_on_timeout:
+                await msg.delete()
+            else:
+                await msg.edit(view=None)
+        except Exception:
+            pass
+
+
+async def _send_interaction_with_auto_view(
+    interaction: discord.Interaction,
+    answer: str,
+    view: AutoDisappearingView,
+    chunked_header: str = "❄️ ดำเนินการเรียบร้อยแล้วค่ะ:",
+):
+    """Sends a deferred Slash/Context-Menu reply and binds `view.message` so buttons auto-disappear on timeout."""
+    if not answer or not answer.strip():
+        return
+    if len(answer) <= 1900:
+        sent_msg = await interaction.followup.send(answer, view=view, wait=True)
+        view.message = sent_msg
+        view.delete_message_on_timeout = False
+    else:
+        await interaction.followup.send(chunked_header)
+        await send_chunked_response(interaction.channel, answer)
+        footer_msg = await interaction.channel.send("-# ตัวเลือกดำเนินการเพิ่มเติม:", view=view)
+        view.message = footer_msg
+        view.delete_message_on_timeout = True
+
+
 # ==============================================================================
-# 1. INTERACTIVE CODE REVIEW & STACK TRACE VIEW
+# 1. INTERACTIVE CODE REVIEW & STACK TRACE VIEW (Code Map / Explain / Optimize)
 # ==============================================================================
-class CodeReviewActionView(discord.ui.View):
-    """Interactive follow-up buttons attached to coding & stack trace responses."""
+class CodeReviewActionView(AutoDisappearingView):
+    """Interactive follow-up buttons (Code Map, Explain, Optimize) attached to coding & stack trace responses."""
 
     def __init__(self, author_id: int, channel_id: int, original_prompt: str, original_answer: str):
-        super().__init__(timeout=300)
+        super().__init__(timeout=300.0)
         self.author_id = author_id
         self.channel_id = channel_id
         self.original_prompt = original_prompt[:2500]
@@ -83,36 +135,40 @@ class CodeReviewActionView(discord.ui.View):
         except Exception:
             pass
 
-    @discord.ui.button(label="เขียน Unit Tests", style=discord.ButtonStyle.primary, emoji="🧪")
-    async def btn_unit_tests(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Code Map", style=discord.ButtonStyle.primary, emoji="🗺️")
+    async def btn_code_map(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._run_followup(
             interaction,
-            "ช่วยเขียน Unit Tests ที่ครอบคลุมทั้ง Happy Path และ Edge Cases/Exception จากโค้ดหรือบั๊กที่เพิ่งวิเคราะห์ไป "
-            "(ใช้ JUnit 5 + Mockito สำหรับ Java/Spring Boot หรือ Jest/Vitest สำหรับ Node.js/React ตามภาษาของโค้ดเดิม) "
-            "พร้อมระบุชื่อไฟล์ไว้บรรทัดแรกของบล็อกโค้ดด้วยค่ะ",
+            "ช่วยสร้าง **Code Map (ไล่ลำดับการทำงานทีละขั้นตอน)** จากโค้ดหรือ Stack Trace ข้างต้น:\n"
+            "- หากเป็นซอร์สโค้ด (หรือหลายไฟล์ที่เชื่อมโยงกัน): ให้ไล่ Flow การทำงานตั้งแต่จุดเริ่มต้นไปจนจบเป็นลำดับขั้น (`1. -> 2. -> 3.`) "
+            "ข้ามเลเยอร์ต่างๆ (เช่น Component/Controller -> Service -> `@Transactional` -> Oracle SQL / Message Queue) "
+            "โดยระบุชื่อคลาส/เมธอด/ฟังก์ชัน จุดที่ข้อมูลถูกแปลงค่า และจุดที่ State เปลี่ยนแปลงอย่างชัดเจน\n"
+            "- หากเป็น Stack Trace / Error Log: ให้ตัดเฟรมของ Framework ที่ไม่จำเป็นออก แล้วไล่ลำดับ Call Path จากจุดเริ่มต้นลงไปจนถึงบรรทัดต้นตอใน `Caused by:` ชั้นในสุดค่ะ",
         )
 
-    @discord.ui.button(label="เจาะลึก Root Cause", style=discord.ButtonStyle.secondary, emoji="🔍")
-    async def btn_deep_dive(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Explain", style=discord.ButtonStyle.secondary, emoji="💡")
+    async def btn_explain(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._run_followup(
             interaction,
-            "ช่วยอธิบายเจาะลึกกลไกเบื้องหลัง (Under-the-hood mechanism), ผลกระทบด้าน Concurrency / Memory / Database Execution Plan "
-            "และแนวทางป้องกันในระดับ Production Architecture ของปัญหานี้อย่างละเอียดค่ะ",
+            "ช่วย **อธิบายการทำงานและสาเหตุ (Explain)** ให้เข้าใจง่ายและตรงประเด็น:\n"
+            "- หากเป็นบล็อกโค้ดหรือคิวรี SQL/PL/SQL: อธิบายตรรกะทีละส่วนแบบเข้าใจง่าย (รับ Input อะไร ประมวลผลเงื่อนไขอย่างไร คืนค่า Output อะไร และมี Edge Case ตรงไหนที่ต้องระวัง)\n"
+            "- หากเป็น Stack Trace / Error Log: อธิบายกลไกเบื้องหลังของ Root Cause (เช่น ทำไมถึงเกิด Exception, รหัส `ORA-`, Spring Bean error, หรือ K8s `OOMKilled`/`CrashLoopBackOff`) ให้เห็นภาพชัดเจนโดยไม่ใช้ศัพท์อ้อมค้อมค่ะ",
         )
 
-    @discord.ui.button(label="สร้าง Config / SQL / Infra", style=discord.ButtonStyle.secondary, emoji="🛠️")
-    async def btn_infra_sql(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Optimize", style=discord.ButtonStyle.secondary, emoji="⚡")
+    async def btn_optimize(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._run_followup(
             interaction,
-            "จากโค้ดหรือปัญหาเมื่อครู่ ช่วยสร้างไฟล์ประกอบที่จำเป็นให้สมบูรณ์ เช่น Oracle SQL Index/DDL Script, "
-            "`application.yml` / `pom.xml` snippet, หรือ `Dockerfile` / Kubernetes manifest ที่ปลอดภัยและพร้อมใช้งานจริงค่ะ",
+            "ช่วย **ปรับปรุงประสิทธิภาพและโครงสร้าง (Optimize)** ของโค้ด คิวรี SQL หรือคอนฟิกข้างต้น:\n"
+            "- วิเคราะห์จุดคอขวด (เช่น Oracle SQL Execution Plan, Missing Foreign Key/Composite Index, Implicit Type Conversion, JPA/Hibernate N+1, ลูปซ้ำซ้อน, Blocking Async I/O, React Re-render หรือ Resource Limits)\n"
+            "- มอบโค้ด/SQL/คอนฟิกที่ Refactor และ Optimize แล้วให้พร้อมนำไปใช้งานจริง โดยระบุชื่อไฟล์ไว้ในบรรทัดแรกของบล็อกโค้ดด้วยค่ะ",
         )
 
 
 # ==============================================================================
 # 2. INTERACTIVE GENERAL / YUKIPEDIA / RESEARCH SUGGESTION VIEW
 # ==============================================================================
-class GeneralAssistantActionView(discord.ui.View):
+class GeneralAssistantActionView(AutoDisappearingView):
     """
     Context-aware suggestion buttons for non-code replies (News, Games, Anime, YouTube, Ideas, Products).
     Includes a dynamic 3rd 'Suggested Next Angle' button tailored to what Yukinon just answered.
@@ -126,7 +182,7 @@ class GeneralAssistantActionView(discord.ui.View):
         suggested_label: str = "มุมมอง & คำแนะนำเพิ่ม",
         suggested_prompt: str = "",
     ):
-        super().__init__(timeout=300)
+        super().__init__(timeout=300.0)
         self.channel_id = channel_id
         self.user_query = user_query[:1200]
         self.bot_reply = bot_reply[:2500]
@@ -186,7 +242,10 @@ class GeneralAssistantActionView(discord.ui.View):
 def build_contextual_suggestion_view(channel_id: int, user_query: str, bot_reply: str) -> GeneralAssistantActionView:
     """Chooses a smart, domain-specific 3rd suggestion button based on conversation topic."""
     combined = f"{user_query} {bot_reply}".lower()
-    if any(k in combined for k in ("เกม", "game", "steam", "pso2", "ngs", "build", "คลาส", "class")):
+    if any(k in combined for k in ("pixiv", "twitter", "x.com", "ศิลปิน", "ผู้วาด", "วาร์ป", "source")):
+        label = "ค้นหาผลงานอื่นของศิลปิน"
+        prompt = "ช่วยค้นหาข้อมูลเพิ่มเติมเกี่ยวกับศิลปินหรือผลงานชุดนี้ (เช่น บัญชี Pixiv/X หรือซีรีส์ที่เกี่ยวข้อง) ให้หน่อยค่ะ"
+    elif any(k in combined for k in ("เกม", "game", "steam", "pso2", "ngs", "build", "คลาส", "class")):
         label = "แนะนำแนวทางเล่น / Build"
         prompt = "ช่วยแนะนำแนวทางการเล่น การจัดสาย/อุปกรณ์ หรือเคล็ดลับสำคัญสำหรับผู้เล่นในเรื่องนี้พร้อมเช็คข้อมูลล่าสุดให้หน่อยค่ะ"
     elif any(k in combined for k in ("อนิเมะ", "มังงะ", "นิยาย", "anime", "manga", "novel", "เรื่องย่อ")):
@@ -257,22 +316,24 @@ class OTEditModal(discord.ui.Modal, title="แก้ไขรายการบ�
                 self.guild = inter.guild
 
         reply = await process_ot_request(_ProxyMsg(interaction), cmd_str)
-        await interaction.response.send_message(
-            reply,
-            view=OTActionView(
-                owner_id=interaction.user.id,
-                record_date=self.date_input.value.strip(),
-                record_slot=self.time_input.value.strip(),
-                record_detail=self.detail_input.value.strip(),
-            ),
+        view = OTActionView(
+            owner_id=interaction.user.id,
+            record_date=self.date_input.value.strip(),
+            record_slot=self.time_input.value.strip(),
+            record_detail=self.detail_input.value.strip(),
         )
+        await interaction.response.send_message(reply, view=view)
+        try:
+            view.message = await interaction.original_response()
+        except Exception:
+            pass
 
 
-class OTActionView(discord.ui.View):
+class OTActionView(AutoDisappearingView):
     """Interactive buttons under OT log confirmations for 1-click Monthly Table, Edit Modal, or Delete."""
 
     def __init__(self, owner_id: int, record_date: str = "", record_slot: str = "", record_detail: str = ""):
-        super().__init__(timeout=300)
+        super().__init__(timeout=300.0)
         self.owner_id = owner_id
         self.record_date = record_date
         self.record_slot = record_slot
@@ -321,11 +382,11 @@ class OTActionView(discord.ui.View):
             prof["ot_logs"] = new_logs
             save_user_profiles_local()
             await backup_user_profiles_to_discord(force=True)
-            for child in self.children:
-                child.disabled = True
+            self.stop()
+            self.message = None
             await interaction.response.edit_message(
                 content=f"🗑️ ลบรายการบันทึก OT ของวันที่ **`{self.record_date}`** เรียบร้อยแล้วค่ะ",
-                view=self,
+                view=None,
             )
         else:
             await interaction.response.send_message(f"ไม่พบรายการวันที่ `{self.record_date}` ในระบบแล้วค่ะ", ephemeral=True)
@@ -346,7 +407,7 @@ def parse_ot_record_metadata(ot_reply_text: str) -> tuple[str, str, str]:
 # 4. NATIVE SLASH COMMANDS & RIGHT-CLICK CONTEXT MENUS
 # ==============================================================================
 def register_app_commands(bot: discord.ext.commands.Bot):
-    """Registers all Slash Commands (/code, /ot, /yukipedia) and Right-Click Context Menus."""
+    """Registers all Slash Commands (/code, /ot, /yukipedia, /source, /manga) and Right-Click Context Menus."""
 
     @bot.tree.command(name="code", description="วิเคราะห์โค้ด, Stack Trace, SQL หรือ Manifest ตามมาตรฐาน Enterprise")
     @app_commands.describe(
@@ -381,9 +442,14 @@ def register_app_commands(bot: discord.ext.commands.Bot):
         att_block = ""
         if attachment is not None and attachment.size <= 15 * 1024 * 1024:
             raw_b = await attachment.read()
-            decoded = raw_b.decode("utf-8", errors="replace")
-            formatted = format_code_or_log_attachment(decoded, is_log=attachment.filename.lower().endswith(".log"))
-            att_block = f"\n\n=== Attached File: `{attachment.filename}` ===\n```\n{formatted}\n```"
+            fname = attachment.filename.lower()
+            if fname.endswith(IMAGE_EXTENSIONS):
+                ocr_out = await extract_image_via_transient_ocr(raw_b, attachment.filename, run_source_lookup=False)
+                att_block = f"\n\n=== Attached Screenshot OCR (`{attachment.filename}`) ===\n{ocr_out}"
+            else:
+                decoded = raw_b.decode("utf-8", errors="replace")
+                formatted = format_code_or_log_attachment(decoded, is_log=fname.endswith(".log"))
+                att_block = f"\n\n=== Attached File: `{attachment.filename}` ===\n```\n{formatted}\n```"
 
         full_prompt = f"{prefix}{prompt}{att_block}"
         answer, _ = await query_local_ollama_chat(
@@ -397,11 +463,9 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             speaker_user=interaction.user,
         )
         view = CodeReviewActionView(interaction.user.id, interaction.channel_id, prompt, answer)
-        if len(answer) <= 1900:
-            await interaction.followup.send(answer, view=view)
-        else:
-            await interaction.followup.send("❄️ ผลการวิเคราะห์เสร็จสมบูรณ์แล้วค่ะ:", view=view)
-            await send_chunked_response(interaction.channel, answer)
+        await _send_interaction_with_auto_view(
+            interaction, answer, view, chunked_header="❄️ ผลการวิเคราะห์เสร็จสมบูรณ์แล้วค่ะ:"
+        )
 
     @bot.tree.command(name="ot", description="บันทึกเวลาทำ OT, แก้ไข, ลบ หรือดูตารางสรุปรายเดือน")
     @app_commands.describe(
@@ -454,6 +518,10 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             else OTActionView(interaction.user.id)
         )
         await interaction.response.send_message(reply, view=view)
+        try:
+            view.message = await interaction.original_response()
+        except Exception:
+            pass
 
     @bot.tree.command(name="yukipedia", description="ค้นหาข้อมูลเรียลไทม์ วิเคราะห์ข่าว เกม อนิเมะ หรือสรุปหัวข้อพร้อมปุ่มแนะนำ")
     @app_commands.describe(query="หัวข้อหรือคำถามที่ต้องการให้ Yukipedia ค้นหาและวิเคราะห์")
@@ -470,11 +538,111 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             speaker_user=interaction.user,
         )
         view = build_contextual_suggestion_view(interaction.channel_id, query, answer)
-        if len(answer) <= 1900:
-            await interaction.followup.send(answer, view=view)
-        else:
-            await interaction.followup.send("❄️ ข้อมูลจาก Yukipedia พร้อมแล้วค่ะ:", view=view)
-            await send_chunked_response(interaction.channel, answer)
+        await _send_interaction_with_auto_view(
+            interaction, answer, view, chunked_header="❄️ ข้อมูลจาก Yukipedia พร้อมแล้วค่ะ:"
+        )
+
+    @bot.tree.command(name="source", description="หาที่มาของรูปภาพ, งานวาด, อนิเมะ หรือโพสต์จากไฟล์แนบหรือลิงก์ (X/Pixiv/Embed)")
+    @app_commands.describe(
+        link="วางลิงก์ X (Twitter), Pixiv, phixiv, Bluesky หรือลิงก์รูปภาพ (ถ้าไม่ได้แนบไฟล์)",
+        attachment="แนบไฟล์รูปภาพที่ต้องการหาที่มา (ถ้าไม่ได้วางลิงก์)",
+        question="คำถามเพิ่มเติม (เช่น ใครวาด, ตอนที่เท่าไหร่, รุ่นอะไร)",
+    )
+    async def slash_source(
+        interaction: discord.Interaction,
+        link: str = "",
+        attachment: discord.Attachment | None = None,
+        question: str = "",
+    ):
+        if not link.strip() and attachment is None:
+            await interaction.response.send_message(
+                "กรุณาแนบรูปภาพ หรือวางลิงก์ (เช่น X/Twitter, Pixiv/phixiv หรือลิงก์รูปภาพ) มาด้วยนะคะ",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True)
+        class _FakeSourceMsg:
+            def __init__(self):
+                self.id = 0
+                self.content = link.strip()
+                self.attachments = [attachment] if attachment is not None else []
+                self.embeds = []
+                self.stickers = []
+                self.reference = None
+                self.channel = interaction.channel
+                self.author = interaction.user
+
+        extracted_ctx, _ = await extract_all_context(_FakeSourceMsg())
+        user_q = question.strip() or (
+            "ช่วยระบุที่มาของภาพและลิงก์นี้อย่างละเอียด: "
+            "หากเป็นภาพวาด/อนิเมะ/มังงะ ให้บอกชื่อเรื่อง ชื่อตัวละคร ตอนที่/Chapter ชื่อผู้วาด และแนบลิงก์ที่มา (เช่น Pixiv/X/MyAnimeList) ถ้ามี "
+            "หากเป็นภาพถ่ายสิ่งของหรืออุปกรณ์ ให้ระบุยี่ห้อ รุ่น และรายละเอียดสำคัญของสิ่งนั้นค่ะ"
+        )
+        answer, _ = await query_local_ollama_chat(
+            f"{user_q}\n\n{extracted_ctx}",
+            model=ACTIVE_FAST_MODEL,
+            system_prompt=FAST_SYSTEM_PROMPT,
+            channel_id=interaction.channel_id,
+            temperature=0.2,
+            allow_agentic_search=True,
+            has_fresh_attachment=True,
+            speaker_user=interaction.user,
+        )
+        view = build_contextual_suggestion_view(interaction.channel_id, user_q, answer)
+        await _send_interaction_with_auto_view(
+            interaction, answer, view, chunked_header="❄️ ตรวจสอบที่มาเรียบร้อยแล้วค่ะ:"
+        )
+
+    @bot.tree.command(name="manga", description="แปลหน้ามังงะในช่องคำพูดพร้อมฝังคำแปลลงในภาพ (รองรับไฟล์แนบและลิงก์ X/Pixiv)")
+    @app_commands.describe(
+        language="ภาษาปลายทางที่ต้องการแปล",
+        link="วางลิงก์ X (Twitter), Pixiv/phixiv หรือลิงก์รูปมังงะ (รองรับหลายหน้าในโพสต์เดียว)",
+        attachment="แนบไฟล์รูปหน้ามังงะ (ถ้าไม่ได้วางลิงก์)",
+    )
+    @app_commands.choices(
+        language=[
+            app_commands.Choice(name="ภาษาไทย (Thai)", value="Thai"),
+            app_commands.Choice(name="ภาษาอังกฤษ (English)", value="English"),
+        ]
+    )
+    async def slash_manga(
+        interaction: discord.Interaction,
+        language: str = "Thai",
+        link: str = "",
+        attachment: discord.Attachment | None = None,
+    ):
+        if not link.strip() and attachment is None:
+            await interaction.response.send_message(
+                "กรุณาแนบไฟล์รูปมังงะ หรือวางลิงก์ X (Twitter) / Pixiv / phixiv ที่มีรูปมังงะนะคะ",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"📖 กำลังแปลหน้ามังงะเป็น **{language}** และจัดวางข้อความลงในช่องคำพูดให้สักครู่นะคะ...",
+            ephemeral=True,
+        )
+
+        class _FakeMangaMsg:
+            def __init__(self):
+                self.id = 0
+                self.content = link.strip()
+                self.attachments = [attachment] if attachment is not None else []
+                self.embeds = []
+                self.reference = None
+                self.channel = interaction.channel
+                self.author = interaction.user
+
+            async def reply(self, **kwargs):
+                return await interaction.channel.send(**kwargs)
+
+        class _FakeCtx:
+            def __init__(self):
+                self.message = _FakeMangaMsg()
+                self.channel = interaction.channel
+
+        await process_manga_translation_request(_FakeCtx(), f"translate manga to {language}")
 
     # --- Right-Click Message Context Menus ---
     @bot.tree.context_menu(name="Analyze Code / Stack Trace")
@@ -495,11 +663,9 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             speaker_user=interaction.user,
         )
         view = CodeReviewActionView(interaction.user.id, interaction.channel_id, base_text, answer)
-        if len(answer) <= 1900:
-            await interaction.followup.send(answer, view=view)
-        else:
-            await interaction.followup.send("❄️ วิเคราะห์โค้ด/Stack Trace เรียบร้อยแล้วค่ะ:", view=view)
-            await send_chunked_response(interaction.channel, answer)
+        await _send_interaction_with_auto_view(
+            interaction, answer, view, chunked_header="❄️ วิเคราะห์โค้ด/Stack Trace เรียบร้อยแล้วค่ะ:"
+        )
 
     @bot.tree.context_menu(name="Yukipedia Fact-Check / Summary")
     async def ctx_yukipedia_summary(interaction: discord.Interaction, message: discord.Message):
@@ -519,18 +685,47 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             speaker_user=interaction.user,
         )
         view = build_contextual_suggestion_view(interaction.channel_id, base_text, answer)
-        if len(answer) <= 1900:
-            await interaction.followup.send(answer, view=view)
-        else:
-            await interaction.followup.send("❄️ ตรวจสอบและสรุปข้อมูลเรียบร้อยแล้วค่ะ:", view=view)
-            await send_chunked_response(interaction.channel, answer)
+        await _send_interaction_with_auto_view(
+            interaction, answer, view, chunked_header="❄️ ตรวจสอบและสรุปข้อมูลเรียบร้อยแล้วค่ะ:"
+        )
+
+    @bot.tree.context_menu(name="Find Image / Link Source")
+    async def ctx_find_source(interaction: discord.Interaction, message: discord.Message):
+        await interaction.response.defer(thinking=True)
+        extracted_ctx, _ = await extract_all_context(message)
+        if not extracted_ctx:
+            await interaction.followup.send(
+                "ไม่พบรูปภาพหรือลิงก์ที่สามารถตรวจสอบที่มาได้ในข้อความนี้ค่ะ",
+                ephemeral=True,
+            )
+            return
+        user_q = (
+            "ช่วยระบุที่มาของภาพและลิงก์นี้อย่างละเอียด: "
+            "หากเป็นภาพวาด/อนิเมะ/มังงะ ให้บอกชื่อเรื่อง ชื่อตัวละคร ตอนที่/Chapter ชื่อผู้วาด และแนบลิงก์ที่มา (เช่น Pixiv/X/MyAnimeList) ถ้ามี "
+            "หากเป็นภาพถ่ายสิ่งของหรืออุปกรณ์ ให้ระบุยี่ห้อ รุ่น และรายละเอียดสำคัญของสิ่งนั้นค่ะ"
+        )
+        answer, _ = await query_local_ollama_chat(
+            f"{user_q}\n\n{extracted_ctx}",
+            model=ACTIVE_FAST_MODEL,
+            system_prompt=FAST_SYSTEM_PROMPT,
+            channel_id=interaction.channel_id,
+            temperature=0.2,
+            allow_agentic_search=True,
+            has_fresh_attachment=True,
+            speaker_user=interaction.user,
+        )
+        view = build_contextual_suggestion_view(interaction.channel_id, user_q, answer)
+        await _send_interaction_with_auto_view(
+            interaction, answer, view, chunked_header="❄️ ตรวจสอบที่มาเรียบร้อยแล้วค่ะ:"
+        )
 
     @bot.tree.context_menu(name="Translate Manga Page (TH)")
     async def ctx_translate_manga_th(interaction: discord.Interaction, message: discord.Message):
         has_imgs = any(a.filename.lower().endswith(IMAGE_EXTENSIONS) for a in message.attachments)
-        if not has_imgs:
+        has_embeds_or_links = bool(message.embeds) or bool(URL_REGEX.search(message.content or ""))
+        if not has_imgs and not has_embeds_or_links:
             await interaction.response.send_message(
-                "ข้อความที่เลือกไม่มีไฟล์รูปภาพแนบอยู่ค่ะ กรุณาคลิกขวาที่ข้อความที่มีรูปมังงะนะคะ",
+                "ข้อความที่เลือกไม่มีไฟล์รูปภาพหรือลิงก์ที่มีรูปภาพแนบอยู่ค่ะ กรุณาคลิกขวาที่ข้อความที่มีรูปมังงะหรือลิงก์ X/Pixiv นะคะ",
                 ephemeral=True,
             )
             return

@@ -38,11 +38,34 @@ from config import (
     release_unused_memory,
 )
 from persona import TYPHOON_OCR_PROMPT
-from search_engine import fetch_webpage_sync, run_safe_web_search_sync
+from search_engine import (
+    fetch_webpage_sync,
+    run_safe_web_search_sync,
+    validate_safe_public_url,
+)
 from llm import (
     discover_active_groq_vision_models,
     call_gemma_ai_studio_vision,
     call_cloudflare_vision_chat,
+)
+
+MAX_EMBED_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB per embedded image cap for 512MB Render container
+
+TWITTER_STATUS_URL_REGEX = re.compile(
+    r"https?://(?:www\.|mobile\.)?(?:x\.com|twitter\.com|fixupx\.com|fxtwitter\.com|vxtwitter\.com|fixvx\.com|twittpr\.com)/(?:[^/\s]+/status|i/web/status)/(\d+)",
+    re.IGNORECASE,
+)
+PIXIV_ILLUST_URL_REGEX = re.compile(
+    r"https?://(?:www\.)?(?:pixiv\.net|phixiv\.net|ppxiv\.net)/(?:[a-z]{2}/)?(?:artworks/|i/|member_illust\.php\?[^#\s]*illust_id=)(\d+)",
+    re.IGNORECASE,
+)
+BSKY_POST_URL_REGEX = re.compile(
+    r"https?://(?:www\.)?(?:bsky\.app|fxbsky\.app)/profile/([^/\s]+)/post/([a-zA-Z0-9]+)",
+    re.IGNORECASE,
+)
+DIRECT_IMAGE_URL_REGEX = re.compile(
+    r"https?://[^\s<>'\"]+\.(?:jpg|jpeg|png|webp)(?:\?[^\s<>'\"]*)?",
+    re.IGNORECASE,
 )
 
 
@@ -116,13 +139,11 @@ def extract_key_stack_trace_windows(log_text: str, max_chars: int = 28000) -> st
     total_lines = len(lines)
     keep_indices: set[int] = set()
 
-    # Always keep startup/header context (first 45 lines) and latest tail (last 180 lines)
     for i in range(min(45, total_lines)):
         keep_indices.add(i)
     for i in range(max(0, total_lines - 180), total_lines):
         keep_indices.add(i)
 
-    # Scan for stack trace / exception / ORA- / K8s failure anchors and preserve surrounding frames
     for idx, line in enumerate(lines):
         if STACK_TRACE_SIGNATURE_REGEX.search(line) or re.search(r"\b(ERROR|FATAL|SEVERE|PANIC)\b", line):
             start_w = max(0, idx - 6)
@@ -184,6 +205,459 @@ def extract_youtube_id(url: str):
     return None
 
 
+# ==============================================================================
+# EMBEDDED LINKS & SOCIAL MEDIA MEDIA/METADATA RESOLVER (X, PIXIV, BSKY, EMBEDS)
+# ==============================================================================
+def _guess_image_filename_from_url(url: str, fallback_prefix: str = "embed_img") -> str:
+    try:
+        path = urlparse(url).path
+        base = path.rsplit("/", 1)[-1].split("?")[0]
+        if base and any(base.lower().endswith(ext) for ext in IMAGE_EXTENSIONS):
+            return base[:80]
+    except Exception:
+        pass
+    return f"{fallback_prefix}.jpg"
+
+
+async def _download_remote_image_safe(url: str, referer: str = "") -> tuple[bytes, str] | None:
+    """
+    Safely downloads an external embedded image (with SSRF check, 10MB cap, and automatic
+    Pixiv Referer header injection when fetching from i.pximg.net).
+    """
+    try:
+        safe_url = await asyncio.to_thread(validate_safe_public_url, url)
+    except Exception as e:
+        api_log(f"Embed Image SSRF/URL skip ({url[:60]}): {e}")
+        return None
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+    lower_u = safe_url.lower()
+    if referer:
+        headers["Referer"] = referer
+    elif "pximg.net" in lower_u or "pixiv.net" in lower_u:
+        headers["Referer"] = f"{HTTPS}www.pixiv.net/"
+
+    try:
+        session = get_http_session()
+        async with session.get(
+            safe_url, headers=headers, timeout=aiohttp.ClientTimeout(total=12)
+        ) as resp:
+            if resp.status != 200:
+                api_log(f"Embed Image HTTP {resp.status} -> {safe_url[:70]}")
+                return None
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if ctype and not (ctype.startswith("image/") or "octet-stream" in ctype):
+                return None
+            c_len = int(resp.headers.get("Content-Length") or 0)
+            if c_len > MAX_EMBED_IMAGE_BYTES:
+                return None
+
+            buf = bytearray()
+            async for chunk in resp.content.iter_chunked(65536):
+                buf.extend(chunk)
+                if len(buf) > MAX_EMBED_IMAGE_BYTES:
+                    return None
+            if len(buf) < 512:
+                return None
+            fname = _guess_image_filename_from_url(safe_url)
+            return bytes(buf), fname
+    except Exception as e:
+        api_log(f"Embed Image download note ({safe_url[:60]}): {type(e).__name__}")
+        return None
+
+
+async def _fetch_x_twitter_post_info(tweet_id: str) -> tuple[str, list[str]]:
+    """
+    Queries keyless FxTwitter / vxTwitter JSON APIs for a tweet ID.
+    Returns (formatted_metadata_text, list_of_direct_photo_urls).
+    """
+    t0 = time.monotonic()
+    session = get_http_session()
+    endpoints = (
+        f"{HTTPS}api.fxtwitter.com/status/{tweet_id}",
+        f"{HTTPS}api.vxtwitter.com/status/{tweet_id}",
+    )
+    for ep in endpoints:
+        try:
+            async with session.get(
+                ep,
+                headers={"User-Agent": "YukinonBot/3.0"},
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status != 200:
+                    continue
+                data = await resp.json(content_type=None)
+                if not isinstance(data, dict):
+                    continue
+
+                # Case A: FxTwitter JSON schema
+                tweet = data.get("tweet")
+                if isinstance(tweet, dict):
+                    author = tweet.get("author") or {}
+                    a_name = author.get("name") or ""
+                    a_handle = author.get("screen_name") or ""
+                    t_text = (tweet.get("text") or "").strip()
+                    t_url = tweet.get("url") or f"{HTTPS}x.com/{a_handle or 'i'}/status/{tweet_id}"
+                    created = tweet.get("created_at") or ""
+                    likes = tweet.get("likes")
+                    retweets = tweet.get("retweets")
+
+                    photo_urls = []
+                    media = tweet.get("media") or {}
+                    for ph in media.get("photos") or []:
+                        if isinstance(ph, dict) and ph.get("url"):
+                            photo_urls.append(ph["url"])
+                    if not photo_urls:
+                        for m_item in media.get("all") or []:
+                            if isinstance(m_item, dict):
+                                u = m_item.get("url") or m_item.get("thumbnail_url")
+                                if u and m_item.get("type") in ("photo", "image", "gif", "video"):
+                                    photo_urls.append(u)
+
+                    lines = [
+                        f"Platform: X (Twitter) | Post URL: {t_url}",
+                        f"Author: {a_name} (@{a_handle})" if a_handle else f"Author: {a_name}",
+                    ]
+                    if created:
+                        lines.append(f"Posted At: {created}")
+                    if likes is not None or retweets is not None:
+                        lines.append(f"Engagement: {likes or 0} Likes | {retweets or 0} Reposts")
+                    if t_text:
+                        lines.append(f"Post Content:\n{t_text}")
+
+                    quote = tweet.get("quote")
+                    if isinstance(quote, dict):
+                        q_auth = quote.get("author") or {}
+                        q_handle = q_auth.get("screen_name") or ""
+                        q_text = (quote.get("text") or "").strip()
+                        if q_text:
+                            lines.append(f"Quoted Post (@{q_handle}):\n{q_text}")
+                        if not photo_urls:
+                            for qph in (quote.get("media") or {}).get("photos") or []:
+                                if isinstance(qph, dict) and qph.get("url"):
+                                    photo_urls.append(qph["url"])
+
+                    api_log(
+                        f"Embed Link (FxTwitter) -> tweet={tweet_id}, photos={len(photo_urls)} ({time.monotonic() - t0:.2f}s)"
+                    )
+                    return "\n".join(lines), photo_urls
+
+                # Case B: vxTwitter JSON schema
+                if "text" in data or "mediaURLs" in data:
+                    u_name = data.get("user_name") or ""
+                    u_screen = data.get("user_screen_name") or ""
+                    t_text = (data.get("text") or "").strip()
+                    media_urls = [
+                        u for u in (data.get("mediaURLs") or [])
+                        if isinstance(u, str) and any(ext in u.lower() for ext in (".jpg", ".jpeg", ".png", ".webp", "pbs.twimg.com/media"))
+                    ]
+                    lines = [
+                        f"Platform: X (Twitter) | Post URL: {HTTPS}x.com/{u_screen or 'i'}/status/{tweet_id}",
+                        f"Author: {u_name} (@{u_screen})" if u_screen else f"Author: {u_name}",
+                    ]
+                    if t_text:
+                        lines.append(f"Post Content:\n{t_text}")
+                    api_log(
+                        f"Embed Link (vxTwitter) -> tweet={tweet_id}, photos={len(media_urls)} ({time.monotonic() - t0:.2f}s)"
+                    )
+                    return "\n".join(lines), media_urls
+        except Exception:
+            continue
+    return "", []
+
+
+async def _fetch_pixiv_artwork_info(illust_id: str) -> tuple[str, list[str]]:
+    """
+    Queries Pixiv's public AJAX endpoints for artwork metadata, artist, tags,
+    and direct regular-resolution image URLs.
+    """
+    t0 = time.monotonic()
+    session = get_http_session()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": f"{HTTPS}www.pixiv.net/artworks/{illust_id}",
+        "Accept": "application/json",
+    }
+    meta_url = f"{HTTPS}www.pixiv.net/ajax/illust/{illust_id}?lang=en"
+    pages_url = f"{HTTPS}www.pixiv.net/ajax/illust/{illust_id}/pages?lang=en"
+
+    try:
+        async with session.get(meta_url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status != 200:
+                return "", []
+            payload = await resp.json(content_type=None)
+            if payload.get("error"):
+                return "", []
+            body = payload.get("body") or {}
+
+        title = (body.get("title") or "").strip()
+        user_name = (body.get("userName") or "").strip()
+        user_id = str(body.get("userId") or "").strip()
+        page_count = int(body.get("pageCount") or 1)
+        desc_raw = re.sub(r"<[^>]+>", " ", body.get("description") or "").strip()
+        desc_clean = re.sub(r"\s+", " ", desc_raw)[:600]
+
+        tags_list = []
+        for t_obj in ((body.get("tags") or {}).get("tags") or [])[:15]:
+            if isinstance(t_obj, dict):
+                t_jp = t_obj.get("tag") or ""
+                t_en = ((t_obj.get("translation") or {}).get("en")) or ""
+                tags_list.append(f"{t_jp} ({t_en})" if t_en else t_jp)
+
+        image_urls = []
+        urls_obj = body.get("urls") or {}
+        primary_u = urls_obj.get("regular") or urls_obj.get("small") or urls_obj.get("original")
+        if primary_u:
+            image_urls.append(primary_u)
+
+        if page_count > 1:
+            try:
+                async with session.get(pages_url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as p_resp:
+                    if p_resp.status == 200:
+                        p_data = await p_resp.json(content_type=None)
+                        p_items = p_data.get("body") or []
+                        extracted_pages = []
+                        for item in p_items[:6]:
+                            u_map = (item.get("urls") or {}) if isinstance(item, dict) else {}
+                            pu = u_map.get("regular") or u_map.get("small")
+                            if pu:
+                                extracted_pages.append(pu)
+                        if extracted_pages:
+                            image_urls = extracted_pages
+            except Exception:
+                pass
+
+        lines = [
+            f"Platform: Pixiv | Artwork URL: {HTTPS}www.pixiv.net/artworks/{illust_id}",
+            f"Artwork Title: {title}",
+            f"Artist / Illustrator: {user_name} (Pixiv User ID: {user_id})",
+            f"Total Pages: {page_count}",
+        ]
+        if tags_list:
+            lines.append(f"Tags: {', '.join(tags_list)}")
+        if desc_clean:
+            lines.append(f"Artist Caption: {desc_clean}")
+
+        api_log(
+            f"Embed Link (Pixiv AJAX) -> illust={illust_id}, pages={len(image_urls)} ({time.monotonic() - t0:.2f}s)"
+        )
+        return "\n".join(lines), image_urls
+    except Exception as e:
+        api_log(f"Embed Link (Pixiv AJAX) -> skipped ({type(e).__name__})")
+        return "", []
+
+
+async def _fetch_bsky_post_info(handle: str, rkey: str) -> tuple[str, list[str]]:
+    """Queries public Bluesky AppView API for post text and embedded images."""
+    session = get_http_session()
+    try:
+        resolve_url = f"{HTTPS}public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle?handle={quote_plus(handle)}"
+        async with session.get(resolve_url, timeout=aiohttp.ClientTimeout(total=6)) as r1:
+            if r1.status != 200:
+                return "", []
+            did = (await r1.json()).get("did")
+            if not did:
+                return "", []
+
+        uri = f"at://{did}/app.bsky.feed.post/{rkey}"
+        thread_url = f"{HTTPS}public.api.bsky.app/xrpc/app.bsky.feed.getPostThread?uri={quote_plus(uri)}&depth=0"
+        async with session.get(thread_url, timeout=aiohttp.ClientTimeout(total=6)) as r2:
+            if r2.status != 200:
+                return "", []
+            post = ((await r2.json()).get("thread") or {}).get("post") or {}
+            author = post.get("author") or {}
+            record = post.get("record") or {}
+            embed = post.get("embed") or {}
+            img_urls = []
+            for img_obj in embed.get("images") or []:
+                if isinstance(img_obj, dict) and img_obj.get("fullsize"):
+                    img_urls.append(img_obj["fullsize"])
+
+            lines = [
+                f"Platform: Bluesky | Post URL: {HTTPS}bsky.app/profile/{handle}/post/{rkey}",
+                f"Author: {author.get('displayName') or handle} (@{handle})",
+            ]
+            if record.get("text"):
+                lines.append(f"Post Content:\n{record['text']}")
+            return "\n".join(lines), img_urls
+    except Exception:
+        return "", []
+
+
+def _extract_native_discord_embeds_data(embeds: list[discord.Embed]) -> tuple[list[str], list[str]]:
+    """
+    Extracts structured metadata and primary image URLs from Discord's native `message.embeds`.
+    Ignores small avatar/footer icons so Vision OCR focuses strictly on actual content images.
+    """
+    meta_blocks = []
+    image_urls = []
+    seen_imgs = set()
+
+    for idx, emb in enumerate(embeds, 1):
+        parts = []
+        if emb.provider and emb.provider.name:
+            parts.append(f"Provider: {emb.provider.name}")
+        if emb.author and emb.author.name:
+            a_str = f"Author: {emb.author.name}"
+            if emb.author.url:
+                a_str += f" ({emb.author.url})"
+            parts.append(a_str)
+        if emb.title:
+            parts.append(f"Title: {emb.title}")
+        if emb.url:
+            parts.append(f"URL: {emb.url}")
+        if emb.description:
+            parts.append(f"Description:\n{emb.description[:3000]}")
+        for fld in emb.fields:
+            if fld.name or fld.value:
+                parts.append(f"- {fld.name}: {fld.value}")
+        if emb.footer and emb.footer.text:
+            parts.append(f"Footer: {emb.footer.text}")
+
+        for img_candidate in (
+            getattr(emb.image, "url", None),
+            getattr(emb.image, "proxy_url", None),
+            getattr(emb.thumbnail, "url", None),
+            getattr(emb.thumbnail, "proxy_url", None),
+        ):
+            if img_candidate and isinstance(img_candidate, str):
+                clean_img = clean_url(img_candidate)
+                if clean_img and clean_img not in seen_imgs:
+                    seen_imgs.add(clean_img)
+                    image_urls.append(clean_img)
+                    break  # Prefer emb.image over emb.thumbnail for the same embed card
+
+        if parts:
+            meta_blocks.append(f"[Discord Embed #{idx}]\n" + "\n".join(parts))
+
+    return meta_blocks, image_urls
+
+
+async def collect_embedded_images_and_metadata(
+    message: discord.Message,
+    ref_msg: discord.Message | None = None,
+    max_images: int = 6,
+) -> tuple[list[tuple[bytes, str, str]], list[str], set[str]]:
+    """
+    Unified Embedded Link & Social Post Inspector:
+    1) Waits briefly if Discord has not yet unfurled `message.embeds` for posted URLs.
+    2) Resolves X/Twitter (`fxtwitter`/`vxtwitter`), Pixiv/phixiv (`pixiv.net/ajax`), and Bluesky links.
+    3) Extracts native Discord `message.embeds` (title, description, author, fields, image, thumbnail).
+    4) Downloads embedded image bytes safely for Vision OCR, Reverse Source Lookup, or Manga Translation.
+
+    Returns:
+      - downloaded_images: list of (raw_bytes, filename, source_url)
+      - metadata_sections: list of formatted metadata strings
+      - handled_urls: set of URLs already resolved by specialized extractors (so generic scraper skips them)
+    """
+    downloaded_images: list[tuple[bytes, str, str]] = []
+    metadata_sections: list[str] = []
+    handled_urls: set[str] = set()
+    candidate_image_urls: list[tuple[str, str]] = []  # (img_url, referer)
+    seen_img_urls: set[str] = set()
+
+    def _queue_img(u: str, referer: str = ""):
+        cu = clean_url(u)
+        if cu and cu not in seen_img_urls:
+            seen_img_urls.add(cu)
+            candidate_image_urls.append((cu, referer))
+
+    # Determine which message(s) carry URLs or embeds
+    target_msgs = [message]
+    if ref_msg is not None:
+        target_msgs.append(ref_msg)
+
+    # If current message has URLs but embeds haven't unfurled yet, wait 1.0s and re-fetch
+    urls_in_curr = URL_REGEX.findall(message.content or "")
+    if urls_in_curr and not message.embeds:
+        try:
+            await asyncio.sleep(1.0)
+            refetched = await message.channel.fetch_message(message.id)
+            target_msgs[0] = refetched
+        except Exception:
+            pass
+
+    all_urls: list[str] = []
+    for m in target_msgs:
+        for u in URL_REGEX.findall(m.content or ""):
+            cu = clean_url(u)
+            if cu and cu not in all_urls:
+                all_urls.append(cu)
+
+    # 1. Specialized Social / Art Link Resolvers (X/Twitter, Pixiv/phixiv, Bluesky, Direct Image URLs)
+    for url in all_urls[:4]:
+        tw_m = TWITTER_STATUS_URL_REGEX.search(url)
+        if tw_m:
+            handled_urls.add(url)
+            tweet_id = tw_m.group(1)
+            tw_meta, tw_photos = await _fetch_x_twitter_post_info(tweet_id)
+            if tw_meta:
+                metadata_sections.append(f"=== Embedded X (Twitter) Post ===\n{tw_meta}")
+            for p_url in tw_photos:
+                _queue_img(p_url)
+            continue
+
+        px_m = PIXIV_ILLUST_URL_REGEX.search(url)
+        if px_m:
+            handled_urls.add(url)
+            illust_id = px_m.group(1)
+            px_meta, px_photos = await _fetch_pixiv_artwork_info(illust_id)
+            if px_meta:
+                metadata_sections.append(f"=== Embedded Pixiv Artwork Metadata ===\n{px_meta}")
+            for p_url in px_photos:
+                _queue_img(p_url, referer=f"{HTTPS}www.pixiv.net/artworks/{illust_id}")
+            continue
+
+        bsky_m = BSKY_POST_URL_REGEX.search(url)
+        if bsky_m:
+            handled_urls.add(url)
+            b_meta, b_photos = await _fetch_bsky_post_info(bsky_m.group(1), bsky_m.group(2))
+            if b_meta:
+                metadata_sections.append(f"=== Embedded Bluesky Post ===\n{b_meta}")
+            for p_url in b_photos:
+                _queue_img(p_url)
+            continue
+
+        if DIRECT_IMAGE_URL_REGEX.match(url):
+            handled_urls.add(url)
+            _queue_img(url)
+
+    # 2. Native Discord `message.embeds` (captures link previews, webhook embeds, bot embeds, phixiv/vxtwitter cards)
+    for m in target_msgs:
+        if not m.embeds:
+            continue
+        non_yt_embeds = [
+            e for e in m.embeds
+            if not (e.url and extract_youtube_id(e.url))
+        ]
+        if not non_yt_embeds:
+            continue
+        emb_meta_list, emb_img_urls = _extract_native_discord_embeds_data(non_yt_embeds)
+        for idx, e_meta in enumerate(emb_meta_list):
+            # Avoid duplicate metadata if FxTwitter/Pixiv API already extracted richer post details
+            if not metadata_sections or idx > 0:
+                metadata_sections.append(f"=== Discord Link Embed Metadata ===\n{e_meta}")
+        for e_img in emb_img_urls:
+            _queue_img(e_img)
+
+    # 3. Download up to `max_images` unique embedded images concurrently
+    if candidate_image_urls:
+        tasks = [
+            _download_remote_image_safe(img_u, referer=ref)
+            for img_u, ref in candidate_image_urls[:max_images]
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for (img_u, _), res in zip(candidate_image_urls[:max_images], results):
+            if isinstance(res, tuple) and len(res) == 2:
+                raw_b, fname = res
+                downloaded_images.append((raw_b, fname, img_u))
+
+    return downloaded_images, metadata_sections, handled_urls
+
+
 def fetch_youtube_context_sync(
     video_id: str, discord_embed_info: dict | None = None, max_chars: int = 20000
 ) -> str:
@@ -201,7 +675,6 @@ def fetch_youtube_context_sync(
     description = (discord_embed_info or {}).get("description", "").strip()
     transcript_text = ""
 
-    # Layer 1: Noembed & YouTube oEmbed
     if not title or not author:
         for oe_endpoint in (
             clean_url(f"{HTTPS}noembed.com/embed?url={quote_plus(watch_url)}"),
@@ -218,7 +691,6 @@ def fetch_youtube_context_sync(
             except Exception:
                 continue
 
-    # Layer 2: Watch Page HTML
     if len(description) < 200 or not title:
         try:
             req_page = urllib.request.Request(
@@ -247,7 +719,6 @@ def fetch_youtube_context_sync(
         except Exception as e:
             api_log(f"YouTube HTML metadata note ({video_id}): {type(e).__name__}")
 
-    # Layer 3: Subtitles / Transcript strictly in Thai, Japanese, or English
     proxy_cfg = (
         GenericProxyConfig(http_url=YOUTUBE_PROXY_URL, https_url=YOUTUBE_PROXY_URL)
         if YOUTUBE_PROXY_URL else None
@@ -272,7 +743,6 @@ def fetch_youtube_context_sync(
     except Exception:
         pass
 
-    # Layer 4: Supplemental Web Search whenever a video has no/minimal spoken transcript
     search_enrichment = ""
     if len(transcript_text) < 120 and title:
         clean_title_for_search = re.sub(
@@ -665,6 +1135,7 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
     blocks, voice_clip_transcripts = [], []
     has_code_file = False
     parsed_heavy_doc = False
+    processed_image_count = 0
 
     # 1. Resolve replied-to message
     ref_msg = await resolve_referenced_message(message)
@@ -714,7 +1185,8 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
                     f"=== Attached Word: `{att.filename}` ===\n"
                     + await asyncio.to_thread(parse_docx_bytes, raw_bytes)
                 )
-            elif fname.endswith(IMAGE_EXTENSIONS):
+            elif fname.endswith(IMAGE_EXTENSIONS) and processed_image_count < 4:
+                processed_image_count += 1
                 ocr_out = await extract_image_via_transient_ocr(raw_bytes, att.filename, run_source_lookup=True)
                 if STACK_TRACE_SIGNATURE_REGEX.search(ocr_out):
                     has_code_file = True
@@ -724,7 +1196,29 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
         except Exception as e:
             blocks.append(f"[Error reading `{att.filename}`: {e}]")
 
-    if parsed_heavy_doc:
+    # 1B. Resolve Embedded Links (`message.embeds`, X/Twitter, Pixiv/phixiv, Bluesky, Direct Image Links)
+    embed_images, embed_meta_sections, handled_social_urls = await collect_embedded_images_and_metadata(
+        message, ref_msg=ref_msg, max_images=max(1, 4 - processed_image_count)
+    )
+    for meta_sec in embed_meta_sections:
+        blocks.append(meta_sec)
+
+    for idx, (emb_bytes, emb_fname, emb_url) in enumerate(embed_images, 1):
+        if processed_image_count >= 4:
+            break
+        processed_image_count += 1
+        try:
+            ocr_out = await extract_image_via_transient_ocr(emb_bytes, emb_fname, run_source_lookup=True)
+            if STACK_TRACE_SIGNATURE_REGEX.search(ocr_out):
+                has_code_file = True
+            blocks.append(
+                f"=== Embedded Image #{idx} Inspection & Source Lookup (`{emb_fname}` | `{emb_url}`) ===\n{ocr_out}"
+            )
+        except Exception as e:
+            blocks.append(f"[Error inspecting embedded image `{emb_fname}`: {e}]")
+
+    if parsed_heavy_doc or embed_images:
+        embed_images.clear()
         release_unused_memory()
 
     # 2. Extract Discord Stickers
@@ -763,7 +1257,7 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
             f"User included custom emoji(s): {', '.join(emote_names)}"
         )
 
-    # 4. Extract URLs (YouTube or Webpages)
+    # 4. Extract URLs (YouTube or general Webpages not already handled by X/Pixiv/Bsky extractors)
     url_source_msg = message
     urls_in_msg = URL_REGEX.findall(message.content or "")[:2]
     if not urls_in_msg and ref_msg and ref_msg.content:
@@ -779,7 +1273,10 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
             pass
 
     for url in urls_in_msg:
-        yt_id = extract_youtube_id(url)
+        cu = clean_url(url)
+        if cu in handled_social_urls:
+            continue
+        yt_id = extract_youtube_id(cu)
         if yt_id:
             embed_info = {}
             for emb in url_source_msg.embeds:
@@ -793,14 +1290,18 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
             try:
                 yt_context = await asyncio.to_thread(fetch_youtube_context_sync, yt_id, embed_info)
                 if yt_context:
-                    blocks.append(f"=== YouTube Video Information (`{url}`) ===\n{yt_context}")
+                    blocks.append(f"=== YouTube Video Information (`{cu}`) ===\n{yt_context}")
             except Exception as e:
                 print(f"YouTube context error ({yt_id}): {e}")
         else:
+            # Skip redundant web scraping if Discord's own embed card already extracted rich description & image
+            has_rich_embed_already = bool(embed_meta_sections and embed_images)
+            if has_rich_embed_already:
+                continue
             try:
                 blocks.append(
-                    f'<untrusted_web_search_results url="{url}">\n'
-                    + await asyncio.to_thread(fetch_webpage_sync, url)
+                    f'<untrusted_web_search_results url="{cu}">\n'
+                    + await asyncio.to_thread(fetch_webpage_sync, cu)
                     + "\n</untrusted_web_search_results>"
                 )
             except Exception as e:
@@ -810,7 +1311,7 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
     if ref_msg and ref_msg.content and ref_msg.content.strip():
         ref_txt = re.sub(r"<@!?\d+>", "", ref_msg.content).strip()
         is_old_image_cmd = bool(
-            ref_msg.attachments
+            (ref_msg.attachments or ref_msg.embeds)
             and re.search(r"(^!|แปลมังงะ|แปลรูป|แปลภาพ|แปลหน้า|\btranslate\b)", ref_txt, re.IGNORECASE)
         )
         if ref_txt and not is_old_image_cmd:
@@ -822,7 +1323,11 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
     joined_context = "\n\n".join(blocks)[:125000]
     prune_stale_attachments()
     if joined_context and message.channel:
-        att_names = [a.filename for a in target_attachments] if target_attachments else ["context"]
+        att_names = (
+            [a.filename for a in target_attachments]
+            if target_attachments
+            else ([f[1] for f in embed_images] or ["embed_context"])
+        )
         channel_last_attachment[message.channel.id].append({
             "filenames": att_names,
             "content": joined_context[:50000],

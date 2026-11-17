@@ -38,6 +38,7 @@ from config import (
     IMAGE_GEN_INTENT_PATTERN,
     AGENTIC_IMAGE_TAG_REGEX,
     PURE_DATETIME_PATTERN,
+    URL_REGEX,
     intents,
     channel_memory,
     channel_last_attachment,
@@ -186,7 +187,7 @@ async def handle_root(request: web.Request) -> web.Response:
         <title>Yukinon Discord Bot - System Telemetry</title>
     </head>
     <body style="font-family: system-ui, sans-serif; max-width: 720px; margin: 36px auto; line-height: 1.6; color: #1f2937; padding: 0 16px;">
-        <h2>❄️ Yukino Yukinoshita Discord Bot (Enterprise & Hybrid Cloud Edition)</h2>
+        <h2>❄️ Yukino Yukinoshita Discord Bot (Enterprise, Embed & Interactive UI Edition)</h2>
         <p><b>System Time (TH):</b> {m['system_time_th']}</p>
         <p><b>Discord Gateway:</b> {gw_status}</p>
         <p><b>Voice & DAVE E2EE:</b> {d['active_voice_sessions']} active session(s) | DAVE Ready: {d['dave_e2ee_ready']}{edge_cd_note}</p>
@@ -229,7 +230,6 @@ async def monthly_ot_auto_report_task():
     prev_year, prev_month, prev_month_label = get_previous_month_info(now_th)
     ym_key = f"{prev_year:04d}-{prev_month:02d}"
 
-    # Trigger on the 1st day of the new month starting at 09:00 ICT
     if now_th.day != 1 or now_th.hour < 9 or state.last_ot_auto_report_ym == ym_key:
         return
 
@@ -314,22 +314,32 @@ async def _send_response_with_interactive_view(
     view: discord.ui.View | None,
     reply_to: discord.Message | None = None,
 ):
-    """Sends a text response with interactive UI buttons attached cleanly."""
+    """
+    Sends a text response with interactive UI buttons attached, binding `view.message`
+    so the buttons automatically disappear when the 5-minute timeout expires.
+    """
     if not answer or not answer.strip():
         return
     if len(answer) <= 1900:
+        sent_msg = None
         if reply_to is not None:
             try:
-                await reply_to.reply(answer, view=view, mention_author=False)
-                return
+                sent_msg = await reply_to.reply(answer, view=view, mention_author=False)
             except Exception:
-                pass
-        await channel.send(answer, view=view)
+                sent_msg = None
+        if sent_msg is None:
+            sent_msg = await channel.send(answer, view=view)
+        if view is not None and hasattr(view, "message"):
+            view.message = sent_msg
+            view.delete_message_on_timeout = False
         return
 
     await send_chunked_response(channel, answer, reply_to=reply_to)
     if view is not None:
-        await channel.send("-# ตัวเลือกดำเนินการเพิ่มเติม:", view=view)
+        footer_msg = await channel.send("-# ตัวเลือกดำเนินการเพิ่มเติม:", view=view)
+        if hasattr(view, "message"):
+            view.message = footer_msg
+            view.delete_message_on_timeout = True
 
 
 @bot.event
@@ -380,8 +390,14 @@ async def on_message(message: discord.Message):
 
     all_msg_atts = list(message.attachments) + (list(ref_msg.attachments) if ref_msg else [])
     has_image_att = any(a.filename.lower().endswith(config.IMAGE_EXTENSIONS) for a in all_msg_atts)
+    has_embedded_media_or_link = (
+        bool(message.embeds)
+        or bool(ref_msg and ref_msg.embeds)
+        or bool(URL_REGEX.search(clean_prompt))
+        or bool(ref_msg and URL_REGEX.search(ref_msg.content or ""))
+    )
 
-    # 0A. Overtime (OT) Logger & Monthly Table Summarizer with Interactive Buttons
+    # 0A. Overtime (OT) Logger & Monthly Table Summarizer with Auto-Disappearing Interactive Buttons
     if is_ot_command_text(clean_prompt, channel_id=message.channel.id, user_id=message.author.id):
         ot_reply = await process_ot_request(message, clean_prompt)
         rec_date, rec_slot, rec_detail = parse_ot_record_metadata(ot_reply)
@@ -398,9 +414,10 @@ async def on_message(message: discord.Message):
         await process_yukipedia_request(message, clean_prompt)
         return
 
-    # 1. Natural Chat Manga / Image Translation Trigger
+    # 1. Natural Chat Manga / Image Translation Trigger (supports direct uploads AND embedded links like X/Pixiv!)
     if MANGA_TRANSLATE_INTENT_PATTERN.search(clean_prompt) or (
-        has_image_att and re.search(r"(แปล|\btranslate\b|\btl\b)", clean_prompt, re.IGNORECASE)
+        (has_image_att or has_embedded_media_or_link)
+        and re.search(r"(แปล|\btranslate\b|\btl\b)", clean_prompt, re.IGNORECASE)
     ):
         await process_manga_translation_request(message, clean_prompt)
         return
@@ -412,7 +429,7 @@ async def on_message(message: discord.Message):
         return
 
     # 3. Fast Instant Date/Time Check
-    if not message.attachments:
+    if not message.attachments and not message.embeds:
         instant_dt = try_instant_datetime_reply(clean_prompt)
         if instant_dt:
             channel_memory[message.channel.id].append({"role": "user", "content": clean_prompt})
@@ -465,7 +482,6 @@ async def on_message(message: discord.Message):
             )
             return
 
-        # Attach contextual interactive buttons for code reviews OR substantial informational/suggestion replies
         action_view = None
         if use_coder:
             action_view = CodeReviewActionView(message.author.id, message.channel.id, user_request, answer)
@@ -679,13 +695,13 @@ async def source_command(ctx, *, question: str = ""):
         ctx_text, _ = await extract_all_context(ctx.message)
         if not ctx_text:
             await ctx.send(
-                "กรุณาแนบรูปภาพ หรือกด Reply ที่รูปภาพที่ต้องการให้ฉันช่วยตรวจสอบที่มา/ชื่อเรื่อง/ชื่อรุ่นด้วยนะคะ "
-                "(เช่น แนบรูปพร้อมพิมพ์ `!source` หรือถามในแชทได้เลยค่ะ)"
+                "กรุณาแนบรูปภาพ วางลิงก์ (เช่น X/Twitter, Pixiv/phixiv หรือลิงก์รูปภาพ) "
+                "หรือกด Reply ที่ข้อความที่มีรูป/ลิงก์ที่ต้องการให้ฉันช่วยตรวจสอบที่มาด้วยนะคะ"
             )
             return
         user_q = question.strip() or (
-            "ช่วยระบุที่มาของภาพนี้อย่างละเอียด: "
-            "หากเป็นภาพวาด/อนิเมะ/มังงะ ให้บอกชื่อเรื่อง ชื่อตัวละคร ตอนที่/Chapter ชื่อผู้วาด และแนบลิงก์ที่มา (เช่น Pixiv/MyAnimeList/Danbooru) ถ้ามี "
+            "ช่วยระบุที่มาของภาพและลิงก์นี้อย่างละเอียด: "
+            "หากเป็นภาพวาด/อนิเมะ/มังงะ ให้บอกชื่อเรื่อง ชื่อตัวละคร ตอนที่/Chapter ชื่อผู้วาด และแนบลิงก์ที่มา (เช่น Pixiv/X/MyAnimeList/Danbooru) ถ้ามี "
             "หากเป็นภาพถ่ายสิ่งของหรืออุปกรณ์ ให้ระบุยี่ห้อ รุ่น และรายละเอียดสำคัญของสิ่งนั้นค่ะ"
         )
         answer, _ = await query_local_ollama_chat(
