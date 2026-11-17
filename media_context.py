@@ -47,6 +47,7 @@ from llm import (
     discover_active_groq_vision_models,
     call_gemma_ai_studio_vision,
     call_cloudflare_vision_chat,
+    call_gemini_generate_content_self_healing,
 )
 
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024   # 25 MB cap (supports standard Discord PDF/doc uploads safely)
@@ -68,6 +69,27 @@ DIRECT_IMAGE_URL_REGEX = re.compile(
     r"https?://[^\s<>'\"]+\.(?:jpg|jpeg|png|webp)(?:\?[^\s<>'\"]*)?",
     re.IGNORECASE,
 )
+
+# Common Japanese manga SFX tokens that should NEVER trigger a web search query
+_SFX_TOKEN_REGEX = re.compile(
+    r"^(?:タッ|ドシッ|ドッ|ドドン|ピュ+|ピシャ+ン|ズシ+|ズゥ+ン|ズーン|ヴォ+|ブル+|ムチ+|ムク+|"
+    r"ぷくっ?|ぷる+|だぷっ?|ずり+|ガタッ|クッ|カッ|ボフッ|ハッ|ハァ|フゥ|ゴゴ+|ザワ+|ドキッ|PAN|[!?…・ーッっ]+)$",
+    re.IGNORECASE,
+)
+
+
+def _is_pure_sfx_query(q: str) -> bool:
+    """Returns True if a proposed web verification query consists only of comic sound effects (SFX)."""
+    if not q:
+        return True
+    cleaned = re.sub(r"[\s\u3000!?…・ー「」『』（）()]+", " ", q).strip()
+    if len(cleaned) < 4:
+        return True
+    tokens = [t for t in cleaned.split(" ") if t]
+    if not tokens:
+        return True
+    non_sfx = [t for t in tokens if not _SFX_TOKEN_REGEX.match(t)]
+    return len(non_sfx) == 0
 
 
 def parse_xlsx_bytes_to_markdown(raw_bytes: bytes, max_chars: int = 25000) -> str:
@@ -143,11 +165,6 @@ def parse_docx_bytes(raw_bytes: bytes, max_chars: int = 30000) -> str:
 
 
 def extract_key_stack_trace_windows(log_text: str, max_chars: int = 28000) -> str:
-    """
-    Intelligently extracts high-value error/exception windows from large logs so nested
-    Java/Spring Boot `Caused by:` chains, `ORA-` errors, Node.js rejections, and K8s pod
-    events are never truncated out of the middle of a file.
-    """
     if len(log_text) <= max_chars:
         return log_text
 
@@ -225,11 +242,6 @@ def extract_youtube_id(url: str):
 # EMBEDDED LINKS & SOCIAL MEDIA MEDIA/METADATA RESOLVER (X, PIXIV, BSKY, EMBEDS)
 # ==============================================================================
 def _normalize_image_dedup_key(url: str) -> str:
-    """
-    Produces a canonical deduplication key for image URLs so Discord proxy variants
-    (`media.discordapp.net/external/.../pbs.twimg.com/media/XYZ?format=jpg&name=large`
-    vs `pbs.twimg.com/media/XYZ?format=jpg&name=small`) are never downloaded/OCR'd twice.
-    """
     cu = clean_url(url)
     tw_media_m = re.search(r"pbs\.twimg\.com/media/([A-Za-z0-9_-]+)", cu)
     if tw_media_m:
@@ -937,19 +949,83 @@ async def _search_tracemoe_async(raw_bytes: bytes, mime_type: str) -> str:
     return ""
 
 
-def _compress_image_for_vision_ocr_sync(raw_bytes: bytes) -> tuple[str, str, bool]:
+def _compress_image_for_vision_ocr_sync(raw_bytes: bytes, max_dim: int = 1280, quality: int = 90) -> tuple[str, str, bool]:
     from PIL import Image, ImageStat
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-    img.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+    img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
 
     hsv_stat = ImageStat.Stat(img.convert("HSV"))
     mean_saturation = hsv_stat.mean[1] if len(hsv_stat.mean) > 1 else 0.0
     is_color_image = (mean_saturation >= 14.0)
 
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=90)
+    img.save(buf, format="JPEG", quality=quality)
     img.close()
     return base64.b64encode(buf.getvalue()).decode("utf-8"), "image/jpeg", is_color_image
+
+
+async def extract_multi_images_batch_ocr(
+    images_list: list[tuple[bytes, str, str]],
+    post_meta_hint: str = "",
+) -> str:
+    """
+    When an X/Twitter or Pixiv post contains 2-4 sequential comic/illustration pages,
+    inspects ALL pages together in ONE Gemini Flash multi-image request (~4-6s total)
+    so the series title (e.g., Blue Archive, Uma Musume), all characters (e.g., Ako, Noa, Hina),
+    and the cross-page narrative are recognized together instead of running 4 slow isolated OCRs.
+    """
+    if not GEMINI_API_KEY or len(images_list) < 2:
+        return ""
+
+    parts = [
+        {
+            "text": (
+                "You are analyzing a sequential multi-image post/comic (Pages 1 to "
+                f"{len(images_list)}) for Yukino Yukinoshita.\n"
+                + (f"Post Metadata / Caption Context:\n{post_meta_hint[:1000]}\n\n" if post_meta_hint else "")
+                + "Examine ALL pages together in order so you accurately identify:\n"
+                "1. [Series / Franchise & Character Identification]:\n"
+                "   - State the exact Anime, Game, or Manga franchise and Character names if recognizable "
+                "(check visual details like halos above heads -> Blue Archive, school uniforms, hair ornaments, "
+                "and any character names or ship portmanteaus in the post caption such as ノアコ = Noa & Ako).\n"
+                "2. [Page-by-Page Story & Panel-by-Panel Dialogue/SFX (Right-to-Left, Top-to-Bottom)]:\n"
+                "   - For each page (Page 1, Page 2, ...), summarize the visual events and list all dialogue, thoughts, "
+                "and key SFX in Japanese reading order tagged with the speaker."
+            )
+        }
+    ]
+    for idx, (raw_b, fname, _) in enumerate(images_list[:4], 1):
+        try:
+            b64_str, mime_type, _ = await asyncio.to_thread(_compress_image_for_vision_ocr_sync, raw_b, 1024, 86)
+            parts.append({"text": f"=== Image {idx}/{len(images_list)} (`{fname}`) ==="})
+            parts.append({"inlineData": {"mimeType": mime_type, "data": b64_str}})
+        except Exception:
+            continue
+
+    if len(parts) < 3:
+        return ""
+
+    payload = {
+        "contents": [{"parts": parts}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 3072,
+            "thinkingConfig": {"thinkingBudget": 128},
+        },
+    }
+    try:
+        data = await call_gemini_generate_content_self_healing(
+            payload, timeout_sec=22, purpose=f"MultiImageOCR({len(images_list)}p)"
+        )
+        if data:
+            resp_parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+            out_txt = "\n".join(p.get("text", "") for p in resp_parts if p.get("text")).strip()
+            out_txt = re.sub(r"<think>[\s\S]*?</think>", "", out_txt).strip()
+            if out_txt:
+                return f"=== Unified Multi-Image Visual & OCR Analysis ({len(images_list)} Images) ===\n{out_txt}"
+    except Exception as e:
+        api_log(f"MultiImageOCR -> fallback to per-image OCR ({type(e).__name__})")
+    return ""
 
 
 async def extract_image_via_transient_ocr(
@@ -966,20 +1042,21 @@ async def extract_image_via_transient_ocr(
 
     ocr_prompt = (
         "Analyze this image thoroughly so Yukino Yukinoshita can understand the exact visual story, "
-        "character dynamics, speaker attribution, and source.\n"
+        "series/character identity, speaker attribution, and source.\n"
         "Provide your output in 3 concise, well-structured sections:\n"
         "1. [Identification & Panel-by-Panel Visual Context]:\n"
-        "   - If Comic / Manga / Fanart: Identify the Series and Characters ONLY if certain (do NOT guess random famous series). "
+        "   - If Comic / Manga / Fanart: Identify the Anime/Game/Manga Series and Character names if recognizable "
+        "(inspect visual cues like halos above heads -> Blue Archive, school uniforms, hair ornaments, eyes; do NOT guess randomly if unsure). "
         "Describe what is happening visually in each panel in traditional Japanese reading order (Top-to-Bottom, Right-to-Left), "
-        "including character expressions, body language, who is speaking or thinking each line, and the punchline/joke.\n"
+        "including character expressions, body language, who is speaking or thinking each line, and the punchline.\n"
         "   - If Code / Terminal / Stack Trace / UI Screenshot: Describe the exact error message, HTTP status, UI component, or terminal output shown.\n"
         "   - If Real-World Photo/Product/Hardware: Identify the Brand, Product Line, Model Name/Number, and distinguishing physical features.\n"
         "2. [Ordered Dialogue & Verbatim OCR Text]:\n"
         "   - For comics/manga: List the dialogue and SFX in reading order (Right-to-Left, Top-to-Bottom) tagged with the speaker "
-        "(e.g., `[Panel 1 - Kitasan Black]: ...`, `[Panel 2 - Trainer (off-screen)]: ...`, `[SFX]: ...`).\n"
+        "(e.g., `[Panel 1 - Ako]: ...`, `[Panel 2 - Noa]: ...`, `[SFX]: ...`).\n"
         "   - Transcribe ALL visible text (Thai, Japanese, English, code, error codes) verbatim, paying close attention to Thai tone marks/vowels.\n"
-        "3. [WEB_VERIFY_QUERY]: On the very last line, if the image is a manga page or product whose source/model should be looked up via Google Search, output:\n"
-        "   `[WEB_VERIFY_QUERY: <exact verbatim Japanese/English quote from the image OR exact visible product markings — NEVER put a guessed series name here>]`"
+        "3. [WEB_VERIFY_QUERY]: On the very last line, ONLY if the image contains actual spoken dialogue or product model text (NEVER pure comic sound effects like タッ or ドシッ!), output:\n"
+        "   `[WEB_VERIFY_QUERY: <exact verbatim dialogue quote or product model — NEVER pure SFX and NEVER a guessed title>]`"
     )
 
     reverse_tasks = []
@@ -1042,7 +1119,7 @@ async def extract_image_via_transient_ocr(
     # Tier 3: Google AI Studio Gemma 4 Vision
     if not vision_result:
         gemma_ocr = await call_gemma_ai_studio_vision(
-            ocr_prompt, mime_type, b64_img, timeout_sec=10, purpose="Image OCR Tier 3"
+            ocr_prompt, mime_type, b64_img, timeout_sec=12, purpose="Image OCR Tier 3"
         )
         if gemma_ocr:
             vision_result = gemma_ocr
@@ -1101,7 +1178,11 @@ async def extract_image_via_transient_ocr(
         q_match = re.search(r"\[WEB_VERIFY_QUERY:\s*([^\]]+?)\s*\]", vision_result, re.IGNORECASE)
         if run_source_lookup and q_match:
             verify_q = q_match.group(1).strip()[:120]
-            if verify_q and verify_q.lower() not in ("none", "n/a"):
+            if (
+                verify_q
+                and verify_q.lower() not in ("none", "n/a")
+                and not _is_pure_sfx_query(verify_q)
+            ):
                 try:
                     web_verify = await asyncio.to_thread(run_safe_web_search_sync, verify_q, 3)
                     if web_verify:
@@ -1136,6 +1217,8 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
     target_attachments = list(message.attachments)
     if not target_attachments and ref_msg and ref_msg.attachments:
         target_attachments = list(ref_msg.attachments)
+
+    image_att_batch: list[tuple[bytes, str, str]] = []
 
     for att in target_attachments:
         if att.size > MAX_ATTACHMENT_BYTES:
@@ -1183,17 +1266,28 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
                     f"=== Attached Word Document: `{att.filename}` ===\n"
                     + await asyncio.to_thread(parse_docx_bytes, raw_bytes)
                 )
-            elif fname.endswith(IMAGE_EXTENSIONS) and processed_image_count < 4:
-                processed_image_count += 1
-                ocr_out = await extract_image_via_transient_ocr(raw_bytes, att.filename, run_source_lookup=True)
-                if STACK_TRACE_SIGNATURE_REGEX.search(ocr_out):
-                    has_code_file = True
-                blocks.append(
-                    f"=== Image Inspection & Source Lookup (`{att.filename}`) ===\n{ocr_out}"
-                )
+            elif fname.endswith(IMAGE_EXTENSIONS) and len(image_att_batch) < 4:
+                image_att_batch.append((raw_bytes, att.filename, ""))
             raw_bytes = None
         except Exception as e:
             blocks.append(f"[Error reading `{att.filename}`: {e}]")
+
+    if image_att_batch:
+        if len(image_att_batch) >= 2:
+            batch_vis = await extract_multi_images_batch_ocr(image_att_batch, post_meta_hint=message.content or "")
+            if batch_vis:
+                processed_image_count += len(image_att_batch)
+                if STACK_TRACE_SIGNATURE_REGEX.search(batch_vis):
+                    has_code_file = True
+                blocks.append(batch_vis)
+        if processed_image_count == 0:
+            for img_b, img_fn, _ in image_att_batch:
+                processed_image_count += 1
+                ocr_out = await extract_image_via_transient_ocr(img_b, img_fn, run_source_lookup=True)
+                if STACK_TRACE_SIGNATURE_REGEX.search(ocr_out):
+                    has_code_file = True
+                blocks.append(f"=== Image Inspection & Source Lookup (`{img_fn}`) ===\n{ocr_out}")
+        image_att_batch.clear()
 
     embed_images, embed_meta_sections, handled_social_urls = await collect_embedded_images_and_metadata(
         message, ref_msg=ref_msg, max_images=max(1, 4 - processed_image_count)
@@ -1201,19 +1295,34 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
     for meta_sec in embed_meta_sections:
         blocks.append(meta_sec)
 
-    for idx, (emb_bytes, emb_fname, emb_url) in enumerate(embed_images, 1):
-        if processed_image_count >= 4:
-            break
-        processed_image_count += 1
-        try:
-            ocr_out = await extract_image_via_transient_ocr(emb_bytes, emb_fname, run_source_lookup=True)
-            if STACK_TRACE_SIGNATURE_REGEX.search(ocr_out):
-                has_code_file = True
-            blocks.append(
-                f"=== Embedded Image #{idx} Inspection & Source Lookup (`{emb_fname}` | `{emb_url}`) ===\n{ocr_out}"
-            )
-        except Exception as e:
-            blocks.append(f"[Error inspecting embedded image `{emb_fname}`: {e}]")
+    if embed_images and processed_image_count < 4:
+        remaining_slots = 4 - processed_image_count
+        target_embed_imgs = embed_images[:remaining_slots]
+        batch_done = False
+        if len(target_embed_imgs) >= 2:
+            meta_hint = "\n".join(embed_meta_sections)
+            batch_vis = await extract_multi_images_batch_ocr(target_embed_imgs, post_meta_hint=meta_hint)
+            if batch_vis:
+                processed_image_count += len(target_embed_imgs)
+                if STACK_TRACE_SIGNATURE_REGEX.search(batch_vis):
+                    has_code_file = True
+                blocks.append(batch_vis)
+                batch_done = True
+
+        if not batch_done:
+            for idx, (emb_bytes, emb_fname, emb_url) in enumerate(target_embed_imgs, 1):
+                if processed_image_count >= 4:
+                    break
+                processed_image_count += 1
+                try:
+                    ocr_out = await extract_image_via_transient_ocr(emb_bytes, emb_fname, run_source_lookup=True)
+                    if STACK_TRACE_SIGNATURE_REGEX.search(ocr_out):
+                        has_code_file = True
+                    blocks.append(
+                        f"=== Embedded Image #{idx} Inspection & Source Lookup (`{emb_fname}` | `{emb_url}`) ===\n{ocr_out}"
+                    )
+                except Exception as e:
+                    blocks.append(f"[Error inspecting embedded image `{emb_fname}`: {e}]")
 
     if parsed_heavy_doc or embed_images:
         embed_images.clear()

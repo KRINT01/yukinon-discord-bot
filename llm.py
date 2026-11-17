@@ -2,12 +2,15 @@ import re
 import json
 import time
 import asyncio
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import aiohttp
 
 from config import (
     HTTPS,
     GEMINI_API_KEY,
     GEMINI_DECISION_MODEL,
+    GEMINI_HEAVY_MODEL,
     GEMMA_CHAT_MODEL,
     GEMMA_VISION_MODEL,
     CF_ACCOUNT_ID,
@@ -58,7 +61,7 @@ from search_engine import (
 
 GEMINI_MODEL_HINT_REGEX = re.compile(r"models/([a-zA-Z0-9._-]+)")
 GEMINI_EXCLUDED_SUBSTRINGS = (
-    "image", "lite", "tts", "audio", "live", "embedding", "aqa", "bison", "gecko", "decision"
+    "image", "lite", "tts", "audio", "live", "embedding", "aqa", "bison", "gecko", "decision", "hydrogen"
 )
 
 GROQ_EXCLUDED_SUBSTRINGS = (
@@ -96,11 +99,6 @@ def _extract_raw_user_turn(prompt: str) -> str:
 
 
 def _compact_messages_for_token_budget(messages: list, max_est_tokens: int = 4500) -> list:
-    """
-    Trims oversized attachment/search context blocks in the final user message so
-    TPM-capped endpoints (AI Studio Gemma 4 16K TPM, Groq 6K-8K TPM) finish in ~2-4s
-    without prefill queueing timeouts or HTTP 413 errors.
-    """
     if _estimate_messages_tokens(messages) <= max_est_tokens:
         return messages
 
@@ -122,6 +120,174 @@ def _compact_messages_for_token_budget(messages: list, max_est_tokens: int = 450
 
 
 # ==============================================================================
+# GOOGLE GEMINI 4 HYDROGEN SPECIALIST (`gemini-4-hydrogen` — 5 RPM, 250K TPM, 20 RPD)
+# ==============================================================================
+def _can_use_gemini_hydrogen() -> bool:
+    """
+    Enforces `gemini-4-hydrogen`'s strict 5 RPM / 20 RPD envelope with a 2-request
+    daily safety reserve (max 18 RPD) and sliding 60s RPM window so it never wastes
+    quota or stalls on 429s, falling back cleanly when saturated.
+    """
+    if not GEMINI_API_KEY or not GEMINI_HEAVY_MODEL:
+        return False
+    now = time.time()
+    if now < state.gemini_hydrogen_cooldown_until:
+        return False
+
+    today_th = datetime.now(ZoneInfo("Asia/Bangkok")).strftime("%Y-%m-%d")
+    if state.gemini_hydrogen_rpd_date != today_th:
+        state.gemini_hydrogen_rpd_date = today_th
+        state.gemini_hydrogen_rpd_count = 0
+
+    if state.gemini_hydrogen_rpd_count >= 18:
+        return False
+
+    ts_q = state.gemini_hydrogen_call_timestamps
+    if len(ts_q) >= 5 and (now - ts_q[0] < 61.0):
+        return False
+
+    return True
+
+
+def _record_gemini_hydrogen_call():
+    now = time.time()
+    today_th = datetime.now(ZoneInfo("Asia/Bangkok")).strftime("%Y-%m-%d")
+    if state.gemini_hydrogen_rpd_date != today_th:
+        state.gemini_hydrogen_rpd_date = today_th
+        state.gemini_hydrogen_rpd_count = 0
+    state.gemini_hydrogen_rpd_count += 1
+    state.gemini_hydrogen_call_timestamps.append(now)
+
+
+async def call_gemini_hydrogen_generate(
+    payload: dict, timeout_sec: int = 75, purpose: str = "HydrogenHeavy"
+) -> dict | None:
+    """
+    Executes a high-context multimodal or text request on `gemini-4-hydrogen` (250K TPM).
+    Automatically updates cooldowns/RPD counters and returns None on any error so callers
+    seamlessly fall back to Gemini Flash / Groq / Gemma 4.
+    """
+    if not _can_use_gemini_hydrogen():
+        return None
+
+    model_id = GEMINI_HEAVY_MODEL
+    url = clean_url(
+        f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
+        f"{model_id}:generateContent?key={GEMINI_API_KEY}"
+    )
+    work_payload = json.loads(json.dumps(payload))
+    session = get_http_session()
+    _record_gemini_hydrogen_call()
+
+    for attempt in range(2):
+        t0 = time.monotonic()
+        try:
+            async with session.post(
+                url, json=work_payload, timeout=aiohttp.ClientTimeout(total=timeout_sec)
+            ) as resp:
+                status = resp.status
+                body_text = await resp.text()
+                elapsed = time.monotonic() - t0
+
+                if status == 200:
+                    api_log(
+                        f"Gemini Hydrogen ({purpose}) -> {model_id} 200 OK "
+                        f"({elapsed:.2f}s | RPD {state.gemini_hydrogen_rpd_count}/18)"
+                    )
+                    return json.loads(body_text)
+
+                if status == 400 and "thinkingConfig" in body_text and attempt == 0:
+                    work_payload.get("generationConfig", {}).pop("thinkingConfig", None)
+                    continue
+
+                if status == 429:
+                    if "per day" in body_text.lower() or "rpd" in body_text.lower():
+                        state.gemini_hydrogen_rpd_count = 20
+                        state.gemini_hydrogen_cooldown_until = time.time() + 3600.0
+                    else:
+                        state.gemini_hydrogen_cooldown_until = time.time() + 75.0
+                elif status in (404, 400, 500, 503):
+                    state.gemini_hydrogen_cooldown_until = time.time() + 300.0
+
+                api_log(
+                    f"Gemini Hydrogen ({purpose}) -> {model_id} HTTP {status} "
+                    f"({elapsed:.2f}s); falling back"
+                )
+                return None
+        except Exception as e:
+            state.gemini_hydrogen_cooldown_until = time.time() + 180.0
+            api_log(
+                f"Gemini Hydrogen ({purpose}) -> {model_id} failed ({type(e).__name__}); falling back"
+            )
+            return None
+
+    return None
+
+
+async def call_gemini_hydrogen_chat(
+    messages: list,
+    temperature: float = 0.25,
+    max_output_tokens: int = 4096,
+    purpose: str = "HydrogenChat",
+) -> str:
+    """
+    Sends full untrimmed conversation + large document/code context (~up to 120K chars)
+    to `gemini-4-hydrogen` (250K TPM), returning the clean text output or `""` on fallback.
+    """
+    if not _can_use_gemini_hydrogen():
+        return ""
+
+    sys_parts = []
+    raw_turns = []
+    for m in messages:
+        role = m.get("role", "user")
+        txt = (m.get("content") or "").strip()
+        if not txt:
+            continue
+        if role == "system":
+            sys_parts.append(txt)
+        elif role == "assistant":
+            raw_turns.append(("model", txt))
+        else:
+            raw_turns.append(("user", txt))
+
+    if not raw_turns:
+        return ""
+
+    contents = []
+    for r_role, r_txt in raw_turns:
+        if contents and contents[-1]["role"] == r_role:
+            contents[-1]["parts"][0]["text"] += f"\n\n{r_txt}"
+        else:
+            contents.append({"role": r_role, "parts": [{"text": r_txt[:110000]}]})
+
+    payload = {
+        "contents": contents,
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_output_tokens,
+            "thinkingConfig": {"thinkingBudget": 512},
+        },
+    }
+    if sys_parts:
+        payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(sys_parts)}]}
+
+    data = await call_gemini_hydrogen_generate(payload, timeout_sec=60, purpose=purpose)
+    if not data:
+        return ""
+
+    parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+    text_parts = [
+        p.get("text", "") for p in parts
+        if p.get("text") and not p.get("thought", False)
+    ]
+    out = "\n".join(text_parts).strip()
+    out = re.sub(r"<think>[\s\S]*?</think>", "", out).strip()
+    out = re.sub(r"<\|thought\|>[\s\S]*?<\|/thought\|>", "", out).strip()
+    return out
+
+
+# ==============================================================================
 # GOOGLE GEMINI DECISIONS API ORCHESTRATOR (`gemini-decision-1` — 200 RPM, 50K TPM, 10K RPD)
 # ==============================================================================
 async def call_gemini_decision_orchestrator(
@@ -130,12 +296,6 @@ async def call_gemini_decision_orchestrator(
     timeout_sec: float = 4.0,
     purpose: str = "Orchestrator",
 ) -> dict:
-    """
-    Calls Google's discriminative Decisions API (`POST /v1beta/decisions` with `gemini-decision-1`)
-    which evaluates typed `choice` and `noul` (yes/no) questions in a single ~150-250ms forward pass
-    with ZERO output tokens. Returns the parsed `answers` dict, or `{}` on error/cooldown so
-    callers seamlessly fall back to deterministic regex/LLM routing.
-    """
     if not GEMINI_API_KEY or not GEMINI_DECISION_MODEL:
         return {}
     if time.time() < state.gemini_decision_cooldown_until:
@@ -183,15 +343,6 @@ async def orchestrate_message_with_decision_1(
     extracted_ctx: str = "",
     has_code_attachment: bool = False,
 ) -> dict | None:
-    """
-    Single-pass ~200ms multimodal/text routing orchestrator powered by `gemini-decision-1`.
-    Determines:
-      - `route`: 'code' | 'weather' | 'web_search' | 'chat'
-      - `needs_web_search`: bool (avoids redundant 11s web searches when embed/OCR already has full context!)
-      - `attach_buttons`: bool
-      - `button_domain`: 'code' | 'document' | 'social_art' | 'game' | 'news' | 'general'
-    Returns None if Decisions API is unavailable so callers fall back to regex heuristics cleanly.
-    """
     clean_u = _extract_raw_user_turn(user_text)
     if not clean_u and not extracted_ctx:
         return None
@@ -439,7 +590,7 @@ async def _discover_active_gemini_flash_model() -> list[str]:
 
 
 # ==============================================================================
-# GOOGLE AI STUDIO GEMMA 4 (WITH 4.5K TOKEN COMPACTION GUARD)
+# GOOGLE AI STUDIO GEMMA 4 (WITH 4.5K TOKEN COMPACTION & FAST FAILOVER)
 # ==============================================================================
 async def call_gemma_ai_studio_chat(
     messages: list, temperature: float = 0.4, max_output_tokens: int = 1024, purpose: str = "GemmaChat"
@@ -447,7 +598,6 @@ async def call_gemma_ai_studio_chat(
     if not GEMINI_API_KEY:
         return ""
 
-    # Compact to <=4,500 est tokens (~9,900 chars) so AI Studio never hits 16K TPM prefill timeouts
     safe_messages = _compact_messages_for_token_budget(messages, max_est_tokens=4500)
 
     sys_parts = []
@@ -510,7 +660,7 @@ async def call_gemma_ai_studio_chat(
             t0 = time.monotonic()
             try:
                 async with session.post(
-                    url, json=payload, timeout=aiohttp.ClientTimeout(total=14)
+                    url, json=payload, timeout=aiohttp.ClientTimeout(total=26)
                 ) as resp:
                     status = resp.status
                     body_text = await resp.text()
@@ -542,8 +692,10 @@ async def call_gemma_ai_studio_chat(
                     api_log(f"Gemma AI Studio ({purpose}) -> {model_id} HTTP {status} ({elapsed:.2f}s)")
                     break
             except Exception as e:
-                _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 120.0
+                _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 180.0
                 api_log(f"Gemma AI Studio ({purpose}) -> {model_id} failed ({type(e).__name__})")
+                if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+                    return ""
                 break
 
     return ""
@@ -777,7 +929,7 @@ async def call_cloudflare_gemma_chat(
     try:
         session = get_http_session()
         async with session.post(
-            cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=18)
+            cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=22)
         ) as resp:
             elapsed = time.monotonic() - t0
             if resp.status == 200:
@@ -806,11 +958,6 @@ async def call_cloudflare_gpt_oss(
     is_coding: bool = False,
     purpose: str = "CFGPTOSS",
 ) -> str:
-    """
-    Calls Cloudflare Workers AI `@cf/openai/gpt-oss-120b` or `@cf/openai/gpt-oss-20b`.
-    Tries Cloudflare's OpenAI Responses API (`/ai/v1/responses`) first, then automatically
-    falls back to `/ai/v1/chat/completions` if needed.
-    """
     target_model = cf_model or (CF_CODE_MODEL if is_coding else CF_CHAT_FAST_MODEL)
     if not CF_ACCOUNT_ID or not CF_API_TOKEN or not target_model:
         return ""
@@ -825,7 +972,6 @@ async def call_cloudflare_gpt_oss(
     session = get_http_session()
     req_timeout = 45 if is_coding else 24
 
-    # 1) Cloudflare OpenAI Responses API (`/ai/v1/responses`)
     sys_parts = []
     convo_lines = []
     for m in messages:
@@ -879,7 +1025,6 @@ async def call_cloudflare_gpt_oss(
     except Exception as e:
         api_log(f"Cloudflare Responses ({purpose}) -> {target_model} note ({type(e).__name__}); trying chat/completions")
 
-    # 2) Fallback: OpenAI Chat Completions API (`/ai/v1/chat/completions`)
     chat_url = f"{HTTPS}{cf_host}/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1/chat/completions"
     chat_payload = {
         "model": target_model,
@@ -1113,7 +1258,7 @@ async def query_local_ollama_chat(
         or RECENCY_INTENT_REGEX.search(raw_user_query)
     )
     is_japanese_or_social_media = bool(
-        re.search(r"=== Embedded (?:X|Pixiv|Bluesky)|=== Image Inspection", prompt)
+        re.search(r"=== (?:Embedded (?:X|Pixiv|Bluesky)|Image Inspection|Unified Multi-Image)", prompt)
         or re.search(r"[ぁ-んァ-ヶ一-龯]", prompt)
     )
 
@@ -1145,7 +1290,6 @@ async def query_local_ollama_chat(
                 f"[ไฟล์อ้างอิงล่าสุดในห้องแชทนี้ (เรียงตามลำดับเวลา สามารถเชื่อมโยงข้ามไฟล์ได้)]:\n{cached_ctx}"
             )
 
-    # Combine Gemini Decision 1 orchestrator verdict with deterministic regex fallback
     dec_route = (decision_plan or {}).get("route")
     dec_conf = float((decision_plan or {}).get("route_confidence") or 0.0)
     dec_needs_search = (decision_plan or {}).get("needs_web_search")
@@ -1163,7 +1307,6 @@ async def query_local_ollama_chat(
                 "[หมายเหตุ: ใช้ข้อมูลพยากรณ์อากาศและแนวโน้มรายชั่วโมงด้านบนตอบโดยตรง (พกร่ม/เสื้อกันฝน) ห้ามแต่งตัวเลขหรือทิศทางลมขึ้นมาเอง]"
             )
 
-    # Decide whether live web search is needed (Decisions API suppresses redundant search on complete social embeds!)
     if dec_needs_search is not None and dec_conf >= 0.65:
         should_run_web_search = bool(dec_needs_search or is_user_correction)
     else:
@@ -1230,13 +1373,15 @@ async def query_local_ollama_chat(
                 })
         messages.append({"role": "user", "content": user_content})
 
-        # PATH A: Coding ->
-        # 1) Groq openai/gpt-oss-120b
-        # 2) Cloudflare Workers AI @cf/openai/gpt-oss-120b
-        # 3) Google AI Studio Gemma 4 (compacted <=4.5K tok)
-        # 4) Cloudflare Workers AI @cf/google/gemma-4-26b-a4b-it
-        # 5) Modal GPU Ollama (qwen2.5-coder:7b)
+        # PATH A: Coding (routes >13K-char multi-file/large stack traces to `gemini-4-hydrogen` 250K TPM first!)
         if is_coding:
+            if len(user_content) > 13000:
+                ans = await call_gemini_hydrogen_chat(
+                    messages, temperature=temperature, max_output_tokens=4096, purpose="HeavyCode"
+                )
+                if ans:
+                    return ans
+
             if GROQ_API_KEY:
                 code_candidates = [GROQ_CODE_MODEL] + await get_groq_search_and_chat_candidates()
                 for c_mod in code_candidates:
@@ -1268,19 +1413,27 @@ async def query_local_ollama_chat(
             except Exception as e:
                 print(f"Modal GPU coding error: {e}")
 
+        # HEAVY DOCUMENT SPECIALIST (>12.5K chars: full PDFs, Word docs, Excel sheets -> `gemini-4-hydrogen` 250K TPM)
+        if not is_coding and len(user_content) > 12500:
+            ans = await call_gemini_hydrogen_chat(
+                messages, temperature=0.25, max_output_tokens=3072, purpose="HeavyDoc"
+            )
+            if ans:
+                return ans
+
         # PATH B: Search / Fact-Check / Japanese Manga & Social Media
         if prefer_high_knowledge_llm and not is_coding:
             target_temp = 0.2 if (did_search or is_user_correction) else temperature
 
             if is_japanese_or_social_media:
                 ans = await call_gemma_ai_studio_chat(
-                    messages, temperature=target_temp, max_output_tokens=2048, purpose="MangaSocialChat"
+                    messages, temperature=target_temp, max_output_tokens=1800, purpose="MangaSocialChat"
                 )
                 if ans:
                     return ans
 
                 ans = await call_cloudflare_gemma_chat(
-                    messages, temperature=target_temp, max_tokens=2048, purpose="MangaSocialChat"
+                    messages, temperature=target_temp, max_tokens=1800, purpose="MangaSocialChat"
                 )
                 if ans:
                     return ans
@@ -1305,13 +1458,13 @@ async def query_local_ollama_chat(
 
             if not is_japanese_or_social_media:
                 ans = await call_gemma_ai_studio_chat(
-                    messages, temperature=target_temp, max_output_tokens=2048, purpose="FactSearchChat"
+                    messages, temperature=target_temp, max_output_tokens=1800, purpose="FactSearchChat"
                 )
                 if ans:
                     return ans
 
                 ans = await call_cloudflare_gemma_chat(
-                    messages, temperature=target_temp, max_tokens=2048, purpose="FactSearchChat"
+                    messages, temperature=target_temp, max_tokens=1800, purpose="FactSearchChat"
                 )
                 if ans:
                     return ans
@@ -1365,7 +1518,10 @@ async def query_local_ollama_chat(
 
     raw_answer = await _run_inference_pass(working_prompt)
 
-    search_tag_match = AGENTIC_SEARCH_TAG_REGEX.search(raw_answer)
+    allow_tag_search = allow_agentic_search and not (
+        dec_needs_search is False and dec_conf >= 0.65 and not is_user_correction
+    )
+    search_tag_match = AGENTIC_SEARCH_TAG_REGEX.search(raw_answer) if allow_tag_search else None
     if search_tag_match:
         agent_query = search_tag_match.group(1).strip()[:180]
         extra_search_block = await asyncio.to_thread(run_safe_web_search_sync, agent_query)

@@ -18,6 +18,7 @@ from config import (
     CF_API_TOKEN,
     CF_IMAGE_MODEL,
     GEMINI_API_KEY,
+    GEMINI_HEAVY_MODEL,
     GROQ_API_KEY,
     GROQ_CHAT_FALLBACK_MODEL,
     ACTIVE_FAST_MODEL,
@@ -32,6 +33,7 @@ from config import (
     release_unused_memory,
 )
 from llm import (
+    call_gemini_hydrogen_generate,
     call_gemini_generate_content_self_healing,
     call_gemma_ai_studio_chat,
     call_gemma_ai_studio_vision,
@@ -472,11 +474,12 @@ def _detect_target_translation_lang(user_prompt: str) -> tuple[str, str]:
     return "en", "English"
 
 
-def _prepare_manga_image_for_vision(raw_bytes: bytes) -> str:
+def _prepare_manga_image_for_vision(raw_bytes: bytes, max_dim: int = 1280, quality: int = 92) -> str:
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-    img.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+    img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=92)
+    img.save(buf, format="JPEG", quality=quality)
+    img.close()
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
@@ -582,10 +585,10 @@ def _parse_manga_pages_batch_json(
             if any(b for b, _ in results):
                 return results
 
-        if expected_pages == 1 and "bubbles" in parsed:
-            bubbles = _normalize_and_validate_bubbles(parsed.get("bubbles") or [])
-            summary = str(parsed.get("summary") or "").strip()
-            return [(bubbles, summary)]
+    if expected_pages == 1 and isinstance(parsed, dict) and "bubbles" in parsed:
+        bubbles = _normalize_and_validate_bubbles(parsed.get("bubbles") or [])
+        summary = str(parsed.get("summary") or "").strip()
+        return [(bubbles, summary)]
 
     if expected_pages == 1:
         b, s = _parse_manga_bubbles_json(raw_text)
@@ -597,13 +600,24 @@ def _parse_manga_pages_batch_json(
 async def extract_and_translate_manga_pages_batch(
     pages_input: list[tuple[bytes, str]], target_lang_name: str
 ) -> list[tuple[list[dict], str]]:
+    """
+    Processes 2 to 10 manga pages in a SINGLE unified multimodal batch call:
+    - Tier 1: `gemini-4-hydrogen` (250K TPM Heavy Multi-Page Batch Specialist)
+    - Tier 2: `gemini-3-flash-preview` (Self-healing Flash fallback if Hydrogen hits 5 RPM / 20 RPD)
+    - Tier 3: Concurrent `Semaphore(2)` per-page fallback
+    For `num_pages == 1`, delegates straight to `extract_and_translate_manga_bubbles()` to preserve Hydrogen's 20 RPD.
+    """
     num_pages = len(pages_input)
     if num_pages == 0:
         return []
 
+    if num_pages == 1:
+        b, s = await extract_and_translate_manga_bubbles(pages_input[0][0], pages_input[0][1], target_lang_name)
+        return [(b, s)]
+
     b64_pages = []
     for raw_b, fname in pages_input:
-        b64_str = await asyncio.to_thread(_prepare_manga_image_for_vision, raw_b)
+        b64_str = await asyncio.to_thread(_prepare_manga_image_for_vision, raw_b, 1024, 86)
         b64_pages.append((b64_str, fname))
 
     mime_type = "image/jpeg"
@@ -611,23 +625,23 @@ async def extract_and_translate_manga_pages_batch(
     manga_batch_instruction = f"""
 You are a professional Manga, Manhwa, and Comic Localizer.
 You are given {num_pages} sequential manga page image(s) (labeled PAGE 1 to PAGE {num_pages}).
-Analyze all pages in order so character names, pronouns, tone, and ongoing dialogue stay consistent across pages,
-and translate ALL speech bubbles on every page into natural, idiomatic {target_lang_name}.
+Analyze all pages together in sequence so series title, character names, pronouns, tone, and ongoing story stay consistent across pages,
+and translate ALL speech bubbles and SFX on every page into natural, idiomatic {target_lang_name}.
 
 CRITICAL RULES:
 1. Reading Order: Within each page, order the bubbles strictly in traditional Japanese Manga reading order (Top-to-Bottom, Right-to-Left across panels).
 2. In-Context Localization & Honorifics:
    - Adapt idioms, pronouns, tone, and emotion so the dialogue sounds natural in {target_lang_name} while fitting inside a speech bubble. Do NOT use double quotes inside `translated_text` (use single quotes if needed).
-   - When translating to English, ALWAYS preserve Japanese honorifics attached directly with a hyphen and NO space (translate さん as `-san`, くん/君 as `-kun`, ちゃん as `-chan`, 様/さま as `-sama`, 先生 as `-sensei`, 先輩 as `-senpai` — e.g., 'Melt-san', NEVER 'Melt- san' or 'Miss Melt').
+   - When translating to English, ALWAYS preserve Japanese honorifics attached directly with a hyphen and NO space (translate さん as `-san`, くん/君 as `-kun`, ちゃん as `-chan`, 様/さま as `-sama`, 先生 as `-sensei`, 先輩 as `-senpai`).
 3. Speech Bubble Bounding Boxes (`box_2d`):
    - For each speech bubble on a page, provide `box_2d` as `[ymin, xmin, ymax, xmax]` normalized from 0 to 1000 relative to THAT page's dimensions.
-   - `box_2d` must tightly cover the Japanese text block inside that specific bubble lobe ( NEVER place `box_2d` on a character's face/hair outside the bubble, and NEVER merge two separate bubbles into one `box_2d`).
+   - `box_2d` must tightly cover the Japanese text block inside that specific bubble lobe (NEVER place `box_2d` on a character's face/hair outside the bubble, and NEVER merge two separate bubbles into one `box_2d`).
 4. Return ONLY valid JSON matching this exact structure for all {num_pages} page(s):
 {{
   "pages": [
     {{
       "page_index": 1,
-      "summary": "Brief 1-sentence scene context for Page 1",
+      "summary": "Brief 1-sentence scene context for Page 1 (mentioning series/character names if recognizable)",
       "bubbles": [
         {{
           "id": 1,
@@ -654,13 +668,37 @@ CRITICAL RULES:
                 "temperature": 0.1,
                 "maxOutputTokens": 8192,
                 "responseMimeType": "application/json",
-                "thinkingConfig": {"thinkingBudget": 512},
+                "thinkingConfig": {"thinkingBudget": 128},
             },
         }
-        timeout_sec = min(90, 22 + (8 * num_pages))
+        timeout_sec = min(115, 45 + (14 * num_pages))
+
+        # Tier 1: Gemini 4 Hydrogen (250K TPM Multi-Page Batch Specialist)
+        try:
+            h_data = await call_gemini_hydrogen_generate(
+                gemini_payload, timeout_sec=timeout_sec, purpose=f"MangaBatch({num_pages}p)"
+            )
+            if h_data:
+                resp_parts = (
+                    ((h_data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                )
+                raw_json_str = "\n".join(p.get("text", "") for p in resp_parts if p.get("text")).strip()
+                batch_results = _parse_manga_pages_batch_json(raw_json_str, num_pages)
+                if any(bubbles for bubbles, _ in batch_results):
+                    total_b = sum(len(b) for b, _ in batch_results)
+                    print(
+                        f"[Manga Vision Batch] Completed {num_pages} page(s) in 1 request via Tier 1 Hydrogen "
+                        f"({GEMINI_HEAVY_MODEL}) - {total_b} total bubbles",
+                        flush=True,
+                    )
+                    return batch_results
+        except Exception as e:
+            print(f"Gemini Hydrogen Manga Batch warning ({type(e).__name__}): {e}", flush=True)
+
+        # Tier 2: Gemini Flash Self-Healing Batch Fallback
         try:
             data = await call_gemini_generate_content_self_healing(
-                gemini_payload, timeout_sec=timeout_sec, purpose=f"MangaBatch({num_pages}p)"
+                gemini_payload, timeout_sec=timeout_sec, purpose=f"MangaBatchFallback({num_pages}p)"
             )
             if data:
                 resp_parts = (
@@ -671,19 +709,25 @@ CRITICAL RULES:
                 if any(bubbles for bubbles, _ in batch_results):
                     total_b = sum(len(b) for b, _ in batch_results)
                     print(
-                        f"[Manga Vision Batch] Completed {num_pages} page(s) in 1 request via Tier 1 Gemini "
+                        f"[Manga Vision Batch] Completed {num_pages} page(s) in 1 request via Tier 2 Gemini Flash "
                         f"({state.active_gemini_model}) - {total_b} total bubbles",
                         flush=True,
                     )
                     return batch_results
         except Exception as e:
-            print(f"Gemini Manga Batch Vision warning: {e}", flush=True)
+            print(f"Gemini Flash Manga Batch warning ({type(e).__name__}): {e}", flush=True)
 
-    fallback_results = []
-    for raw_b, fname in pages_input:
-        b, s = await extract_and_translate_manga_bubbles(raw_b, fname, target_lang_name)
-        fallback_results.append((b, s))
-    return fallback_results
+    # Tier 3: Concurrent per-page fallback (2 pages at a time)
+    sem = asyncio.Semaphore(2)
+
+    async def _bounded_single(rb: bytes, fn: str) -> tuple[list[dict], str]:
+        async with sem:
+            return await extract_and_translate_manga_bubbles(rb, fn, target_lang_name)
+
+    fallback_results = await asyncio.gather(
+        *[_bounded_single(raw_b, fname) for raw_b, fname in pages_input]
+    )
+    return list(fallback_results)
 
 
 def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
@@ -776,7 +820,7 @@ CRITICAL RULES:
    - When translating to English, ALWAYS preserve Japanese honorifics attached directly with a hyphen and NO space (translate さん as `-san`, くん/君 as `-kun`, ちゃん as `-chan`, 様/さま as `-sama`, 先生 as `-sensei`, 先輩 as `-senpai` — e.g., 'Melt-san', NEVER 'Melt- san' or 'Miss Melt').
 3. Speech Bubble Bounding Boxes (`box_2d`):
    - For each speech bubble on a page, provide `box_2d` as `[ymin, xmin, ymax, xmax]` normalized from 0 to 1000 relative to THAT page's dimensions.
-   - `box_2d` must tightly cover the Japanese text block inside that specific bubble lobe ( NEVER place `box_2d` on a character's face/hair outside the bubble, and NEVER merge two separate bubbles into one `box_2d`).
+   - `box_2d` must tightly cover the Japanese text block inside that specific bubble lobe (NEVER place `box_2d` on a character's face/hair outside the bubble, and NEVER merge two separate bubbles into one `box_2d`).
 4. Return ONLY valid JSON matching this exact structure (every bubble MUST have a non-empty `translated_text`):
 {{
   "summary": "Brief 1-sentence scene context",
@@ -808,11 +852,11 @@ CRITICAL RULES:
             "generationConfig": {
                 "temperature": 0.1,
                 "responseMimeType": "application/json",
-                "thinkingConfig": {"thinkingBudget": 256},
+                "thinkingConfig": {"thinkingBudget": 128},
             },
         }
         try:
-            data = await call_gemini_generate_content_self_healing(gemini_payload, timeout_sec=25)
+            data = await call_gemini_generate_content_self_healing(gemini_payload, timeout_sec=30)
             if data:
                 parts = (
                     ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
@@ -826,7 +870,7 @@ CRITICAL RULES:
                     )
                     return bubbles, summary
         except Exception as e:
-            print(f"Gemini Manga Vision warning: {e}")
+            print(f"Gemini Manga Vision warning ({type(e).__name__}): {e}")
 
     try:
         gemma_content = await call_gemma_ai_studio_vision(
@@ -1538,7 +1582,6 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
         raw_b = await att.read()
         pages_input.append((raw_b, att.filename))
 
-    # Fallback: extract images from Embedded Links (X/Twitter, Pixiv/phixiv, Discord message.embeds)
     if not pages_input:
         embedded_imgs, _, _ = await collect_embedded_images_and_metadata(msg, ref_msg=ref_msg, max_images=10)
         for emb_bytes, emb_fname, _ in embedded_imgs:
@@ -1594,7 +1637,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
                 src_txt = re.sub(r"\s+", " ", (b.get("source_text") or "")).strip()
                 tr_txt = re.sub(r"\s+", " ", (b.get("translated_text") or "")).strip()
                 if tr_txt:
-                    transcript_lines.append(f"**[#{idx} | {speaker}]** `{src_txt}`\n  ↳ **{tr_txt}**")
+                    transcript_lines.append(f"**[#{idx} | {speaker}]** `{src_txt}`\n ↳ **{tr_txt}**")
 
             try:
                 rendered_png = await asyncio.to_thread(
@@ -1622,12 +1665,12 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
         else:
             await send_chunked_response(channel, transcript_text, reply_to=msg)
 
-        for df in discord_files:
-            try:
-                df.close()
-            except Exception:
-                pass
-        discord_files.clear()
-        pages_input.clear()
-        rendered_png = raw_bytes = None
-        release_unused_memory()
+    for df in discord_files:
+        try:
+            df.close()
+        except Exception:
+            pass
+    discord_files.clear()
+    pages_input.clear()
+    rendered_png = raw_bytes = None
+    release_unused_memory()
