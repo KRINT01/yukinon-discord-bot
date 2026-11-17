@@ -58,7 +58,6 @@ GROQ_EXCLUDED_SUBSTRINGS = (
     "whisper", "orpheus", "guard", "safeguard", "tts", "audio", "embed", "moderation", "playai", "allam"
 )
 
-# Per-model cooldowns & 1-hour live catalog caches
 _GROQ_MODEL_COOLDOWN_UNTIL: dict[str, float] = {}
 _GROQ_AVAILABLE_MODELS_CACHE: list[str] = []
 _GROQ_MODELS_LAST_FETCH_TS: float = 0.0
@@ -70,17 +69,11 @@ _CF_GEMMA_COOLDOWN_UNTIL: float = 0.0
 
 
 def _estimate_messages_tokens(messages: list) -> int:
-    """Rough token estimator (~3 chars per token for mixed Thai/English/Japanese)."""
     total_chars = sum(len(m.get("content") or "") for m in messages)
     return total_chars // 3
 
 
 def _extract_raw_user_turn(prompt: str) -> str:
-    """
-    Separates the user's actual typed message from appended context blocks
-    (`=== ... ===`, `<untrusted_web_search_results`, `<mentioned_users_dossier>`)
-    so OCR descriptions or PDF text never trigger false weather/search intents.
-    """
     if not prompt:
         return ""
     head = re.split(
@@ -92,10 +85,6 @@ def _extract_raw_user_turn(prompt: str) -> str:
 
 
 def _compact_messages_for_token_budget(messages: list, max_est_tokens: int = 5200) -> list:
-    """
-    Trims oversized attachment/search context blocks in the final user message so
-    free-tier TPM-capped endpoints (e.g., Groq 6K-8K TPM) never fail with HTTP 413.
-    """
     if _estimate_messages_tokens(messages) <= max_est_tokens:
         return messages
 
@@ -197,10 +186,6 @@ async def discover_active_groq_vision_models() -> list[str]:
 
 
 async def discover_active_gemma_models(vision_required: bool = False) -> list[str]:
-    """
-    Discovers active Gemma 4 models on Google AI Studio (14.4K RPD, 30 RPM, 16K TPM).
-    For vision tasks, prioritizes gemma-4-26b-a4b-it (multimodal MoE) and gemma-4-31b-it.
-    """
     global _GEMMA_AVAILABLE_MODELS_CACHE, _GEMMA_MODELS_LAST_FETCH_TS
     default_list = (
         [GEMMA_VISION_MODEL, "gemma-4-26b-a4b-it", "gemma-4-31b-it"]
@@ -701,7 +686,6 @@ async def call_groq_chat(
         _GROQ_MODEL_COOLDOWN_UNTIL[groq_model] = now + 3600.0
         return ""
 
-    # Respect Groq Free Tier TPM limits (~6K-8K TPM on 20B/27B/120B) so heavy OCR/PDF contexts don't trigger HTTP 413
     token_budget = 6500 if is_coding else 5200
     safe_messages = _compact_messages_for_token_budget(messages, max_est_tokens=token_budget)
 
@@ -799,7 +783,6 @@ async def query_local_ollama_chat(
     speaker_user=None,
     speaker_name: str = "",
 ) -> tuple[str, bool]:
-    # Isolate the user's actual message from attached OCR/PDF/Embed blocks before running intent regexes!
     raw_user_query = _extract_raw_user_turn(prompt)
 
     if PROMPT_INJECTION_REGEX.search(raw_user_query[:600]):
@@ -834,6 +817,10 @@ async def query_local_ollama_chat(
         or ANIME_MANGA_QUERY_REGEX.search(raw_user_query)
         or RECENCY_INTENT_REGEX.search(raw_user_query)
     )
+    is_japanese_or_social_media = bool(
+        re.search(r"=== Embedded (?:X|Pixiv|Bluesky)|=== Image Inspection", prompt)
+        or re.search(r"[ぁ-んァ-ヶ一-龯]", prompt)
+    )
 
     active_topic = update_and_get_channel_topic(raw_user_query, channel_id=channel_id)
     topic_anchor_note = (
@@ -863,7 +850,6 @@ async def query_local_ollama_chat(
                 f"[ไฟล์อ้างอิงล่าสุดในห้องแชทนี้ (เรียงตามลำดับเวลา สามารถเชื่อมโยงข้ามไฟล์ได้)]:\n{cached_ctx}"
             )
 
-    # Check weather & web search intent strictly against `raw_user_query` (never against OCR/PDF text!)
     is_weather_query = allow_agentic_search and detect_weather_intent(raw_user_query, channel_id=channel_id)
     if is_weather_query:
         weather_block = await fetch_live_weather_context(raw_user_query, channel_id=channel_id)
@@ -889,16 +875,16 @@ async def query_local_ollama_chat(
         working_prompt = (
             f"{working_prompt}\n\n"
             f"[คำสั่งระบบสำหรับการตรวจสอบข้อเท็จจริง (Fact-Check Arbitrator Mode — หัวข้อ: {active_topic or 'ตามบริบทสนทนา'})]:\n"
-            "1. ผู้ใช้กำลังโต้แย้งหรือชี้ข้อผิดพลาดในคำตอบก่อนหน้าของคุณ (เช่น อาวุธของคลาส บริษัทผู้พัฒนา ปีที่เปิดให้บริการ หรือเนื้อเรื่อง)\n"
+            "1. ผู้ใช้กำลังโต้แย้งหรือชี้ข้อผิดพลาดในคำตอบก่อนหน้าของคุณ\n"
             "2. ตรวจสอบกับหลักฐานใน `<untrusted_web_search_results>` ด้านบนอย่างตรงไปตรงมา:\n"
             "   - หากคำตอบก่อนหน้าของคุณมีข้อมูลที่แต่งขึ้นเองหรือผิดพลาดจริง: จงยอมรับอย่างตรงไปตรงมาและแก้ไขเฉพาะจุดที่ผิดให้ถูกต้องตามหลักฐานทันที\n"
             "   - หากหลักฐานจากการค้นหายืนยันว่าสิ่งที่คุณพูดถูกต้องอยู่แล้วและผู้ใช้เข้าใจผิดเอง: จงยืนยันตามข้อเท็จจริงจากผลการค้นหา\n"
-            "3. ห้ามเบี่ยงประเด็นไปอธิบายประวัติของบริษัทที่ไม่เกี่ยวข้อง และห้ามใช้คำลงท้ายว่า 'ครับ' เด็ดขาด (คุณคือผู้หญิง ให้ใช้ 'ค่ะ'/'นะคะ' เท่านั้น)"
+            "3. ห้ามเบี่ยงประเด็นไปอธิบายประวัติของบริษัทที่ไม่เกี่ยวข้อง และห้ามใช้คำลงท้ายว่า 'ครับ' เด็ดขาด"
         )
 
     is_coding = (model == ACTIVE_CODE_MODEL)
     prefer_high_knowledge_llm = bool(
-        is_coding or did_search or is_user_correction or is_factual_domain or bool(active_topic)
+        is_coding or did_search or is_user_correction or is_factual_domain or is_japanese_or_social_media or bool(active_topic)
     )
 
     async def _run_inference_pass(user_content: str) -> str:
@@ -927,12 +913,12 @@ async def query_local_ollama_chat(
                     "content": (
                         f"[SYSTEM NOTE — PERSONA & TOPIC ANCHOR]: You are Yukino Yukinoshita (female; NEVER use 'ครับ', only 'ค่ะ'/'นะคะ'). "
                         f"Current active topic: '{active_topic or 'General'}'. "
-                        "Use ONLY verified facts from `<untrusted_web_search_results>`; never invent fake weapons, fake classes, or fake developers."
+                        "Speak naturally in first person ('ฉัน'); NEVER write a meta-heading like 'ความคิดเห็นในสไตล์ยูกิโนะ'."
                     ),
                 })
         messages.append({"role": "user", "content": user_content})
 
-        # PATH A: Coding -> 1) Groq gpt-oss-120b, 2) AI Studio Gemma 4 (if <=11.5K tok), 3) Cloudflare Gemma 4, 4) Modal Coder
+        # PATH A: Coding -> 1) Groq gpt-oss-120b, 2) AI Studio Gemma 4, 3) Cloudflare Gemma 4, 4) Modal Coder
         if is_coding:
             if GROQ_API_KEY:
                 code_candidates = [GROQ_CODE_MODEL] + await get_groq_search_and_chat_candidates()
@@ -959,9 +945,24 @@ async def query_local_ollama_chat(
             except Exception as e:
                 print(f"Modal GPU coding error: {e}")
 
-        # PATH B: Search / Fact-Check / Knowledge Queries
+        # PATH B: Search / Fact-Check / Japanese Manga & Social Media
+        # Prioritizes Gemma 4 (31B/26B) on Japanese/Anime/Manga social posts for superior idiomatic nuance,
+        # while keeping Groq LPU first for general English/Thai web search & fact-checking.
         if prefer_high_knowledge_llm and not is_coding:
             target_temp = 0.2 if (did_search or is_user_correction) else temperature
+
+            if is_japanese_or_social_media:
+                ans = await call_gemma_ai_studio_chat(
+                    messages, temperature=target_temp, max_output_tokens=2048, purpose="MangaSocialChat"
+                )
+                if ans:
+                    return ans
+
+                ans = await call_cloudflare_gemma_chat(
+                    messages, temperature=target_temp, max_tokens=2048, purpose="MangaSocialChat"
+                )
+                if ans:
+                    return ans
 
             if GROQ_API_KEY:
                 groq_search_candidates = await get_groq_search_and_chat_candidates()
@@ -975,17 +976,18 @@ async def query_local_ollama_chat(
                     except Exception:
                         continue
 
-            ans = await call_gemma_ai_studio_chat(
-                messages, temperature=target_temp, max_output_tokens=2048, purpose="FactSearchChat"
-            )
-            if ans:
-                return ans
+            if not is_japanese_or_social_media:
+                ans = await call_gemma_ai_studio_chat(
+                    messages, temperature=target_temp, max_output_tokens=2048, purpose="FactSearchChat"
+                )
+                if ans:
+                    return ans
 
-            ans = await call_cloudflare_gemma_chat(
-                messages, temperature=target_temp, max_tokens=2048, purpose="FactSearchChat"
-            )
-            if ans:
-                return ans
+                ans = await call_cloudflare_gemma_chat(
+                    messages, temperature=target_temp, max_tokens=2048, purpose="FactSearchChat"
+                )
+                if ans:
+                    return ans
 
             if GEMINI_API_KEY:
                 try:

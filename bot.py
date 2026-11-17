@@ -109,7 +109,6 @@ def _format_uptime(seconds: int) -> str:
 
 
 def _collect_health_metrics() -> dict:
-    """Collects zero-cost in-memory telemetry and prunes expired attachment caches."""
     prune_stale_attachments()
     now = time.time()
     proc = psutil.Process(os.getpid())
@@ -221,10 +220,6 @@ async def handle_healthz(request: web.Request) -> web.Response:
 
 @tasks.loop(minutes=15)
 async def monthly_ot_auto_report_task():
-    """
-    Automatically posts the previous month's complete OT summary table
-    on the 1st of the new month at 09:00 ICT (Asia/Bangkok).
-    """
     if not bot.is_ready():
         return
     now_th = datetime.now(ZoneInfo("Asia/Bangkok"))
@@ -315,10 +310,6 @@ async def _send_response_with_interactive_view(
     view: discord.ui.View | None,
     reply_to: discord.Message | None = None,
 ):
-    """
-    Sends a text response with interactive UI buttons attached, binding `view.message`
-    so the buttons automatically disappear when the 5-minute timeout expires.
-    """
     if not answer or not answer.strip():
         return
     if len(answer) <= 1900:
@@ -441,8 +432,6 @@ async def on_message(message: discord.Message):
     async with message.channel.typing():
         extracted_ctx, spoken_clip_text = await extract_all_context(message)
 
-        # Determine coding intent strictly from user's own text + attachments + stack trace signatures
-        # (NEVER from general OCR descriptions or web search snippets!)
         use_coder = detect_coding_intent(
             clean_prompt,
             message.attachments,
@@ -450,13 +439,13 @@ async def on_message(message: discord.Message):
             extracted_ctx=extracted_ctx,
         )
 
-        # Build natural default instruction if the user sent ONLY a link or ONLY an attachment with no question
         text_without_urls = URL_REGEX.sub("", clean_prompt).strip()
         if clean_prompt and not text_without_urls and extracted_ctx:
             user_request = (
                 f"{clean_prompt}\n"
-                "(ผู้ใช้ส่งลิงก์มาให้ ช่วยตรวจสอบเนื้อหา แคปชัน และภาพในลิงก์นี้ สรุปบริบทหรือแปลข้อความสำคัญอย่างเป็นธรรมชาติ "
-                "และแสดงความคิดเห็นในสไตล์ยูกิโนะให้หน่อย โดยห้ามสร้างตาราง Markdown)"
+                "(ผู้ใช้ส่งลิงก์นี้มาให้ ช่วยเล่าเหตุการณ์และบริบทของโพสต์นี้โดยเชื่อมโยงแคปชัน ชื่อผู้วาด และบทสนทนาในภาพตามลำดับช่องอ่าน "
+                "แปลบทพูดสำคัญเป็นภาษาไทยอย่างเป็นธรรมชาติ และแสดงความรู้สึกส่วนตัวของเธอต่อฉากนี้โดยตรงเป็นย่อหน้าสั้นๆ "
+                "ห้ามสร้างตาราง Markdown และห้ามเขียนหัวข้อว่า 'ความคิดเห็นในสไตล์ยูกิโนะ')"
             )
         elif clean_prompt or spoken_clip_text:
             user_request = clean_prompt or spoken_clip_text
@@ -515,7 +504,11 @@ async def on_message(message: discord.Message):
                 action_view = CodeReviewActionView(message.author.id, message.channel.id, user_request, answer)
             else:
                 action_view = build_contextual_suggestion_view(
-                    message.channel.id, user_request, answer, extracted_ctx=extracted_ctx
+                    message.channel.id,
+                    clean_prompt or user_request,
+                    answer,
+                    extracted_ctx=extracted_ctx,
+                    source_message=message,
                 )
 
         await _send_response_with_interactive_view(message.channel, answer, action_view, reply_to=reply_target)
@@ -526,7 +519,6 @@ async def on_message(message: discord.Message):
 
 @bot.command(name="sync")
 async def sync_app_commands(ctx, scope: str = "guild"):
-    """Owner-only command to sync Slash Commands & Context Menus with Discord."""
     if not is_owner_user(ctx.author):
         await ctx.send("คำสั่งนี้สงวนไว้สำหรับเจ้าของบอทเท่านั้นนะคะ")
         return
@@ -694,7 +686,9 @@ async def ask_fast(ctx, *, prompt: str = ""):
             effective_prompt, has_attachments=bool(ctx_text), is_instant_datetime=is_dt
         )
         view = (
-            build_contextual_suggestion_view(ctx.channel.id, effective_prompt, answer, extracted_ctx=ctx_text)
+            build_contextual_suggestion_view(
+                ctx.channel.id, effective_prompt, answer, extracted_ctx=ctx_text, source_message=ctx.message
+            )
             if should_attach_interactive_view(
                 effective_prompt,
                 answer,
@@ -755,7 +749,9 @@ async def source_command(ctx, *, question: str = ""):
             speaker_user=ctx.author,
         )
         view = (
-            build_contextual_suggestion_view(ctx.channel.id, user_q, answer, extracted_ctx=ctx_text)
+            build_contextual_suggestion_view(
+                ctx.channel.id, question.strip() or ctx.message.content, answer, extracted_ctx=ctx_text, source_message=ctx.message
+            )
             if should_attach_interactive_view(user_q, answer, did_search=did_search, extracted_ctx=ctx_text)
             else None
         )

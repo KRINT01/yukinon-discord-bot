@@ -231,7 +231,6 @@ def _normalize_image_dedup_key(url: str) -> str:
     vs `pbs.twimg.com/media/XYZ?format=jpg&name=small`) are never downloaded/OCR'd twice.
     """
     cu = clean_url(url)
-    # Extract underlying pbs.twimg.com/media/<id> if wrapped by Discord media proxy
     tw_media_m = re.search(r"pbs\.twimg\.com/media/([A-Za-z0-9_-]+)", cu)
     if tw_media_m:
         return f"twimg:{tw_media_m.group(1)}"
@@ -254,10 +253,6 @@ def _guess_image_filename_from_url(url: str, fallback_prefix: str = "embed_img")
 
 
 async def _download_remote_image_safe(url: str, referer: str = "") -> tuple[bytes, str] | None:
-    """
-    Safely downloads an external embedded image (with SSRF check, 10MB cap, and automatic
-    Pixiv Referer header injection when fetching from i.pximg.net).
-    """
     try:
         safe_url = await asyncio.to_thread(validate_safe_public_url, url)
     except Exception as e:
@@ -304,11 +299,6 @@ async def _download_remote_image_safe(url: str, referer: str = "") -> tuple[byte
 
 
 async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[str, list[str]]:
-    """
-    Queries keyless FxTwitter / vxTwitter JSON APIs for a tweet ID.
-    Uses browser-compatible headers and both /{user}/status/{id} and /status/{id} endpoints
-    so the tweet caption (`text`) and all photo URLs are reliably extracted.
-    """
     t0 = time.monotonic()
     session = get_http_session()
     user_seg = screen_name or "i"
@@ -335,7 +325,6 @@ async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[s
                 if not isinstance(data, dict):
                     continue
 
-                # Case A: FxTwitter JSON schema
                 tweet = data.get("tweet")
                 if isinstance(tweet, dict):
                     author = tweet.get("author") or {}
@@ -386,7 +375,6 @@ async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[s
                     )
                     return "\n".join(lines), photo_urls
 
-                # Case B: vxTwitter JSON schema
                 if "text" in data or "mediaURLs" in data:
                     u_name = data.get("user_name") or ""
                     u_screen = data.get("user_screen_name") or screen_name or ""
@@ -411,10 +399,6 @@ async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[s
 
 
 async def _fetch_pixiv_artwork_info(illust_id: str) -> tuple[str, list[str]]:
-    """
-    Queries Pixiv's public AJAX endpoints for artwork metadata, artist, tags,
-    and direct regular-resolution image URLs.
-    """
     t0 = time.monotonic()
     session = get_http_session()
     headers = {
@@ -492,7 +476,6 @@ async def _fetch_pixiv_artwork_info(illust_id: str) -> tuple[str, list[str]]:
 
 
 async def _fetch_bsky_post_info(handle: str, rkey: str) -> tuple[str, list[str]]:
-    """Queries public Bluesky AppView API for post text and embedded images."""
     session = get_http_session()
     try:
         resolve_url = f"{HTTPS}public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle?handle={quote_plus(handle)}"
@@ -528,10 +511,6 @@ async def _fetch_bsky_post_info(handle: str, rkey: str) -> tuple[str, list[str]]
 
 
 def _extract_native_discord_embeds_data(embeds: list[discord.Embed]) -> tuple[list[str], list[str]]:
-    """
-    Extracts structured metadata (specifically highlighting Post Caption / Description)
-    and deduplicated primary image URLs from Discord's native `message.embeds`.
-    """
     meta_blocks = []
     image_urls = []
     seen_dedup_keys = set()
@@ -582,13 +561,6 @@ async def collect_embedded_images_and_metadata(
     ref_msg: discord.Message | None = None,
     max_images: int = 4,
 ) -> tuple[list[tuple[bytes, str, str]], list[str], set[str]]:
-    """
-    Unified Embedded Link & Social Post Inspector:
-    1) Waits briefly if Discord has not yet unfurled `message.embeds` for posted URLs.
-    2) Resolves X/Twitter (`fxtwitter`/`vxtwitter`), Pixiv/phixiv (`pixiv.net/ajax`), and Bluesky links.
-    3) Extracts native Discord `message.embeds` (title, description/caption, author, fields, image, thumbnail).
-    4) Deduplicates image URLs canonically so multi-card Discord embeds never OCR the same image twice.
-    """
     downloaded_images: list[tuple[bytes, str, str]] = []
     metadata_sections: list[str] = []
     handled_urls: set[str] = set()
@@ -622,7 +594,6 @@ async def collect_embedded_images_and_metadata(
             if cu and cu not in all_urls:
                 all_urls.append(cu)
 
-    # 1. Specialized Social / Art Link Resolvers
     for url in all_urls[:4]:
         tw_m = TWITTER_STATUS_URL_REGEX.search(url)
         if tw_m:
@@ -660,7 +631,6 @@ async def collect_embedded_images_and_metadata(
             handled_urls.add(url)
             _queue_img(url)
 
-    # 2. Native Discord `message.embeds` (captures link previews, caption descriptions, and images)
     for m in target_msgs:
         if not m.embeds:
             continue
@@ -677,7 +647,6 @@ async def collect_embedded_images_and_metadata(
         for e_img in emb_img_urls:
             _queue_img(e_img)
 
-    # 3. Download up to `max_images` unique embedded images concurrently
     if candidate_image_urls:
         tasks = [
             _download_remote_image_safe(img_u, referer=ref)
@@ -996,17 +965,19 @@ async def extract_image_via_transient_ocr(
         is_color_img = True
 
     ocr_prompt = (
-        "Analyze this image thoroughly for Yukino Yukinoshita so she can identify its exact source, "
-        "read any text or stack trace/screenshot, and give her sharp personal critique.\n"
-        "Provide your output in 3 concise sections:\n"
-        "1. [Identification & Origin]:\n"
+        "Analyze this image thoroughly so Yukino Yukinoshita can understand the exact visual story, "
+        "character dynamics, speaker attribution, and source.\n"
+        "Provide your output in 3 concise, well-structured sections:\n"
+        "1. [Identification & Panel-by-Panel Visual Context]:\n"
+        "   - If Comic / Manga / Fanart: Identify the Series and Characters ONLY if certain (do NOT guess random famous series). "
+        "Describe what is happening visually in each panel in traditional Japanese reading order (Top-to-Bottom, Right-to-Left), "
+        "including character expressions, body language, who is speaking or thinking each line, and the punchline/joke.\n"
         "   - If Code / Terminal / Stack Trace / UI Screenshot: Describe the exact error message, HTTP status, UI component, or terminal output shown.\n"
-        "   - If Illustration/Anime/Manga: State the Series/Character ONLY if you are 100% certain. "
-        "NEVER guess random famous series if unsure! Describe the visual scene, expressions, composition, and any cats or pandas.\n"
         "   - If Real-World Photo/Product/Hardware: Identify the Brand, Product Line, Model Name/Number, and distinguishing physical features.\n"
-        "2. [Verbatim OCR Text]: Transcribe ALL visible text (Thai, Japanese, English, code, error codes) verbatim. "
-        "Pay close attention to Thai tone marks (วรรณยุกต์), vowels (สระ), and visually similar consonants "
-        "(ก/ภ/ถ, ข/ช, ค/ด/ต, พ/ผ/ฝ/ฟ, ร/ธ), and note if the original text contains any spelling errors.\n"
+        "2. [Ordered Dialogue & Verbatim OCR Text]:\n"
+        "   - For comics/manga: List the dialogue and SFX in reading order (Right-to-Left, Top-to-Bottom) tagged with the speaker "
+        "(e.g., `[Panel 1 - Kitasan Black]: ...`, `[Panel 2 - Trainer (off-screen)]: ...`, `[SFX]: ...`).\n"
+        "   - Transcribe ALL visible text (Thai, Japanese, English, code, error codes) verbatim, paying close attention to Thai tone marks/vowels.\n"
         "3. [WEB_VERIFY_QUERY]: On the very last line, if the image is a manga page or product whose source/model should be looked up via Google Search, output:\n"
         "   `[WEB_VERIFY_QUERY: <exact verbatim Japanese/English quote from the image OR exact visible product markings — NEVER put a guessed series name here>]`"
     )
@@ -1142,10 +1113,6 @@ async def extract_image_via_transient_ocr(
 
 
 async def resolve_referenced_message(message: discord.Message) -> discord.Message | None:
-    """
-    Safely retrieves the replied-to Discord Message even if it was sent before the bot
-    restarted/redeployed (when message.reference.resolved is None).
-    """
     if not message.reference or not message.reference.message_id:
         return None
     if isinstance(message.reference.resolved, discord.Message):
@@ -1164,7 +1131,6 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
     parsed_heavy_doc = False
     processed_image_count = 0
 
-    # 1. Resolve replied-to message
     ref_msg = await resolve_referenced_message(message)
 
     target_attachments = list(message.attachments)
@@ -1229,7 +1195,6 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
         except Exception as e:
             blocks.append(f"[Error reading `{att.filename}`: {e}]")
 
-    # 1B. Resolve Embedded Links (`message.embeds`, X/Twitter, Pixiv/phixiv, Bluesky, Direct Image Links)
     embed_images, embed_meta_sections, handled_social_urls = await collect_embedded_images_and_metadata(
         message, ref_msg=ref_msg, max_images=max(1, 4 - processed_image_count)
     )
@@ -1254,7 +1219,6 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
         embed_images.clear()
         release_unused_memory()
 
-    # 2. Extract Discord Stickers
     target_stickers = list(getattr(message, "stickers", []) or [])
     if not target_stickers and ref_msg:
         target_stickers = list(getattr(ref_msg, "stickers", []) or [])
@@ -1281,7 +1245,6 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
                 print(f"Sticker vision note ({stk_name}): {e}")
         blocks.append(f"=== Discord Sticker ===\n{stk_desc}")
 
-    # 3. Translate Custom Discord Emojis
     custom_emojis = CUSTOM_EMOJI_REGEX.findall(message.content or "")
     if custom_emojis:
         emote_names = [f":{name}:" for name, _ in custom_emojis]
@@ -1290,7 +1253,6 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
             f"User included custom emoji(s): {', '.join(emote_names)}"
         )
 
-    # 4. Extract URLs (YouTube or general Webpages not already handled by X/Pixiv/Bsky extractors)
     url_source_msg = message
     urls_in_msg = URL_REGEX.findall(message.content or "")[:2]
     if not urls_in_msg and ref_msg and ref_msg.content:
@@ -1339,7 +1301,6 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
             except Exception as e:
                 blocks.append(f"[Web extraction error: {e}]")
 
-    # 5. Include replied-to message text content
     if ref_msg and ref_msg.content and ref_msg.content.strip():
         ref_txt = re.sub(r"<@!?\d+>", "", ref_msg.content).strip()
         is_old_image_cmd = bool(

@@ -60,11 +60,15 @@ _SUBSTANTIVE_REQUEST_REGEX = re.compile(
 )
 
 
+def _strip_internal_prompt_hints(text: str) -> str:
+    """Removes parenthetical system instructions from `user_query` so follow-up buttons never inherit meta-prompts."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"\n*\(ผู้ใช้ส่งลิงก์นี้มาให้[\s\S]*?\)\s*$", "", text).strip()
+    return cleaned
+
+
 def has_valid_extracted_context(extracted_ctx: str) -> bool:
-    """
-    Returns True only when `extracted_ctx` contains actual parsed document, image,
-    embed, or webpage content — ignoring bracketed error/size/scanned-PDF notices.
-    """
     if not extracted_ctx or not extracted_ctx.strip():
         return False
     cleaned = _CONTEXT_ERROR_NOTICE_REGEX.sub("", extracted_ctx)
@@ -73,7 +77,6 @@ def has_valid_extracted_context(extracted_ctx: str) -> bool:
 
 
 def is_failure_or_refusal_reply(answer: str) -> bool:
-    """Detects when Yukinon's reply is reporting an inability to read/fetch/access content or rejecting prompt injection."""
     if not answer or not answer.strip():
         return True
     return bool(_FAILURE_OR_REFUSAL_REPLY_REGEX.search(answer[:1200]))
@@ -87,13 +90,6 @@ def should_attach_interactive_view(
     extracted_ctx: str = "",
     is_instant_dt: bool = False,
 ) -> bool:
-    """
-    Smart gating for interactive follow-up buttons:
-    - Never attaches buttons on date/time replies, short banter, failed file/link extractions,
-      or replies where Yukinon states she could not read/fetch/access something.
-    - Attaches buttons only when there is actionable technical context, verified search/media data,
-      or an explicit analytical/comparison/recommendation query.
-    """
     if is_instant_dt or PURE_DATETIME_PATTERN.search(user_request or ""):
         return False
     if not answer or len(answer.strip()) < 60:
@@ -102,7 +98,6 @@ def should_attach_interactive_view(
         return False
 
     valid_ctx = has_valid_extracted_context(extracted_ctx)
-    # If the user sent an attachment/link that failed extraction (and no web search rescued it), suppress buttons
     if extracted_ctx and extracted_ctx.strip() and not valid_ctx and not did_search:
         return False
 
@@ -116,7 +111,6 @@ def should_attach_interactive_view(
 
 
 def get_previous_month_info(now_th: datetime) -> tuple[int, int, str]:
-    """Returns (prev_year_ce, prev_month_num, formatted_thai_month_year) for the 1st-of-month OT report."""
     first_of_this_month = now_th.replace(day=1)
     last_day_prev_month = first_of_this_month - timedelta(days=1)
     y_ce = last_day_prev_month.year
@@ -128,7 +122,7 @@ class AutoDisappearingView(discord.ui.View):
     """
     Base View that automatically removes its buttons from the Discord message
     (or deletes the standalone button footer message) when `timeout` expires,
-    and releases its message reference to keep Render 512MB RAM clean.
+    and releases its message references to keep Render 512MB RAM clean.
     """
 
     def __init__(self, timeout: float = 300.0):
@@ -139,6 +133,8 @@ class AutoDisappearingView(discord.ui.View):
     async def on_timeout(self) -> None:
         msg = self.message
         self.message = None
+        if hasattr(self, "source_message"):
+            self.source_message = None
         if msg is None:
             return
         try:
@@ -156,10 +152,6 @@ async def _send_interaction_with_auto_view(
     view: AutoDisappearingView | None,
     chunked_header: str = "❄️ ดำเนินการเรียบร้อยแล้วค่ะ:",
 ):
-    """
-    Sends a deferred Slash/Context-Menu reply and binds `view.message` so buttons auto-disappear on timeout.
-    Automatically omits buttons if `view` is None or the reply indicates an error/inability.
-    """
     if not answer or not answer.strip():
         return
     effective_view = None if is_failure_or_refusal_reply(answer) else view
@@ -265,16 +257,48 @@ class GeneralAssistantActionView(AutoDisappearingView):
         user_query: str,
         bot_reply: str,
         button_specs: list[tuple[str, str, discord.ButtonStyle, str, bool]],
+        source_message: discord.Message | None = None,
     ):
         super().__init__(timeout=300.0)
         self.channel_id = channel_id
-        self.user_query = user_query[:1200]
+        self.user_query = _strip_internal_prompt_hints(user_query)[:1200]
         self.bot_reply = bot_reply[:2500]
+        self.source_message = source_message
 
-        for label, emoji, style, prompt_instruction, use_search in button_specs[:3]:
+        for label, emoji, style, action_spec, use_search in button_specs[:3]:
             btn = discord.ui.Button(label=label[:34], emoji=emoji, style=style)
-            btn.callback = self._make_followup_callback(prompt_instruction, use_search)
+            if action_spec == "__IN_BUBBLE_MANGA_TH__":
+                btn.callback = self._make_in_bubble_manga_callback()
+            else:
+                btn.callback = self._make_followup_callback(action_spec, use_search)
             self.add_item(btn)
+
+    def _make_in_bubble_manga_callback(self):
+        async def _callback(interaction: discord.Interaction):
+            await interaction.response.send_message(
+                "📖 กำลังแปลบทสนทนาและฝังข้อความภาษาไทยลงในช่องคำพูดของภาพให้สักครู่นะคะ...",
+                ephemeral=True,
+            )
+            target_msg = self.source_message
+            if target_msg is None:
+                class _FallbackLinkMsg:
+                    def __init__(self, q_txt: str, ch, usr):
+                        self.id = 0
+                        self.content = q_txt
+                        self.attachments = []
+                        self.embeds = []
+                        self.reference = None
+                        self.channel = ch
+                        self.author = usr
+
+                    async def reply(self, **kwargs):
+                        return await self.channel.send(**kwargs)
+
+                target_msg = _FallbackLinkMsg(self.user_query, interaction.channel, interaction.user)
+
+            await process_manga_translation_request(target_msg, "แปลมังงะเป็นภาษาไทย")
+
+        return _callback
 
     def _make_followup_callback(self, instruction: str, use_search: bool):
         async def _callback(interaction: discord.Interaction):
@@ -286,8 +310,10 @@ class GeneralAssistantActionView(AutoDisappearingView):
         cached_ctx = get_cached_channel_attachments(self.channel_id, max_total_chars=25000)
         composed = (
             f"{instruction}\n\n"
+            f"[กฎสำคัญ]: ห้ามคัดลอกหรือเขียนคำตอบเดิมซ้ำ ห้ามสร้างตาราง Markdown (`|---|---|`) "
+            f"และห้ามเขียนหัวข้อว่า 'ความคิดเห็นในสไตล์ยูกิโนะ' เด็ดขาด\n\n"
             f"[บริบทหัวข้อก่อนหน้า]: {self.user_query}\n"
-            f"[ข้อมูลที่สรุปไว้]: {self.bot_reply[:1800]}"
+            f"[สรุปคำตอบก่อนหน้า (ห้ามเขียนซ้ำ)]: {self.bot_reply[:1500]}"
         )
         if cached_ctx and not use_search:
             composed += f"\n\n[เนื้อหาอ้างอิงจากไฟล์/ลิงก์ในห้องแชท]:\n{cached_ctx[:18000]}"
@@ -297,7 +323,7 @@ class GeneralAssistantActionView(AutoDisappearingView):
             model=ACTIVE_FAST_MODEL,
             system_prompt=YUKIPEDIA_SYSTEM_PROMPT if use_search else FAST_SYSTEM_PROMPT,
             channel_id=self.channel_id,
-            temperature=0.4,
+            temperature=0.45,
             allow_agentic_search=use_search,
             has_fresh_attachment=bool(cached_ctx and not use_search),
             speaker_user=interaction.user,
@@ -314,10 +340,10 @@ def build_contextual_suggestion_view(
     user_query: str,
     bot_reply: str,
     extracted_ctx: str = "",
+    source_message: discord.Message | None = None,
 ) -> GeneralAssistantActionView:
     """
-    Selects the exact set of interactive buttons based on what was actually shared or asked,
-    avoiding irrelevant buttons like 'Pros & Cons' on PDF documents or manga art.
+    Selects the exact set of interactive buttons based on what was actually shared or asked.
     """
     ctx_lower = (extracted_ctx or "").lower()
     combined = f"{user_query} {bot_reply}".lower()
@@ -356,7 +382,7 @@ def build_contextual_suggestion_view(
                 False,
             ),
         ]
-        return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs)
+        return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs, source_message=source_message)
 
     # 2. Embedded Social Posts (X / Twitter, Pixiv, Bluesky), Artwork & Anime/Manga
     if any(
@@ -364,36 +390,48 @@ def build_contextual_suggestion_view(
         for tag in ("=== embedded x", "=== embedded pixiv", "=== embedded bluesky", "=== image inspection")
     ) or any(k in combined for k in ("pixiv", "twitter", "x.com", "ศิลปิน", "ผู้วาด", "อนิเมะ", "มังงะ", "anime", "manga")):
         has_foreign_dialogue = bool(re.search(r"[ぁ-んァ-ヶ一-龯]", extracted_ctx or ""))
-        specs = [
-            (
-                "ค้นหาผลงานอื่น / เรื่องคล้ายกัน",
-                "🎨",
-                discord.ButtonStyle.primary,
-                "ช่วยค้นหาข้อมูลเพิ่มเติมเกี่ยวกับศิลปิน ผู้วาด หรือผลงาน/เรื่องที่บรรยากาศคล้ายกัน 2-3 เรื่องพร้อมรายละเอียดให้หน่อยค่ะ",
-                True,
-            ),
-        ]
+        specs = []
         if has_foreign_dialogue:
             specs.append(
                 (
-                    "แปลข้อความในภาพเป็นไทย",
-                    "💬",
+                    "แปลลงภาพ (In-Bubble)",
+                    "🎨",
+                    discord.ButtonStyle.primary,
+                    "__IN_BUBBLE_MANGA_TH__",
+                    False,
+                )
+            )
+            specs.append(
+                (
+                    "เจาะลึกตัวละคร & มุก",
+                    "📖",
                     discord.ButtonStyle.secondary,
-                    "ช่วยแปลข้อความและบทสนทนาทั้งหมดที่ปรากฏในภาพ/โพสต์เมื่อครู่เป็นภาษาไทยที่สละสลวย พร้อมอธิบายบริบทหรือมุก/สำนวนให้หน่อยค่ะ",
+                    "ช่วยอธิบายเจาะลึกเฉพาะความสัมพันธ์ของตัวละครในเรื่อง (Canon lore/นิสัยตัวละคร) และเกร็ดคำศัพท์หรือมุกภาษาญี่ปุ่นในฉากนี้เพิ่มเติม "
+                    "โดยไม่ต้องแปลบทสนทนาซ้ำทั้งหมดค่ะ",
                     False,
                 )
             )
         else:
             specs.append(
                 (
-                    "สรุปบริบท & จุดเด่น",
+                    "วิเคราะห์องค์ประกอบ & บรรยากาศ",
                     "📌",
-                    discord.ButtonStyle.secondary,
-                    "ช่วยสรุปบริบท ตัวละคร และจุดเด่นที่น่าสนใจของภาพ/เรื่องนี้ให้กระชับใน 3 ข้อค่ะ",
+                    discord.ButtonStyle.primary,
+                    "ช่วยวิเคราะห์องค์ประกอบภาพ อารมณ์สีหน้า และรายละเอียดที่น่าสนใจในภาพนี้เพิ่มเติมจากที่เล่าไปเมื่อครู่ค่ะ",
                     False,
                 )
             )
-        return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs)
+
+        specs.append(
+            (
+                "หาผลงานอื่นของศิลปิน",
+                "🔍",
+                discord.ButtonStyle.secondary,
+                "ช่วยค้นหาข้อมูลเพิ่มเติมเกี่ยวกับศิลปิน ผู้วาด (บัญชี X / Pixiv) หรือผลงาน/ซีรีส์ที่เกี่ยวข้องกับโพสต์นี้ให้หน่อยค่ะ",
+                True,
+            )
+        )
+        return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs, source_message=source_message)
 
     # 3. Video Games / Builds / Mechanics
     if any(k in combined for k in ("เกม", "game", "steam", "pso2", "ngs", "build", "คลาส", "class", "เมต้า", "meta")):
@@ -420,7 +458,7 @@ def build_contextual_suggestion_view(
                 False,
             ),
         ]
-        return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs)
+        return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs, source_message=source_message)
 
     # 4. News / Market / Financial Updates
     if any(k in combined for k in ("ข่าว", "news", "ราคา", "หุ้น", "ทอง", "บิตคอยน์", "อัปเดต")):
@@ -447,7 +485,7 @@ def build_contextual_suggestion_view(
                 True,
             ),
         ]
-        return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs)
+        return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs, source_message=source_message)
 
     # 5. Hardware / Gear / Comparisons / General Recommendations
     specs = [
@@ -473,7 +511,7 @@ def build_contextual_suggestion_view(
             False,
         ),
     ]
-    return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs)
+    return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs, source_message=source_message)
 
 
 # ==============================================================================
@@ -533,8 +571,6 @@ class OTEditModal(discord.ui.Modal, title="แก้ไขรายการบ�
 
 
 class OTActionView(AutoDisappearingView):
-    """Interactive buttons under OT log confirmations for 1-click Monthly Table, Edit Modal, or Delete."""
-
     def __init__(self, owner_id: int, record_date: str = "", record_slot: str = "", record_detail: str = ""):
         super().__init__(timeout=300.0)
         self.owner_id = owner_id
@@ -596,7 +632,6 @@ class OTActionView(AutoDisappearingView):
 
 
 def parse_ot_record_metadata(ot_reply_text: str) -> tuple[str, str, str]:
-    """Extracts (date, slot, detail) from the hidden -# [OT_RECORD: ...] footer if present."""
     m = re.search(
         r"\[OT_RECORD:\s*uid=\d+\s*\|\s*date=([0-9/\-]+)\s*\|\s*slot=([0-9:.]+-[0-9:.]+)\s*\|\s*hours=[0-9.]+\s*\|\s*detail=(.+?)\]",
         ot_reply_text or "",
@@ -610,8 +645,6 @@ def parse_ot_record_metadata(ot_reply_text: str) -> tuple[str, str, str]:
 # 4. NATIVE SLASH COMMANDS & RIGHT-CLICK CONTEXT MENUS
 # ==============================================================================
 def register_app_commands(bot: discord.ext.commands.Bot):
-    """Registers all Slash Commands (/code, /ot, /yukipedia, /source, /manga) and Right-Click Context Menus."""
-
     @bot.tree.command(name="code", description="วิเคราะห์โค้ด, Stack Trace, SQL หรือ Manifest ตามมาตรฐาน Enterprise")
     @app_commands.describe(
         focus="เลือกความเชี่ยวชาญเฉพาะทางที่ต้องการเน้น",
@@ -776,6 +809,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             return
 
         await interaction.response.defer(thinking=True)
+
         class _FakeSourceMsg:
             def __init__(self):
                 self.id = 0
@@ -787,7 +821,11 @@ def register_app_commands(bot: discord.ext.commands.Bot):
                 self.channel = interaction.channel
                 self.author = interaction.user
 
-        extracted_ctx, _ = await extract_all_context(_FakeSourceMsg())
+            async def reply(self, **kwargs):
+                return await interaction.channel.send(**kwargs)
+
+        fake_msg = _FakeSourceMsg()
+        extracted_ctx, _ = await extract_all_context(fake_msg)
         user_q = question.strip() or (
             "ช่วยระบุที่มาของภาพและลิงก์นี้อย่างละเอียด: "
             "หากเป็นภาพวาด/อนิเมะ/มังงะ ให้บอกชื่อเรื่อง ชื่อตัวละคร ตอนที่/Chapter ชื่อผู้วาด และแนบลิงก์ที่มา (เช่น Pixiv/X/MyAnimeList) ถ้ามี "
@@ -804,7 +842,9 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             speaker_user=interaction.user,
         )
         view = (
-            build_contextual_suggestion_view(interaction.channel_id, user_q, answer, extracted_ctx=extracted_ctx)
+            build_contextual_suggestion_view(
+                interaction.channel_id, link.strip() or user_q, answer, extracted_ctx=extracted_ctx, source_message=fake_msg
+            )
             if should_attach_interactive_view(user_q, answer, did_search=did_search, extracted_ctx=extracted_ctx)
             else None
         )
@@ -907,7 +947,9 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             speaker_user=interaction.user,
         )
         view = (
-            build_contextual_suggestion_view(interaction.channel_id, base_text, answer, extracted_ctx=extracted_ctx)
+            build_contextual_suggestion_view(
+                interaction.channel_id, base_text, answer, extracted_ctx=extracted_ctx, source_message=message
+            )
             if should_attach_interactive_view(base_text, answer, did_search=did_search, extracted_ctx=extracted_ctx)
             else None
         )
@@ -941,7 +983,9 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             speaker_user=interaction.user,
         )
         view = (
-            build_contextual_suggestion_view(interaction.channel_id, user_q, answer, extracted_ctx=extracted_ctx)
+            build_contextual_suggestion_view(
+                interaction.channel_id, message.content or user_q, answer, extracted_ctx=extracted_ctx, source_message=message
+            )
             if should_attach_interactive_view(user_q, answer, did_search=did_search, extracted_ctx=extracted_ctx)
             else None
         )
