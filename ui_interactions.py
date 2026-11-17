@@ -11,6 +11,7 @@ from config import (
     IMAGE_EXTENSIONS,
     THAI_MONTHS,
     URL_REGEX,
+    PURE_DATETIME_PATTERN,
     get_cached_channel_attachments,
 )
 from persona import (
@@ -36,6 +37,82 @@ from user_memory import (
     save_user_profiles_local,
     backup_user_profiles_to_discord,
 )
+
+_CONTEXT_ERROR_NOTICE_REGEX = re.compile(
+    r"\[(?:Web extraction error|Error reading|Attachment Size Notice|PDF Notice|OCR could not extract|Error inspecting embedded image)[^\]]*\]",
+    re.IGNORECASE,
+)
+
+_FAILURE_OR_REFUSAL_REPLY_REGEX = re.compile(
+    r"(ไม่สามารถเข้าถึง|ไม่สามารถดึง|ไม่สามารถอ่าน|ไม่สามารถตรวจสอบ|ไม่สามารถเชื่อมต่อได้ชั่วคราว|"
+    r"ไม่สามารถสร้างรูปภาพได้|ไม่สามารถตรวจจับข้อความ|ไม่พบรายการ|ไม่พบข้อมูล(?:ที่|ใน|เพียงพอ)|"
+    r"ไม่มีข้อมูลเพียงพอ|ไฟล์มีขนาดใหญ่เกิน|ไม่มีข้อความที่สามารถอ่านได้|สแกนหรือเป็นรูปภาพ|"
+    r"ส่งไฟล์.*มาใหม่|แนบไฟล์.*มาใหม่|ลืมคำสั่งก่อนหน้า|"
+    r"\b(?:unable to access|cannot read|could not extract|no readable (?:article )?text|shallow, transparent attempt)\b)",
+    re.IGNORECASE,
+)
+
+_SUBSTANTIVE_REQUEST_REGEX = re.compile(
+    r"(เปรียบเทียบ|ข้อดี|ข้อเสีย|แนะนำ|วิเคราะห์|สรุป|อธิบาย|ต่างกันยังไง|ต่างกันอย่างไร|"
+    r"เลือกอะไรดี|รุ่นไหนดี|แนวทาง|ไอเดีย|วางแผน|จัดสเปค|วิจารณ์|"
+    r"\b(?:compare|comparison|pros|cons|recommend|analyze|analysis|explain|difference|best|review|strategy|idea)\b)",
+    re.IGNORECASE,
+)
+
+
+def has_valid_extracted_context(extracted_ctx: str) -> bool:
+    """
+    Returns True only when `extracted_ctx` contains actual parsed document, image,
+    embed, or webpage content — ignoring bracketed error/size/scanned-PDF notices.
+    """
+    if not extracted_ctx or not extracted_ctx.strip():
+        return False
+    cleaned = _CONTEXT_ERROR_NOTICE_REGEX.sub("", extracted_ctx)
+    cleaned = re.sub(r"===[^=\n]+===", "", cleaned).strip()
+    return len(cleaned) >= 25
+
+
+def is_failure_or_refusal_reply(answer: str) -> bool:
+    """Detects when Yukinon's reply is reporting an inability to read/fetch/access content or rejecting prompt injection."""
+    if not answer or not answer.strip():
+        return True
+    return bool(_FAILURE_OR_REFUSAL_REPLY_REGEX.search(answer[:1200]))
+
+
+def should_attach_interactive_view(
+    user_request: str,
+    answer: str,
+    use_coder: bool = False,
+    did_search: bool = False,
+    extracted_ctx: str = "",
+    is_instant_dt: bool = False,
+) -> bool:
+    """
+    Smart gating for interactive follow-up buttons:
+    - Never attaches buttons on date/time replies, short banter, failed file/link extractions,
+      or replies where Yukinon states she could not read/fetch/access something.
+    - Attaches buttons only when there is actionable technical context, verified search/media data,
+      or an explicit analytical/comparison/recommendation query.
+    """
+    if is_instant_dt or PURE_DATETIME_PATTERN.search(user_request or ""):
+        return False
+    if not answer or len(answer.strip()) < 60:
+        return False
+    if is_failure_or_refusal_reply(answer):
+        return False
+
+    valid_ctx = has_valid_extracted_context(extracted_ctx)
+    # If the user sent an attachment/link that failed extraction (and no web search rescued it), suppress buttons
+    if extracted_ctx and extracted_ctx.strip() and not valid_ctx and not did_search:
+        return False
+
+    if use_coder:
+        return True
+    if valid_ctx or did_search:
+        return True
+    if _SUBSTANTIVE_REQUEST_REGEX.search(user_request or ""):
+        return True
+    return False
 
 
 def get_previous_month_info(now_th: datetime) -> tuple[int, int, str]:
@@ -76,22 +153,30 @@ class AutoDisappearingView(discord.ui.View):
 async def _send_interaction_with_auto_view(
     interaction: discord.Interaction,
     answer: str,
-    view: AutoDisappearingView,
+    view: AutoDisappearingView | None,
     chunked_header: str = "❄️ ดำเนินการเรียบร้อยแล้วค่ะ:",
 ):
-    """Sends a deferred Slash/Context-Menu reply and binds `view.message` so buttons auto-disappear on timeout."""
+    """
+    Sends a deferred Slash/Context-Menu reply and binds `view.message` so buttons auto-disappear on timeout.
+    Automatically omits buttons if `view` is None or the reply indicates an error/inability.
+    """
     if not answer or not answer.strip():
         return
+    effective_view = None if is_failure_or_refusal_reply(answer) else view
     if len(answer) <= 1900:
-        sent_msg = await interaction.followup.send(answer, view=view, wait=True)
-        view.message = sent_msg
-        view.delete_message_on_timeout = False
+        if effective_view is not None:
+            sent_msg = await interaction.followup.send(answer, view=effective_view, wait=True)
+            effective_view.message = sent_msg
+            effective_view.delete_message_on_timeout = False
+        else:
+            await interaction.followup.send(answer)
     else:
         await interaction.followup.send(chunked_header)
         await send_chunked_response(interaction.channel, answer)
-        footer_msg = await interaction.channel.send("-# ตัวเลือกดำเนินการเพิ่มเติม:", view=view)
-        view.message = footer_msg
-        view.delete_message_on_timeout = True
+        if effective_view is not None:
+            footer_msg = await interaction.channel.send("-# ตัวเลือกดำเนินการเพิ่มเติม:", view=effective_view)
+            effective_view.message = footer_msg
+            effective_view.delete_message_on_timeout = True
 
 
 # ==============================================================================
@@ -166,12 +251,12 @@ class CodeReviewActionView(AutoDisappearingView):
 
 
 # ==============================================================================
-# 2. INTERACTIVE GENERAL / YUKIPEDIA / RESEARCH SUGGESTION VIEW
+# 2. DYNAMIC DOMAIN-TAILORED SUGGESTION VIEW
 # ==============================================================================
 class GeneralAssistantActionView(AutoDisappearingView):
     """
-    Context-aware suggestion buttons for non-code replies (News, Games, Anime, YouTube, Ideas, Products).
-    Includes a dynamic 3rd 'Suggested Next Angle' button tailored to what Yukinon just answered.
+    Dynamically constructs 2-3 context-matched suggestion buttons tailored to the exact
+    domain (Documents/PDFs, Art/Social Embeds, Gaming, News/Finance, or Product/Advice).
     """
 
     def __init__(
@@ -179,33 +264,42 @@ class GeneralAssistantActionView(AutoDisappearingView):
         channel_id: int,
         user_query: str,
         bot_reply: str,
-        suggested_label: str = "มุมมอง & คำแนะนำเพิ่ม",
-        suggested_prompt: str = "",
+        button_specs: list[tuple[str, str, discord.ButtonStyle, str, bool]],
     ):
         super().__init__(timeout=300.0)
         self.channel_id = channel_id
         self.user_query = user_query[:1200]
         self.bot_reply = bot_reply[:2500]
-        self.suggested_prompt = suggested_prompt or (
-            "จากหัวข้อที่เราเพิ่งคุยกัน ช่วยวิเคราะห์มุมมองที่น่าสนใจเพิ่มเติม ข้อควรระวัง หรือสิ่งที่คนมักมองข้ามให้หน่อยค่ะ"
-        )
-        self.btn_smart_suggest.label = suggested_label[:34]
+
+        for label, emoji, style, prompt_instruction, use_search in button_specs[:3]:
+            btn = discord.ui.Button(label=label[:34], emoji=emoji, style=style)
+            btn.callback = self._make_followup_callback(prompt_instruction, use_search)
+            self.add_item(btn)
+
+    def _make_followup_callback(self, instruction: str, use_search: bool):
+        async def _callback(interaction: discord.Interaction):
+            await self._run_general_followup(interaction, instruction, use_search=use_search)
+        return _callback
 
     async def _run_general_followup(self, interaction: discord.Interaction, instruction: str, use_search: bool = True):
         await interaction.response.defer(thinking=True)
+        cached_ctx = get_cached_channel_attachments(self.channel_id, max_total_chars=25000)
         composed = (
             f"{instruction}\n\n"
             f"[บริบทหัวข้อก่อนหน้า]: {self.user_query}\n"
             f"[ข้อมูลที่สรุปไว้]: {self.bot_reply[:1800]}"
         )
+        if cached_ctx and not use_search:
+            composed += f"\n\n[เนื้อหาอ้างอิงจากไฟล์/ลิงก์ในห้องแชท]:\n{cached_ctx[:18000]}"
+
         answer, _ = await query_local_ollama_chat(
             composed,
             model=ACTIVE_FAST_MODEL,
             system_prompt=YUKIPEDIA_SYSTEM_PROMPT if use_search else FAST_SYSTEM_PROMPT,
             channel_id=self.channel_id,
-            temperature=0.45,
+            temperature=0.4,
             allow_agentic_search=use_search,
-            has_fresh_attachment=False,
+            has_fresh_attachment=bool(cached_ctx and not use_search),
             speaker_user=interaction.user,
         )
         await send_chunked_response(interaction.channel, answer)
@@ -214,63 +308,172 @@ class GeneralAssistantActionView(AutoDisappearingView):
         except Exception:
             pass
 
-    @discord.ui.button(label="สรุปสั้น 3 ข้อ", style=discord.ButtonStyle.secondary, emoji="📌")
-    async def btn_tldr(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._run_general_followup(
-            interaction,
-            "ช่วยสรุปใจความสำคัญจากคำตอบเมื่อครู่ให้กระชับที่สุดเพียง 3 ข้อ (Bullet points) อ่านจบใน 10 วินาทีค่ะ",
-            use_search=False,
-        )
 
-    @discord.ui.button(label="เทียบข้อดี-ข้อเสีย", style=discord.ButtonStyle.secondary, emoji="⚖️")
-    async def btn_pros_cons(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._run_general_followup(
-            interaction,
-            "ช่วยวิเคราะห์ข้อดี ข้อเสีย ความคุ้มค่า และข้อควรระวังของเรื่องนี้ในมุมมองที่ตรงไปตรงมาสไตล์ยูกิโนะให้หน่อยค่ะ",
-            use_search=True,
-        )
-
-    @discord.ui.button(label="มุมมอง & คำแนะนำเพิ่ม", style=discord.ButtonStyle.primary, emoji="💡")
-    async def btn_smart_suggest(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._run_general_followup(
-            interaction,
-            self.suggested_prompt,
-            use_search=True,
-        )
-
-
-def build_contextual_suggestion_view(channel_id: int, user_query: str, bot_reply: str) -> GeneralAssistantActionView:
-    """Chooses a smart, domain-specific 3rd suggestion button based on conversation topic."""
+def build_contextual_suggestion_view(
+    channel_id: int,
+    user_query: str,
+    bot_reply: str,
+    extracted_ctx: str = "",
+) -> GeneralAssistantActionView:
+    """
+    Selects the exact set of interactive buttons based on what was actually shared or asked,
+    avoiding irrelevant buttons like 'Pros & Cons' on PDF documents or manga art.
+    """
+    ctx_lower = (extracted_ctx or "").lower()
     combined = f"{user_query} {bot_reply}".lower()
-    if any(k in combined for k in ("pixiv", "twitter", "x.com", "ศิลปิน", "ผู้วาด", "วาร์ป", "source")):
-        label = "ค้นหาผลงานอื่นของศิลปิน"
-        prompt = "ช่วยค้นหาข้อมูลเพิ่มเติมเกี่ยวกับศิลปินหรือผลงานชุดนี้ (เช่น บัญชี Pixiv/X หรือซีรีส์ที่เกี่ยวข้อง) ให้หน่อยค่ะ"
-    elif any(k in combined for k in ("เกม", "game", "steam", "pso2", "ngs", "build", "คลาส", "class")):
-        label = "แนะนำแนวทางเล่น / Build"
-        prompt = "ช่วยแนะนำแนวทางการเล่น การจัดสาย/อุปกรณ์ หรือเคล็ดลับสำคัญสำหรับผู้เล่นในเรื่องนี้พร้อมเช็คข้อมูลล่าสุดให้หน่อยค่ะ"
-    elif any(k in combined for k in ("อนิเมะ", "มังงะ", "นิยาย", "anime", "manga", "novel", "เรื่องย่อ")):
-        label = "รีวิว & เรื่องคล้ายกัน"
-        prompt = "ช่วยวิจารณ์จุดเด่นของเรื่องนี้ในสไตล์ยูกิโนะ พร้อมแนะนำเรื่องที่บรรยากาศหรือคุณภาพใกล้เคียงกัน 2-3 เรื่องค่ะ"
-    elif any(k in combined for k in ("youtube", "youtu.be", "คลิป", "วิดีโอ")):
-        label = "เจาะลึกประเด็นในคลิป"
-        prompt = "จากเนื้อหาของวิดีโอนี้ ช่วยขยายความประเด็นสำคัญหรือข้อมูลเบื้องหลังที่เกี่ยวข้องเพิ่มเติมให้หน่อยค่ะ"
-    elif any(k in combined for k in ("ข่าว", "news", "ราคา", "หุ้น", "ทอง", "บิตคอยน์", "อัปเดต")):
-        label = "เช็คผลกระทบ & แนวโน้ม"
-        prompt = "ช่วยค้นหาอัปเดตล่าสุดและวิเคราะห์ผลกระทบหรือแนวโน้มที่อาจจะเกิดขึ้นต่อจากข่าวนี้ให้หน่อยค่ะ"
-    elif any(k in combined for k in ("กาแฟ", "espresso", "coffee", "อุปกรณ์", "สเปค", "spec", "แนะนำ")):
-        label = "เทียบตัวเลือกอื่นที่คุ้มกว่า"
-        prompt = "ช่วยเสนอทางเลือกอื่นที่น่าสนใจหรือคุ้มค่ากว่าในระดับใกล้เคียงกัน พร้อมเหตุผลเปรียบเทียบให้หน่อยค่ะ"
-    else:
-        label = "มุมมอง & คำแนะนำเพิ่ม"
-        prompt = "จากเรื่องที่คุยกันเมื่อครู่ ยูกิโนะมีข้อสังเกต คำแนะนำ หรือประเด็นต่อยอดอะไรที่ฉันควรรู้เพิ่มเติมไหมคะ?"
 
-    return GeneralAssistantActionView(
-        channel_id=channel_id,
-        user_query=user_query,
-        bot_reply=bot_reply,
-        suggested_label=label,
-        suggested_prompt=prompt,
-    )
+    # 1. Documents, Spreadsheets, Web Articles & YouTube Videos
+    if any(
+        tag in ctx_lower
+        for tag in (
+            "=== attached pdf",
+            "=== attached word",
+            "=== attached excel",
+            "=== youtube video information",
+            "<untrusted_web_search_results url=",
+        )
+    ):
+        specs = [
+            (
+                "สรุปประเด็นสำคัญ 3 ข้อ",
+                "📌",
+                discord.ButtonStyle.primary,
+                "ช่วยสรุปใจความสำคัญและข้อสรุปหลักจากเอกสาร/เนื้อหานี้ให้กระชับที่สุดเพียง 3 ข้อค่ะ",
+                False,
+            ),
+            (
+                "สกัด Action Items / Checklist",
+                "📋",
+                discord.ButtonStyle.secondary,
+                "ช่วยสกัดขั้นตอนที่ต้องทำ (Action Items), เงื่อนไขสำคัญ หรือ Checklist ที่นำไปใช้งานต่อได้ทันทีจากเอกสาร/เนื้อหานี้ค่ะ",
+                False,
+            ),
+            (
+                "เจาะลึกรายละเอียดสำคัญ",
+                "🔍",
+                discord.ButtonStyle.secondary,
+                "ช่วยขยายความรายละเอียดเชิงลึก ตัวเลข เงื่อนไข หรือจุดที่มักถูกมองข้ามในเอกสาร/เนื้อหานี้ให้ชัดเจนขึ้นค่ะ",
+                False,
+            ),
+        ]
+        return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs)
+
+    # 2. Embedded Social Posts (X / Twitter, Pixiv, Bluesky), Artwork & Anime/Manga
+    if any(
+        tag in ctx_lower
+        for tag in ("=== embedded x", "=== embedded pixiv", "=== embedded bluesky", "=== image inspection")
+    ) or any(k in combined for k in ("pixiv", "twitter", "x.com", "ศิลปิน", "ผู้วาด", "อนิเมะ", "มังงะ", "anime", "manga")):
+        has_foreign_dialogue = bool(re.search(r"[ぁ-んァ-ヶ一-龯]", extracted_ctx or ""))
+        specs = [
+            (
+                "ค้นหาผลงานอื่น / เรื่องคล้ายกัน",
+                "🎨",
+                discord.ButtonStyle.primary,
+                "ช่วยค้นหาข้อมูลเพิ่มเติมเกี่ยวกับศิลปิน ผู้วาด หรือผลงาน/เรื่องที่บรรยากาศคล้ายกัน 2-3 เรื่องพร้อมรายละเอียดให้หน่อยค่ะ",
+                True,
+            ),
+        ]
+        if has_foreign_dialogue:
+            specs.append(
+                (
+                    "แปลข้อความในภาพเป็นไทย",
+                    "💬",
+                    discord.ButtonStyle.secondary,
+                    "ช่วยแปลข้อความและบทสนทนาทั้งหมดที่ปรากฏในภาพ/โพสต์เมื่อครู่เป็นภาษาไทยที่สละสลวย พร้อมอธิบายบริบทหรือมุก/สำนวนให้หน่อยค่ะ",
+                    False,
+                )
+            )
+        else:
+            specs.append(
+                (
+                    "สรุปบริบท & จุดเด่น",
+                    "📌",
+                    discord.ButtonStyle.secondary,
+                    "ช่วยสรุปบริบท ตัวละคร และจุดเด่นที่น่าสนใจของภาพ/เรื่องนี้ให้กระชับใน 3 ข้อค่ะ",
+                    False,
+                )
+            )
+        return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs)
+
+    # 3. Video Games / Builds / Mechanics
+    if any(k in combined for k in ("เกม", "game", "steam", "pso2", "ngs", "build", "คลาส", "class", "เมต้า", "meta")):
+        specs = [
+            (
+                "แนะนำแนวทางเล่น / Build",
+                "🎮",
+                discord.ButtonStyle.primary,
+                "ช่วยแนะนำแนวทางการเล่น การจัดสาย/อุปกรณ์ หรือเคล็ดลับสำคัญสำหรับผู้เล่นในเรื่องนี้พร้อมเช็คข้อมูลล่าสุดให้หน่อยค่ะ",
+                True,
+            ),
+            (
+                "เทียบข้อดี-ข้อเสีย",
+                "⚖️",
+                discord.ButtonStyle.secondary,
+                "ช่วยวิเคราะห์จุดเด่น ข้อด้อย และความคุ้มค่าของเกม/สายการเล่นนี้ในมุมมองที่ตรงไปตรงมาสไตล์ยูกิโนะให้หน่อยค่ะ",
+                True,
+            ),
+            (
+                "สรุปสั้น 3 ข้อ",
+                "📌",
+                discord.ButtonStyle.secondary,
+                "ช่วยสรุปใจความสำคัญจากคำตอบเมื่อครู่ให้กระชับที่สุดเพียง 3 ข้อค่ะ",
+                False,
+            ),
+        ]
+        return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs)
+
+    # 4. News / Market / Financial Updates
+    if any(k in combined for k in ("ข่าว", "news", "ราคา", "หุ้น", "ทอง", "บิตคอยน์", "อัปเดต")):
+        specs = [
+            (
+                "เช็คผลกระทบ & แนวโน้ม",
+                "📈",
+                discord.ButtonStyle.primary,
+                "ช่วยค้นหาอัปเดตล่าสุดและวิเคราะห์ผลกระทบหรือแนวโน้มที่อาจจะเกิดขึ้นต่อจากข่าวนี้ให้หน่อยค่ะ",
+                True,
+            ),
+            (
+                "สรุปสั้น 3 ข้อ",
+                "📌",
+                discord.ButtonStyle.secondary,
+                "ช่วยสรุปข้อเท็จจริงสำคัญจากข่าวนี้ออกมาเป็น 3 ข้อสั้นๆ อ่านจบใน 10 วินาทีค่ะ",
+                False,
+            ),
+            (
+                "ตรวจสอบบริบทเพิ่มเติม",
+                "🔍",
+                discord.ButtonStyle.secondary,
+                "ช่วยค้นหาข้อมูลเบื้องหลังและตรวจสอบข้อเท็จจริงเพิ่มเติมของประเด็นนี้ให้หน่อยค่ะ",
+                True,
+            ),
+        ]
+        return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs)
+
+    # 5. Hardware / Gear / Comparisons / General Recommendations
+    specs = [
+        (
+            "เทียบข้อดี-ข้อเสีย",
+            "⚖️",
+            discord.ButtonStyle.primary,
+            "ช่วยวิเคราะห์ข้อดี ข้อเสีย ความคุ้มค่า และข้อควรระวังของเรื่องนี้ในมุมมองที่ตรงไปตรงมาสไตล์ยูกิโนะให้หน่อยค่ะ",
+            True,
+        ),
+        (
+            "เสนอตัวเลือก / มุมมองเพิ่ม",
+            "💡",
+            discord.ButtonStyle.secondary,
+            "จากเรื่องที่คุยกันเมื่อครู่ ช่วยเสนอทางเลือกอื่นที่น่าสนใจกว่า หรือมุมมองและข้อควรระวังที่ฉันควรรู้เพิ่มเติมให้หน่อยค่ะ",
+            True,
+        ),
+        (
+            "สรุปสั้น 3 ข้อ",
+            "📌",
+            discord.ButtonStyle.secondary,
+            "ช่วยสรุปใจความสำคัญจากคำตอบเมื่อครู่ให้กระชับที่สุดเพียง 3 ข้อ (Bullet points) ค่ะ",
+            False,
+        ),
+    ]
+    return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs)
 
 
 # ==============================================================================
@@ -440,7 +643,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
         prefix = f"{focus_notes[focus]}\n" if focus in focus_notes else ""
 
         att_block = ""
-        if attachment is not None and attachment.size <= 15 * 1024 * 1024:
+        if attachment is not None and attachment.size <= 25 * 1024 * 1024:
             raw_b = await attachment.read()
             fname = attachment.filename.lower()
             if fname.endswith(IMAGE_EXTENSIONS):
@@ -462,7 +665,11 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             has_fresh_attachment=bool(att_block),
             speaker_user=interaction.user,
         )
-        view = CodeReviewActionView(interaction.user.id, interaction.channel_id, prompt, answer)
+        view = (
+            CodeReviewActionView(interaction.user.id, interaction.channel_id, prompt, answer)
+            if should_attach_interactive_view(prompt, answer, use_coder=True, extracted_ctx=att_block)
+            else None
+        )
         await _send_interaction_with_auto_view(
             interaction, answer, view, chunked_header="❄️ ผลการวิเคราะห์เสร็จสมบูรณ์แล้วค่ะ:"
         )
@@ -514,20 +721,23 @@ def register_app_commands(bot: discord.ext.commands.Bot):
         rec_date, rec_slot, rec_detail = parse_ot_record_metadata(reply)
         view = (
             OTActionView(interaction.user.id, rec_date, rec_slot, rec_detail)
-            if rec_date
-            else OTActionView(interaction.user.id)
+            if rec_date and not is_failure_or_refusal_reply(reply)
+            else None
         )
-        await interaction.response.send_message(reply, view=view)
-        try:
-            view.message = await interaction.original_response()
-        except Exception:
-            pass
+        if view is not None:
+            await interaction.response.send_message(reply, view=view)
+            try:
+                view.message = await interaction.original_response()
+            except Exception:
+                pass
+        else:
+            await interaction.response.send_message(reply)
 
     @bot.tree.command(name="yukipedia", description="ค้นหาข้อมูลเรียลไทม์ วิเคราะห์ข่าว เกม อนิเมะ หรือสรุปหัวข้อพร้อมปุ่มแนะนำ")
     @app_commands.describe(query="หัวข้อหรือคำถามที่ต้องการให้ Yukipedia ค้นหาและวิเคราะห์")
     async def slash_yukipedia(interaction: discord.Interaction, query: str):
         await interaction.response.defer(thinking=True)
-        answer, _ = await query_local_ollama_chat(
+        answer, did_search = await query_local_ollama_chat(
             query,
             model=ACTIVE_FAST_MODEL,
             system_prompt=YUKIPEDIA_SYSTEM_PROMPT,
@@ -537,7 +747,11 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             has_fresh_attachment=False,
             speaker_user=interaction.user,
         )
-        view = build_contextual_suggestion_view(interaction.channel_id, query, answer)
+        view = (
+            build_contextual_suggestion_view(interaction.channel_id, query, answer)
+            if should_attach_interactive_view(query, answer, did_search=did_search)
+            else None
+        )
         await _send_interaction_with_auto_view(
             interaction, answer, view, chunked_header="❄️ ข้อมูลจาก Yukipedia พร้อมแล้วค่ะ:"
         )
@@ -579,7 +793,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             "หากเป็นภาพวาด/อนิเมะ/มังงะ ให้บอกชื่อเรื่อง ชื่อตัวละคร ตอนที่/Chapter ชื่อผู้วาด และแนบลิงก์ที่มา (เช่น Pixiv/X/MyAnimeList) ถ้ามี "
             "หากเป็นภาพถ่ายสิ่งของหรืออุปกรณ์ ให้ระบุยี่ห้อ รุ่น และรายละเอียดสำคัญของสิ่งนั้นค่ะ"
         )
-        answer, _ = await query_local_ollama_chat(
+        answer, did_search = await query_local_ollama_chat(
             f"{user_q}\n\n{extracted_ctx}",
             model=ACTIVE_FAST_MODEL,
             system_prompt=FAST_SYSTEM_PROMPT,
@@ -589,7 +803,11 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             has_fresh_attachment=True,
             speaker_user=interaction.user,
         )
-        view = build_contextual_suggestion_view(interaction.channel_id, user_q, answer)
+        view = (
+            build_contextual_suggestion_view(interaction.channel_id, user_q, answer, extracted_ctx=extracted_ctx)
+            if should_attach_interactive_view(user_q, answer, did_search=did_search, extracted_ctx=extracted_ctx)
+            else None
+        )
         await _send_interaction_with_auto_view(
             interaction, answer, view, chunked_header="❄️ ตรวจสอบที่มาเรียบร้อยแล้วค่ะ:"
         )
@@ -662,7 +880,11 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             has_fresh_attachment=bool(extracted_ctx),
             speaker_user=interaction.user,
         )
-        view = CodeReviewActionView(interaction.user.id, interaction.channel_id, base_text, answer)
+        view = (
+            CodeReviewActionView(interaction.user.id, interaction.channel_id, base_text, answer)
+            if should_attach_interactive_view(base_text, answer, use_coder=True, extracted_ctx=extracted_ctx)
+            else None
+        )
         await _send_interaction_with_auto_view(
             interaction, answer, view, chunked_header="❄️ วิเคราะห์โค้ด/Stack Trace เรียบร้อยแล้วค่ะ:"
         )
@@ -674,7 +896,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
         base_text = message.content.strip() or "ช่วยตรวจสอบข้อเท็จจริงและสรุปเนื้อหาในข้อความนี้ให้หน่อย"
         full_prompt = f"{base_text}\n\n{extracted_ctx}" if extracted_ctx else base_text
 
-        answer, _ = await query_local_ollama_chat(
+        answer, did_search = await query_local_ollama_chat(
             full_prompt,
             model=ACTIVE_FAST_MODEL,
             system_prompt=YUKIPEDIA_SYSTEM_PROMPT,
@@ -684,7 +906,11 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             has_fresh_attachment=bool(extracted_ctx),
             speaker_user=interaction.user,
         )
-        view = build_contextual_suggestion_view(interaction.channel_id, base_text, answer)
+        view = (
+            build_contextual_suggestion_view(interaction.channel_id, base_text, answer, extracted_ctx=extracted_ctx)
+            if should_attach_interactive_view(base_text, answer, did_search=did_search, extracted_ctx=extracted_ctx)
+            else None
+        )
         await _send_interaction_with_auto_view(
             interaction, answer, view, chunked_header="❄️ ตรวจสอบและสรุปข้อมูลเรียบร้อยแล้วค่ะ:"
         )
@@ -693,7 +919,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
     async def ctx_find_source(interaction: discord.Interaction, message: discord.Message):
         await interaction.response.defer(thinking=True)
         extracted_ctx, _ = await extract_all_context(message)
-        if not extracted_ctx:
+        if not has_valid_extracted_context(extracted_ctx):
             await interaction.followup.send(
                 "ไม่พบรูปภาพหรือลิงก์ที่สามารถตรวจสอบที่มาได้ในข้อความนี้ค่ะ",
                 ephemeral=True,
@@ -704,7 +930,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             "หากเป็นภาพวาด/อนิเมะ/มังงะ ให้บอกชื่อเรื่อง ชื่อตัวละคร ตอนที่/Chapter ชื่อผู้วาด และแนบลิงก์ที่มา (เช่น Pixiv/X/MyAnimeList) ถ้ามี "
             "หากเป็นภาพถ่ายสิ่งของหรืออุปกรณ์ ให้ระบุยี่ห้อ รุ่น และรายละเอียดสำคัญของสิ่งนั้นค่ะ"
         )
-        answer, _ = await query_local_ollama_chat(
+        answer, did_search = await query_local_ollama_chat(
             f"{user_q}\n\n{extracted_ctx}",
             model=ACTIVE_FAST_MODEL,
             system_prompt=FAST_SYSTEM_PROMPT,
@@ -714,7 +940,11 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             has_fresh_attachment=True,
             speaker_user=interaction.user,
         )
-        view = build_contextual_suggestion_view(interaction.channel_id, user_q, answer)
+        view = (
+            build_contextual_suggestion_view(interaction.channel_id, user_q, answer, extracted_ctx=extracted_ctx)
+            if should_attach_interactive_view(user_q, answer, did_search=did_search, extracted_ctx=extracted_ctx)
+            else None
+        )
         await _send_interaction_with_auto_view(
             interaction, answer, view, chunked_header="❄️ ตรวจสอบที่มาเรียบร้อยแล้วค่ะ:"
         )

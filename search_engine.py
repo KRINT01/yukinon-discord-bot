@@ -49,8 +49,23 @@ ENGLISH_ENTITY_REGEX = re.compile(r"\b[A-Za-z][A-Za-z0-9_.:-]{1,25}(?:\s+[A-Za-z
 STOPWORD_ENTITIES = {
     "search", "google", "wikipedia", "wiki", "what", "when", "where", "which", "who", "how",
     "the", "and", "for", "with", "this", "that", "from", "are", "you", "can", "help", "not",
-    "app", "bot", "yes", "no", "ok", "okay",
+    "app", "bot", "yes", "no", "ok", "okay", "pdf", "docx", "xlsx", "file", "http", "https",
+    "web", "extraction", "error", "readable", "found", "page", "image", "embed", "status",
 }
+
+
+def _strip_context_and_system_blocks(text: str) -> str:
+    """Strips appended context headers, speaker tags, and bracketed error notices before intent/entity scanning."""
+    if not text:
+        return ""
+    head = re.split(
+        r"\n\n(?:===|<untrusted_web_search_results|<mentioned_users_dossier>|\[Attachment |\[PDF Notice:|\[Web extraction error:)",
+        text,
+        maxsplit=1,
+    )[0]
+    head = re.sub(r"^\[ผู้พูด:[^\]]+\]\s*", "", head.strip())
+    head = re.sub(r"\[(?:Web extraction error|Error reading|Attachment Size Notice|PDF Notice):[^\]]+\]", " ", head)
+    return head.strip()
 
 
 def detect_coding_intent(text: str, attachments: list, channel_id: int = None) -> bool:
@@ -65,19 +80,21 @@ def detect_coding_intent(text: str, attachments: list, channel_id: int = None) -
 
 
 def detect_web_search_intent(text: str, channel_id: int = None) -> bool:
+    clean_q = _strip_context_and_system_blocks(text)
+    if not clean_q:
+        return False
     if (
-        WEB_SEARCH_INTENT_PATTERN.search(text)
-        or RECENCY_INTENT_REGEX.search(text)
-        or NEWS_QUERY_REGEX.search(text)
-        or ANIME_MANGA_QUERY_REGEX.search(text)
-        or GAME_QUERY_REGEX.search(text)
-        or USER_CORRECTION_PATTERN.search(text)
+        WEB_SEARCH_INTENT_PATTERN.search(clean_q)
+        or RECENCY_INTENT_REGEX.search(clean_q)
+        or NEWS_QUERY_REGEX.search(clean_q)
+        or ANIME_MANGA_QUERY_REGEX.search(clean_q)
+        or GAME_QUERY_REGEX.search(clean_q)
+        or USER_CORRECTION_PATTERN.search(clean_q)
     ):
         return True
-    # If there is an active factual topic in this channel and the user asks a follow-up question
     if channel_id and channel_id in channel_active_topic:
         if time.time() - channel_active_topic[channel_id].get("timestamp", 0) < 1800:
-            if re.search(r"(\?|ไหม|มั้ย|ยังไง|อะไร|ไหน|เมื่อไหร่|กี่ปี|ทำไม|หรอ|เหรอ|ลอง|สรุป|เช็ค)", text):
+            if re.search(r"(\?|ไหม|มั้ย|ยังไง|อะไร|ไหน|เมื่อไหร่|กี่ปี|ทำไม|หรอ|เหรอ|ลอง|สรุป|เช็ค)", clean_q):
                 return True
     return False
 
@@ -85,7 +102,7 @@ def detect_web_search_intent(text: str, channel_id: int = None) -> bool:
 def update_and_get_channel_topic(user_text: str, channel_id: int = None) -> str:
     """
     Maintains a persistent topic anchor per channel so follow-up messages that shorten the name
-    (e.g. 'PSO2 NGS' -> 'NGS', or 'ตอนนี้เนื้อเรื่องของเกมไปถึงไหนแล้ว') never lose the root subject.
+    (e.g. 'PSO2 NGS' -> 'NGS') never lose the root subject, while ignoring system/error brackets.
     """
     if channel_id is None:
         return ""
@@ -108,31 +125,27 @@ def update_and_get_channel_topic(user_text: str, channel_id: int = None) -> str:
             channel_active_topic[channel_id] = {"topic": yt_title, "timestamp": now}
             return yt_title
 
-    # 2. Strip attached context blocks and raw URLs before scanning for English entities
-    question_only = user_text.split("=== YouTube Video Information")[0].split("<untrusted_web_search_results")[0]
+    # 2. Strip attached context blocks, system brackets, and raw URLs before scanning for English entities
+    question_only = _strip_context_and_system_blocks(user_text)
     text_without_urls = re.sub(r"https?://\S+", " ", question_only)
 
     is_corr = bool(USER_CORRECTION_PATTERN.search(text_without_urls))
     en_matches = [
         m.strip() for m in ENGLISH_ENTITY_REGEX.findall(text_without_urls)
         if m.strip().lower() not in STOPWORD_ENTITIES
+        and not any(w.lower() in {"error", "extraction", "readable", "attachment"} for w in m.split())
     ]
 
-    # If this is a normal question (not a correction listing 10 class names or disputing a company name),
-    # and has a clear primary subject entity (1-3 entities)
     if en_matches and not is_corr and len(en_matches) <= 3:
         candidate = en_matches[0]
         if existing:
             prev_topic = existing.get("topic", "")
-            # If the new entity is just a shortened substring of the existing topic (e.g. 'NGS' inside 'PSO2 NGS'),
-            # keep the fuller topic ('PSO2 NGS')!
             if candidate.lower() in prev_topic.lower() and len(prev_topic) > len(candidate):
                 existing["timestamp"] = now
                 return prev_topic
         channel_active_topic[channel_id] = {"topic": candidate, "timestamp": now}
         return candidate
 
-    # If the user explicitly states the full name during a correction (e.g. 'Phantasy Star Online 2 New Genesis')
     for m in en_matches:
         if len(m.split()) >= 3:
             prev_t = existing.get("topic", "") if existing else ""
@@ -140,7 +153,6 @@ def update_and_get_channel_topic(user_text: str, channel_id: int = None) -> str:
             channel_active_topic[channel_id] = {"topic": combined_t[:80], "timestamp": now}
             return combined_t[:80]
 
-    # Otherwise, keep existing topic or scan earliest user message in channel_memory (with URLs stripped)
     if existing:
         existing["timestamp"] = now
         return existing.get("topic", "")
@@ -149,10 +161,11 @@ def update_and_get_channel_topic(user_text: str, channel_id: int = None) -> str:
         for msg in list(channel_memory[channel_id]):
             if msg.get("role") != "user":
                 continue
-            hist_clean = re.sub(r"https?://\S+", " ", msg.get("content", ""))
+            hist_clean = re.sub(r"https?://\S+", " ", _strip_context_and_system_blocks(msg.get("content", "")))
             first_ents = [
                 m.strip() for m in ENGLISH_ENTITY_REGEX.findall(hist_clean)
                 if m.strip().lower() not in STOPWORD_ENTITIES
+                and not any(w.lower() in {"error", "extraction", "readable", "attachment"} for w in m.split())
             ]
             if first_ents:
                 root_t = first_ents[0]
@@ -162,15 +175,9 @@ def update_and_get_channel_topic(user_text: str, channel_id: int = None) -> str:
 
 
 def build_contextual_search_query(user_text: str, channel_id: int = None) -> str:
-    """
-    Builds a clean, topic-anchored search query:
-    1) Extracts YouTube titles / active topics while stripping raw URLs (so 'youtu.be' is never searched).
-    2) Resolves shortened abbreviations (e.g. 'NGS' -> 'PSO2 NGS') using the channel's active topic anchor.
-    3) Translates common Thai sub-topic questions (เนื้อเรื่อง, คลาส, อาวุธ, ค่ายเกม) into high-recall search keywords.
-    """
     active_topic = update_and_get_channel_topic(user_text, channel_id=channel_id)
 
-    question_only = user_text.split("=== YouTube Video Information")[0].split("<untrusted_web_search_results")[0]
+    question_only = _strip_context_and_system_blocks(user_text)
     raw = re.sub(r"https?://\S+", " ", question_only)
     raw = re.sub(r"[\r\n]+", " ", raw).strip()
 
@@ -225,12 +232,14 @@ def build_contextual_search_query(user_text: str, channel_id: int = None) -> str
 
 
 def detect_weather_intent(text: str, channel_id: int = None) -> bool:
-    if WEATHER_INTENT_PATTERN.search(text):
+    clean_q = _strip_context_and_system_blocks(text)
+    if not clean_q:
+        return False
+    if WEATHER_INTENT_PATTERN.search(clean_q):
         return True
-    # If weather was fetched in this channel within the last 20 minutes and the user asks a time-of-day follow-up
     if channel_id and channel_id in channel_last_weather:
         if time.time() - channel_last_weather[channel_id].get("timestamp", 0) < 1200:
-            if re.search(r"(ช่วงเช้า|ตอนเช้า|ช่วงบ่าย|ตอนบ่าย|ช่วงเย็น|ตอนเย็น|กลางคืน|ดึก|คืนนี้|พรุ่งนี้|กี่โมง)", text):
+            if re.search(r"(ช่วงเช้า|ตอนเช้า|ช่วงบ่าย|ตอนบ่าย|ช่วงเย็น|ตอนเย็น|กลางคืน|ดึก|คืนนี้|พรุ่งนี้|กี่โมง)", clean_q):
                 return True
     return False
 
@@ -248,14 +257,12 @@ async def fetch_live_weather_context(user_text: str, channel_id: int = None) -> 
             custom_loc_requested = True
             break
 
-    # Reuse cached weather report if fetched within the last 10 minutes for the same location
     if not custom_loc_requested and channel_id and channel_id in channel_last_weather:
         cached_w = channel_last_weather[channel_id]
         if time.time() - cached_w.get("timestamp", 0) < 600 and cached_w.get("report"):
             api_log(f"Weather (Cached) -> {loc_display} (reused recent report)")
             return cached_w["report"]
 
-    # Tier 1: Open-Meteo High-Resolution Forecast
     t0 = time.monotonic()
     try:
         om_url = clean_url(
@@ -312,7 +319,6 @@ async def fetch_live_weather_context(user_text: str, channel_id: int = None) -> 
     except Exception as e:
         api_log(f"Weather (Tier 1 Open-Meteo) -> failed ({type(e).__name__}); falling back to wttr.in")
 
-    # Tier 2 Fallback: wttr.in
     t1 = time.monotonic()
     url = clean_url(f"{HTTPS}wttr.in/{wttr_query}?format=j1&lang=th")
     try:
@@ -509,10 +515,6 @@ def _search_google_news_rss_sync(query: str, is_thai: bool, max_results: int = 5
 
 
 def _search_wikipedia_full_extract_sync(query: str, is_thai: bool, max_results: int = 2) -> list[dict]:
-    """
-    Fetches up to 4,200 chars of full Wikipedia article text (including Gameplay, Classes, Plot, and History sections)
-    instead of just the 3-sentence intro summary.
-    """
     has_en_terms = bool(ENGLISH_ENTITY_REGEX.search(query))
     lang_hosts = ["en", "th"] if has_en_terms else (["th", "en"] if is_thai else ["en"])
     hits = []
@@ -678,7 +680,6 @@ def run_safe_web_search_sync(query: str, max_results: int = 5) -> str:
 
     hits = []
 
-    # 1. Domain-Specific Fast APIs
     if is_news:
         hits.extend(_search_google_news_rss_sync(dated_q, is_thai=is_thai, max_results=3))
 
@@ -693,7 +694,6 @@ def run_safe_web_search_sync(query: str, max_results: int = 5) -> str:
     if not is_news and not is_anime_manga and not is_game:
         hits.extend(_search_wikipedia_full_extract_sync(clean_q, is_thai=is_thai, max_results=2))
 
-    # 2. Tavily API (if configured)
     if len(hits) < 3 and TAVILY_API_KEY:
         t0 = time.monotonic()
         try:
@@ -720,7 +720,6 @@ def run_safe_web_search_sync(query: str, max_results: int = 5) -> str:
         except Exception as e:
             api_log(f"Search (Tavily) -> failed ({type(e).__name__})")
 
-    # 3. DDGS v9+ Multi-Backend Metasearch
     if len(hits) < 5:
         t0 = time.monotonic()
         preferred_timelimit = "m" if (is_news and not is_game and not is_anime_manga) else None
@@ -755,7 +754,6 @@ def run_safe_web_search_sync(query: str, max_results: int = 5) -> str:
         except Exception as e:
             api_log(f"Search (DDGS init) -> {type(e).__name__}")
 
-    # 4. Fallbacks if still empty
     if not hits:
         hits.extend(_search_wikipedia_full_extract_sync(clean_q, is_thai=is_thai, max_results=2))
     if not hits:

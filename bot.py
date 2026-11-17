@@ -37,7 +37,6 @@ from config import (
     MANGA_TRANSLATE_INTENT_PATTERN,
     IMAGE_GEN_INTENT_PATTERN,
     AGENTIC_IMAGE_TAG_REGEX,
-    PURE_DATETIME_PATTERN,
     URL_REGEX,
     intents,
     channel_memory,
@@ -93,6 +92,8 @@ from ui_interactions import (
     parse_ot_record_metadata,
     get_previous_month_info,
     register_app_commands,
+    should_attach_interactive_view,
+    is_failure_or_refusal_reply,
 )
 
 
@@ -403,8 +404,8 @@ async def on_message(message: discord.Message):
         rec_date, rec_slot, rec_detail = parse_ot_record_metadata(ot_reply)
         ot_view = (
             OTActionView(message.author.id, rec_date, rec_slot, rec_detail)
-            if rec_date
-            else OTActionView(message.author.id)
+            if rec_date and not is_failure_or_refusal_reply(ot_reply)
+            else None
         )
         await _send_response_with_interactive_view(message.channel, ot_reply, ot_view, reply_to=message)
         return
@@ -414,7 +415,7 @@ async def on_message(message: discord.Message):
         await process_yukipedia_request(message, clean_prompt)
         return
 
-    # 1. Natural Chat Manga / Image Translation Trigger (supports direct uploads AND embedded links like X/Pixiv!)
+    # 1. Natural Chat Manga / Image Translation Trigger
     if MANGA_TRANSLATE_INTENT_PATTERN.search(clean_prompt) or (
         (has_image_att or has_embedded_media_or_link)
         and re.search(r"(แปล|\btranslate\b|\btl\b)", clean_prompt, re.IGNORECASE)
@@ -483,10 +484,19 @@ async def on_message(message: discord.Message):
             return
 
         action_view = None
-        if use_coder:
-            action_view = CodeReviewActionView(message.author.id, message.channel.id, user_request, answer)
-        elif (did_search or extracted_ctx or len(answer) >= 240) and not PURE_DATETIME_PATTERN.search(user_request):
-            action_view = build_contextual_suggestion_view(message.channel.id, user_request, answer)
+        if should_attach_interactive_view(
+            user_request,
+            answer,
+            use_coder=use_coder,
+            did_search=did_search,
+            extracted_ctx=extracted_ctx,
+        ):
+            if use_coder:
+                action_view = CodeReviewActionView(message.author.id, message.channel.id, user_request, answer)
+            else:
+                action_view = build_contextual_suggestion_view(
+                    message.channel.id, user_request, answer, extracted_ctx=extracted_ctx
+                )
 
         await _send_response_with_interactive_view(message.channel, answer, action_view, reply_to=reply_target)
         await maybe_react_to_discord_message(message, raw_llm_output=answer, user_text=user_request)
@@ -664,8 +674,14 @@ async def ask_fast(ctx, *, prompt: str = ""):
             effective_prompt, has_attachments=bool(ctx_text), is_instant_datetime=is_dt
         )
         view = (
-            build_contextual_suggestion_view(ctx.channel.id, effective_prompt, answer)
-            if (did_search or ctx_text or len(answer) >= 240) and not is_dt
+            build_contextual_suggestion_view(ctx.channel.id, effective_prompt, answer, extracted_ctx=ctx_text)
+            if should_attach_interactive_view(
+                effective_prompt,
+                answer,
+                did_search=did_search,
+                extracted_ctx=ctx_text,
+                is_instant_dt=is_dt,
+            )
             else None
         )
         await _send_response_with_interactive_view(ctx.channel, answer, view, reply_to=ctx.message if use_reply else None)
@@ -685,7 +701,11 @@ async def ask_code(ctx, *, prompt: str = "วิเคราะห์โค้�
             has_fresh_attachment=bool(ctx_text),
             speaker_user=ctx.author,
         )
-        view = CodeReviewActionView(ctx.author.id, ctx.channel.id, prompt, answer)
+        view = (
+            CodeReviewActionView(ctx.author.id, ctx.channel.id, prompt, answer)
+            if should_attach_interactive_view(prompt, answer, use_coder=True, extracted_ctx=ctx_text)
+            else None
+        )
         await _send_response_with_interactive_view(ctx.channel, answer, view, reply_to=ctx.message)
 
 
@@ -704,7 +724,7 @@ async def source_command(ctx, *, question: str = ""):
             "หากเป็นภาพวาด/อนิเมะ/มังงะ ให้บอกชื่อเรื่อง ชื่อตัวละคร ตอนที่/Chapter ชื่อผู้วาด และแนบลิงก์ที่มา (เช่น Pixiv/X/MyAnimeList/Danbooru) ถ้ามี "
             "หากเป็นภาพถ่ายสิ่งของหรืออุปกรณ์ ให้ระบุยี่ห้อ รุ่น และรายละเอียดสำคัญของสิ่งนั้นค่ะ"
         )
-        answer, _ = await query_local_ollama_chat(
+        answer, did_search = await query_local_ollama_chat(
             f"{user_q}\n\n{ctx_text}",
             model=ACTIVE_FAST_MODEL,
             system_prompt=FAST_SYSTEM_PROMPT,
@@ -714,7 +734,11 @@ async def source_command(ctx, *, question: str = ""):
             has_fresh_attachment=True,
             speaker_user=ctx.author,
         )
-        view = build_contextual_suggestion_view(ctx.channel.id, user_q, answer)
+        view = (
+            build_contextual_suggestion_view(ctx.channel.id, user_q, answer, extracted_ctx=ctx_text)
+            if should_attach_interactive_view(user_q, answer, did_search=did_search, extracted_ctx=ctx_text)
+            else None
+        )
         await _send_response_with_interactive_view(ctx.channel, answer, view, reply_to=ctx.message)
 
 
@@ -788,8 +812,8 @@ async def ot_command(ctx, *, args: str = ""):
     rec_date, rec_slot, rec_detail = parse_ot_record_metadata(reply)
     ot_view = (
         OTActionView(ctx.author.id, rec_date, rec_slot, rec_detail)
-        if rec_date
-        else OTActionView(ctx.author.id)
+        if rec_date and not is_failure_or_refusal_reply(reply)
+        else None
     )
     await _send_response_with_interactive_view(ctx.channel, reply, ot_view, reply_to=ctx.message)
 

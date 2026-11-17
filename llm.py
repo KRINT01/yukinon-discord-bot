@@ -55,7 +55,7 @@ GEMINI_MODEL_HINT_REGEX = re.compile(r"models/([a-zA-Z0-9._-]+)")
 GEMINI_EXCLUDED_SUBSTRINGS = ("image", "lite", "tts", "audio", "live", "embedding", "aqa", "bison", "gecko")
 
 GROQ_EXCLUDED_SUBSTRINGS = (
-    "whisper", "orpheus", "guard", "safeguard", "tts", "audio", "embed", "moderation", "playai"
+    "whisper", "orpheus", "guard", "safeguard", "tts", "audio", "embed", "moderation", "playai", "allam"
 )
 
 # Per-model cooldowns & 1-hour live catalog caches
@@ -70,9 +70,50 @@ _CF_GEMMA_COOLDOWN_UNTIL: float = 0.0
 
 
 def _estimate_messages_tokens(messages: list) -> int:
-    """Rough token estimator (~3 chars per token for mixed Thai/English) to respect Gemma 4's 16K TPM limit."""
+    """Rough token estimator (~3 chars per token for mixed Thai/English/Japanese)."""
     total_chars = sum(len(m.get("content") or "") for m in messages)
     return total_chars // 3
+
+
+def _extract_raw_user_turn(prompt: str) -> str:
+    """
+    Separates the user's actual typed message from appended context blocks
+    (`=== ... ===`, `<untrusted_web_search_results`, `<mentioned_users_dossier>`)
+    so OCR descriptions or PDF text never trigger false weather/search intents.
+    """
+    if not prompt:
+        return ""
+    head = re.split(
+        r"\n\n(?:===|<untrusted_web_search_results|<mentioned_users_dossier>|\[Attachment |\[PDF Notice:|\[Web extraction error:)",
+        prompt,
+        maxsplit=1,
+    )[0]
+    return head.strip()
+
+
+def _compact_messages_for_token_budget(messages: list, max_est_tokens: int = 5200) -> list:
+    """
+    Trims oversized attachment/search context blocks in the final user message so
+    free-tier TPM-capped endpoints (e.g., Groq 6K-8K TPM) never fail with HTTP 413.
+    """
+    if _estimate_messages_tokens(messages) <= max_est_tokens:
+        return messages
+
+    compacted = [dict(m) for m in messages]
+    max_total_chars = max_est_tokens * 3
+    non_user_chars = sum(len(m.get("content") or "") for m in compacted[:-1])
+    allowed_user_chars = max(2500, max_total_chars - non_user_chars)
+
+    last_content = compacted[-1].get("content") or ""
+    if len(last_content) > allowed_user_chars:
+        keep_head = min(1800, allowed_user_chars // 3)
+        keep_tail = max(800, allowed_user_chars - keep_head - 80)
+        compacted[-1]["content"] = (
+            f"{last_content[:keep_head]}\n\n"
+            f"... [ trimmed middle context to fit model token limit ] ...\n\n"
+            f"{last_content[-keep_tail:]}"
+        )
+    return compacted
 
 
 async def discover_available_groq_models(force_refresh: bool = False) -> list[str]:
@@ -239,11 +280,6 @@ async def _discover_active_gemini_flash_model() -> list[str]:
 async def call_gemma_ai_studio_chat(
     messages: list, temperature: float = 0.4, max_output_tokens: int = 1024, purpose: str = "GemmaChat"
 ) -> str:
-    """
-    Calls Gemma 4 (gemma-4-26b-a4b-it / gemma-4-31b-it) on Google AI Studio (14.4K RPD, 30 RPM, 16K TPM).
-    Disables internal thinking bloat (thinkingBudget=0) so replies finish in ~1.2s instead of timing out,
-    and merges system instructions into the first user turn to prevent HTTP 500/400 errors.
-    """
     if not GEMINI_API_KEY:
         return ""
 
@@ -576,7 +612,7 @@ async def call_cloudflare_gemma_chat(
     try:
         session = get_http_session()
         async with session.post(
-            cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=15)
+            cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=18)
         ) as resp:
             elapsed = time.monotonic() - t0
             if resp.status == 200:
@@ -665,6 +701,10 @@ async def call_groq_chat(
         _GROQ_MODEL_COOLDOWN_UNTIL[groq_model] = now + 3600.0
         return ""
 
+    # Respect Groq Free Tier TPM limits (~6K-8K TPM on 20B/27B/120B) so heavy OCR/PDF contexts don't trigger HTTP 413
+    token_budget = 6500 if is_coding else 5200
+    safe_messages = _compact_messages_for_token_budget(messages, max_est_tokens=token_budget)
+
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
@@ -672,7 +712,7 @@ async def call_groq_chat(
 
     groq_payload = {
         "model": groq_model,
-        "messages": messages,
+        "messages": safe_messages,
         "temperature": temperature,
         "max_tokens": 8192 if is_coding else 2048,
     }
@@ -759,8 +799,11 @@ async def query_local_ollama_chat(
     speaker_user=None,
     speaker_name: str = "",
 ) -> tuple[str, bool]:
-    if PROMPT_INJECTION_REGEX.search(prompt[:600]):
-        is_thai_input = bool(THAI_CHAR_REGEX.search(prompt))
+    # Isolate the user's actual message from attached OCR/PDF/Embed blocks before running intent regexes!
+    raw_user_query = _extract_raw_user_turn(prompt)
+
+    if PROMPT_INJECTION_REGEX.search(raw_user_query[:600]):
+        is_thai_input = bool(THAI_CHAR_REGEX.search(raw_user_query))
         if is_thai_input:
             jb_reply = (
                 "นายคิดว่าการใช้ลูกไม้ตื้นๆ และตรรกะพังๆ อย่างการสั่งให้ฉัน 'ลืมคำสั่งก่อนหน้า' "
@@ -772,27 +815,27 @@ async def query_local_ollama_chat(
                 "Do you genuinely believe such a shallow, transparent attempt to override my instructions "
                 "would work on me? Your logic is as flawed as your methodology. Try asking something worthwhile."
             )
-        jb_reply = sanitize_yukino_output(jb_reply, prompt, speaker_user, speaker_name)
+        jb_reply = sanitize_yukino_output(jb_reply, raw_user_query, speaker_user, speaker_name)
         return jb_reply, False
 
     if not has_fresh_attachment:
-        instant_reply = try_instant_datetime_reply(prompt)
+        instant_reply = try_instant_datetime_reply(raw_user_query)
         if instant_reply:
             if channel_id is not None:
-                channel_memory[channel_id].append({"role": "user", "content": prompt})
+                channel_memory[channel_id].append({"role": "user", "content": raw_user_query})
                 channel_memory[channel_id].append({"role": "assistant", "content": instant_reply})
             return instant_reply, False
 
     did_search = "<untrusted_web_search_results" in prompt
     working_prompt = prompt
-    is_user_correction = bool(USER_CORRECTION_PATTERN.search(prompt))
+    is_user_correction = bool(USER_CORRECTION_PATTERN.search(raw_user_query))
     is_factual_domain = bool(
-        GAME_QUERY_REGEX.search(prompt)
-        or ANIME_MANGA_QUERY_REGEX.search(prompt)
-        or RECENCY_INTENT_REGEX.search(prompt)
+        GAME_QUERY_REGEX.search(raw_user_query)
+        or ANIME_MANGA_QUERY_REGEX.search(raw_user_query)
+        or RECENCY_INTENT_REGEX.search(raw_user_query)
     )
 
-    active_topic = update_and_get_channel_topic(prompt, channel_id=channel_id)
+    active_topic = update_and_get_channel_topic(raw_user_query, channel_id=channel_id)
     topic_anchor_note = (
         f"\n### [หัวข้อหลักที่กำลังสนทนาอยู่ต่อเนื่องในห้องแชทนี้ (Active Conversation Topic)]:\n"
         f"- ขณะนี้คู่สนทนากำลังพูดคุยต่อเนื่องเกี่ยวกับเรื่อง: **{active_topic}**\n"
@@ -820,9 +863,10 @@ async def query_local_ollama_chat(
                 f"[ไฟล์อ้างอิงล่าสุดในห้องแชทนี้ (เรียงตามลำดับเวลา สามารถเชื่อมโยงข้ามไฟล์ได้)]:\n{cached_ctx}"
             )
 
-    is_weather_query = allow_agentic_search and detect_weather_intent(prompt, channel_id=channel_id)
+    # Check weather & web search intent strictly against `raw_user_query` (never against OCR/PDF text!)
+    is_weather_query = allow_agentic_search and detect_weather_intent(raw_user_query, channel_id=channel_id)
     if is_weather_query:
-        weather_block = await fetch_live_weather_context(prompt, channel_id=channel_id)
+        weather_block = await fetch_live_weather_context(raw_user_query, channel_id=channel_id)
         if weather_block:
             working_prompt = (
                 f"{working_prompt}\n\n{weather_block}\n"
@@ -833,9 +877,9 @@ async def query_local_ollama_chat(
         allow_agentic_search
         and not is_weather_query
         and "<untrusted_web_search_results" not in working_prompt
-        and (detect_web_search_intent(prompt, channel_id=channel_id) or is_user_correction or is_factual_domain)
+        and (detect_web_search_intent(raw_user_query, channel_id=channel_id) or is_user_correction or is_factual_domain)
     ):
-        contextual_q = build_contextual_search_query(prompt, channel_id=channel_id)
+        contextual_q = build_contextual_search_query(raw_user_query, channel_id=channel_id)
         search_block = await asyncio.to_thread(run_safe_web_search_sync, contextual_q)
         if search_block:
             working_prompt = f"{working_prompt}\n\n{search_block}"
@@ -986,7 +1030,6 @@ async def query_local_ollama_chat(
 
     raw_answer = await _run_inference_pass(working_prompt)
 
-    # Allow explicit [SEARCH: ...] tag even in coding mode if the model needs official docs/versions
     search_tag_match = AGENTIC_SEARCH_TAG_REGEX.search(raw_answer)
     if search_tag_match:
         agent_query = search_tag_match.group(1).strip()[:180]
@@ -1005,18 +1048,18 @@ async def query_local_ollama_chat(
     memo_match = AGENTIC_MEMO_TAG_REGEX.search(raw_answer or "")
     learned_memo = memo_match.group(1).strip() if memo_match else ""
 
-    answer = sanitize_yukino_output(raw_answer, prompt, speaker_user, speaker_name)
+    answer = sanitize_yukino_output(raw_answer, raw_user_query, speaker_user, speaker_name)
 
     if not answer.strip():
         retry_raw = await _run_inference_pass(
             f"{working_prompt}\n\n(ตอบคำถามโดยตรงตามข้อมูลที่มีในบริบท ห้ามใช้แท็ก [SEARCH: ...] เด็ดขาด)"
         )
-        answer = sanitize_yukino_output(retry_raw, prompt, speaker_user, speaker_name)
+        answer = sanitize_yukino_output(retry_raw, raw_user_query, speaker_user, speaker_name)
 
     if speaker_user is not None:
         record_user_interaction(
             speaker_user,
-            prompt.split("\n\n")[0][:300],
+            raw_user_query[:300],
             channel_id=channel_id,
             learned_memo=learned_memo,
         )
@@ -1035,6 +1078,6 @@ async def query_local_ollama_chat(
             s_name = getattr(speaker_user, "display_name", "") or speaker_name or "Member"
             speaker_tag = f"[ผู้พูด: {s_name}]"
 
-        channel_memory[channel_id].append({"role": "user", "content": f"{speaker_tag} {prompt[:1800]}"})
+        channel_memory[channel_id].append({"role": "user", "content": f"{speaker_tag} {raw_user_query[:1800]}"})
         channel_memory[channel_id].append({"role": "assistant", "content": answer[:3000]})
     return answer, did_search
