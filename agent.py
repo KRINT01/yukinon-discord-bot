@@ -10,9 +10,9 @@ from config import (
     OPENCLAW_API_KEY,
     DEFAULT_WEATHER_CITY,
     GROQ_API_KEY,
-    GROQ_CHAT_FALLBACK_MODEL,
     GEMINI_API_KEY,
     ACTIVE_FAST_MODEL,
+    CF_CHAT_FAST_MODEL,
     IMAGE_EXTENSIONS,
     MANGA_TRANSLATE_INTENT_PATTERN,
     agent_notes_store,
@@ -29,8 +29,9 @@ from search_engine import (
     fetch_live_weather_context,
 )
 from llm import (
+    call_gemini_decision_orchestrator,
     call_groq_chat,
-    call_gemini_generate_content_self_healing,
+    call_cloudflare_gpt_oss,
     call_gemma_ai_studio_chat,
     call_cloudflare_gemma_chat,
     call_modal_ollama_chat,
@@ -72,7 +73,7 @@ Available Tools (Skills):
 AGENT_STEP_LABELS = {
     "web_search": "🔍 กำลังค้นหาข้อมูลบนเว็บ",
     "read_webpage": "📄 กำลังอ่านเนื้อหาเว็บไซต์",
-    "get_weather": "🌦️ กำลังตรวจสอบสภาพอากาศ",
+    "get_weather": "🌤️ กำลังตรวจสอบสภาพอากาศ",
     "youtube_inspect": "▶️ กำลังดึงข้อมูลคลิป YouTube",
     "calculate": "🧮 กำลังคำนวณตัวเลข",
     "save_note": "📝 กำลังบันทึกข้อมูล",
@@ -173,8 +174,58 @@ async def execute_agent_skill(
         return f"[Tool Execution Error in `{t_name}`: {type(e).__name__}: {e}]"
 
 
+async def _pick_next_agent_tool_with_decision_1(
+    effective_goal: str,
+    extracted_ctx: str,
+    observations_log: list[str],
+) -> tuple[str | None, float]:
+    """
+    Uses `gemini-decision-1` (~200ms, 0 output tokens) to select the exact next tool
+    (or `final_ready`) in the autonomous agent loop. Returns (action, confidence) or (None, 0.0).
+    """
+    criteria = {
+        "web_search": "Search Google/DuckDuckGo/News for real-time information, prices, or current facts not yet gathered.",
+        "read_webpage": "Scrape and read the full text of a specific public URL provided or found in search results.",
+        "get_weather": "Fetch real-time weather and rain forecast for a city or Thai province.",
+        "youtube_inspect": "Extract title, description, and subtitles/transcript from a YouTube URL.",
+        "calculate": "Evaluate a math expression, unit conversion, or percentage accurately.",
+        "save_note": "Save a reminder, todo item, or key fact requested by the user.",
+        "list_notes": "Retrieve previously saved notes/todos for this channel.",
+        "generate_image": "Generate an image/illustration via Cloudflare FLUX when requested by the goal.",
+        "final_ready": "All required facts, calculations, and actions for the user's goal have been gathered and we are ready to write the final answer.",
+    }
+    if OPENCLAW_GATEWAY_URL:
+        criteria["openclaw_task"] = "Delegate OS, browser, or external workflow automation to the connected OpenClaw Gateway."
+
+    history_str = "\n\n".join(observations_log[-4:]) if observations_log else "(No tools executed yet)"
+    shared_input = (
+        f"User Goal: {effective_goal}\n\n"
+        f"Attached Context Preview:\n{(extracted_ctx or '(None)')[:3000]}\n\n"
+        f"Completed Tool Steps So Far:\n{history_str[:5000]}"
+    )
+    questions = {
+        "next_action": {
+            "type": "choice",
+            "instructions": "Select the single best next tool to call to fulfill the User Goal, or select 'final_ready' if all necessary data/actions are complete.",
+            "criteria": criteria,
+        }
+    }
+    answers = await call_gemini_decision_orchestrator(shared_input, questions, timeout_sec=4.0, purpose="AgentStep")
+    if not answers:
+        return None, 0.0
+    ans = answers.get("next_action") or {}
+    return ans.get("choice"), float(ans.get("confidence") or 0.0)
+
+
 async def _call_agent_planner_llm(messages: list) -> str:
-    """Uses Groq (gpt-oss-20b / qwen3.8-27b), AI Studio Gemma 4, Cloudflare Gemma 4, or Modal Ollama."""
+    """
+    Generates structured JSON tool action + arguments:
+    1) Groq (gpt-oss-20b / qwen3.8-27b)
+    2) Cloudflare Workers AI (@cf/openai/gpt-oss-20b)
+    3) AI Studio Gemma 4
+    4) Cloudflare Gemma 4
+    5) Modal Ollama
+    """
     if GROQ_API_KEY:
         for g_mod in await get_groq_search_and_chat_candidates():
             try:
@@ -185,6 +236,12 @@ async def _call_agent_planner_llm(messages: list) -> str:
                     return res
             except Exception:
                 continue
+
+    res = await call_cloudflare_gpt_oss(
+        messages, cf_model=CF_CHAT_FAST_MODEL, temperature=0.1, is_coding=False, purpose="AgentPlanner"
+    )
+    if res:
+        return res
 
     res = await call_gemma_ai_studio_chat(messages, temperature=0.1, max_output_tokens=1024, purpose="AgentPlanner")
     if res:
@@ -241,14 +298,35 @@ Break down the user's goal into logical steps. At each turn, output ONLY valid J
     pending_images = []
 
     for step_idx in range(1, max_steps + 1):
-        raw_plan = await _call_agent_planner_llm(planner_messages)
-        json_m = re.search(r"\{[\s\S]*\}", raw_plan or "")
-        if not json_m:
+        # Fast discriminative orchestrator check via `gemini-decision-1`
+        decided_action, dec_conf = await _pick_next_agent_tool_with_decision_1(
+            effective_goal, extracted_ctx, observations_log
+        )
+
+        if decided_action == "final_ready" and dec_conf >= 0.65:
             break
-        try:
-            plan_obj = json.loads(json_m.group(0))
-        except Exception:
-            break
+
+        if decided_action == "list_notes" and dec_conf >= 0.65:
+            plan_obj = {
+                "thought": "Retrieving saved channel notes",
+                "action": "list_notes",
+                "args": {},
+            }
+        else:
+            step_messages = list(planner_messages)
+            if decided_action and dec_conf >= 0.65:
+                step_messages.append({
+                    "role": "system",
+                    "content": f"[Orchestrator Hint]: The selected tool for this step is `{decided_action}`. Output ONLY the JSON object with `"action": "{decided_action}"` and its exact `"args"`. ",
+                })
+            raw_plan = await _call_agent_planner_llm(step_messages)
+            json_m = re.search(r"\{[\s\S]*\}", raw_plan or "")
+            if not json_m:
+                break
+            try:
+                plan_obj = json.loads(json_m.group(0))
+            except Exception:
+                break
 
         action = str(plan_obj.get("action") or "").strip().lower()
         thought = str(plan_obj.get("thought") or "").strip()

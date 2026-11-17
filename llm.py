@@ -7,11 +7,14 @@ import aiohttp
 from config import (
     HTTPS,
     GEMINI_API_KEY,
+    GEMINI_DECISION_MODEL,
     GEMMA_CHAT_MODEL,
     GEMMA_VISION_MODEL,
     CF_ACCOUNT_ID,
     CF_API_TOKEN,
     CF_VISION_MODEL,
+    CF_CODE_MODEL,
+    CF_CHAT_FAST_MODEL,
     GROQ_API_KEY,
     GROQ_CODE_MODEL,
     GROQ_SEARCH_MODEL,
@@ -26,6 +29,8 @@ from config import (
     USER_CORRECTION_PATTERN,
     GAME_QUERY_REGEX,
     ANIME_MANGA_QUERY_REGEX,
+    PURE_DATETIME_PATTERN,
+    URL_REGEX,
     ollama_lock,
     channel_memory,
     channel_active_topic,
@@ -52,7 +57,9 @@ from search_engine import (
 )
 
 GEMINI_MODEL_HINT_REGEX = re.compile(r"models/([a-zA-Z0-9._-]+)")
-GEMINI_EXCLUDED_SUBSTRINGS = ("image", "lite", "tts", "audio", "live", "embedding", "aqa", "bison", "gecko")
+GEMINI_EXCLUDED_SUBSTRINGS = (
+    "image", "lite", "tts", "audio", "live", "embedding", "aqa", "bison", "gecko", "decision"
+)
 
 GROQ_EXCLUDED_SUBSTRINGS = (
     "whisper", "orpheus", "guard", "safeguard", "tts", "audio", "embed", "moderation", "playai", "allam"
@@ -69,8 +76,12 @@ _CF_GEMMA_COOLDOWN_UNTIL: float = 0.0
 
 
 def _estimate_messages_tokens(messages: list) -> int:
+    """
+    Conservative token estimator (~2.2 chars/token for mixed Thai/Japanese/English)
+    so AI Studio Gemma 4 (16K TPM) and Groq (6K-8K TPM) never exceed per-minute token caps.
+    """
     total_chars = sum(len(m.get("content") or "") for m in messages)
-    return total_chars // 3
+    return int(total_chars / 2.2)
 
 
 def _extract_raw_user_turn(prompt: str) -> str:
@@ -84,14 +95,19 @@ def _extract_raw_user_turn(prompt: str) -> str:
     return head.strip()
 
 
-def _compact_messages_for_token_budget(messages: list, max_est_tokens: int = 5200) -> list:
+def _compact_messages_for_token_budget(messages: list, max_est_tokens: int = 4500) -> list:
+    """
+    Trims oversized attachment/search context blocks in the final user message so
+    TPM-capped endpoints (AI Studio Gemma 4 16K TPM, Groq 6K-8K TPM) finish in ~2-4s
+    without prefill queueing timeouts or HTTP 413 errors.
+    """
     if _estimate_messages_tokens(messages) <= max_est_tokens:
         return messages
 
     compacted = [dict(m) for m in messages]
-    max_total_chars = max_est_tokens * 3
+    max_total_chars = int(max_est_tokens * 2.2)
     non_user_chars = sum(len(m.get("content") or "") for m in compacted[:-1])
-    allowed_user_chars = max(2500, max_total_chars - non_user_chars)
+    allowed_user_chars = max(2400, max_total_chars - non_user_chars)
 
     last_content = compacted[-1].get("content") or ""
     if len(last_content) > allowed_user_chars:
@@ -105,6 +121,166 @@ def _compact_messages_for_token_budget(messages: list, max_est_tokens: int = 520
     return compacted
 
 
+# ==============================================================================
+# GOOGLE GEMINI DECISIONS API ORCHESTRATOR (`gemini-decision-1` — 200 RPM, 50K TPM, 10K RPD)
+# ==============================================================================
+async def call_gemini_decision_orchestrator(
+    shared_input: str,
+    questions: dict,
+    timeout_sec: float = 4.0,
+    purpose: str = "Orchestrator",
+) -> dict:
+    """
+    Calls Google's discriminative Decisions API (`POST /v1beta/decisions` with `gemini-decision-1`)
+    which evaluates typed `choice` and `noul` (yes/no) questions in a single ~150-250ms forward pass
+    with ZERO output tokens. Returns the parsed `answers` dict, or `{}` on error/cooldown so
+    callers seamlessly fall back to deterministic regex/LLM routing.
+    """
+    if not GEMINI_API_KEY or not GEMINI_DECISION_MODEL:
+        return {}
+    if time.time() < state.gemini_decision_cooldown_until:
+        return {}
+
+    url = clean_url(f"{HTTPS}generativelanguage.googleapis.com/v1beta/decisions")
+    headers = {
+        "x-goog-api-key": GEMINI_API_KEY,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": GEMINI_DECISION_MODEL,
+        "input": shared_input[:16000],
+        "questions": questions,
+    }
+
+    t0 = time.monotonic()
+    try:
+        session = get_http_session()
+        async with session.post(
+            url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=timeout_sec)
+        ) as resp:
+            elapsed = time.monotonic() - t0
+            if resp.status == 200:
+                data = await resp.json()
+                answers = data.get("answers") or {}
+                if isinstance(answers, dict) and answers:
+                    api_log(f"Decision API ({purpose}) -> {GEMINI_DECISION_MODEL} 200 OK ({elapsed:.2f}s)")
+                    return answers
+            elif resp.status == 429:
+                state.gemini_decision_cooldown_until = time.time() + 60.0
+                api_log(f"Decision API ({purpose}) -> HTTP 429 (cooldown 60s)")
+            else:
+                err_txt = await resp.text()
+                state.gemini_decision_cooldown_until = time.time() + 180.0
+                api_log(f"Decision API ({purpose}) -> HTTP {resp.status} ({elapsed:.2f}s): {err_txt[:100]}")
+    except Exception as e:
+        state.gemini_decision_cooldown_until = time.time() + 120.0
+        api_log(f"Decision API ({purpose}) -> skipped ({type(e).__name__})")
+    return {}
+
+
+async def orchestrate_message_with_decision_1(
+    user_text: str,
+    extracted_ctx: str = "",
+    has_code_attachment: bool = False,
+) -> dict | None:
+    """
+    Single-pass ~200ms multimodal/text routing orchestrator powered by `gemini-decision-1`.
+    Determines:
+      - `route`: 'code' | 'weather' | 'web_search' | 'chat'
+      - `needs_web_search`: bool (avoids redundant 11s web searches when embed/OCR already has full context!)
+      - `attach_buttons`: bool
+      - `button_domain`: 'code' | 'document' | 'social_art' | 'game' | 'news' | 'general'
+    Returns None if Decisions API is unavailable so callers fall back to regex heuristics cleanly.
+    """
+    clean_u = _extract_raw_user_turn(user_text)
+    if not clean_u and not extracted_ctx:
+        return None
+    if len(clean_u) <= 65 and PURE_DATETIME_PATTERN.search(clean_u) and not extracted_ctx:
+        return None
+
+    ctx_preview = (extracted_ctx or "")[:2500]
+    shared_input = (
+        f"User Message:\n{clean_u or '(No text; user sent attachment/link)'}\n\n"
+        f"Has Code File Attachment: {has_code_attachment}\n"
+        f"Attached / Embedded Context Preview:\n{ctx_preview or '(None)'}"
+    )
+
+    questions = {
+        "route": {
+            "type": "choice",
+            "instructions": "Select the single best execution route for this user message.",
+            "criteria": {
+                "code": "Programming, debugging, stack traces, Java, Maven, Spring Boot, Oracle SQL, PL/SQL, Node.js, React, Bootstrap, Docker, Kubernetes, or config/log files.",
+                "weather": "Asking about weather forecast, rain, temperature, humidity, or whether to bring an umbrella.",
+                "web_search": "Asking for real-time news, live prices, release dates, game/anime lore facts, or disputing/fact-checking a previous statement.",
+                "chat": "General conversation, greetings, personal advice, or summarizing/translating already-provided attachments, PDFs, or social media embeds (X/Twitter, Pixiv, YouTube).",
+            },
+        },
+        "needs_web_search": {
+            "type": "noul",
+            "instructions": (
+                "Answer YES only if answering accurately requires searching the live web because the user message "
+                "and attached/embedded context do NOT already contain the needed facts or text. "
+                "Answer NO if the attached PDF, code, or X/Pixiv embed + OCR already provides the full content to summarize or translate."
+            ),
+        },
+        "attach_buttons": {
+            "type": "noul",
+            "instructions": (
+                "Answer YES if this is a substantive technical, coding, document, search, or media post analysis "
+                "that benefits from follow-up action buttons. Answer NO for simple greetings, casual chat, date/time checks, or error notices."
+            ),
+        },
+        "button_domain": {
+            "type": "choice",
+            "instructions": "Select the primary content domain for follow-up action buttons.",
+            "criteria": {
+                "code": "Source code, stack trace, SQL query, or DevOps/Docker/K8s config.",
+                "document": "Attached PDF, Word, Excel document, web article, or YouTube video.",
+                "social_art": "Embedded X/Twitter, Pixiv, Bluesky post, illustration, fanart, or anime/manga page.",
+                "game": "Video games, character builds, classes, or Steam store.",
+                "news": "Breaking news, stock market, gold/crypto prices, or current events.",
+                "general": "Hardware/product comparison, coffee/tech specs, or general advice.",
+            },
+        },
+    }
+
+    answers = await call_gemini_decision_orchestrator(shared_input, questions, timeout_sec=4.0, purpose="Route")
+    if not answers:
+        return None
+
+    route_ans = answers.get("route") or {}
+    search_ans = answers.get("needs_web_search") or {}
+    btn_ans = answers.get("attach_buttons") or {}
+    domain_ans = answers.get("button_domain") or {}
+
+    chosen_route = route_ans.get("choice") or "chat"
+    route_conf = float(route_ans.get("confidence") or 0.0)
+    needs_search = float(search_ans.get("noul") or 0.0) >= 0.55
+    attach_btns = float(btn_ans.get("noul") or 0.0) >= 0.50
+    btn_domain = domain_ans.get("choice") or "general"
+
+    if has_code_attachment:
+        chosen_route = "code"
+        btn_domain = "code"
+        needs_search = False
+
+    api_log(
+        f"Orchestrator Plan -> route={chosen_route} ({route_conf:.2f}), "
+        f"search={needs_search}, buttons={attach_btns} ({btn_domain})"
+    )
+    return {
+        "route": chosen_route,
+        "route_confidence": route_conf,
+        "needs_web_search": needs_search,
+        "attach_buttons": attach_btns,
+        "button_domain": btn_domain,
+    }
+
+
+# ==============================================================================
+# GROQ & GOOGLE AI STUDIO MODEL DISCOVERY
+# ==============================================================================
 async def discover_available_groq_models(force_refresh: bool = False) -> list[str]:
     global _GROQ_AVAILABLE_MODELS_CACHE, _GROQ_MODELS_LAST_FETCH_TS
     if not GROQ_API_KEY:
@@ -262,20 +438,21 @@ async def _discover_active_gemini_flash_model() -> list[str]:
     return [x for x in candidates if x and not (x in seen or seen.add(x))]
 
 
+# ==============================================================================
+# GOOGLE AI STUDIO GEMMA 4 (WITH 4.5K TOKEN COMPACTION GUARD)
+# ==============================================================================
 async def call_gemma_ai_studio_chat(
     messages: list, temperature: float = 0.4, max_output_tokens: int = 1024, purpose: str = "GemmaChat"
 ) -> str:
     if not GEMINI_API_KEY:
         return ""
 
-    est_tokens = _estimate_messages_tokens(messages)
-    if est_tokens > 11500:
-        api_log(f"Gemma AI Studio ({purpose}) -> skipped ({est_tokens} est tokens > 11.5K TPM guard)")
-        return ""
+    # Compact to <=4,500 est tokens (~9,900 chars) so AI Studio never hits 16K TPM prefill timeouts
+    safe_messages = _compact_messages_for_token_budget(messages, max_est_tokens=4500)
 
     sys_parts = []
     raw_turns = []
-    for m in messages:
+    for m in safe_messages:
         role = m.get("role", "user")
         txt = (m.get("content") or "").strip()
         if not txt:
@@ -333,7 +510,7 @@ async def call_gemma_ai_studio_chat(
             t0 = time.monotonic()
             try:
                 async with session.post(
-                    url, json=payload, timeout=aiohttp.ClientTimeout(total=18)
+                    url, json=payload, timeout=aiohttp.ClientTimeout(total=14)
                 ) as resp:
                     status = resp.status
                     body_text = await resp.text()
@@ -563,6 +740,9 @@ async def call_gemini_chat_messages(
     return ""
 
 
+# ==============================================================================
+# CLOUDFLARE WORKERS AI (GEMMA 4 + OPENAI GPT-OSS-120B / GPT-OSS-20B)
+# ==============================================================================
 async def call_cloudflare_gemma_chat(
     messages: list, temperature: float = 0.4, max_tokens: int = 1024, purpose: str = "CFGemmaChat"
 ) -> str:
@@ -616,6 +796,117 @@ async def call_cloudflare_gemma_chat(
     except Exception as e:
         _CF_GEMMA_COOLDOWN_UNTIL = time.time() + 120.0
         api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} failed ({type(e).__name__})")
+    return ""
+
+
+async def call_cloudflare_gpt_oss(
+    messages: list,
+    cf_model: str = None,
+    temperature: float = 0.25,
+    is_coding: bool = False,
+    purpose: str = "CFGPTOSS",
+) -> str:
+    """
+    Calls Cloudflare Workers AI `@cf/openai/gpt-oss-120b` or `@cf/openai/gpt-oss-20b`.
+    Tries Cloudflare's OpenAI Responses API (`/ai/v1/responses`) first, then automatically
+    falls back to `/ai/v1/chat/completions` if needed.
+    """
+    target_model = cf_model or (CF_CODE_MODEL if is_coding else CF_CHAT_FAST_MODEL)
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN or not target_model:
+        return ""
+    if time.time() < state.cf_gpt_oss_cooldown_until:
+        return ""
+
+    cf_host = "api." + "cloudflare.com"
+    headers = {
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    session = get_http_session()
+    req_timeout = 45 if is_coding else 24
+
+    # 1) Cloudflare OpenAI Responses API (`/ai/v1/responses`)
+    sys_parts = []
+    convo_lines = []
+    for m in messages:
+        role = m.get("role", "user")
+        txt = (m.get("content") or "").strip()
+        if not txt:
+            continue
+        if role == "system":
+            sys_parts.append(txt)
+        elif role == "assistant":
+            convo_lines.append(f"Assistant: {txt}")
+        else:
+            convo_lines.append(f"User: {txt}")
+
+    responses_url = f"{HTTPS}{cf_host}/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1/responses"
+    responses_payload = {
+        "model": target_model,
+        "instructions": "\n\n".join(sys_parts),
+        "input": "\n\n".join(convo_lines),
+        "reasoning": {"effort": "high" if is_coding else "low"},
+    }
+    t0 = time.monotonic()
+    try:
+        async with session.post(
+            responses_url, headers=headers, json=responses_payload, timeout=aiohttp.ClientTimeout(total=req_timeout)
+        ) as resp:
+            elapsed = time.monotonic() - t0
+            if resp.status == 200:
+                data = await resp.json()
+                out_txt = (data.get("output_text") or "").strip()
+                if not out_txt:
+                    extracted_chunks = []
+                    for item in data.get("output") or []:
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("type") == "message":
+                            for c_part in item.get("content") or []:
+                                if isinstance(c_part, dict) and c_part.get("text"):
+                                    extracted_chunks.append(c_part["text"])
+                        elif item.get("text"):
+                            extracted_chunks.append(item["text"])
+                    out_txt = "\n".join(extracted_chunks).strip()
+                out_txt = re.sub(r"<think>[\s\S]*?</think>", "", out_txt).strip()
+                if out_txt:
+                    api_log(f"Cloudflare Responses ({purpose}) -> {target_model} 200 OK ({elapsed:.2f}s)")
+                    return out_txt
+            elif resp.status == 429:
+                state.cf_gpt_oss_cooldown_until = time.time() + 180.0
+                api_log(f"Cloudflare Responses ({purpose}) -> {target_model} HTTP 429 (cooldown 3m)")
+                return ""
+    except Exception as e:
+        api_log(f"Cloudflare Responses ({purpose}) -> {target_model} note ({type(e).__name__}); trying chat/completions")
+
+    # 2) Fallback: OpenAI Chat Completions API (`/ai/v1/chat/completions`)
+    chat_url = f"{HTTPS}{cf_host}/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1/chat/completions"
+    chat_payload = {
+        "model": target_model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": 4096 if is_coding else 2048,
+    }
+    t1 = time.monotonic()
+    try:
+        async with session.post(
+            chat_url, headers=headers, json=chat_payload, timeout=aiohttp.ClientTimeout(total=req_timeout)
+        ) as resp:
+            elapsed = time.monotonic() - t1
+            if resp.status == 200:
+                data = await resp.json()
+                choices = data.get("choices") or []
+                if choices:
+                    content = (choices[0].get("message") or {}).get("content") or ""
+                    content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+                    if content:
+                        api_log(f"Cloudflare Chat ({purpose}) -> {target_model} 200 OK ({elapsed:.2f}s)")
+                        return content
+            elif resp.status == 429:
+                state.cf_gpt_oss_cooldown_until = time.time() + 180.0
+            api_log(f"Cloudflare Chat ({purpose}) -> {target_model} HTTP {resp.status} ({elapsed:.2f}s)")
+    except Exception as e:
+        api_log(f"Cloudflare Chat ({purpose}) -> {target_model} failed ({type(e).__name__})")
     return ""
 
 
@@ -686,7 +977,7 @@ async def call_groq_chat(
         _GROQ_MODEL_COOLDOWN_UNTIL[groq_model] = now + 3600.0
         return ""
 
-    token_budget = 6500 if is_coding else 5200
+    token_budget = 6000 if is_coding else 4800
     safe_messages = _compact_messages_for_token_budget(messages, max_est_tokens=token_budget)
 
     headers = {
@@ -772,6 +1063,9 @@ async def call_modal_ollama_chat(
                 return ""
 
 
+# ==============================================================================
+# UNIFIED MULTI-CLOUD CHAT & AGENTIC SEARCH ENGINE
+# ==============================================================================
 async def query_local_ollama_chat(
     prompt: str,
     model: str,
@@ -782,6 +1076,7 @@ async def query_local_ollama_chat(
     has_fresh_attachment: bool = False,
     speaker_user=None,
     speaker_name: str = "",
+    decision_plan: dict | None = None,
 ) -> tuple[str, bool]:
     raw_user_query = _extract_raw_user_turn(prompt)
 
@@ -850,7 +1145,16 @@ async def query_local_ollama_chat(
                 f"[ไฟล์อ้างอิงล่าสุดในห้องแชทนี้ (เรียงตามลำดับเวลา สามารถเชื่อมโยงข้ามไฟล์ได้)]:\n{cached_ctx}"
             )
 
-    is_weather_query = allow_agentic_search and detect_weather_intent(raw_user_query, channel_id=channel_id)
+    # Combine Gemini Decision 1 orchestrator verdict with deterministic regex fallback
+    dec_route = (decision_plan or {}).get("route")
+    dec_conf = float((decision_plan or {}).get("route_confidence") or 0.0)
+    dec_needs_search = (decision_plan or {}).get("needs_web_search")
+
+    if dec_route == "weather" and dec_conf >= 0.65:
+        is_weather_query = allow_agentic_search
+    else:
+        is_weather_query = allow_agentic_search and detect_weather_intent(raw_user_query, channel_id=channel_id)
+
     if is_weather_query:
         weather_block = await fetch_live_weather_context(raw_user_query, channel_id=channel_id)
         if weather_block:
@@ -859,11 +1163,19 @@ async def query_local_ollama_chat(
                 "[หมายเหตุ: ใช้ข้อมูลพยากรณ์อากาศและแนวโน้มรายชั่วโมงด้านบนตอบโดยตรง (พกร่ม/เสื้อกันฝน) ห้ามแต่งตัวเลขหรือทิศทางลมขึ้นมาเอง]"
             )
 
+    # Decide whether live web search is needed (Decisions API suppresses redundant search on complete social embeds!)
+    if dec_needs_search is not None and dec_conf >= 0.65:
+        should_run_web_search = bool(dec_needs_search or is_user_correction)
+    else:
+        should_run_web_search = bool(
+            detect_web_search_intent(raw_user_query, channel_id=channel_id) or is_user_correction or is_factual_domain
+        )
+
     if (
         allow_agentic_search
         and not is_weather_query
         and "<untrusted_web_search_results" not in working_prompt
-        and (detect_web_search_intent(raw_user_query, channel_id=channel_id) or is_user_correction or is_factual_domain)
+        and should_run_web_search
     ):
         contextual_q = build_contextual_search_query(raw_user_query, channel_id=channel_id)
         search_block = await asyncio.to_thread(run_safe_web_search_sync, contextual_q)
@@ -882,7 +1194,7 @@ async def query_local_ollama_chat(
             "3. ห้ามเบี่ยงประเด็นไปอธิบายประวัติของบริษัทที่ไม่เกี่ยวข้อง และห้ามใช้คำลงท้ายว่า 'ครับ' เด็ดขาด"
         )
 
-    is_coding = (model == ACTIVE_CODE_MODEL)
+    is_coding = (model == ACTIVE_CODE_MODEL) or (dec_route == "code" and dec_conf >= 0.70)
     prefer_high_knowledge_llm = bool(
         is_coding or did_search or is_user_correction or is_factual_domain or is_japanese_or_social_media or bool(active_topic)
     )
@@ -918,7 +1230,12 @@ async def query_local_ollama_chat(
                 })
         messages.append({"role": "user", "content": user_content})
 
-        # PATH A: Coding -> 1) Groq gpt-oss-120b, 2) AI Studio Gemma 4, 3) Cloudflare Gemma 4, 4) Modal Coder
+        # PATH A: Coding ->
+        # 1) Groq openai/gpt-oss-120b
+        # 2) Cloudflare Workers AI @cf/openai/gpt-oss-120b
+        # 3) Google AI Studio Gemma 4 (compacted <=4.5K tok)
+        # 4) Cloudflare Workers AI @cf/google/gemma-4-26b-a4b-it
+        # 5) Modal GPU Ollama (qwen2.5-coder:7b)
         if is_coding:
             if GROQ_API_KEY:
                 code_candidates = [GROQ_CODE_MODEL] + await get_groq_search_and_chat_candidates()
@@ -929,6 +1246,12 @@ async def query_local_ollama_chat(
                             return ans
                     except Exception as e:
                         print(f"Groq coding ({c_mod}) warning: {e}")
+
+            ans = await call_cloudflare_gpt_oss(
+                messages, cf_model=CF_CODE_MODEL, temperature=temperature, is_coding=True, purpose="Code"
+            )
+            if ans:
+                return ans
 
             ans = await call_gemma_ai_studio_chat(messages, temperature=temperature, max_output_tokens=4096, purpose="Code")
             if ans:
@@ -946,8 +1269,6 @@ async def query_local_ollama_chat(
                 print(f"Modal GPU coding error: {e}")
 
         # PATH B: Search / Fact-Check / Japanese Manga & Social Media
-        # Prioritizes Gemma 4 (31B/26B) on Japanese/Anime/Manga social posts for superior idiomatic nuance,
-        # while keeping Groq LPU first for general English/Thai web search & fact-checking.
         if prefer_high_knowledge_llm and not is_coding:
             target_temp = 0.2 if (did_search or is_user_correction) else temperature
 
@@ -975,6 +1296,12 @@ async def query_local_ollama_chat(
                             return ans
                     except Exception:
                         continue
+
+            ans = await call_cloudflare_gpt_oss(
+                messages, cf_model=CF_CHAT_FAST_MODEL, temperature=target_temp, is_coding=False, purpose="FactSearchChat"
+            )
+            if ans:
+                return ans
 
             if not is_japanese_or_social_media:
                 ans = await call_gemma_ai_studio_chat(
@@ -1020,6 +1347,12 @@ async def query_local_ollama_chat(
                         return ans
                 except Exception:
                     continue
+
+        ans = await call_cloudflare_gpt_oss(
+            messages, cf_model=CF_CHAT_FAST_MODEL, temperature=chat_temp, is_coding=False, purpose="ChatFallback"
+        )
+        if ans:
+            return ans
 
         try:
             ans = await call_modal_ollama_chat(messages, model, chat_temp, purpose="Chat")

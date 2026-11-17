@@ -29,7 +29,10 @@ from config import (
     CF_ACCOUNT_ID,
     CF_IMAGE_MODEL,
     CF_VISION_MODEL,
+    CF_CODE_MODEL,
+    CF_CHAT_FAST_MODEL,
     GEMINI_API_KEY,
+    GEMINI_DECISION_MODEL,
     OPENCLAW_GATEWAY_URL,
     AUDIO_EXTENSIONS,
     CUSTOM_EMOJI_REGEX,
@@ -38,6 +41,7 @@ from config import (
     IMAGE_GEN_INTENT_PATTERN,
     AGENTIC_IMAGE_TAG_REGEX,
     URL_REGEX,
+    CODE_AND_LOG_EXTENSIONS,
     intents,
     channel_memory,
     channel_last_attachment,
@@ -68,7 +72,10 @@ from user_memory import (
     user_profiles,
 )
 from search_engine import detect_coding_intent
-from llm import query_local_ollama_chat
+from llm import (
+    query_local_ollama_chat,
+    orchestrate_message_with_decision_1,
+)
 from media_context import extract_all_context, resolve_referenced_message
 from image_engine import (
     send_chunked_response,
@@ -122,6 +129,7 @@ def _collect_health_metrics() -> dict:
         else None
     )
     gemini_cd = max(0, int(state.gemini_grounding_cooldown_until - now))
+    decision_cd = max(0, int(state.gemini_decision_cooldown_until - now))
     edge_cd = max(0, int(state.edge_tts_cooldown_until - now))
     cached_files_count = sum(len(q) for q in channel_last_attachment.values())
 
@@ -155,7 +163,10 @@ def _collect_health_metrics() -> dict:
             "cloudflare_enabled": bool(CF_API_TOKEN and CF_ACCOUNT_ID),
             "cloudflare_image_model": CF_IMAGE_MODEL if CF_API_TOKEN else None,
             "cloudflare_gemma_model": CF_VISION_MODEL if CF_API_TOKEN else None,
+            "cloudflare_gpt_oss_models": [CF_CODE_MODEL, CF_CHAT_FAST_MODEL] if CF_API_TOKEN else [],
             "gemini_enabled": bool(GEMINI_API_KEY),
+            "gemini_decision_orchestrator": GEMINI_DECISION_MODEL if GEMINI_API_KEY else None,
+            "gemini_decision_cooldown_sec": decision_cd,
             "gemma_active_model": getattr(state, "active_gemma_model", None) if GEMINI_API_KEY else None,
             "gemini_active_model": state.active_gemini_model if GEMINI_API_KEY else None,
             "gemini_grounding_cooldown_sec": gemini_cd,
@@ -187,16 +198,16 @@ async def handle_root(request: web.Request) -> web.Response:
         <title>Yukinon Discord Bot - System Telemetry</title>
     </head>
     <body style="font-family: system-ui, sans-serif; max-width: 720px; margin: 36px auto; line-height: 1.6; color: #1f2937; padding: 0 16px;">
-        <h2>❄️ Yukino Yukinoshita Discord Bot (Enterprise, Embed & Interactive UI Edition)</h2>
+        <h2>❄️ Yukino Yukinoshita Discord Bot (Enterprise, Decision-Orchestrated & Multi-Cloud Edition)</h2>
         <p><b>System Time (TH):</b> {m['system_time_th']}</p>
         <p><b>Discord Gateway:</b> {gw_status}</p>
         <p><b>Voice & DAVE E2EE:</b> {d['active_voice_sessions']} active session(s) | DAVE Ready: {d['dave_e2ee_ready']}{edge_cd_note}</p>
         <p><b>Container RAM:</b> {mem['bot_ram_mb']} MB / {mem['render_limit_mb']} MB ({mem['ram_usage_pct']}%) |
            <b>Cached Contexts:</b> {mem['active_chat_channels']} chat(s), {mem['cached_attachments']} file(s)</p>
         <hr style="border: 0; border-top: 1px solid #e5e7eb; margin: 16px 0;">
-        <p><b>Autonomous Agent / OpenClaw:</b> {"Connected" if OPENCLAW_GATEWAY_URL else "Internal 8-Skill Agent Active (OpenClaw Gateway on Standby)"}</p>
-        <p><b>Google AI Studio:</b> {"Enabled (Gemma 4: <code>" + str(ai['gemma_active_model']) + "</code> | Gemini: <code>" + str(ai['gemini_active_model']) + "</code>)" + gemini_cd_note if ai['gemini_enabled'] else "Disabled"}</p>
-        <p><b>Cloudflare Workers AI:</b> {"Enabled (Chat & Vision: <code>" + str(ai['cloudflare_gemma_model']) + "</code> | Image: <code>" + str(ai['cloudflare_image_model']) + "</code>)" if ai['cloudflare_enabled'] else "Disabled"}</p>
+        <p><b>Autonomous Agent / OpenClaw:</b> {"Connected" if OPENCLAW_GATEWAY_URL else "Decision-1 + 8-Skill Agent Active (OpenClaw Gateway on Standby)"}</p>
+        <p><b>Google AI Studio:</b> {"Enabled (Orchestrator: <code>" + str(ai['gemini_decision_orchestrator']) + "</code> | Gemma 4: <code>" + str(ai['gemma_active_model']) + "</code> | Gemini: <code>" + str(ai['gemini_active_model']) + "</code>)" + gemini_cd_note if ai['gemini_enabled'] else "Disabled"}</p>
+        <p><b>Cloudflare Workers AI:</b> {"Enabled (Code: <code>" + CF_CODE_MODEL + "</code> | Fast: <code>" + CF_CHAT_FAST_MODEL + "</code> | Vision/Gemma: <code>" + str(ai['cloudflare_gemma_model']) + "</code> | Image: <code>" + str(ai['cloudflare_image_model']) + "</code>)" if ai['cloudflare_enabled'] else "Disabled"}</p>
         <p><b>Groq LPU Acceleration:</b> {"Enabled (Code: <code>" + GROQ_CODE_MODEL + "</code> | Search: <code>" + str(ai['groq_search_model']) + "</code> | Vision: <code>" + str(ai['groq_vision_model']) + "</code>)" if ai['groq_enabled'] else "Disabled"}</p>
         <p><b>Modal GPU Ollama:</b> {"Configured" if ai['modal_ollama_configured'] else "Not Configured"} (Fallback: <code>{ai['fast_model']}</code>)</p>
         <p><b>Uptime:</b> {m['uptime_human']} ({m['uptime_sec']}s)</p>
@@ -389,7 +400,7 @@ async def on_message(message: discord.Message):
         or bool(ref_msg and URL_REGEX.search(ref_msg.content or ""))
     )
 
-    # 0A. Overtime (OT) Logger & Monthly Table Summarizer with Auto-Disappearing Interactive Buttons
+    # 0A. Overtime (OT) Logger & Monthly Table Summarizer
     if is_ot_command_text(clean_prompt, channel_id=message.channel.id, user_id=message.author.id):
         ot_reply = await process_ot_request(message, clean_prompt)
         rec_date, rec_slot, rec_detail = parse_ot_record_metadata(ot_reply)
@@ -431,13 +442,25 @@ async def on_message(message: discord.Message):
 
     async with message.channel.typing():
         extracted_ctx, spoken_clip_text = await extract_all_context(message)
+        has_code_att = any(a.filename.lower().endswith(CODE_AND_LOG_EXTENSIONS) for a in message.attachments)
 
-        use_coder = detect_coding_intent(
+        # Fast ~200ms Orchestrator pass via Google `gemini-decision-1` (falls back seamlessly to regex if unavailable)
+        decision_plan = await orchestrate_message_with_decision_1(
+            clean_prompt or spoken_clip_text,
+            extracted_ctx=extracted_ctx,
+            has_code_attachment=has_code_att,
+        )
+
+        regex_coder = detect_coding_intent(
             clean_prompt,
             message.attachments,
             message.channel.id,
             extracted_ctx=extracted_ctx,
         )
+        if decision_plan and decision_plan.get("route") == "code" and decision_plan.get("route_confidence", 0.0) >= 0.72:
+            use_coder = True
+        else:
+            use_coder = regex_coder
 
         text_without_urls = URL_REGEX.sub("", clean_prompt).strip()
         if clean_prompt and not text_without_urls and extracted_ctx:
@@ -473,6 +496,7 @@ async def on_message(message: discord.Message):
             allow_agentic_search=(not use_coder),
             has_fresh_attachment=bool(extracted_ctx),
             speaker_user=message.author,
+            decision_plan=decision_plan,
         )
 
         use_reply = should_reply_to_message(
@@ -493,13 +517,14 @@ async def on_message(message: discord.Message):
             return
 
         action_view = None
-        if should_attach_interactive_view(
+        should_attach = should_attach_interactive_view(
             user_request,
             answer,
             use_coder=use_coder,
             did_search=did_search,
             extracted_ctx=extracted_ctx,
-        ):
+        )
+        if should_attach:
             if use_coder:
                 action_view = CodeReviewActionView(message.author.id, message.channel.id, user_request, answer)
             else:

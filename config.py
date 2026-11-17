@@ -62,14 +62,17 @@ GROQ_CHAT_FALLBACK_MODEL = os.getenv("GROQ_CHAT_FALLBACK_MODEL", "openai/gpt-oss
 GROQ_VISION_FALLBACK_MODEL = os.getenv("GROQ_VISION_FALLBACK_MODEL", "qwen/qwen3.8-27b")
 GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3")
 
-# Cloudflare Workers AI Free Tier (10,000 Neurons/day for FLUX Image Gen & Gemma 4 Vision)
+# Cloudflare Workers AI Free Tier (10,000 Neurons/day: FLUX Image, Gemma 4 Vision/Chat, GPT-OSS 120B/20B)
 CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "").strip()
 CF_API_TOKEN = os.getenv("CF_API_TOKEN", "").strip()
 CF_IMAGE_MODEL = os.getenv("CF_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell").strip()
 CF_VISION_MODEL = os.getenv("CF_VISION_MODEL", "@cf/google/gemma-4-26b-a4b-it").strip()
+CF_CODE_MODEL = os.getenv("CF_CODE_MODEL", "@cf/openai/gpt-oss-120b").strip()
+CF_CHAT_FAST_MODEL = os.getenv("CF_CHAT_FAST_MODEL", "@cf/openai/gpt-oss-20b").strip()
 
-# Google AI Studio Free Tier
+# Google AI Studio Free Tier (Decisions API Orchestrator + Gemma 4 + Gemini 3 Flash)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_DECISION_MODEL = os.getenv("GEMINI_DECISION_MODEL", "gemini-decision-1").strip()
 GEMINI_SEARCH_MODEL = os.getenv("GEMINI_SEARCH_MODEL", "gemini-3-flash-preview").strip()
 GEMMA_CHAT_MODEL = os.getenv("GEMMA_CHAT_MODEL", "gemma-4-31b-it").strip()
 GEMMA_VISION_MODEL = os.getenv("GEMMA_VISION_MODEL", "gemma-4-26b-a4b-it").strip()
@@ -132,6 +135,8 @@ class RuntimeState:
         self.active_groq_search_model: str = GROQ_SEARCH_MODEL
         self.active_groq_vision_model: str = GROQ_VISION_FALLBACK_MODEL
         self.gemini_grounding_cooldown_until: float = 0.0
+        self.gemini_decision_cooldown_until: float = 0.0
+        self.cf_gpt_oss_cooldown_until: float = 0.0
         self.edge_tts_cooldown_until: float = 0.0
         self.last_ot_auto_report_ym: str = ""
 
