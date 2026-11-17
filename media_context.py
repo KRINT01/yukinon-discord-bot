@@ -17,6 +17,9 @@ from config import (
     YOUTUBE_PROXY_URL,
     GROQ_API_KEY,
     GEMINI_API_KEY,
+    CF_ACCOUNT_ID,
+    CF_API_TOKEN,
+    CF_VISION_MODEL,
     SAUCENAO_API_KEY,
     OLLAMA_BASE_URL,
     ACTIVE_VISION_MODEL,
@@ -796,7 +799,7 @@ async def _search_saucenao_async(raw_bytes: bytes, filename: str) -> str:
         form.add_field("file", raw_bytes, filename=filename, content_type="application/octet-stream")
         session = get_http_session()
         async with session.post(
-            saucenao_url, data=form, timeout=aiohttp.ClientTimeout(total=10)
+            saucenao_url, data=form, timeout=aiohttp.ClientTimeout(total=6)
         ) as resp:
             if resp.status != 200:
                 return ""
@@ -862,7 +865,7 @@ async def _search_iqdb_keyless_async(raw_bytes: bytes, filename: str) -> str:
             iqdb_url,
             data=form,
             headers={"User-Agent": "Mozilla/5.0"},
-            timeout=aiohttp.ClientTimeout(total=10),
+            timeout=aiohttp.ClientTimeout(total=6),
         ) as resp:
             if resp.status != 200:
                 return ""
@@ -906,7 +909,7 @@ async def _search_tracemoe_async(raw_bytes: bytes, mime_type: str) -> str:
             trace_url,
             data=raw_bytes,
             headers={"Content-Type": mime_type},
-            timeout=aiohttp.ClientTimeout(total=10),
+            timeout=aiohttp.ClientTimeout(total=6),
         ) as resp:
             if resp.status != 200:
                 return ""
@@ -969,67 +972,123 @@ async def extract_multi_images_batch_ocr(
     post_meta_hint: str = "",
 ) -> str:
     """
-    When an X/Twitter or Pixiv post contains 2-4 sequential comic/illustration pages,
-    inspects ALL pages together in ONE Gemini Flash multi-image request (~4-6s total)
-    so the series title (e.g., Blue Archive, Uma Musume), all characters (e.g., Ako, Noa, Hina),
-    and the cross-page narrative are recognized together instead of running 4 slow isolated OCRs.
+    Inspects 2-4 sequential comic/illustration pages together in a SINGLE multimodal batch call
+    so the series title, exact character cast, and cross-page story stay 100% consistent without
+    hallucinating new characters on later pages:
+    - Tier 1: Gemini 3 Flash (`thinkingBudget: 0`, `896px` @ `q=82`, `35s` timeout)
+    - Tier 2: Cloudflare Workers AI `@cf/google/gemma-4-26b-a4b-it` (multi-image chat completions)
     """
-    if not GEMINI_API_KEY or len(images_list) < 2:
+    if len(images_list) < 2:
         return ""
 
-    parts = [
-        {
-            "text": (
-                "You are analyzing a sequential multi-image post/comic (Pages 1 to "
-                f"{len(images_list)}) for Yukino Yukinoshita.\n"
-                + (f"Post Metadata / Caption Context:\n{post_meta_hint[:1000]}\n\n" if post_meta_hint else "")
-                + "Examine ALL pages together in order so you accurately identify:\n"
-                "1. [Series / Franchise & Character Identification]:\n"
-                "   - State the exact Anime, Game, or Manga franchise and Character names if recognizable "
-                "(check visual details like halos above heads -> Blue Archive, school uniforms, hair ornaments, "
-                "and any character names or ship portmanteaus in the post caption such as ノアコ = Noa & Ako).\n"
-                "2. [Page-by-Page Story & Panel-by-Panel Dialogue/SFX (Right-to-Left, Top-to-Bottom)]:\n"
-                "   - For each page (Page 1, Page 2, ...), summarize the visual events and list all dialogue, thoughts, "
-                "and key SFX in Japanese reading order tagged with the speaker."
-            )
-        }
-    ]
-    for idx, (raw_b, fname, _) in enumerate(images_list[:4], 1):
+    batch_prompt = (
+        f"You are analyzing a sequential multi-image post/comic (Pages 1 to {len(images_list)}) for Yukino Yukinoshita.\n"
+        + (f"Post Metadata / Caption Context:\n{post_meta_hint[:1000]}\n\n" if post_meta_hint else "")
+        + "Examine ALL pages together in sequence so you maintain strict character consistency across every page:\n"
+        "1. [Series / Franchise & Character Identification]:\n"
+        "   - State the Anime, Game, or Manga franchise and Character names ONLY if clearly supported by visual cues "
+        "(e.g., halos -> Blue Archive) or the post caption (e.g., ノアコ = Noa & Ako).\n"
+        "   - CRITICAL ANTI-HALLUCINATION RULE: Keep the SAME characters consistent across pages! "
+        "NEVER invent or guess extra characters from the same franchise (such as Arona, Ui, or Shiroko) unless they are clearly and unmistakably drawn in that panel.\n"
+        "2. [Page-by-Page Story & Panel-by-Panel Dialogue/SFX (Right-to-Left, Top-to-Bottom)]:\n"
+        "   - For each page (Page 1, Page 2, ...), summarize the visual events and list all dialogue, thoughts, "
+        "and key SFX in Japanese reading order tagged with the speaker."
+    )
+
+    encoded_images: list[tuple[str, str, str]] = []
+    for raw_b, fname, _ in images_list[:4]:
         try:
-            b64_str, mime_type, _ = await asyncio.to_thread(_compress_image_for_vision_ocr_sync, raw_b, 1024, 86)
-            parts.append({"text": f"=== Image {idx}/{len(images_list)} (`{fname}`) ==="})
-            parts.append({"inlineData": {"mimeType": mime_type, "data": b64_str}})
+            b64_str, mime_type, _ = await asyncio.to_thread(_compress_image_for_vision_ocr_sync, raw_b, 896, 82)
+            encoded_images.append((b64_str, mime_type, fname))
         except Exception:
             continue
 
-    if len(parts) < 3:
+    if len(encoded_images) < 2:
         return ""
 
-    payload = {
-        "contents": [{"parts": parts}],
-        "generationConfig": {
+    # Tier 1: Gemini 3 Flash Multi-Image Batch (`thinkingBudget: 0` for fast ~6-10s response)
+    if GEMINI_API_KEY:
+        parts = [{"text": batch_prompt}]
+        for idx, (b64_img, mime_type, fname) in enumerate(encoded_images, 1):
+            parts.append({"text": f"=== Image {idx}/{len(encoded_images)} (`{fname}`) ==="})
+            parts.append({"inlineData": {"mimeType": mime_type, "data": b64_img}})
+
+        payload = {
+            "contents": [{"parts": parts}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 2048,
+                "thinkingConfig": {"thinkingBudget": 0},
+            },
+        }
+        try:
+            data = await call_gemini_generate_content_self_healing(
+                payload, timeout_sec=35, purpose=f"MultiImageOCR({len(encoded_images)}p)"
+            )
+            if data:
+                resp_parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                out_txt = "\n".join(p.get("text", "") for p in resp_parts if p.get("text")).strip()
+                out_txt = re.sub(r"<think>[\s\S]*?</think>", "", out_txt).strip()
+                if out_txt:
+                    return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{out_txt}"
+        except Exception as e:
+            api_log(f"MultiImageOCR Tier 1 Gemini -> fallback to Tier 2 CF ({type(e).__name__})")
+
+    # Tier 2: Cloudflare Workers AI Gemma 4 Multi-Image Batch
+    if CF_ACCOUNT_ID and CF_API_TOKEN:
+        cf_host = "api." + "cloudflare.com"
+        cf_chat_url = f"{HTTPS}{cf_host}/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {CF_API_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        user_content: list[dict] = [{"type": "text", "text": batch_prompt}]
+        for idx, (b64_img, mime_type, fname) in enumerate(encoded_images, 1):
+            user_content.append({"type": "text", "text": f"=== Image {idx}/{len(encoded_images)} (`{fname}`) ==="})
+            user_content.append({"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}})
+
+        cf_payload = {
+            "model": CF_VISION_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Respond directly and concisely with the requested analysis. Do NOT output internal thinking steps.",
+                },
+                {"role": "user", "content": user_content},
+            ],
             "temperature": 0.1,
-            "maxOutputTokens": 3072,
-            "thinkingConfig": {"thinkingBudget": 128},
-        },
-    }
-    try:
-        data = await call_gemini_generate_content_self_healing(
-            payload, timeout_sec=22, purpose=f"MultiImageOCR({len(images_list)}p)"
-        )
-        if data:
-            resp_parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-            out_txt = "\n".join(p.get("text", "") for p in resp_parts if p.get("text")).strip()
-            out_txt = re.sub(r"<think>[\s\S]*?</think>", "", out_txt).strip()
-            if out_txt:
-                return f"=== Unified Multi-Image Visual & OCR Analysis ({len(images_list)} Images) ===\n{out_txt}"
-    except Exception as e:
-        api_log(f"MultiImageOCR -> fallback to per-image OCR ({type(e).__name__})")
+            "max_tokens": 2048,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        t0 = time.monotonic()
+        try:
+            session = get_http_session()
+            async with session.post(
+                cf_chat_url, headers=headers, json=cf_payload, timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                elapsed = time.monotonic() - t0
+                if resp.status == 200:
+                    data = await resp.json()
+                    choices = data.get("choices") or []
+                    if choices:
+                        content = (choices[0].get("message") or {}).get("content") or ""
+                        content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+                        if content:
+                            api_log(f"MultiImageOCR (Tier 2 CF) -> {CF_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
+                            return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{content}"
+                api_log(f"MultiImageOCR (Tier 2 CF) -> HTTP {resp.status} ({elapsed:.2f}s)")
+        except Exception as e:
+            api_log(f"MultiImageOCR (Tier 2 CF) -> fallback to per-image OCR ({type(e).__name__})")
+
     return ""
 
 
 async def extract_image_via_transient_ocr(
-    raw_bytes: bytes, filename: str, run_source_lookup: bool = True
+    raw_bytes: bytes,
+    filename: str,
+    run_source_lookup: bool = True,
+    post_meta_hint: str = "",
+    page_label: str = "",
 ) -> str:
     try:
         b64_img, mime_type, is_color_img = await asyncio.to_thread(
@@ -1040,20 +1099,28 @@ async def extract_image_via_transient_ocr(
         mime_type = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
         is_color_img = True
 
+    context_header = ""
+    if page_label or post_meta_hint:
+        context_header = (
+            f"Context Note ({page_label or 'Single Image'}):\n"
+            + (f"{post_meta_hint[:600]}\n" if post_meta_hint else "")
+            + "Keep character identities consistent with the post caption/context above.\n\n"
+        )
+
     ocr_prompt = (
+        f"{context_header}"
         "Analyze this image thoroughly so Yukino Yukinoshita can understand the exact visual story, "
         "series/character identity, speaker attribution, and source.\n"
         "Provide your output in 3 concise, well-structured sections:\n"
         "1. [Identification & Panel-by-Panel Visual Context]:\n"
-        "   - If Comic / Manga / Fanart: Identify the Anime/Game/Manga Series and Character names if recognizable "
-        "(inspect visual cues like halos above heads -> Blue Archive, school uniforms, hair ornaments, eyes; do NOT guess randomly if unsure). "
-        "Describe what is happening visually in each panel in traditional Japanese reading order (Top-to-Bottom, Right-to-Left), "
-        "including character expressions, body language, who is speaking or thinking each line, and the punchline.\n"
+        "   - If Comic / Manga / Fanart: Identify the Anime/Game/Manga Series and Character names ONLY if clearly supported by "
+        "unmistakable visual features or the post caption above. NEVER guess or invent other characters from the same franchise "
+        "when a character is distorted or ambiguous—describe them by appearance or as the same character from the caption instead! "
+        "Describe what is happening visually in each panel in traditional Japanese reading order (Top-to-Bottom, Right-to-Left).\n"
         "   - If Code / Terminal / Stack Trace / UI Screenshot: Describe the exact error message, HTTP status, UI component, or terminal output shown.\n"
         "   - If Real-World Photo/Product/Hardware: Identify the Brand, Product Line, Model Name/Number, and distinguishing physical features.\n"
         "2. [Ordered Dialogue & Verbatim OCR Text]:\n"
-        "   - For comics/manga: List the dialogue and SFX in reading order (Right-to-Left, Top-to-Bottom) tagged with the speaker "
-        "(e.g., `[Panel 1 - Ako]: ...`, `[Panel 2 - Noa]: ...`, `[SFX]: ...`).\n"
+        "   - For comics/manga: List the dialogue and SFX in reading order (Right-to-Left, Top-to-Bottom) tagged with the speaker.\n"
         "   - Transcribe ALL visible text (Thai, Japanese, English, code, error codes) verbatim, paying close attention to Thai tone marks/vowels.\n"
         "3. [WEB_VERIFY_QUERY]: On the very last line, ONLY if the image contains actual spoken dialogue or product model text (NEVER pure comic sound effects like タッ or ドシッ!), output:\n"
         "   `[WEB_VERIFY_QUERY: <exact verbatim dialogue quote or product model — NEVER pure SFX and NEVER a guessed title>]`"
@@ -1163,7 +1230,7 @@ async def extract_image_via_transient_ocr(
 
         if saucenao_txt:
             out_parts.append(saucenao_txt)
-        else:
+        elif not post_meta_hint:
             iqdb_txt = await _search_iqdb_keyless_async(raw_bytes, filename)
             if iqdb_txt:
                 out_parts.append(iqdb_txt)
@@ -1281,12 +1348,19 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
                     has_code_file = True
                 blocks.append(batch_vis)
         if processed_image_count == 0:
-            for img_b, img_fn, _ in image_att_batch:
+            total_att_imgs = len(image_att_batch)
+            for idx, (img_b, img_fn, _) in enumerate(image_att_batch, 1):
                 processed_image_count += 1
-                ocr_out = await extract_image_via_transient_ocr(img_b, img_fn, run_source_lookup=True)
+                ocr_out = await extract_image_via_transient_ocr(
+                    img_b,
+                    img_fn,
+                    run_source_lookup=(idx == 1),
+                    post_meta_hint=message.content or "",
+                    page_label=f"Page {idx} of {total_att_imgs}" if total_att_imgs > 1 else "",
+                )
                 if STACK_TRACE_SIGNATURE_REGEX.search(ocr_out):
                     has_code_file = True
-                blocks.append(f"=== Image Inspection & Source Lookup (`{img_fn}`) ===\n{ocr_out}")
+                blocks.append(f"=== Image #{idx} Inspection & Source Lookup (`{img_fn}`) ===\n{ocr_out}")
         image_att_batch.clear()
 
     embed_images, embed_meta_sections, handled_social_urls = await collect_embedded_images_and_metadata(
@@ -1298,9 +1372,11 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
     if embed_images and processed_image_count < 4:
         remaining_slots = 4 - processed_image_count
         target_embed_imgs = embed_images[:remaining_slots]
+        meta_hint = "\n".join(embed_meta_sections)
+        has_known_post_meta = bool(meta_hint.strip())
         batch_done = False
+
         if len(target_embed_imgs) >= 2:
-            meta_hint = "\n".join(embed_meta_sections)
             batch_vis = await extract_multi_images_batch_ocr(target_embed_imgs, post_meta_hint=meta_hint)
             if batch_vis:
                 processed_image_count += len(target_embed_imgs)
@@ -1310,12 +1386,21 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
                 batch_done = True
 
         if not batch_done:
+            total_emb_imgs = len(target_embed_imgs)
             for idx, (emb_bytes, emb_fname, emb_url) in enumerate(target_embed_imgs, 1):
                 if processed_image_count >= 4:
                     break
                 processed_image_count += 1
                 try:
-                    ocr_out = await extract_image_via_transient_ocr(emb_bytes, emb_fname, run_source_lookup=True)
+                    # Skip redundant reverse-image lookups when FxTwitter/Pixiv already provided the exact source post
+                    do_lookup = (not has_known_post_meta) and (idx == 1)
+                    ocr_out = await extract_image_via_transient_ocr(
+                        emb_bytes,
+                        emb_fname,
+                        run_source_lookup=do_lookup,
+                        post_meta_hint=meta_hint,
+                        page_label=f"Page {idx} of {total_emb_imgs}" if total_emb_imgs > 1 else "",
+                    )
                     if STACK_TRACE_SIGNATURE_REGEX.search(ocr_out):
                         has_code_file = True
                     blocks.append(

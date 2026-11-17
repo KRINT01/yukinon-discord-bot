@@ -123,11 +123,6 @@ def _compact_messages_for_token_budget(messages: list, max_est_tokens: int = 450
 # GOOGLE GEMINI 4 HYDROGEN SPECIALIST (`gemini-4-hydrogen` — 5 RPM, 250K TPM, 20 RPD)
 # ==============================================================================
 def _can_use_gemini_hydrogen() -> bool:
-    """
-    Enforces `gemini-4-hydrogen`'s strict 5 RPM / 20 RPD envelope with a 2-request
-    daily safety reserve (max 18 RPD) and sliding 60s RPM window so it never wastes
-    quota or stalls on 429s, falling back cleanly when saturated.
-    """
     if not GEMINI_API_KEY or not GEMINI_HEAVY_MODEL:
         return False
     now = time.time()
@@ -162,11 +157,6 @@ def _record_gemini_hydrogen_call():
 async def call_gemini_hydrogen_generate(
     payload: dict, timeout_sec: int = 75, purpose: str = "HydrogenHeavy"
 ) -> dict | None:
-    """
-    Executes a high-context multimodal or text request on `gemini-4-hydrogen` (250K TPM).
-    Automatically updates cooldowns/RPD counters and returns None on any error so callers
-    seamlessly fall back to Gemini Flash / Groq / Gemma 4.
-    """
     if not _can_use_gemini_hydrogen():
         return None
 
@@ -230,10 +220,6 @@ async def call_gemini_hydrogen_chat(
     max_output_tokens: int = 4096,
     purpose: str = "HydrogenChat",
 ) -> str:
-    """
-    Sends full untrimmed conversation + large document/code context (~up to 120K chars)
-    to `gemini-4-hydrogen` (250K TPM), returning the clean text output or `""` on fallback.
-    """
     if not _can_use_gemini_hydrogen():
         return ""
 
@@ -554,14 +540,16 @@ async def discover_active_gemma_models(vision_required: bool = False) -> list[st
     return candidates or list(dict.fromkeys(x for x in default_list if x))
 
 
-async def _discover_active_gemini_flash_model() -> list[str]:
+async def _discover_active_gemini_flash_model(skip_remote_if_known: bool = True) -> list[str]:
     candidates = [
         state.active_gemini_model,
         "gemini-3-flash-preview",
         "gemini-flash-latest",
     ]
-    if not GEMINI_API_KEY:
-        return candidates
+    seen = set()
+    deduped = [x for x in candidates if x and not (x in seen or seen.add(x))]
+    if not GEMINI_API_KEY or (skip_remote_if_known and deduped):
+        return deduped
 
     list_url = clean_url(
         f"{HTTPS}generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
@@ -571,22 +559,19 @@ async def _discover_active_gemini_flash_model() -> list[str]:
         async with session.get(list_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                api_models = []
                 for m in data.get("models") or []:
                     name = (m.get("name") or "").replace("models/", "")
                     lower_name = name.lower()
                     methods = m.get("supportedGenerationMethods") or []
                     if "generateContent" in methods and "flash" in lower_name:
                         if not any(bad in lower_name for bad in GEMINI_EXCLUDED_SUBSTRINGS):
-                            api_models.append(name)
-                for m_name in api_models:
-                    if m_name not in candidates:
-                        candidates.append(m_name)
+                            if name not in seen:
+                                seen.add(name)
+                                deduped.append(name)
     except Exception as e:
         print(f"Gemini model auto-discovery warning: {e}")
 
-    seen = set()
-    return [x for x in candidates if x and not (x in seen or seen.add(x))]
+    return deduped
 
 
 # ==============================================================================
@@ -793,7 +778,7 @@ async def call_gemini_generate_content_self_healing(
     if not GEMINI_API_KEY:
         return None
 
-    candidate_models = await _discover_active_gemini_flash_model()
+    candidate_models = await _discover_active_gemini_flash_model(skip_remote_if_known=True)
     tried = set()
 
     session = get_http_session()
@@ -1258,7 +1243,7 @@ async def query_local_ollama_chat(
         or RECENCY_INTENT_REGEX.search(raw_user_query)
     )
     is_japanese_or_social_media = bool(
-        re.search(r"=== (?:Embedded (?:X|Pixiv|Bluesky)|Image Inspection|Unified Multi-Image)", prompt)
+        re.search(r"=== (?:Embedded (?:X|Pixiv|Bluesky)|Image (?:#\d+ )?Inspection|Unified Multi-Image)", prompt)
         or re.search(r"[ぁ-んァ-ヶ一-龯]", prompt)
     )
 
@@ -1426,14 +1411,15 @@ async def query_local_ollama_chat(
             target_temp = 0.2 if (did_search or is_user_correction) else temperature
 
             if is_japanese_or_social_media:
-                ans = await call_gemma_ai_studio_chat(
-                    messages, temperature=target_temp, max_output_tokens=1800, purpose="MangaSocialChat"
+                # Cloudflare Gemma 4 26B runs in ~9-13s with zero free-tier prefill timeout; AI Studio Gemma 4 is fallback
+                ans = await call_cloudflare_gemma_chat(
+                    messages, temperature=target_temp, max_tokens=1800, purpose="MangaSocialChat"
                 )
                 if ans:
                     return ans
 
-                ans = await call_cloudflare_gemma_chat(
-                    messages, temperature=target_temp, max_tokens=1800, purpose="MangaSocialChat"
+                ans = await call_gemma_ai_studio_chat(
+                    messages, temperature=target_temp, max_output_tokens=1800, purpose="MangaSocialChat"
                 )
                 if ans:
                     return ans
@@ -1457,14 +1443,14 @@ async def query_local_ollama_chat(
                 return ans
 
             if not is_japanese_or_social_media:
-                ans = await call_gemma_ai_studio_chat(
-                    messages, temperature=target_temp, max_output_tokens=1800, purpose="FactSearchChat"
+                ans = await call_cloudflare_gemma_chat(
+                    messages, temperature=target_temp, max_tokens=1800, purpose="FactSearchChat"
                 )
                 if ans:
                     return ans
 
-                ans = await call_cloudflare_gemma_chat(
-                    messages, temperature=target_temp, max_tokens=1800, purpose="FactSearchChat"
+                ans = await call_gemma_ai_studio_chat(
+                    messages, temperature=target_temp, max_output_tokens=1800, purpose="FactSearchChat"
                 )
                 if ans:
                     return ans
@@ -1480,14 +1466,14 @@ async def query_local_ollama_chat(
         # PATH C: Casual Chat, Weather & Voice Chat
         chat_temp = 0.25 if (did_search or is_user_correction or is_weather_query) else temperature
 
-        ans = await call_gemma_ai_studio_chat(
-            messages, temperature=chat_temp, max_output_tokens=1024, purpose="Chat"
+        ans = await call_cloudflare_gemma_chat(
+            messages, temperature=chat_temp, max_tokens=1024, purpose="Chat"
         )
         if ans:
             return ans
 
-        ans = await call_cloudflare_gemma_chat(
-            messages, temperature=chat_temp, max_tokens=1024, purpose="Chat"
+        ans = await call_gemma_ai_studio_chat(
+            messages, temperature=chat_temp, max_output_tokens=1024, purpose="Chat"
         )
         if ans:
             return ans
