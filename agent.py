@@ -317,7 +317,10 @@ Break down the user's goal into logical steps. At each turn, output ONLY valid J
             if decided_action and dec_conf >= 0.65:
                 step_messages.append({
                     "role": "system",
-                    "content": f"[Orchestrator Hint]: The selected tool for this step is `{decided_action}`. Output ONLY the JSON object with `"action": "{decided_action}"` and its exact `"args"`. ",
+                    "content": (
+                        f'[Orchestrator Hint]: The selected tool for this step is `{decided_action}`. '
+                        f'Output ONLY the JSON object with `"action": "{decided_action}"` and its exact `"args"`.'
+                    ),
                 })
             raw_plan = await _call_agent_planner_llm(step_messages)
             json_m = re.search(r"\{[\s\S]*\}", raw_plan or "")
