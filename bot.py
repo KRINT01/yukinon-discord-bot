@@ -1,7 +1,6 @@
 import os
 import re
 import time
-import calendar
 import asyncio
 import platform
 from datetime import datetime
@@ -38,6 +37,7 @@ from config import (
     MANGA_TRANSLATE_INTENT_PATTERN,
     IMAGE_GEN_INTENT_PATTERN,
     AGENTIC_IMAGE_TAG_REGEX,
+    PURE_DATETIME_PATTERN,
     intents,
     channel_memory,
     channel_last_attachment,
@@ -50,6 +50,7 @@ from config import (
     close_http_session,
 )
 from persona import (
+    is_owner_user,
     get_current_thai_datetime_str,
     try_instant_datetime_reply,
     should_reply_to_message,
@@ -63,6 +64,7 @@ from user_memory import (
     is_ot_command_text,
     process_ot_request,
     build_monthly_ot_summary_markdown,
+    _parse_stored_ot_date,
     user_profiles,
 )
 from search_engine import detect_coding_intent
@@ -82,6 +84,14 @@ from voice_engine import (
 from agent import (
     run_autonomous_agent_loop,
     process_yukipedia_request,
+)
+from ui_interactions import (
+    CodeReviewActionView,
+    OTActionView,
+    build_contextual_suggestion_view,
+    parse_ot_record_metadata,
+    get_previous_month_info,
+    register_app_commands,
 )
 
 
@@ -209,14 +219,18 @@ async def handle_healthz(request: web.Request) -> web.Response:
 
 @tasks.loop(minutes=15)
 async def monthly_ot_auto_report_task():
-    """Automatically posts the monthly OT summary table at 21:00 ICT on the last day of each month."""
+    """
+    Automatically posts the previous month's complete OT summary table
+    on the 1st of the new month at 09:00 ICT (Asia/Bangkok).
+    """
     if not bot.is_ready():
         return
     now_th = datetime.now(ZoneInfo("Asia/Bangkok"))
-    last_day = calendar.monthrange(now_th.year, now_th.month)[1]
-    ym_key = f"{now_th.year:04d}-{now_th.month:02d}"
+    prev_year, prev_month, prev_month_label = get_previous_month_info(now_th)
+    ym_key = f"{prev_year:04d}-{prev_month:02d}"
 
-    if now_th.day != last_day or now_th.hour < 21 or state.last_ot_auto_report_ym == ym_key:
+    # Trigger on the 1st day of the new month starting at 09:00 ICT
+    if now_th.day != 1 or now_th.hour < 9 or state.last_ot_auto_report_ym == ym_key:
         return
 
     state.last_ot_auto_report_ym = ym_key
@@ -234,16 +248,17 @@ async def monthly_ot_auto_report_task():
 
     for uid_str, prof in list(user_profiles.items()):
         ot_logs = prof.get("ot_logs") or []
-        has_month_data = any(
-            (pk := (int(e["date"].split("/")[2]) - 543, int(e["date"].split("/")[1])))
-            and pk[0] == now_th.year and pk[1] == now_th.month
-            for e in ot_logs if "/" in str(e.get("date", ""))
+        has_prev_month_data = any(
+            (pk := _parse_stored_ot_date(e.get("date", ""))) is not None
+            and pk[0] == prev_year
+            and pk[1] == prev_month
+            for e in ot_logs
         )
-        if has_month_data:
-            summary_md = build_monthly_ot_summary_markdown(ot_logs, now_th.year, now_th.month)
+        if has_prev_month_data:
+            summary_md = build_monthly_ot_summary_markdown(ot_logs, prev_year, prev_month)
             await send_chunked_response(
                 target_channel,
-                f"📅 **[สรุปยอด OT อัตโนมัติประจำสิ้นเดือน]**\n{summary_md}",
+                f"📅 **[สรุปยอด OT ประจำเดือน{prev_month_label} — รายงานอัตโนมัติวันที่ 1 ของเดือนใหม่]**\n{summary_md}",
             )
 
 
@@ -253,6 +268,7 @@ class YukinonBot(commands.Bot):
         self.web_runner = None
 
     async def setup_hook(self):
+        register_app_commands(self)
         state.http_session = aiohttp.ClientSession()
         app = web.Application()
         app.router.add_get("/", handle_root)
@@ -290,6 +306,30 @@ async def on_ready():
     if not monthly_ot_auto_report_task.is_running():
         monthly_ot_auto_report_task.start()
     print(f"Logged in as {bot.user} on {platform.machine()} at {get_current_thai_datetime_str()}", flush=True)
+
+
+async def _send_response_with_interactive_view(
+    channel: discord.abc.Messageable,
+    answer: str,
+    view: discord.ui.View | None,
+    reply_to: discord.Message | None = None,
+):
+    """Sends a text response with interactive UI buttons attached cleanly."""
+    if not answer or not answer.strip():
+        return
+    if len(answer) <= 1900:
+        if reply_to is not None:
+            try:
+                await reply_to.reply(answer, view=view, mention_author=False)
+                return
+            except Exception:
+                pass
+        await channel.send(answer, view=view)
+        return
+
+    await send_chunked_response(channel, answer, reply_to=reply_to)
+    if view is not None:
+        await channel.send("-# ตัวเลือกดำเนินการเพิ่มเติม:", view=view)
 
 
 @bot.event
@@ -341,10 +381,16 @@ async def on_message(message: discord.Message):
     all_msg_atts = list(message.attachments) + (list(ref_msg.attachments) if ref_msg else [])
     has_image_att = any(a.filename.lower().endswith(config.IMAGE_EXTENSIONS) for a in all_msg_atts)
 
-    # 0A. Overtime (OT) Logger & Monthly Table Summarizer
+    # 0A. Overtime (OT) Logger & Monthly Table Summarizer with Interactive Buttons
     if is_ot_command_text(clean_prompt, channel_id=message.channel.id, user_id=message.author.id):
         ot_reply = await process_ot_request(message, clean_prompt)
-        await send_chunked_response(message.channel, ot_reply, reply_to=message)
+        rec_date, rec_slot, rec_detail = parse_ot_record_metadata(ot_reply)
+        ot_view = (
+            OTActionView(message.author.id, rec_date, rec_slot, rec_detail)
+            if rec_date
+            else OTActionView(message.author.id)
+        )
+        await _send_response_with_interactive_view(message.channel, ot_reply, ot_view, reply_to=message)
         return
 
     # 0. Natural Chat "Yukipedia Mode" Trigger
@@ -391,7 +437,7 @@ async def on_message(message: discord.Message):
         use_coder = detect_coding_intent(full_prompt, message.attachments, message.channel.id)
         model = ACTIVE_CODE_MODEL if use_coder else ACTIVE_FAST_MODEL
         sys_prompt = CODE_SYSTEM_PROMPT if use_coder else FAST_SYSTEM_PROMPT
-        answer, _ = await query_local_ollama_chat(
+        answer, did_search = await query_local_ollama_chat(
             full_prompt,
             model=model,
             system_prompt=sys_prompt,
@@ -419,10 +465,38 @@ async def on_message(message: discord.Message):
             )
             return
 
-        await send_chunked_response(message.channel, answer, reply_to=reply_target)
+        # Attach contextual interactive buttons for code reviews OR substantial informational/suggestion replies
+        action_view = None
+        if use_coder:
+            action_view = CodeReviewActionView(message.author.id, message.channel.id, user_request, answer)
+        elif (did_search or extracted_ctx or len(answer) >= 240) and not PURE_DATETIME_PATTERN.search(user_request):
+            action_view = build_contextual_suggestion_view(message.channel.id, user_request, answer)
+
+        await _send_response_with_interactive_view(message.channel, answer, action_view, reply_to=reply_target)
         await maybe_react_to_discord_message(message, raw_llm_output=answer, user_text=user_request)
         if has_audio and not use_coder:
             await speak_in_voice_channel(message.guild, answer, fallback_channel=message.channel)
+
+
+@bot.command(name="sync")
+async def sync_app_commands(ctx, scope: str = "guild"):
+    """Owner-only command to sync Slash Commands & Context Menus with Discord."""
+    if not is_owner_user(ctx.author):
+        await ctx.send("คำสั่งนี้สงวนไว้สำหรับเจ้าของบอทเท่านั้นนะคะ")
+        return
+    try:
+        if scope.strip().lower() == "global":
+            synced = await bot.tree.sync()
+            await ctx.send(f"❄️ ซิงค์ Slash Commands & Context Menus แบบ **Global** เรียบร้อยแล้วค่ะ (`{len(synced)}` รายการ — อาจใช้เวลาสูงสุด 1 ชม. ในการอัปเดตทุกเซิร์ฟเวอร์)")
+        elif ctx.guild:
+            bot.tree.copy_global_to(guild=ctx.guild)
+            synced = await bot.tree.sync(guild=ctx.guild)
+            await ctx.send(f"❄️ ซิงค์ Slash Commands & Context Menus เข้าสู่เซิร์ฟเวอร์ **`{ctx.guild.name}`** ทันทีเรียบร้อยแล้วค่ะ (`{len(synced)}` รายการ)")
+        else:
+            synced = await bot.tree.sync()
+            await ctx.send(f"❄️ ซิงค์ Global Commands เรียบร้อยแล้วค่ะ (`{len(synced)}` รายการ)")
+    except Exception as e:
+        await ctx.send(f"เกิดข้อผิดพลาดระหว่างซิงค์คำสั่งค่ะ (`{type(e).__name__}: {e}`)")
 
 
 @bot.command(name="join")
@@ -562,7 +636,7 @@ async def ask_fast(ctx, *, prompt: str = ""):
             "ช่วยตรวจสอบ สรุปเนื้อหา และบอกความรู้สึกหรือความคิดเห็นของเธอต่อสิ่งที่แนบมาให้หน่อย" if ctx_text else "สวัสดี"
         )
         is_dt = (not ctx_text) and (try_instant_datetime_reply(effective_prompt) is not None)
-        answer, _ = await query_local_ollama_chat(
+        answer, did_search = await query_local_ollama_chat(
             f"{effective_prompt}\n\n{ctx_text}" if ctx_text else effective_prompt,
             ACTIVE_FAST_MODEL,
             FAST_SYSTEM_PROMPT,
@@ -573,7 +647,12 @@ async def ask_fast(ctx, *, prompt: str = ""):
         use_reply = should_reply_to_message(
             effective_prompt, has_attachments=bool(ctx_text), is_instant_datetime=is_dt
         )
-        await send_chunked_response(ctx, answer, reply_to=ctx.message if use_reply else None)
+        view = (
+            build_contextual_suggestion_view(ctx.channel.id, effective_prompt, answer)
+            if (did_search or ctx_text or len(answer) >= 240) and not is_dt
+            else None
+        )
+        await _send_response_with_interactive_view(ctx.channel, answer, view, reply_to=ctx.message if use_reply else None)
 
 
 @bot.command(name="code", aliases=["review", "diff", "trace"])
@@ -590,7 +669,8 @@ async def ask_code(ctx, *, prompt: str = "วิเคราะห์โค้�
             has_fresh_attachment=bool(ctx_text),
             speaker_user=ctx.author,
         )
-        await send_chunked_response(ctx, answer, reply_to=ctx.message)
+        view = CodeReviewActionView(ctx.author.id, ctx.channel.id, prompt, answer)
+        await _send_response_with_interactive_view(ctx.channel, answer, view, reply_to=ctx.message)
 
 
 @bot.command(name="source", aliases=["sauce", "whatis", "วาร์ป"])
@@ -618,7 +698,8 @@ async def source_command(ctx, *, question: str = ""):
             has_fresh_attachment=True,
             speaker_user=ctx.author,
         )
-        await send_chunked_response(ctx, answer, reply_to=ctx.message)
+        view = build_contextual_suggestion_view(ctx.channel.id, user_q, answer)
+        await _send_response_with_interactive_view(ctx.channel, answer, view, reply_to=ctx.message)
 
 
 @bot.command(name="status", aliases=["stat", "ping", "ram"])
@@ -688,7 +769,13 @@ async def ot_command(ctx, *, args: str = ""):
     if query and not is_ot_command_text(query, channel_id=ctx.channel.id, user_id=ctx.author.id):
         query = f"จด OT {query}"
     reply = await process_ot_request(ctx.message, query or "สรุป OT")
-    await send_chunked_response(ctx, reply, reply_to=ctx.message)
+    rec_date, rec_slot, rec_detail = parse_ot_record_metadata(reply)
+    ot_view = (
+        OTActionView(ctx.author.id, rec_date, rec_slot, rec_detail)
+        if rec_date
+        else OTActionView(ctx.author.id)
+    )
+    await _send_response_with_interactive_view(ctx.channel, reply, ot_view, reply_to=ctx.message)
 
 
 @bot.command(name="agent", aliases=["claw", "auto"])
