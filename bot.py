@@ -440,19 +440,39 @@ async def on_message(message: discord.Message):
 
     async with message.channel.typing():
         extracted_ctx, spoken_clip_text = await extract_all_context(message)
-        if clean_prompt or spoken_clip_text:
+
+        # Determine coding intent strictly from user's own text + attachments + stack trace signatures
+        # (NEVER from general OCR descriptions or web search snippets!)
+        use_coder = detect_coding_intent(
+            clean_prompt,
+            message.attachments,
+            message.channel.id,
+            extracted_ctx=extracted_ctx,
+        )
+
+        # Build natural default instruction if the user sent ONLY a link or ONLY an attachment with no question
+        text_without_urls = URL_REGEX.sub("", clean_prompt).strip()
+        if clean_prompt and not text_without_urls and extracted_ctx:
+            user_request = (
+                f"{clean_prompt}\n"
+                "(ผู้ใช้ส่งลิงก์มาให้ ช่วยตรวจสอบเนื้อหา แคปชัน และภาพในลิงก์นี้ สรุปบริบทหรือแปลข้อความสำคัญอย่างเป็นธรรมชาติ "
+                "และแสดงความคิดเห็นในสไตล์ยูกิโนะให้หน่อย โดยห้ามสร้างตาราง Markdown)"
+            )
+        elif clean_prompt or spoken_clip_text:
             user_request = clean_prompt or spoken_clip_text
         elif message.stickers:
             stk_names = ", ".join(s.name for s in message.stickers)
             user_request = f"(ผู้ใช้ส่งสติกเกอร์ `{stk_names}` มาให้ ช่วยตอบโต้หรือแสดงความเห็นต่อสติกเกอร์นี้ในสไตล์ยูกิโนะ)"
         elif extracted_ctx:
-            user_request = "ช่วยตรวจสอบ วิเคราะห์จุดบกพร่องหรือหา Root Cause และสรุปแนวทางแก้ไขสำหรับสิ่งที่แนบมาให้หน่อย"
+            if use_coder:
+                user_request = "ช่วยตรวจสอบ วิเคราะห์จุดบกพร่องหรือหา Root Cause และสรุปแนวทางแก้ไขสำหรับสิ่งที่แนบมาให้หน่อย"
+            else:
+                user_request = "ช่วยตรวจสอบ สรุปเนื้อหา และบอกความรู้สึกหรือความคิดเห็นของเธอต่อสิ่งที่แนบมาให้หน่อย"
         else:
             user_request = "สวัสดี (ทักทายกลับตามธรรมชาติในสไตล์ยูกิโนะ)"
 
         extra_blocks = "\n\n".join(b for b in (mentioned_dossier, extracted_ctx) if b)
         full_prompt = f"{user_request}\n\n{extra_blocks}" if extra_blocks else user_request
-        use_coder = detect_coding_intent(full_prompt, message.attachments, message.channel.id)
         model = ACTIVE_CODE_MODEL if use_coder else ACTIVE_FAST_MODEL
         sys_prompt = CODE_SYSTEM_PROMPT if use_coder else FAST_SYSTEM_PROMPT
         answer, did_search = await query_local_ollama_chat(

@@ -32,6 +32,7 @@ from config import (
     NEWS_QUERY_REGEX,
     ANIME_MANGA_QUERY_REGEX,
     GAME_QUERY_REGEX,
+    URL_REGEX,
     TAVILY_API_KEY,
     DDGS_PROXY,
     GEMINI_API_KEY,
@@ -68,12 +69,43 @@ def _strip_context_and_system_blocks(text: str) -> str:
     return head.strip()
 
 
-def detect_coding_intent(text: str, attachments: list, channel_id: int = None) -> bool:
+def detect_coding_intent(
+    text: str,
+    attachments: list,
+    channel_id: int = None,
+    extracted_ctx: str = "",
+) -> bool:
+    """
+    Determines whether the message should route to Coding / Stack-Trace mode (Path A):
+    1) Checks if any uploaded file has a code/log extension.
+    2) Checks `CODE_INTENT_PATTERN` and `STACK_TRACE_SIGNATURE_REGEX` strictly against the user's
+       own typed message (with URLs and appended OCR/Search blocks stripped so words like 'class',
+       'state', 'build', or 'error' inside anime/game OCR or web search results never trigger Code mode!).
+    3) Checks `STACK_TRACE_SIGNATURE_REGEX` (strict stack trace signatures only) against `extracted_ctx`
+       so screenshots of terminal exceptions still route to Code mode.
+    4) Uses `channel_has_recent_code_attachment(channel_id)` ONLY if the current message is not a fresh
+       non-code media/social-link/document post.
+    """
     for att in attachments:
         if att.filename.lower().endswith(CODE_AND_LOG_EXTENSIONS):
             return True
-    if bool(CODE_INTENT_PATTERN.search(text)) or bool(STACK_TRACE_SIGNATURE_REGEX.search(text)):
+
+    clean_user_text = _strip_context_and_system_blocks(text)
+    user_text_no_urls = URL_REGEX.sub(" ", clean_user_text).strip()
+
+    if user_text_no_urls:
+        if CODE_INTENT_PATTERN.search(user_text_no_urls) or STACK_TRACE_SIGNATURE_REGEX.search(user_text_no_urls):
+            return True
+
+    if extracted_ctx and STACK_TRACE_SIGNATURE_REGEX.search(extracted_ctx):
         return True
+
+    # If the user just posted a fresh non-code attachment, embedded social link (X/Pixiv/YouTube),
+    # or document without any code keywords, do NOT let an old code file in channel memory hijack it!
+    has_non_code_fresh_media = bool(attachments) or bool(extracted_ctx) or bool(URL_REGEX.search(clean_user_text))
+    if has_non_code_fresh_media:
+        return False
+
     if channel_has_recent_code_attachment(channel_id):
         return True
     return False
@@ -112,7 +144,6 @@ def update_and_get_channel_topic(user_text: str, channel_id: int = None) -> str:
         channel_active_topic.pop(channel_id, None)
         existing = None
 
-    # 1. If a YouTube Video Title was extracted in the context block, use it as the topic!
     yt_title_m = re.search(r"Video Title:\s*(.+)", user_text)
     if yt_title_m:
         yt_title = re.sub(
@@ -125,7 +156,6 @@ def update_and_get_channel_topic(user_text: str, channel_id: int = None) -> str:
             channel_active_topic[channel_id] = {"topic": yt_title, "timestamp": now}
             return yt_title
 
-    # 2. Strip attached context blocks, system brackets, and raw URLs before scanning for English entities
     question_only = _strip_context_and_system_blocks(user_text)
     text_without_urls = re.sub(r"https?://\S+", " ", question_only)
 

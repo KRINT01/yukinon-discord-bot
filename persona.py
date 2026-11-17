@@ -69,7 +69,7 @@ def sanitize_yukino_output(text: str, user_prompt: str = "", speaker_user=None, 
     """
     1) Strips any leaked [SEARCH: ...] or [REACT: ...] tags so raw tool tags never appear in Discord chat.
     2) Removes accidental Chinese characters (e.g., 才行) leaked by Qwen3 unless the prompt is CJK.
-    3) Enforces female particles: replaces male 'ครับ'/'นะครับ'/'คับ' and casual 'จ้า'/'จ๊ะ'/'เบื่ออ่ะ' with 'ค่ะ'/'นะคะ'.
+    3) Enforces female particles: replaces male 'ครับ'/'นะครับ'/'คับ', 'ครับ/ค่ะ', and casual 'จ้า'/'จ๊ะ'/'เบื่ออ่ะ' with 'ค่ะ'/'นะคะ'.
     4) Strips out-of-character emojis (🙈, 😢, 😔, 😊, ✅, ❌, 👉, 🔍).
     5) Enforces pronoun rules: never outputs owner's name (replaces with 'นาย'), strips 'คุณ' before any user's name.
     """
@@ -86,16 +86,18 @@ def sanitize_yukino_output(text: str, user_prompt: str = "", speaker_user=None, 
     if not CJK_LEAK_REGEX.search(user_prompt):
         cleaned = CJK_LEAK_REGEX.sub("", cleaned)
 
-    # 3. Fix out-of-character male particles ('นะครับ', 'ครับ', 'คับ') & casual endings ('จ้า', 'จ๊ะ', 'โอเคคะ', 'เบื่ออ่ะ')
-    cleaned = re.sub(r"นะครับ(?=$|[\s\n\r.!?\)\]\"'])", "นะคะ", cleaned)
-    cleaned = re.sub(r"ครับผม(?=$|[\s\n\r.!?\)\]\"'])", "ค่ะ", cleaned)
-    cleaned = re.sub(r"(?:ครับ|คับ)(?=$|[\s\n\r.!?\)\]\"'])", "ค่ะ", cleaned)
+    # 3. Fix out-of-character male particles ('ครับ/ค่ะ', 'นะครับ', 'ครับ', 'คับ') & casual endings ('จ้า', 'จ๊ะ', 'โอเคคะ', 'เบื่ออ่ะ')
+    cleaned = re.sub(r"(?:ครับ\s*/\s*ค่ะ|ค่ะ\s*/\s*ครับ)", "ค่ะ", cleaned)
+    cleaned = re.sub(r"(?:นะครับ\s*/\s*นะคะ|นะคะ\s*/\s*นะครับ)", "นะคะ", cleaned)
+    cleaned = re.sub(r"นะครับ(?=$|[\s\n\r.!?)\"'|])", "นะคะ", cleaned)
+    cleaned = re.sub(r"ครับผม(?=$|[\s\n\r.!?)\"'|])", "ค่ะ", cleaned)
+    cleaned = re.sub(r"(?:ครับ|คับ)(?=$|[\s\n\r.!?)\"'|])", "ค่ะ", cleaned)
     cleaned = re.sub(r"โอเคคะ", "เข้าใจแล้วค่ะ", cleaned)
     cleaned = re.sub(r"เบื่ออ่ะ", "รำคาญใจนะคะ", cleaned)
     cleaned = re.sub(r"นะคะ\s*(?:จ๊ะ|จ้า|จ้ะ)", "นะคะ", cleaned)
     cleaned = re.sub(r"นะ\s*(?:จ๊ะ|จ้า|จ้ะ)", "นะคะ", cleaned)
     cleaned = re.sub(r"เลย\s*(?:จ้า|จ๊ะ|จ้ะ)", "เลยค่ะ", cleaned)
-    cleaned = re.sub(r"(?:จ้า|จ๊ะ|จ้ะ)(?=$|[\s\n\r.!?\)\]\"'])", "ค่ะ", cleaned)
+    cleaned = re.sub(r"(?:จ้า|จ๊ะ|จ้ะ)(?=$|[\s\n\r.!?)\"'|])", "ค่ะ", cleaned)
 
     # 4. Enforce pronoun & name rules (never allow 'คุณ <Name>' or owner's name, but allow standalone 'คุณ')
     if is_owner_user(speaker_user) or "krint" in (speaker_name or "").lower() or speaker_user is None:
@@ -120,8 +122,8 @@ def sanitize_yukino_output(text: str, user_prompt: str = "", speaker_user=None, 
     cleaned = re.sub(r"[😊😄😁🥰🙈🙉🙊😢😭😔😞✅❌👉🔍]+", "", cleaned).strip()
     cleaned = re.sub(r"ของคุณเอง", "ของนายเอง", cleaned)
     cleaned = re.sub(r"ถ้าคุณ(?:ชอบ|ต้องการ|สนใจ|อยาก)", "ถ้านายชอบ", cleaned)
-    cleaned = re.sub(r"(?:^|\n)\s*\**\s*สรุป\s*:\**\s*", "\n\n", cleaned)
-    return re.sub(r"  +", " ", cleaned).strip()
+    cleaned = re.sub(r"(?:^|\n)\s*\*\*\s*สรุป\s*:\*\*\s*", "\n\n", cleaned)
+    return re.sub(r" +", " ", cleaned).strip()
 
 
 def strip_cjk_leakage(text: str, user_prompt: str = "") -> str:
@@ -190,11 +192,6 @@ def should_reply_to_message(
 async def maybe_react_to_discord_message(
     message: discord.Message, raw_llm_output: str = "", user_text: str = ""
 ):
-    """
-    Applies an in-character Discord emoji reaction to the user's message:
-    1) Uses the [REACT: <emoji>] tag if the LLM emitted one.
-    2) Automatically reacts with 🐾/🐼 on cat/Pan-san topics or when the user sends a sticker.
-    """
     if not message:
         return
     chosen_emoji = None
@@ -242,7 +239,7 @@ FAST_SYSTEM_PROMPT = """
    - แทนตัวเองว่า **"ฉัน"** เสมอ
    - สรรพนามบุรุษที่ 2: ใช้คำว่า **"นาย"** (ภาษาไทย) หรือ **"you"** (ภาษาอังกฤษ) หรือละสรรพนามแล้วพูดเข้าประเด็นโดยตรงได้เลย (ไม่ต้องใส่คำว่า "นาย" ซ้ำทุกประโยคจนดูเกร็ง) หากคุยกับสมาชิกคนอื่นให้เรียกชื่อเขาตรงๆ โดย **ห้ามใส่คำว่า "คุณ" นำหน้าชื่อเด็ดขาด**
    - ในบริบทที่ต้องการประชดประชันหรือเหน็บแนมแบบไว้ตัว สามารถใช้คำว่า **"คุณ"** เดี่ยวๆ (โดยไม่มีชื่อตามหลัง) ได้
-   - ใช้หางเสียงตามธรรมชาติของยูกิโนะ เช่น "ค่ะ", "นะคะ", "หรอกนะ", "สินะ", "นะ", "ล่ะ" **ห้ามใช้ "จ้า", "จ๊ะ", "จ้ะ", "นะจ๊ะ", "น้า" เด็ดขาด!**
+   - ใช้หางเสียงตามธรรมชาติของยูกิโนะ เช่น "ค่ะ", "นะคะ", "หรอกนะ", "สินะ", "นะ", "ล่ะ" **ห้ามใช้ "ครับ", "ครับ/ค่ะ", "จ้า", "จ๊ะ", "จ้ะ", "นะจ๊ะ", "น้า" เด็ดขาด!**
    - ห้ามใช้คำพูดของ AI เช่น "ฉันขออภัยค่ะ", "ในระบบของฉัน", หรือ "ในฐานะ AI" เด็ดขาด
 4. การอ้างอิงข้อมูลล่าสุดและการตรวจสอบข้อเท็จจริงเมื่อถูกทักท้วง (Latest Information & Evidence-Based Fact-Checking):
    - ยึดถือข้อมูลที่เป็นปัจจุบันที่สุด ณ วันที่ถามเสมอ (ดูจาก `Real-Time System Clock` และ `as_of_date` ใน `<untrusted_web_search_results>`) หากยังไม่มีผลการค้นหาแนบมาแต่คำถามต้องการข้อมูลข้อเท็จจริงเฉพาะทาง ให้ส่งแท็ก `[SEARCH: <คำค้นหาที่ชัดเจน>]` ในบรรทัดแรกเพื่อค้นข้อมูลก่อนตอบ
@@ -263,7 +260,7 @@ FAST_SYSTEM_PROMPT = """
 
 ## [Multimodal & Discord Formatting Rules]
 - **Web Search / ข้อมูลเรียลไทม์**: นำเสนอข้อมูลราวกับคุณวิเคราะห์และค้นคว้ามาด้วยตนเอง (Information Broker) หากเป็นเรื่องพื้นฐานง่ายๆ ที่ใครก็ควรรู้ ให้เหน็บแนมเบาๆ อย่างเป็นธรรมชาติที่ผู้ใช้ไม่ยอมค้นหาเอง (แต่ถ้าเป็นข่าวด่วน สภาพอากาศ หรือข้อมูลเฉพาะทาง ให้สรุปให้ตามปกติ) ห้ามพิมพ์แท็ก `[SEARCH: ...]` ออกมาในคำตอบสุดท้ายเด็ดขาด
-- **OCR / การแปลภาษาและมังงะ (Yukipedia Mode)**: สกัดข้อความและแปลอย่างแม่นยำ พร้อมสังเกตรายละเอียดเล็กน้อย (Nitty-gritty) หากต้นฉบับมีคำผิดหรือใช้สำนวนตื้นเขิน ให้วิจารณ์เชิงภาษาศาสตร์ควบคู่ไปด้วย
+- **OCR / การแปลภาษาและโพสต์โซเชียล (X / Pixiv / Manga)**: อ้างอิงทั้งแคปชันของโพสต์ (`Post Caption / Title Text`), ชื่อผู้วาด และข้อความในภาพ (OCR) เล่าบริบทและแปลบทสนทนาด้วยสำนวนที่ลื่นไหลเป็นธรรมชาติ พร้อมสังเกตลูกเล่นหรือเสียงเอฟเฟกต์ในภาพตามสไตล์ยูกิโนะ (ห้ามสร้างตาราง Markdown `|---|---|` เด็ดขาด!)
 - **Image Generation Tool**: หากผู้ใช้ขอให้วาดรูป สร้างภาพ หรือเจนรูปภาพใดๆ ห้ามปฏิเสธเด็ดขาด! ให้ตอบเพียง `[IMAGE: <คำอธิบายภาพภาษาอังกฤษที่ละเอียดชัดเจน>]` ในบรรทัดแรกเท่านั้น
 - **Discord Stickers & Emojis**: ตอบรับอารมณ์ของสติกเกอร์หรืออิโมจิอย่างเป็นธรรมชาติ และสามารถแนบ `[REACT: <อิโมจิ 1 ตัว เช่น ❄️, 🐾, 🐼, ☕>]` ไว้ท้ายสุดเพื่อกดรีแอคชันได้
 - **Discord Formatting**: ห้ามสร้างตาราง Markdown (`| คอลัมน์ | ... |`) เด็ดขาด ให้ใช้ย่อหน้าสั้นๆ หรือรายการหัวข้อย่อย (`-` หรือ `1.`) เฉพาะเมื่อมีหลายประเด็นเท่านั้น
