@@ -474,13 +474,13 @@ CODE_INTENT_PATTERN = re.compile(
     r"segfault|refactor|compile|build|script|algorithm|leetcode|git|diff|patch|pip|npm|yarn|gradle)\b|"
     r"ORA-\d{4,5}|TNS-\d{4,5}|HTTP\s*[45]\d{2}|"
     r"at\s+[a-zA-Z0-9_$.]+\([A-Za-z0-9_]+\.java:\d+\)|"
-    r"Caused\s+by:\s+[a-zA-Z0-9_.$\]+|"
+    r"Caused\s+by:\s+[a-zA-Z0-9_.$/-]+|"
     r"โค้ด|เขียนโปรแกรม|แก้บั๊ก|รันไม่ผ่าน|สคริปต์|ฟังก์ชัน|แก้โค้ด|ซ่อนปุ่ม|แสดงปุ่ม|คิวรี|ฐานข้อมูล|คอนเทนเนอร์)",
     re.IGNORECASE,
 )
 
 STACK_TRACE_SIGNATURE_REGEX = re.compile(
-    r"(Caused\s+by:\s+[a-zA-Z0-9_.$\]+|"
+    r"(Caused\s+by:\s+[a-zA-Z0-9_.$/-]+|"
     r"Exception\s+in\s+thread\s+\"[^\"]+\"|"
     r"at\s+[a-zA-Z0-9_$.]+\([A-Za-z0-9_]+\.(?:java|kt|scala):\d+\)|"
     r"org\.springframework\.[a-zA-Z0-9_.]+\.Exception|"
