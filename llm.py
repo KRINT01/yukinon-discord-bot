@@ -79,10 +79,6 @@ _CF_GEMMA_COOLDOWN_UNTIL: float = 0.0
 
 
 def _estimate_messages_tokens(messages: list) -> int:
-    """
-    Conservative token estimator (~2.2 chars/token for mixed Thai/Japanese/English)
-    so AI Studio Gemma 4 (16K TPM) and Groq (6K-8K TPM) never exceed per-minute token caps.
-    """
     total_chars = sum(len(m.get("content") or "") for m in messages)
     return int(total_chars / 2.2)
 
@@ -91,7 +87,8 @@ def _extract_raw_user_turn(prompt: str) -> str:
     if not prompt:
         return ""
     head = re.split(
-        r"\n\n(?:===|<untrusted_web_search_results|<mentioned_users_dossier>|\[Attachment |\[PDF Notice:|\[Web extraction error:)",
+        r"\n\n(?:===|<untrusted_web_search_results|<mentioned_users_dossier>|\[Attachment |\[PDF Notice:|\[Web extraction error:|"
+        r"\[กฎสำคัญ\]|\[บริบทหัวข้อก่อนหน้า\]|\[สรุปคำตอบก่อนหน้า|\[เนื้อหาอ้างอิงจากไฟล์)",
         prompt,
         maxsplit=1,
     )[0]
@@ -167,7 +164,6 @@ async def call_gemini_hydrogen_generate(
     )
     work_payload = json.loads(json.dumps(payload))
     session = get_http_session()
-    _record_gemini_hydrogen_call()
 
     for attempt in range(2):
         t0 = time.monotonic()
@@ -180,6 +176,7 @@ async def call_gemini_hydrogen_generate(
                 elapsed = time.monotonic() - t0
 
                 if status == 200:
+                    _record_gemini_hydrogen_call()
                     api_log(
                         f"Gemini Hydrogen ({purpose}) -> {model_id} 200 OK "
                         f"({elapsed:.2f}s | RPD {state.gemini_hydrogen_rpd_count}/18)"
@@ -277,7 +274,7 @@ async def call_gemini_hydrogen_chat(
 # GOOGLE GEMINI DECISIONS API ORCHESTRATOR (`gemini-decision-1` — 200 RPM, 50K TPM, 10K RPD)
 # ==============================================================================
 async def call_gemini_decision_orchestrator(
-    shared_input: str,
+    shared_input: str | list[dict],
     questions: dict,
     timeout_sec: float = 4.0,
     purpose: str = "Orchestrator",
@@ -292,9 +289,10 @@ async def call_gemini_decision_orchestrator(
         "x-goog-api-key": GEMINI_API_KEY,
         "Content-Type": "application/json",
     }
+    formatted_input = shared_input[:16000] if isinstance(shared_input, str) else shared_input
     payload = {
         "model": GEMINI_DECISION_MODEL,
-        "input": shared_input[:16000],
+        "input": formatted_input,
         "questions": questions,
     }
 
@@ -328,29 +326,46 @@ async def orchestrate_message_with_decision_1(
     user_text: str,
     extracted_ctx: str = "",
     has_code_attachment: bool = False,
+    inline_images_b64: list[tuple[str, str]] | None = None,
+    purpose: str = "Route",
 ) -> dict | None:
     clean_u = _extract_raw_user_turn(user_text)
-    if not clean_u and not extracted_ctx:
+    if not clean_u and not extracted_ctx and not inline_images_b64:
         return None
-    if len(clean_u) <= 65 and PURE_DATETIME_PATTERN.search(clean_u) and not extracted_ctx:
+    if len(clean_u) <= 65 and PURE_DATETIME_PATTERN.search(clean_u) and not extracted_ctx and not inline_images_b64:
         return None
 
     ctx_preview = (extracted_ctx or "")[:2500]
-    shared_input = (
+    text_block = (
         f"User Message:\n{clean_u or '(No text; user sent attachment/link)'}\n\n"
         f"Has Code File Attachment: {has_code_attachment}\n"
         f"Attached / Embedded Context Preview:\n{ctx_preview or '(None)'}"
     )
 
+    if inline_images_b64:
+        shared_input: str | list[dict] = [{"type": "text", "text": text_block + "\n"}]
+        for b64_data, mime_t in inline_images_b64[:2]:
+            shared_input.append({
+                "type": "image",
+                "data": b64_data,
+                "mime_type": mime_t,
+                "resolution": "low",
+            })
+    else:
+        shared_input = text_block
+
     questions = {
         "route": {
             "type": "choice",
-            "instructions": "Select the single best execution route for this user message.",
+            "instructions": "Select the single best primary action route for this user request.",
             "criteria": {
-                "code": "Programming, debugging, stack traces, Java, Maven, Spring Boot, Oracle SQL, PL/SQL, Node.js, React, Bootstrap, Docker, Kubernetes, or config/log files.",
-                "weather": "Asking about weather forecast, rain, temperature, humidity, or whether to bring an umbrella.",
-                "web_search": "Asking for real-time news, live prices, release dates, game/anime lore facts, or disputing/fact-checking a previous statement.",
-                "chat": "General conversation, greetings, personal advice, or summarizing/translating already-provided attachments, PDFs, or social media embeds (X/Twitter, Pixiv, YouTube).",
+                "manga_translate": "User explicitly asks to translate speech bubbles or text inside a manga/comic/image into Thai or English (e.g., 'แปลมังงะ', 'แปลหน้านี้', 'translate bubbles').",
+                "image_gen": "User asks the bot to draw, generate, or create a new image or illustration from scratch (e.g., 'วาดรูป...', 'สร้างภาพ...', 'draw a...').",
+                "ot_log": "User is logging, editing, deleting, or requesting a monthly table of overtime (OT) work hours (e.g., 'จด OT', 'สรุป OT').",
+                "code": "Programming, debugging, stack traces, Java, Maven, Spring Boot, Oracle SQL, PL/SQL, Node.js, React, Bootstrap, Docker, Kubernetes, config/log files, or screenshots of code/terminal errors.",
+                "weather": "Asking about weather forecast, rain, temperature, humidity, PM2.5, or bringing an umbrella.",
+                "web_search": "Asking for real-time news, live prices, release dates, game/anime lore facts, looking up an artist's other works, or disputing/fact-checking a statement.",
+                "chat": "General conversation, greetings, personal advice, or summarizing/explaining/commenting on already-provided attachments, PDFs, or social media embeds (X/Twitter, Pixiv, YouTube).",
             },
         },
         "needs_web_search": {
@@ -358,7 +373,7 @@ async def orchestrate_message_with_decision_1(
             "instructions": (
                 "Answer YES only if answering accurately requires searching the live web because the user message "
                 "and attached/embedded context do NOT already contain the needed facts or text. "
-                "Answer NO if the attached PDF, code, or X/Pixiv embed + OCR already provides the full content to summarize or translate."
+                "Answer NO if the attached PDF, code, or X/Pixiv embed + OCR already provides the full content to summarize or explain."
             ),
         },
         "attach_buttons": {
@@ -382,7 +397,7 @@ async def orchestrate_message_with_decision_1(
         },
     }
 
-    answers = await call_gemini_decision_orchestrator(shared_input, questions, timeout_sec=4.0, purpose="Route")
+    answers = await call_gemini_decision_orchestrator(shared_input, questions, timeout_sec=4.0, purpose=purpose)
     if not answers:
         return None
 
@@ -403,7 +418,7 @@ async def orchestrate_message_with_decision_1(
         needs_search = False
 
     api_log(
-        f"Orchestrator Plan -> route={chosen_route} ({route_conf:.2f}), "
+        f"Orchestrator Plan ({purpose}) -> route={chosen_route} ({route_conf:.2f}), "
         f"search={needs_search}, buttons={attach_btns} ({btn_domain})"
     )
     return {
@@ -645,7 +660,7 @@ async def call_gemma_ai_studio_chat(
             t0 = time.monotonic()
             try:
                 async with session.post(
-                    url, json=payload, timeout=aiohttp.ClientTimeout(total=26)
+                    url, json=payload, timeout=aiohttp.ClientTimeout(total=24)
                 ) as resp:
                     status = resp.status
                     body_text = await resp.text()
@@ -878,7 +893,7 @@ async def call_gemini_chat_messages(
 
 
 # ==============================================================================
-# CLOUDFLARE WORKERS AI (GEMMA 4 + OPENAI GPT-OSS-120B / GPT-OSS-20B)
+# CLOUDFLARE WORKERS AI (GEMMA 4 + OPENAI GPT-OSS-120B / GPT-OSS-20B) + HEDGING
 # ==============================================================================
 async def call_cloudflare_gemma_chat(
     messages: list, temperature: float = 0.4, max_tokens: int = 1024, purpose: str = "CFGemmaChat"
@@ -914,7 +929,7 @@ async def call_cloudflare_gemma_chat(
     try:
         session = get_http_session()
         async with session.post(
-            cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=22)
+            cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=28)
         ) as resp:
             elapsed = time.monotonic() - t0
             if resp.status == 200:
@@ -930,9 +945,88 @@ async def call_cloudflare_gemma_chat(
             elif resp.status == 429:
                 _CF_GEMMA_COOLDOWN_UNTIL = time.time() + 300.0
             api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} HTTP {resp.status} ({elapsed:.2f}s)")
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         _CF_GEMMA_COOLDOWN_UNTIL = time.time() + 120.0
         api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} failed ({type(e).__name__})")
+    return ""
+
+
+async def _run_fast_groq_hedge(messages: list, temperature: float, purpose: str) -> str:
+    """Fast ~1.4s Groq LPU backup launched if primary Cloudflare Gemma 4 exceeds the 14s hedge window."""
+    if not GROQ_API_KEY:
+        return ""
+    for g_mod in await get_groq_search_and_chat_candidates():
+        try:
+            res = await call_groq_chat(messages, g_mod, temperature, is_coding=False, purpose=purpose)
+            if res:
+                return res
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            continue
+    return ""
+
+
+async def _call_cf_gemma_hedged_with_groq(
+    messages: list,
+    temperature: float = 0.4,
+    max_tokens: int = 1024,
+    purpose: str = "Chat",
+    hedge_delay_sec: float = 14.0,
+) -> str:
+    """
+    Runs Cloudflare `@cf/google/gemma-4-26b-a4b-it` as primary. If it hasn't finished
+    within `hedge_delay_sec` (14s), spawns Groq (`~1.4s`) in parallel and takes whichever
+    completes first, cancelling the slower task cleanly so worst-case latency stays ~15.5s.
+    """
+    cf_available = bool(CF_ACCOUNT_ID and CF_API_TOKEN and time.time() >= _CF_GEMMA_COOLDOWN_UNTIL)
+    if not cf_available:
+        return ""
+
+    cf_task = asyncio.create_task(
+        call_cloudflare_gemma_chat(messages, temperature=temperature, max_tokens=max_tokens, purpose=purpose)
+    )
+
+    if not GROQ_API_KEY:
+        return await cf_task
+
+    done, pending = await asyncio.wait({cf_task}, timeout=hedge_delay_sec)
+    if cf_task in done:
+        try:
+            return cf_task.result() or ""
+        except Exception:
+            return ""
+
+    # Hedge: Cloudflare took >14s; launch fast Groq backup in parallel and race FIRST_COMPLETED
+    api_log(f"Hedge ({purpose}) -> CF >{hedge_delay_sec:.0f}s; racing Groq backup in parallel")
+    groq_task = asyncio.create_task(
+        _run_fast_groq_hedge(messages, temperature=temperature, purpose=f"{purpose}-Hedge")
+    )
+    tasks = {cf_task, groq_task}
+    try:
+        while tasks:
+            done_set, pending_set = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for finished in done_set:
+                tasks.discard(finished)
+                try:
+                    ans = finished.result()
+                except Exception:
+                    ans = ""
+                if ans:
+                    for p in pending_set:
+                        p.cancel()
+                    if pending_set:
+                        await asyncio.gather(*pending_set, return_exceptions=True)
+                    return ans
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     return ""
 
 
@@ -1411,9 +1505,13 @@ async def query_local_ollama_chat(
             target_temp = 0.2 if (did_search or is_user_correction) else temperature
 
             if is_japanese_or_social_media:
-                # Cloudflare Gemma 4 26B runs in ~9-13s with zero free-tier prefill timeout; AI Studio Gemma 4 is fallback
-                ans = await call_cloudflare_gemma_chat(
-                    messages, temperature=target_temp, max_tokens=1800, purpose="MangaSocialChat"
+                # Primary Cloudflare Gemma 4 hedged with fast Groq at 14s so worst-case latency stays ~15.5s
+                ans = await _call_cf_gemma_hedged_with_groq(
+                    messages,
+                    temperature=target_temp,
+                    max_tokens=1800,
+                    purpose="MangaSocialChat",
+                    hedge_delay_sec=14.0,
                 )
                 if ans:
                     return ans
@@ -1466,8 +1564,12 @@ async def query_local_ollama_chat(
         # PATH C: Casual Chat, Weather & Voice Chat
         chat_temp = 0.25 if (did_search or is_user_correction or is_weather_query) else temperature
 
-        ans = await call_cloudflare_gemma_chat(
-            messages, temperature=chat_temp, max_tokens=1024, purpose="Chat"
+        ans = await _call_cf_gemma_hedged_with_groq(
+            messages,
+            temperature=chat_temp,
+            max_tokens=1024,
+            purpose="Chat",
+            hedge_delay_sec=14.0,
         )
         if ans:
             return ans

@@ -73,7 +73,6 @@ DIRECT_IMAGE_URL_REGEX = re.compile(
     re.IGNORECASE,
 )
 
-# Common Japanese manga SFX tokens that should NEVER trigger a web search query
 _SFX_TOKEN_REGEX = re.compile(
     r"^(?:タッ|ドシッ|ドッ|ドドン|ピュ+|ピシャ+ン|ズシ+|ズゥ+ン|ズーン|ヴォ+|ブル+|ムチ+|ムク+|"
     r"ぷくっ?|ぷる+|だぷっ?|ずり+|ガタッ|クッ|カッ|ボフッ|ハッ|ハァ|フゥ|ゴゴ+|ザワ+|ドキッ|PAN|[!?…・ーッっ]+)$",
@@ -82,7 +81,6 @@ _SFX_TOKEN_REGEX = re.compile(
 
 
 def _is_pure_sfx_query(q: str) -> bool:
-    """Returns True if a proposed web verification query consists only of comic sound effects (SFX)."""
     if not q:
         return True
     cleaned = re.sub(r"[\s\u3000!?…・ー「」『』（）()]+", " ", q).strip()
@@ -96,7 +94,7 @@ def _is_pure_sfx_query(q: str) -> bool:
 
 
 def parse_xlsx_bytes_to_markdown(raw_bytes: bytes, max_chars: int = 25000) -> str:
-    import openpyxl  # Lazy-loaded to save startup RAM on 512MB Render container
+    import openpyxl
 
     wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True, read_only=True)
     out_sections = []
@@ -131,7 +129,7 @@ def parse_xlsx_bytes_to_markdown(raw_bytes: bytes, max_chars: int = 25000) -> st
 
 
 def parse_pdf_bytes(raw_bytes: bytes, max_chars: int = 32000) -> str:
-    from pypdf import PdfReader  # Lazy-loaded to save startup RAM
+    from pypdf import PdfReader
 
     reader = PdfReader(io.BytesIO(raw_bytes))
     total_pages = len(reader.pages)
@@ -157,7 +155,7 @@ def parse_pdf_bytes(raw_bytes: bytes, max_chars: int = 32000) -> str:
 
 
 def parse_docx_bytes(raw_bytes: bytes, max_chars: int = 30000) -> str:
-    import docx  # Lazy-loaded to save startup RAM
+    import docx
 
     doc = docx.Document(io.BytesIO(raw_bytes))
     parts = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
@@ -241,9 +239,6 @@ def extract_youtube_id(url: str):
     return None
 
 
-# ==============================================================================
-# EMBEDDED LINKS & SOCIAL MEDIA MEDIA/METADATA RESOLVER (X, PIXIV, BSKY, EMBEDS)
-# ==============================================================================
 def _normalize_image_dedup_key(url: str) -> str:
     cu = clean_url(url)
     tw_media_m = re.search(r"pbs\.twimg\.com/media/([A-Za-z0-9_-]+)", cu)
@@ -967,16 +962,104 @@ def _compress_image_for_vision_ocr_sync(raw_bytes: bytes, max_dim: int = 1280, q
     return base64.b64encode(buf.getvalue()).decode("utf-8"), "image/jpeg", is_color_image
 
 
+async def _call_gemini_multi_image_batch(
+    encoded_images: list[tuple[str, str, str]], batch_prompt: str, timeout_sec: int = 38
+) -> str:
+    if not GEMINI_API_KEY:
+        return ""
+    parts = [{"text": batch_prompt}]
+    for idx, (b64_img, mime_type, fname) in enumerate(encoded_images, 1):
+        parts.append({"text": f"=== Image {idx}/{len(encoded_images)} (`{fname}`) ==="})
+        parts.append({"inlineData": {"mimeType": mime_type, "data": b64_img}})
+
+    payload = {
+        "contents": [{"parts": parts}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 2048,
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }
+    try:
+        data = await call_gemini_generate_content_self_healing(
+            payload, timeout_sec=timeout_sec, purpose=f"MultiImageOCR({len(encoded_images)}p)"
+        )
+        if data:
+            resp_parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+            out_txt = "\n".join(p.get("text", "") for p in resp_parts if p.get("text")).strip()
+            out_txt = re.sub(r"<think>[\s\S]*?</think>", "", out_txt).strip()
+            if out_txt:
+                return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{out_txt}"
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        api_log(f"MultiImageOCR Tier 1 Gemini -> error ({type(e).__name__})")
+    return ""
+
+
+async def _call_cf_multi_image_batch(
+    encoded_images: list[tuple[str, str, str]], batch_prompt: str, timeout_sec: int = 32
+) -> str:
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+        return ""
+    cf_host = "api." + "cloudflare.com"
+    cf_chat_url = f"{HTTPS}{cf_host}/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    user_content: list[dict] = [{"type": "text", "text": batch_prompt}]
+    for idx, (b64_img, mime_type, fname) in enumerate(encoded_images, 1):
+        user_content.append({"type": "text", "text": f"=== Image {idx}/{len(encoded_images)} (`{fname}`) ==="})
+        user_content.append({"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}})
+
+    cf_payload = {
+        "model": CF_VISION_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Respond directly and concisely with the requested analysis. Do NOT output internal thinking steps.",
+            },
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 2048,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    t0 = time.monotonic()
+    try:
+        session = get_http_session()
+        async with session.post(
+            cf_chat_url, headers=headers, json=cf_payload, timeout=aiohttp.ClientTimeout(total=timeout_sec)
+        ) as resp:
+            elapsed = time.monotonic() - t0
+            if resp.status == 200:
+                data = await resp.json()
+                choices = data.get("choices") or []
+                if choices:
+                    content = (choices[0].get("message") or {}).get("content") or ""
+                    content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+                    if content:
+                        api_log(f"MultiImageOCR (Tier 2 CF) -> {CF_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
+                        return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{content}"
+            api_log(f"MultiImageOCR (Tier 2 CF) -> HTTP {resp.status} ({elapsed:.2f}s)")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        api_log(f"MultiImageOCR (Tier 2 CF) -> error ({type(e).__name__})")
+    return ""
+
+
 async def extract_multi_images_batch_ocr(
     images_list: list[tuple[bytes, str, str]],
     post_meta_hint: str = "",
 ) -> str:
     """
     Inspects 2-4 sequential comic/illustration pages together in a SINGLE multimodal batch call
-    so the series title, exact character cast, and cross-page story stay 100% consistent without
-    hallucinating new characters on later pages:
-    - Tier 1: Gemini 3 Flash (`thinkingBudget: 0`, `896px` @ `q=82`, `35s` timeout)
-    - Tier 2: Cloudflare Workers AI `@cf/google/gemma-4-26b-a4b-it` (multi-image chat completions)
+    with a staggered 18s hedged backup:
+    - Starts Gemini 3 Flash (`thinkingBudget: 0`, `832px` @ `q=80`) first.
+    - If Gemini hasn't returned by 18s, launches Cloudflare `@cf/google/gemma-4-26b-a4b-it`
+      multi-image batch in parallel and takes whichever finishes first, cancelling the slower task.
     """
     if len(images_list) < 2:
         return ""
@@ -995,10 +1078,15 @@ async def extract_multi_images_batch_ocr(
         "and key SFX in Japanese reading order tagged with the speaker."
     )
 
+    target_dim = 832 if len(images_list) >= 3 else 896
+    target_q = 80 if len(images_list) >= 3 else 84
+
     encoded_images: list[tuple[str, str, str]] = []
     for raw_b, fname, _ in images_list[:4]:
         try:
-            b64_str, mime_type, _ = await asyncio.to_thread(_compress_image_for_vision_ocr_sync, raw_b, 896, 82)
+            b64_str, mime_type, _ = await asyncio.to_thread(
+                _compress_image_for_vision_ocr_sync, raw_b, target_dim, target_q
+            )
             encoded_images.append((b64_str, mime_type, fname))
         except Exception:
             continue
@@ -1006,79 +1094,57 @@ async def extract_multi_images_batch_ocr(
     if len(encoded_images) < 2:
         return ""
 
-    # Tier 1: Gemini 3 Flash Multi-Image Batch (`thinkingBudget: 0` for fast ~6-10s response)
-    if GEMINI_API_KEY:
-        parts = [{"text": batch_prompt}]
-        for idx, (b64_img, mime_type, fname) in enumerate(encoded_images, 1):
-            parts.append({"text": f"=== Image {idx}/{len(encoded_images)} (`{fname}`) ==="})
-            parts.append({"inlineData": {"mimeType": mime_type, "data": b64_img}})
+    has_gemini = bool(GEMINI_API_KEY)
+    has_cf = bool(CF_ACCOUNT_ID and CF_API_TOKEN)
 
-        payload = {
-            "contents": [{"parts": parts}],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 2048,
-                "thinkingConfig": {"thinkingBudget": 0},
-            },
-        }
+    if not has_gemini and has_cf:
+        return await _call_cf_multi_image_batch(encoded_images, batch_prompt, timeout_sec=35)
+    if has_gemini and not has_cf:
+        return await _call_gemini_multi_image_batch(encoded_images, batch_prompt, timeout_sec=42)
+    if not has_gemini and not has_cf:
+        return ""
+
+    gemini_task = asyncio.create_task(
+        _call_gemini_multi_image_batch(encoded_images, batch_prompt, timeout_sec=42)
+    )
+    done, _ = await asyncio.wait({gemini_task}, timeout=18.0)
+    if gemini_task in done:
         try:
-            data = await call_gemini_generate_content_self_healing(
-                payload, timeout_sec=35, purpose=f"MultiImageOCR({len(encoded_images)}p)"
-            )
-            if data:
-                resp_parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-                out_txt = "\n".join(p.get("text", "") for p in resp_parts if p.get("text")).strip()
-                out_txt = re.sub(r"<think>[\s\S]*?</think>", "", out_txt).strip()
-                if out_txt:
-                    return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{out_txt}"
-        except Exception as e:
-            api_log(f"MultiImageOCR Tier 1 Gemini -> fallback to Tier 2 CF ({type(e).__name__})")
+            res = gemini_task.result()
+            if res:
+                return res
+        except Exception:
+            pass
+        # Gemini finished early with empty result -> run Cloudflare immediately
+        return await _call_cf_multi_image_batch(encoded_images, batch_prompt, timeout_sec=35)
 
-    # Tier 2: Cloudflare Workers AI Gemma 4 Multi-Image Batch
-    if CF_ACCOUNT_ID and CF_API_TOKEN:
-        cf_host = "api." + "cloudflare.com"
-        cf_chat_url = f"{HTTPS}{cf_host}/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {CF_API_TOKEN}",
-            "Content-Type": "application/json",
-        }
-        user_content: list[dict] = [{"type": "text", "text": batch_prompt}]
-        for idx, (b64_img, mime_type, fname) in enumerate(encoded_images, 1):
-            user_content.append({"type": "text", "text": f"=== Image {idx}/{len(encoded_images)} (`{fname}`) ==="})
-            user_content.append({"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}})
-
-        cf_payload = {
-            "model": CF_VISION_MODEL,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "Respond directly and concisely with the requested analysis. Do NOT output internal thinking steps.",
-                },
-                {"role": "user", "content": user_content},
-            ],
-            "temperature": 0.1,
-            "max_tokens": 2048,
-            "chat_template_kwargs": {"enable_thinking": False},
-        }
-        t0 = time.monotonic()
-        try:
-            session = get_http_session()
-            async with session.post(
-                cf_chat_url, headers=headers, json=cf_payload, timeout=aiohttp.ClientTimeout(total=30)
-            ) as resp:
-                elapsed = time.monotonic() - t0
-                if resp.status == 200:
-                    data = await resp.json()
-                    choices = data.get("choices") or []
-                    if choices:
-                        content = (choices[0].get("message") or {}).get("content") or ""
-                        content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
-                        if content:
-                            api_log(f"MultiImageOCR (Tier 2 CF) -> {CF_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
-                            return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{content}"
-                api_log(f"MultiImageOCR (Tier 2 CF) -> HTTP {resp.status} ({elapsed:.2f}s)")
-        except Exception as e:
-            api_log(f"MultiImageOCR (Tier 2 CF) -> fallback to per-image OCR ({type(e).__name__})")
+    # Hedge at 18s: launch Cloudflare multi-image batch in parallel and take FIRST_COMPLETED
+    api_log(f"Hedge (MultiImageOCR {len(encoded_images)}p) -> Gemini >18s; racing Cloudflare batch in parallel")
+    cf_task = asyncio.create_task(
+        _call_cf_multi_image_batch(encoded_images, batch_prompt, timeout_sec=35)
+    )
+    tasks = {gemini_task, cf_task}
+    try:
+        while tasks:
+            done_set, pending_set = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for finished in done_set:
+                tasks.discard(finished)
+                try:
+                    out = finished.result()
+                except Exception:
+                    out = ""
+                if out:
+                    for p in pending_set:
+                        p.cancel()
+                    if pending_set:
+                        await asyncio.gather(*pending_set, return_exceptions=True)
+                    return out
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     return ""
 
@@ -1230,7 +1296,7 @@ async def extract_image_via_transient_ocr(
 
         if saucenao_txt:
             out_parts.append(saucenao_txt)
-        elif not post_meta_hint:
+        else:
             iqdb_txt = await _search_iqdb_keyless_async(raw_bytes, filename)
             if iqdb_txt:
                 out_parts.append(iqdb_txt)
@@ -1271,7 +1337,10 @@ async def resolve_referenced_message(message: discord.Message) -> discord.Messag
         return None
 
 
-async def extract_all_context(message: discord.Message) -> tuple[str, str]:
+async def extract_all_context(
+    message: discord.Message,
+    preloaded_attachments: dict[int, bytes] | None = None,
+) -> tuple[str, str]:
     from voice_engine import convert_audio_bytes_to_wav_sync, transcribe_wav_bytes_hybrid
 
     blocks, voice_clip_transcripts = [], []
@@ -1296,7 +1365,11 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
             )
             continue
         try:
-            raw_bytes = await att.read()
+            # Reuse preloaded bytes when available to avoid duplicate Discord CDN downloads
+            if preloaded_attachments and att.id in preloaded_attachments:
+                raw_bytes = preloaded_attachments[att.id]
+            else:
+                raw_bytes = await att.read()
             fname = att.filename.lower()
             if fname.endswith(AUDIO_EXTENSIONS):
                 wav_bytes = await asyncio.to_thread(convert_audio_bytes_to_wav_sync, raw_bytes)
@@ -1354,7 +1427,7 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
                 ocr_out = await extract_image_via_transient_ocr(
                     img_b,
                     img_fn,
-                    run_source_lookup=(idx == 1),
+                    run_source_lookup=(idx <= 2),
                     post_meta_hint=message.content or "",
                     page_label=f"Page {idx} of {total_att_imgs}" if total_att_imgs > 1 else "",
                 )
@@ -1373,7 +1446,9 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
         remaining_slots = 4 - processed_image_count
         target_embed_imgs = embed_images[:remaining_slots]
         meta_hint = "\n".join(embed_meta_sections)
-        has_known_post_meta = bool(meta_hint.strip())
+        # Only skip reverse lookups when an authoritative social API (FxTwitter/Pixiv/Bluesky) already resolved the post;
+        # generic Discord link embeds still get reverse-image lookups on the first 2 images.
+        has_authoritative_social_meta = any(s.startswith("=== Embedded ") for s in embed_meta_sections)
         batch_done = False
 
         if len(target_embed_imgs) >= 2:
@@ -1392,8 +1467,7 @@ async def extract_all_context(message: discord.Message) -> tuple[str, str]:
                     break
                 processed_image_count += 1
                 try:
-                    # Skip redundant reverse-image lookups when FxTwitter/Pixiv already provided the exact source post
-                    do_lookup = (not has_known_post_meta) and (idx == 1)
+                    do_lookup = (not has_authoritative_social_meta) and (idx <= 2)
                     ocr_out = await extract_image_via_transient_ocr(
                         emb_bytes,
                         emb_fname,

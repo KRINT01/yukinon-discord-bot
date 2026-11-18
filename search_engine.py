@@ -47,25 +47,38 @@ from config import (
 )
 
 ENGLISH_ENTITY_REGEX = re.compile(r"\b[A-Za-z][A-Za-z0-9_.:-]{1,25}(?:\s+[A-Za-z0-9_.:-]{1,25}){0,4}\b")
+
+# Kept deliberately narrow (articles, prepositions, and formatting/markup tokens only)
+# so legitimate multi-word titles containing words like 'Action', 'Status', or 'Twitter' still anchor topics.
 STOPWORD_ENTITIES = {
     "search", "google", "wikipedia", "wiki", "what", "when", "where", "which", "who", "how",
     "the", "and", "for", "with", "this", "that", "from", "are", "you", "can", "help", "not",
-    "app", "bot", "yes", "no", "ok", "okay", "pdf", "docx", "xlsx", "file", "http", "https",
-    "web", "extraction", "error", "readable", "found", "page", "image", "embed", "status",
+    "yes", "no", "ok", "okay", "pdf", "docx", "xlsx", "file", "http", "https",
+    "web", "extraction", "error", "readable", "found", "embed",
+    "markdown", "json", "html", "table", "tables", "bullet", "bullets", "points", "checklist",
+    "items", "in-bubble", "bubble", "ocr", "sfx", "canon", "lore",
 }
+_MARKUP_NOISE_WORDS = {"markdown", "json", "html", "in-bubble", "ocr", "sfx", "error", "extraction", "readable"}
 
 
 def _strip_context_and_system_blocks(text: str) -> str:
-    """Strips appended context headers, speaker tags, and bracketed error notices before intent/entity scanning."""
+    """Strips appended context headers, speaker tags, and internal prompt directives before intent/entity scanning."""
     if not text:
         return ""
     head = re.split(
-        r"\n\n(?:===|<untrusted_web_search_results|<mentioned_users_dossier>|\[Attachment |\[PDF Notice:|\[Web extraction error:)",
+        r"\n\n(?:===|<untrusted_web_search_results|<mentioned_users_dossier>|\[Attachment |\[PDF Notice:|\[Web extraction error:|"
+        r"\[กฎสำคัญ\]|\[บริบทหัวข้อก่อนหน้า\]|\[สรุปคำตอบก่อนหน้า|\[เนื้อหาอ้างอิงจากไฟล์)",
         text,
         maxsplit=1,
     )[0]
     head = re.sub(r"^\[ผู้พูด:[^\]]+\]\s*", "", head.strip())
-    head = re.sub(r"\[(?:Web extraction error|Error reading|Attachment Size Notice|PDF Notice):[^\]]+\]", " ", head)
+    head = re.sub(
+        r"\[(?:Web extraction error|Error reading|Attachment Size Notice|PDF Notice|กฎสำคัญ|SEARCH_HINT):[^\]]+\]",
+        " ",
+        head,
+        flags=re.IGNORECASE,
+    )
+    head = re.sub(r"\(ผู้ใช้ส่งลิงก์นี้มาให้[\s\S]*?\)", " ", head)
     return head.strip()
 
 
@@ -79,10 +92,8 @@ def detect_coding_intent(
     Determines whether the message should route to Coding / Stack-Trace mode (Path A):
     1) Checks if any uploaded file has a code/log extension.
     2) Checks `CODE_INTENT_PATTERN` and `STACK_TRACE_SIGNATURE_REGEX` strictly against the user's
-       own typed message (with URLs and appended OCR/Search blocks stripped so words like 'class',
-       'state', 'build', or 'error' inside anime/game OCR or web search results never trigger Code mode!).
-    3) Checks `STACK_TRACE_SIGNATURE_REGEX` (strict stack trace signatures only) against `extracted_ctx`
-       so screenshots of terminal exceptions still route to Code mode.
+       own typed message (with URLs and appended OCR/Search blocks stripped).
+    3) Checks `STACK_TRACE_SIGNATURE_REGEX` against `extracted_ctx` for terminal/error screenshots.
     4) Uses `channel_has_recent_code_attachment(channel_id)` ONLY if the current message is not a fresh
        non-code media/social-link/document post.
     """
@@ -100,8 +111,6 @@ def detect_coding_intent(
     if extracted_ctx and STACK_TRACE_SIGNATURE_REGEX.search(extracted_ctx):
         return True
 
-    # If the user just posted a fresh non-code attachment, embedded social link (X/Pixiv/YouTube),
-    # or document without any code keywords, do NOT let an old code file in channel memory hijack it!
     has_non_code_fresh_media = bool(attachments) or bool(extracted_ctx) or bool(URL_REGEX.search(clean_user_text))
     if has_non_code_fresh_media:
         return False
@@ -131,10 +140,22 @@ def detect_web_search_intent(text: str, channel_id: int = None) -> bool:
     return False
 
 
+def _is_valid_entity_phrase(phrase: str) -> bool:
+    p = phrase.strip()
+    if not p or p.lower() in STOPWORD_ENTITIES:
+        return False
+    words = [w.lower() for w in p.split()]
+    if all(w in STOPWORD_ENTITIES for w in words):
+        return False
+    if any(w in _MARKUP_NOISE_WORDS for w in words):
+        return False
+    return True
+
+
 def update_and_get_channel_topic(user_text: str, channel_id: int = None) -> str:
     """
     Maintains a persistent topic anchor per channel so follow-up messages that shorten the name
-    (e.g. 'PSO2 NGS' -> 'NGS') never lose the root subject, while ignoring system/error brackets.
+    (e.g. 'PSO2 NGS' -> 'NGS') never lose the root subject, while preserving multi-word titles.
     """
     if channel_id is None:
         return ""
@@ -162,8 +183,7 @@ def update_and_get_channel_topic(user_text: str, channel_id: int = None) -> str:
     is_corr = bool(USER_CORRECTION_PATTERN.search(text_without_urls))
     en_matches = [
         m.strip() for m in ENGLISH_ENTITY_REGEX.findall(text_without_urls)
-        if m.strip().lower() not in STOPWORD_ENTITIES
-        and not any(w.lower() in {"error", "extraction", "readable", "attachment"} for w in m.split())
+        if _is_valid_entity_phrase(m)
     ]
 
     if en_matches and not is_corr and len(en_matches) <= 3:
@@ -194,8 +214,7 @@ def update_and_get_channel_topic(user_text: str, channel_id: int = None) -> str:
             hist_clean = re.sub(r"https?://\S+", " ", _strip_context_and_system_blocks(msg.get("content", "")))
             first_ents = [
                 m.strip() for m in ENGLISH_ENTITY_REGEX.findall(hist_clean)
-                if m.strip().lower() not in STOPWORD_ENTITIES
-                and not any(w.lower() in {"error", "extraction", "readable", "attachment"} for w in m.split())
+                if _is_valid_entity_phrase(m)
             ]
             if first_ents:
                 root_t = first_ents[0]
@@ -205,6 +224,12 @@ def update_and_get_channel_topic(user_text: str, channel_id: int = None) -> str:
 
 
 def build_contextual_search_query(user_text: str, channel_id: int = None) -> str:
+    hint_m = re.search(r"\[SEARCH_HINT:\s*([^\]]+?)\s*\]", user_text or "", re.IGNORECASE)
+    if hint_m:
+        clean_hint = re.sub(r"\s+", " ", hint_m.group(1)).strip()
+        if clean_hint:
+            return clean_hint[:140]
+
     active_topic = update_and_get_channel_topic(user_text, channel_id=channel_id)
 
     question_only = _strip_context_and_system_blocks(user_text)
@@ -213,7 +238,7 @@ def build_contextual_search_query(user_text: str, channel_id: int = None) -> str
 
     en_in_msg = [
         m.strip() for m in ENGLISH_ENTITY_REGEX.findall(raw)
-        if m.strip().lower() not in STOPWORD_ENTITIES
+        if _is_valid_entity_phrase(m)
     ]
 
     subject_prefix = active_topic
@@ -557,7 +582,7 @@ def _search_wikipedia_full_extract_sync(query: str, is_thai: bool, max_results: 
         if lang_host == "en" and is_thai and has_en_terms:
             en_parts = [
                 m.strip() for m in ENGLISH_ENTITY_REGEX.findall(query)
-                if m.strip().lower() not in STOPWORD_ENTITIES
+                if _is_valid_entity_phrase(m)
             ]
             if en_parts:
                 q_for_wiki = " ".join(en_parts[:4])

@@ -19,7 +19,10 @@ from persona import (
     CODE_SYSTEM_PROMPT,
     YUKIPEDIA_SYSTEM_PROMPT,
 )
-from llm import query_local_ollama_chat
+from llm import (
+    query_local_ollama_chat,
+    orchestrate_message_with_decision_1,
+)
 from media_context import (
     extract_all_context,
     format_code_or_log_attachment,
@@ -61,11 +64,25 @@ _SUBSTANTIVE_REQUEST_REGEX = re.compile(
 
 
 def _strip_internal_prompt_hints(text: str) -> str:
-    """Removes parenthetical system instructions from `user_query` so follow-up buttons never inherit meta-prompts."""
     if not text:
         return ""
     cleaned = re.sub(r"\n*\(ผู้ใช้ส่งลิงก์นี้มาให้[\s\S]*?\)\s*$", "", text).strip()
     return cleaned
+
+
+def _extract_clean_artist_or_topic_hint(cached_ctx: str, bot_reply: str) -> str:
+    """Extracts clean artist handle/name (e.g. 'きりんまる @kirinmarun Pixiv') from metadata or reply for follow-up searches."""
+    for src in (cached_ctx or "", bot_reply or ""):
+        m_auth = re.search(r"Author / Artist:\s*([^\n(|]+)(?:\(@([A-Za-z0-9_]+)\))?", src)
+        if m_auth:
+            name_part = m_auth.group(1).strip()
+            handle_part = (m_auth.group(2) or "").strip()
+            if name_part or handle_part:
+                return f"{name_part} {handle_part} Pixiv X".strip()
+        m_at = re.search(r"@([A-Za-z0-9_]{3,30})", src)
+        if m_at:
+            return f"{m_at.group(1)} Pixiv X".strip()
+    return ""
 
 
 def has_valid_extracted_context(extracted_ctx: str) -> bool:
@@ -89,6 +106,7 @@ def should_attach_interactive_view(
     did_search: bool = False,
     extracted_ctx: str = "",
     is_instant_dt: bool = False,
+    decision_plan: dict | None = None,
 ) -> bool:
     if is_instant_dt or PURE_DATETIME_PATTERN.search(user_request or ""):
         return False
@@ -105,6 +123,11 @@ def should_attach_interactive_view(
         return True
     if valid_ctx or did_search:
         return True
+
+    if decision_plan and float(decision_plan.get("route_confidence") or 0.0) >= 0.65:
+        if decision_plan.get("attach_buttons"):
+            return True
+
     if _SUBSTANTIVE_REQUEST_REGEX.search(user_request or ""):
         return True
     return False
@@ -205,6 +228,7 @@ class CodeReviewActionView(AutoDisappearingView):
             allow_agentic_search=False,
             has_fresh_attachment=True,
             speaker_user=interaction.user,
+            decision_plan={"route": "code", "route_confidence": 0.99, "needs_web_search": False},
         )
         await send_chunked_response(interaction.channel, answer)
         try:
@@ -270,7 +294,7 @@ class GeneralAssistantActionView(AutoDisappearingView):
             if action_spec == "__IN_BUBBLE_MANGA_TH__":
                 btn.callback = self._make_in_bubble_manga_callback()
             else:
-                btn.callback = self._make_followup_callback(action_spec, use_search)
+                btn.callback = self._make_followup_callback(label, action_spec, use_search)
             self.add_item(btn)
 
     def _make_in_bubble_manga_callback(self):
@@ -300,18 +324,46 @@ class GeneralAssistantActionView(AutoDisappearingView):
 
         return _callback
 
-    def _make_followup_callback(self, instruction: str, use_search: bool):
+    def _make_followup_callback(self, btn_label: str, instruction: str, use_search: bool):
         async def _callback(interaction: discord.Interaction):
-            await self._run_general_followup(interaction, instruction, use_search=use_search)
+            await self._run_general_followup(interaction, btn_label, instruction, use_search=use_search)
         return _callback
 
-    async def _run_general_followup(self, interaction: discord.Interaction, instruction: str, use_search: bool = True):
+    async def _run_general_followup(
+        self,
+        interaction: discord.Interaction,
+        btn_label: str,
+        instruction: str,
+        use_search: bool = True,
+    ):
         await interaction.response.defer(thinking=True)
         cached_ctx = get_cached_channel_attachments(self.channel_id, max_total_chars=25000)
+
+        # Build a clean search hint if searching for artist/related works so formatting words never leak into DDGS
+        search_hint_tag = ""
+        if use_search:
+            artist_hint = _extract_clean_artist_or_topic_hint(cached_ctx, self.bot_reply)
+            if artist_hint and ("ศิลปิน" in btn_label or "ผลงาน" in btn_label):
+                search_hint_tag = f"\n[SEARCH_HINT: {artist_hint}]"
+
+        # Run Decision 1 orchestrator on the button follow-up
+        dec_plan = await orchestrate_message_with_decision_1(
+            f"Follow-up action ({btn_label}): {instruction}",
+            extracted_ctx=cached_ctx[:2500],
+            purpose="ButtonFollowup",
+        )
+        if dec_plan is None:
+            dec_plan = {
+                "route": "web_search" if use_search else "chat",
+                "route_confidence": 0.90,
+                "needs_web_search": use_search,
+            }
+        else:
+            dec_plan["needs_web_search"] = use_search
+
         composed = (
-            f"{instruction}\n\n"
-            f"[กฎสำคัญ]: ห้ามคัดลอกหรือเขียนคำตอบเดิมซ้ำ ห้ามสร้างตาราง Markdown (`|---|---|`) "
-            f"และห้ามเขียนหัวข้อว่า 'ความคิดเห็นในสไตล์ยูกิโนะ' เด็ดขาด\n\n"
+            f"{instruction}{search_hint_tag}\n\n"
+            f"[กฎสำคัญ]: ห้ามคัดลอกหรือเขียนคำตอบเดิมซ้ำ ห้ามสร้างตาราง และห้ามเขียนหัวข้อเมตาของตัวละครเด็ดขาด\n\n"
             f"[บริบทหัวข้อก่อนหน้า]: {self.user_query}\n"
             f"[สรุปคำตอบก่อนหน้า (ห้ามเขียนซ้ำ)]: {self.bot_reply[:1500]}"
         )
@@ -327,6 +379,7 @@ class GeneralAssistantActionView(AutoDisappearingView):
             allow_agentic_search=use_search,
             has_fresh_attachment=bool(cached_ctx and not use_search),
             speaker_user=interaction.user,
+            decision_plan=dec_plan,
         )
         await send_chunked_response(interaction.channel, answer)
         try:
@@ -341,15 +394,23 @@ def build_contextual_suggestion_view(
     bot_reply: str,
     extracted_ctx: str = "",
     source_message: discord.Message | None = None,
+    decision_plan: dict | None = None,
 ) -> GeneralAssistantActionView:
     """
-    Selects the exact set of interactive buttons based on what was actually shared or asked.
+    Selects the exact set of interactive buttons using the `gemini-decision-1` orchestrator's
+    `button_domain` classification (with deterministic tag/keyword fallback).
     """
     ctx_lower = (extracted_ctx or "").lower()
     combined = f"{user_query} {bot_reply}".lower()
 
-    # 1. Documents, Spreadsheets, Web Articles & YouTube Videos
-    if any(
+    dec_domain = ""
+    if decision_plan and float(decision_plan.get("route_confidence") or 0.0) >= 0.65:
+        dec_domain = str(decision_plan.get("button_domain") or "").strip().lower()
+
+    # Resolve domain: Orchestrator verdict first, deterministic fallback second
+    if dec_domain in ("document", "social_art", "game", "news"):
+        domain = dec_domain
+    elif any(
         tag in ctx_lower
         for tag in (
             "=== attached pdf",
@@ -359,6 +420,21 @@ def build_contextual_suggestion_view(
             "<untrusted_web_search_results url=",
         )
     ):
+        domain = "document"
+    elif any(
+        tag in ctx_lower
+        for tag in ("=== embedded x", "=== embedded pixiv", "=== embedded bluesky", "=== image", "=== unified multi-image")
+    ) or any(k in combined for k in ("pixiv", "twitter", "x.com", "ศิลปิน", "ผู้วาด", "อนิเมะ", "มังงะ", "anime", "manga")):
+        domain = "social_art"
+    elif any(k in combined for k in ("เกม", "game", "steam", "pso2", "ngs", "build", "คลาส", "class", "เมต้า", "meta")):
+        domain = "game"
+    elif any(k in combined for k in ("ข่าว", "news", "ราคา", "หุ้น", "ทอง", "บิตคอยน์", "อัปเดต")):
+        domain = "news"
+    else:
+        domain = "general"
+
+    # 1. Documents, Spreadsheets, Web Articles & YouTube Videos
+    if domain == "document":
         specs = [
             (
                 "สรุปประเด็นสำคัญ 3 ข้อ",
@@ -385,10 +461,7 @@ def build_contextual_suggestion_view(
         return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs, source_message=source_message)
 
     # 2. Embedded Social Posts (X / Twitter, Pixiv, Bluesky), Artwork & Anime/Manga
-    if any(
-        tag in ctx_lower
-        for tag in ("=== embedded x", "=== embedded pixiv", "=== embedded bluesky", "=== image inspection")
-    ) or any(k in combined for k in ("pixiv", "twitter", "x.com", "ศิลปิน", "ผู้วาด", "อนิเมะ", "มังงะ", "anime", "manga")):
+    if domain == "social_art":
         has_foreign_dialogue = bool(re.search(r"[ぁ-んァ-ヶ一-龯]", extracted_ctx or ""))
         specs = []
         if has_foreign_dialogue:
@@ -434,7 +507,7 @@ def build_contextual_suggestion_view(
         return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs, source_message=source_message)
 
     # 3. Video Games / Builds / Mechanics
-    if any(k in combined for k in ("เกม", "game", "steam", "pso2", "ngs", "build", "คลาส", "class", "เมต้า", "meta")):
+    if domain == "game":
         specs = [
             (
                 "แนะนำแนวทางเล่น / Build",
@@ -461,7 +534,7 @@ def build_contextual_suggestion_view(
         return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs, source_message=source_message)
 
     # 4. News / Market / Financial Updates
-    if any(k in combined for k in ("ข่าว", "news", "ราคา", "หุ้น", "ทอง", "บิตคอยน์", "อัปเดต")):
+    if domain == "news":
         specs = [
             (
                 "เช็คผลกระทบ & แนวโน้ม",
@@ -697,6 +770,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             allow_agentic_search=False,
             has_fresh_attachment=bool(att_block),
             speaker_user=interaction.user,
+            decision_plan={"route": "code", "route_confidence": 0.99, "needs_web_search": False},
         )
         view = (
             CodeReviewActionView(interaction.user.id, interaction.channel_id, prompt, answer)
@@ -770,6 +844,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
     @app_commands.describe(query="หัวข้อหรือคำถามที่ต้องการให้ Yukipedia ค้นหาและวิเคราะห์")
     async def slash_yukipedia(interaction: discord.Interaction, query: str):
         await interaction.response.defer(thinking=True)
+        dec_plan = await orchestrate_message_with_decision_1(query, purpose="SlashYukipedia")
         answer, did_search = await query_local_ollama_chat(
             query,
             model=ACTIVE_FAST_MODEL,
@@ -779,10 +854,11 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             allow_agentic_search=True,
             has_fresh_attachment=False,
             speaker_user=interaction.user,
+            decision_plan=dec_plan,
         )
         view = (
-            build_contextual_suggestion_view(interaction.channel_id, query, answer)
-            if should_attach_interactive_view(query, answer, did_search=did_search)
+            build_contextual_suggestion_view(interaction.channel_id, query, answer, decision_plan=dec_plan)
+            if should_attach_interactive_view(query, answer, did_search=did_search, decision_plan=dec_plan)
             else None
         )
         await _send_interaction_with_auto_view(
@@ -826,6 +902,9 @@ def register_app_commands(bot: discord.ext.commands.Bot):
 
         fake_msg = _FakeSourceMsg()
         extracted_ctx, _ = await extract_all_context(fake_msg)
+        dec_plan = await orchestrate_message_with_decision_1(
+            question.strip() or link.strip(), extracted_ctx=extracted_ctx, purpose="SlashSource"
+        )
         user_q = question.strip() or (
             "ช่วยระบุที่มาของภาพและลิงก์นี้อย่างละเอียด: "
             "หากเป็นภาพวาด/อนิเมะ/มังงะ ให้บอกชื่อเรื่อง ชื่อตัวละคร ตอนที่/Chapter ชื่อผู้วาด และแนบลิงก์ที่มา (เช่น Pixiv/X/MyAnimeList) ถ้ามี "
@@ -840,12 +919,20 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             allow_agentic_search=True,
             has_fresh_attachment=True,
             speaker_user=interaction.user,
+            decision_plan=dec_plan,
         )
         view = (
             build_contextual_suggestion_view(
-                interaction.channel_id, link.strip() or user_q, answer, extracted_ctx=extracted_ctx, source_message=fake_msg
+                interaction.channel_id,
+                link.strip() or user_q,
+                answer,
+                extracted_ctx=extracted_ctx,
+                source_message=fake_msg,
+                decision_plan=dec_plan,
             )
-            if should_attach_interactive_view(user_q, answer, did_search=did_search, extracted_ctx=extracted_ctx)
+            if should_attach_interactive_view(
+                user_q, answer, did_search=did_search, extracted_ctx=extracted_ctx, decision_plan=dec_plan
+            )
             else None
         )
         await _send_interaction_with_auto_view(
@@ -919,6 +1006,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             allow_agentic_search=False,
             has_fresh_attachment=bool(extracted_ctx),
             speaker_user=interaction.user,
+            decision_plan={"route": "code", "route_confidence": 0.99, "needs_web_search": False},
         )
         view = (
             CodeReviewActionView(interaction.user.id, interaction.channel_id, base_text, answer)
@@ -934,6 +1022,9 @@ def register_app_commands(bot: discord.ext.commands.Bot):
         await interaction.response.defer(thinking=True)
         extracted_ctx, _ = await extract_all_context(message)
         base_text = message.content.strip() or "ช่วยตรวจสอบข้อเท็จจริงและสรุปเนื้อหาในข้อความนี้ให้หน่อย"
+        dec_plan = await orchestrate_message_with_decision_1(
+            base_text, extracted_ctx=extracted_ctx, purpose="CtxYukipedia"
+        )
         full_prompt = f"{base_text}\n\n{extracted_ctx}" if extracted_ctx else base_text
 
         answer, did_search = await query_local_ollama_chat(
@@ -945,12 +1036,20 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             allow_agentic_search=True,
             has_fresh_attachment=bool(extracted_ctx),
             speaker_user=interaction.user,
+            decision_plan=dec_plan,
         )
         view = (
             build_contextual_suggestion_view(
-                interaction.channel_id, base_text, answer, extracted_ctx=extracted_ctx, source_message=message
+                interaction.channel_id,
+                base_text,
+                answer,
+                extracted_ctx=extracted_ctx,
+                source_message=message,
+                decision_plan=dec_plan,
             )
-            if should_attach_interactive_view(base_text, answer, did_search=did_search, extracted_ctx=extracted_ctx)
+            if should_attach_interactive_view(
+                base_text, answer, did_search=did_search, extracted_ctx=extracted_ctx, decision_plan=dec_plan
+            )
             else None
         )
         await _send_interaction_with_auto_view(
@@ -967,6 +1066,9 @@ def register_app_commands(bot: discord.ext.commands.Bot):
                 ephemeral=True,
             )
             return
+        dec_plan = await orchestrate_message_with_decision_1(
+            message.content or "", extracted_ctx=extracted_ctx, purpose="CtxFindSource"
+        )
         user_q = (
             "ช่วยระบุที่มาของภาพและลิงก์นี้อย่างละเอียด: "
             "หากเป็นภาพวาด/อนิเมะ/มังงะ ให้บอกชื่อเรื่อง ชื่อตัวละคร ตอนที่/Chapter ชื่อผู้วาด และแนบลิงก์ที่มา (เช่น Pixiv/X/MyAnimeList) ถ้ามี "
@@ -981,12 +1083,20 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             allow_agentic_search=True,
             has_fresh_attachment=True,
             speaker_user=interaction.user,
+            decision_plan=dec_plan,
         )
         view = (
             build_contextual_suggestion_view(
-                interaction.channel_id, message.content or user_q, answer, extracted_ctx=extracted_ctx, source_message=message
+                interaction.channel_id,
+                message.content or user_q,
+                answer,
+                extracted_ctx=extracted_ctx,
+                source_message=message,
+                decision_plan=dec_plan,
             )
-            if should_attach_interactive_view(user_q, answer, did_search=did_search, extracted_ctx=extracted_ctx)
+            if should_attach_interactive_view(
+                user_q, answer, did_search=did_search, extracted_ctx=extracted_ctx, decision_plan=dec_plan
+            )
             else None
         )
         await _send_interaction_with_auto_view(

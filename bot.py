@@ -1,6 +1,8 @@
 import os
+import io
 import re
 import time
+import base64
 import asyncio
 import platform
 from datetime import datetime
@@ -114,6 +116,46 @@ def _format_uptime(seconds: int) -> str:
     if hours > 0:
         return f"{hours}h {mins}m {secs}s"
     return f"{mins}m {secs}s"
+
+
+def _encode_low_res_decision_thumb_sync(raw_bytes: bytes) -> str:
+    from PIL import Image
+    img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    img.thumbnail((512, 512), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=72)
+    img.close()
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+async def _preload_image_attachments_and_thumb(
+    all_msg_atts: list[discord.Attachment],
+) -> tuple[dict[int, bytes], list[tuple[str, str]]]:
+    """
+    Reads attached images once into an `{attachment.id: bytes}` cache so `PreRoute`
+    and `extract_all_context()` share the exact same bytes without downloading twice.
+    """
+    preloaded: dict[int, bytes] = {}
+    img_atts = [
+        a for a in all_msg_atts
+        if a.filename.lower().endswith(config.IMAGE_EXTENSIONS) and a.size <= 8 * 1024 * 1024
+    ][:4]
+    for att in img_atts:
+        try:
+            preloaded[att.id] = await att.read()
+        except Exception:
+            continue
+
+    low_res_imgs: list[tuple[str, str]] = []
+    if preloaded and GEMINI_API_KEY and time.time() >= state.gemini_decision_cooldown_until:
+        try:
+            first_bytes = next(iter(preloaded.values()))
+            b64_thumb = await asyncio.to_thread(_encode_low_res_decision_thumb_sync, first_bytes)
+            low_res_imgs.append((b64_thumb, "image/jpeg"))
+        except Exception:
+            pass
+
+    return preloaded, low_res_imgs
 
 
 def _collect_health_metrics() -> dict:
@@ -400,6 +442,8 @@ async def on_message(message: discord.Message):
 
     all_msg_atts = list(message.attachments) + (list(ref_msg.attachments) if ref_msg else [])
     has_image_att = any(a.filename.lower().endswith(config.IMAGE_EXTENSIONS) for a in all_msg_atts)
+    has_code_att = any(a.filename.lower().endswith(CODE_AND_LOG_EXTENSIONS) for a in all_msg_atts)
+    has_doc_att = any(a.filename.lower().endswith((".pdf", ".docx", ".xlsx")) for a in all_msg_atts)
     has_embedded_media_or_link = (
         bool(message.embeds)
         or bool(ref_msg and ref_msg.embeds)
@@ -407,8 +451,33 @@ async def on_message(message: discord.Message):
         or bool(ref_msg and URL_REGEX.search(ref_msg.content or ""))
     )
 
+    # Fast Instant Date/Time Check (zero API calls)
+    if not message.attachments and not message.embeds:
+        instant_dt = try_instant_datetime_reply(clean_prompt)
+        if instant_dt:
+            channel_memory[message.channel.id].append({"role": "user", "content": clean_prompt})
+            channel_memory[message.channel.id].append({"role": "assistant", "content": instant_dt})
+            await message.channel.send(instant_dt)
+            return
+
+    # Single-pass attachment preload + Pre-Flight Multimodal Orchestrator (`gemini-decision-1`)
+    preloaded_att_bytes, low_res_imgs = (
+        await _preload_image_attachments_and_thumb(all_msg_atts) if has_image_att else ({}, [])
+    )
+    pre_plan = await orchestrate_message_with_decision_1(
+        clean_prompt,
+        has_code_attachment=has_code_att,
+        inline_images_b64=low_res_imgs,
+        purpose="PreRoute",
+    )
+    pre_route = (pre_plan or {}).get("route", "")
+    pre_conf = float((pre_plan or {}).get("route_confidence") or 0.0)
+
     # 0A. Overtime (OT) Logger & Monthly Table Summarizer
-    if is_ot_command_text(clean_prompt, channel_id=message.channel.id, user_id=message.author.id):
+    if is_ot_command_text(clean_prompt, channel_id=message.channel.id, user_id=message.author.id) or (
+        pre_route == "ot_log" and pre_conf >= 0.82
+    ):
+        preloaded_att_bytes.clear()
         ot_reply = await process_ot_request(message, clean_prompt)
         rec_date, rec_slot, rec_detail = parse_ot_record_metadata(ot_reply)
         ot_view = (
@@ -421,42 +490,61 @@ async def on_message(message: discord.Message):
 
     # 0. Natural Chat "Yukipedia Mode" Trigger
     if YUKIPEDIA_INTENT_PATTERN.search(clean_prompt):
+        preloaded_att_bytes.clear()
         await process_yukipedia_request(message, clean_prompt)
         return
 
     # 1. Natural Chat Manga / Image Translation Trigger
-    if MANGA_TRANSLATE_INTENT_PATTERN.search(clean_prompt) or (
-        (has_image_att or has_embedded_media_or_link)
-        and re.search(r"(แปล|\btranslate\b|\btl\b)", clean_prompt, re.IGNORECASE)
+    if (
+        MANGA_TRANSLATE_INTENT_PATTERN.search(clean_prompt)
+        or (
+            (has_image_att or has_embedded_media_or_link)
+            and re.search(r"(แปล|\btranslate\b|\btl\b)", clean_prompt, re.IGNORECASE)
+        )
+        or (
+            (has_image_att or has_embedded_media_or_link)
+            and pre_route == "manga_translate"
+            and pre_conf >= 0.78
+        )
     ):
+        preloaded_att_bytes.clear()
         await process_manga_translation_request(message, clean_prompt)
         return
 
     # 2. Natural Chat Image Generation Trigger
-    if not message.attachments and IMAGE_GEN_INTENT_PATTERN.search(clean_prompt):
+    if not message.attachments and (
+        IMAGE_GEN_INTENT_PATTERN.search(clean_prompt)
+        or (pre_route == "image_gen" and pre_conf >= 0.82)
+    ):
+        preloaded_att_bytes.clear()
         async with message.channel.typing():
             await send_generated_image_to_channel(message.channel, clean_prompt, reply_to=message)
         return
 
-    # 3. Fast Instant Date/Time Check
-    if not message.attachments and not message.embeds:
-        instant_dt = try_instant_datetime_reply(clean_prompt)
-        if instant_dt:
-            channel_memory[message.channel.id].append({"role": "user", "content": clean_prompt})
-            channel_memory[message.channel.id].append({"role": "assistant", "content": instant_dt})
-            await message.channel.send(instant_dt)
-            return
-
     async with message.channel.typing():
-        extracted_ctx, spoken_clip_text = await extract_all_context(message)
-        has_code_att = any(a.filename.lower().endswith(CODE_AND_LOG_EXTENSIONS) for a in message.attachments)
-
-        # Fast ~200ms Orchestrator pass via Google `gemini-decision-1` (falls back seamlessly to regex if unavailable)
-        decision_plan = await orchestrate_message_with_decision_1(
-            clean_prompt or spoken_clip_text,
-            extracted_ctx=extracted_ctx,
-            has_code_attachment=has_code_att,
+        extracted_ctx, spoken_clip_text = await extract_all_context(
+            message, preloaded_attachments=preloaded_att_bytes
         )
+        preloaded_att_bytes.clear()
+
+        # Deduplicate `gemini-decision-1` calls: reuse `pre_plan` whenever confidence >= 0.85
+        # and no external links/embeds, PDFs/Docs, or voice clips introduced unseen text.
+        needs_refined_route = (
+            pre_plan is None
+            or pre_conf < 0.85
+            or has_embedded_media_or_link
+            or has_doc_att
+            or bool(spoken_clip_text and not clean_prompt)
+        )
+        if needs_refined_route and (extracted_ctx or spoken_clip_text):
+            decision_plan = await orchestrate_message_with_decision_1(
+                clean_prompt or spoken_clip_text,
+                extracted_ctx=extracted_ctx,
+                has_code_attachment=has_code_att,
+                purpose="Route",
+            ) or pre_plan
+        else:
+            decision_plan = pre_plan
 
         regex_coder = detect_coding_intent(
             clean_prompt,
@@ -530,6 +618,7 @@ async def on_message(message: discord.Message):
             use_coder=use_coder,
             did_search=did_search,
             extracted_ctx=extracted_ctx,
+            decision_plan=decision_plan,
         )
         if should_attach:
             if use_coder:
@@ -541,6 +630,7 @@ async def on_message(message: discord.Message):
                     answer,
                     extracted_ctx=extracted_ctx,
                     source_message=message,
+                    decision_plan=decision_plan,
                 )
 
         await _send_response_with_interactive_view(message.channel, answer, action_view, reply_to=reply_target)
@@ -706,6 +796,9 @@ async def ask_fast(ctx, *, prompt: str = ""):
             "ช่วยตรวจสอบ สรุปเนื้อหา และบอกความรู้สึกหรือความคิดเห็นของเธอต่อสิ่งที่แนบมาให้หน่อย" if ctx_text else "สวัสดี"
         )
         is_dt = (not ctx_text) and (try_instant_datetime_reply(effective_prompt) is not None)
+        dec_plan = None if is_dt else await orchestrate_message_with_decision_1(
+            effective_prompt, extracted_ctx=ctx_text, purpose="AskCmd"
+        )
         answer, did_search = await query_local_ollama_chat(
             f"{effective_prompt}\n\n{ctx_text}" if ctx_text else effective_prompt,
             ACTIVE_FAST_MODEL,
@@ -713,13 +806,19 @@ async def ask_fast(ctx, *, prompt: str = ""):
             ctx.channel.id,
             has_fresh_attachment=bool(ctx_text),
             speaker_user=ctx.author,
+            decision_plan=dec_plan,
         )
         use_reply = should_reply_to_message(
             effective_prompt, has_attachments=bool(ctx_text), is_instant_datetime=is_dt
         )
         view = (
             build_contextual_suggestion_view(
-                ctx.channel.id, effective_prompt, answer, extracted_ctx=ctx_text, source_message=ctx.message
+                ctx.channel.id,
+                effective_prompt,
+                answer,
+                extracted_ctx=ctx_text,
+                source_message=ctx.message,
+                decision_plan=dec_plan,
             )
             if should_attach_interactive_view(
                 effective_prompt,
@@ -727,6 +826,7 @@ async def ask_fast(ctx, *, prompt: str = ""):
                 did_search=did_search,
                 extracted_ctx=ctx_text,
                 is_instant_dt=is_dt,
+                decision_plan=dec_plan,
             )
             else None
         )
@@ -746,6 +846,7 @@ async def ask_code(ctx, *, prompt: str = "วิเคราะห์โค้�
             allow_agentic_search=False,
             has_fresh_attachment=bool(ctx_text),
             speaker_user=ctx.author,
+            decision_plan={"route": "code", "route_confidence": 0.99, "needs_web_search": False},
         )
         view = (
             CodeReviewActionView(ctx.author.id, ctx.channel.id, prompt, answer)
@@ -765,6 +866,9 @@ async def source_command(ctx, *, question: str = ""):
                 "หรือกด Reply ที่ข้อความที่มีรูป/ลิงก์ที่ต้องการให้ฉันช่วยตรวจสอบที่มาด้วยนะคะ"
             )
             return
+        dec_plan = await orchestrate_message_with_decision_1(
+            question.strip() or ctx.message.content, extracted_ctx=ctx_text, purpose="SourceCmd"
+        )
         user_q = question.strip() or (
             "ช่วยระบุที่มาของภาพและลิงก์นี้อย่างละเอียด: "
             "หากเป็นภาพวาด/อนิเมะ/มังงะ ให้บอกชื่อเรื่อง ชื่อตัวละคร ตอนที่/Chapter ชื่อผู้วาด และแนบลิงก์ที่มา (เช่น Pixiv/X/MyAnimeList/Danbooru) ถ้ามี "
@@ -779,12 +883,20 @@ async def source_command(ctx, *, question: str = ""):
             allow_agentic_search=True,
             has_fresh_attachment=True,
             speaker_user=ctx.author,
+            decision_plan=dec_plan,
         )
         view = (
             build_contextual_suggestion_view(
-                ctx.channel.id, question.strip() or ctx.message.content, answer, extracted_ctx=ctx_text, source_message=ctx.message
+                ctx.channel.id,
+                question.strip() or ctx.message.content,
+                answer,
+                extracted_ctx=ctx_text,
+                source_message=ctx.message,
+                decision_plan=dec_plan,
             )
-            if should_attach_interactive_view(user_q, answer, did_search=did_search, extracted_ctx=ctx_text)
+            if should_attach_interactive_view(
+                user_q, answer, did_search=did_search, extracted_ctx=ctx_text, decision_plan=dec_plan
+            )
             else None
         )
         await _send_response_with_interactive_view(ctx.channel, answer, view, reply_to=ctx.message)
