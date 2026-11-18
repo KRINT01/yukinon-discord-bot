@@ -36,6 +36,7 @@ from config import (
     TAVILY_API_KEY,
     DDGS_PROXY,
     GEMINI_API_KEY,
+    GEMINI_SEARCH_MODEL,
     channel_memory,
     channel_active_topic,
     channel_last_weather,
@@ -487,9 +488,12 @@ def _search_google_ai_studio_grounded_sync(query: str) -> str:
             }
         ],
         "tools": [{"google_search": {}}],
-        "generationConfig": {"temperature": 0.1},
+        "generationConfig": {
+            "temperature": 0.1,
+            "thinkingConfig": {"thinkingLevel": "MINIMAL"},
+        },
     }
-    model_id = state.active_gemini_model or "gemini-3-flash-preview"
+    model_id = GEMINI_SEARCH_MODEL or "gemini-3.5-flash-lite"
     url = clean_url(
         f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
         f"{model_id}:generateContent?key={GEMINI_API_KEY}"
@@ -504,32 +508,32 @@ def _search_google_ai_studio_grounded_sync(query: str) -> str:
         )
         with urllib.request.urlopen(req, timeout=12) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        elapsed = time.monotonic() - t0
-        candidates = data.get("candidates") or []
-        if not candidates:
-            return ""
-        cand = candidates[0]
-        parts = (cand.get("content") or {}).get("parts") or []
-        summary_text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+            elapsed = time.monotonic() - t0
+            candidates = data.get("candidates") or []
+            if not candidates:
+                return ""
+            cand = candidates[0]
+            parts = (cand.get("content") or {}).get("parts") or []
+            summary_text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
 
-        chunks = (cand.get("groundingMetadata") or {}).get("groundingChunks") or []
-        sources = []
-        for idx, ch in enumerate(chunks[:5], 1):
-            web_info = ch.get("web") or {}
-            uri = web_info.get("uri", "")
-            title = web_info.get("title", "Source")
-            if uri:
-                sources.append(f"[{idx}] {title}: {uri}")
+            chunks = (cand.get("groundingMetadata") or {}).get("groundingChunks") or []
+            sources = []
+            for idx, ch in enumerate(chunks[:5], 1):
+                web_info = ch.get("web") or {}
+                uri = web_info.get("uri", "")
+                title = web_info.get("title", "Source")
+                if uri:
+                    sources.append(f"[{idx}] {title}: {uri}")
 
-        if summary_text:
-            api_log(f"Search (Gemini Grounding) -> {model_id} 200 OK ({elapsed:.2f}s)")
-            sources_block = "\n".join(sources)
-            return (
-                f'<untrusted_web_search_results query="{query}" engine="google_search_grounding">\n'
-                f"Verified Google Search Summary:\n{summary_text}\n\n"
-                f"Sources:\n{sources_block}\n"
-                f"</untrusted_web_search_results>"
-            )
+            if summary_text:
+                api_log(f"Search (Gemini Grounding) -> {model_id} 200 OK ({elapsed:.2f}s)")
+                sources_block = "\n".join(sources)
+                return (
+                    f'<untrusted_web_search_results query="{query}" engine="google_search_grounding">\n'
+                    f"Verified Google Search Summary:\n{summary_text}\n\n"
+                    f"Sources:\n{sources_block}\n"
+                    f"</untrusted_web_search_results>"
+                )
     except Exception as e:
         err_str = str(e)
         if "429" in err_str:
@@ -551,17 +555,17 @@ def _search_google_news_rss_sync(query: str, is_thai: bool, max_results: int = 5
         req = urllib.request.Request(rss_url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=8) as resp:
             xml_bytes = resp.read()
-        root = ET.fromstring(xml_bytes)
-        for item in root.findall("./channel/item")[:max_results]:
-            title = (item.findtext("title") or "").strip()
-            link = (item.findtext("link") or "").strip()
-            pub_date = (item.findtext("pubDate") or "").strip()
-            source = (item.findtext("source") or "").strip()
-            results.append({
-                "title": f"[{source}] {title}" if source else title,
-                "href": link,
-                "body": f"สำนักข่าว (Source): {source or 'Unknown'} | วันที่เผยแพร่: {pub_date} | พาดหัวข่าว: {title}",
-            })
+            root = ET.fromstring(xml_bytes)
+            for item in root.findall("./channel/item")[:max_results]:
+                title = (item.findtext("title") or "").strip()
+                link = (item.findtext("link") or "").strip()
+                pub_date = (item.findtext("pubDate") or "").strip()
+                source = (item.findtext("source") or "").strip()
+                results.append({
+                    "title": f"[{source}] {title}" if source else title,
+                    "href": link,
+                    "body": f"สำนักข่าว (Source): {source or 'Unknown'} | วันที่เผยแพร่: {pub_date} | พาดหัวข่าว: {title}",
+                })
         if results:
             api_log(f"Search (Tier 1 Google News RSS) -> {len(results)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception as e:
@@ -595,32 +599,32 @@ def _search_wikipedia_full_extract_sync(query: str, is_thai: bool, max_results: 
             req = urllib.request.Request(search_url, headers={"User-Agent": "YukinonBot/2.0"})
             with urllib.request.urlopen(req, timeout=6) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-            search_items = ((data.get("query") or {}).get("search")) or []
-            for item in search_items[:max_results]:
-                title = item.get("title", "")
-                if not title:
-                    continue
-                ext_url = clean_url(
-                    f"{HTTPS}{lang_host}.wikipedia.org/w/api.php"
-                    f"?action=query&prop=extracts&explaintext=1&exchars=4200"
-                    f"&titles={quote_plus(title)}&format=json"
-                )
-                req_e = urllib.request.Request(ext_url, headers={"User-Agent": "YukinonBot/2.0"})
-                with urllib.request.urlopen(req_e, timeout=6) as e_resp:
-                    e_data = json.loads(e_resp.read().decode("utf-8"))
-                pages = ((e_data.get("query") or {}).get("pages")) or {}
-                extract = ""
-                for _, p_obj in pages.items():
-                    extract = (p_obj.get("extract") or "").strip()
-                    if extract:
-                        break
-                page_url = f"{HTTPS}{lang_host}.wikipedia.org/wiki/{quote_plus(title.replace(' ', '_'))}"
-                if extract:
-                    hits.append({
-                        "title": f"[Wikipedia {lang_host.upper()}] {title}",
-                        "href": page_url,
-                        "body": extract[:4200],
-                    })
+                search_items = ((data.get("query") or {}).get("search")) or []
+                for item in search_items[:max_results]:
+                    title = item.get("title", "")
+                    if not title:
+                        continue
+                    ext_url = clean_url(
+                        f"{HTTPS}{lang_host}.wikipedia.org/w/api.php"
+                        f"?action=query&prop=extracts&explaintext=1&exchars=4200"
+                        f"&titles={quote_plus(title)}&format=json"
+                    )
+                    req_e = urllib.request.Request(ext_url, headers={"User-Agent": "YukinonBot/2.0"})
+                    with urllib.request.urlopen(req_e, timeout=6) as e_resp:
+                        e_data = json.loads(e_resp.read().decode("utf-8"))
+                        pages = ((e_data.get("query") or {}).get("pages")) or {}
+                        extract = ""
+                        for _, p_obj in pages.items():
+                            extract = (p_obj.get("extract") or "").strip()
+                            if extract:
+                                break
+                        page_url = f"{HTTPS}{lang_host}.wikipedia.org/wiki/{quote_plus(title.replace(' ', '_'))}"
+                        if extract:
+                            hits.append({
+                                "title": f"[Wikipedia {lang_host.upper()}] {title}",
+                                "href": page_url,
+                                "body": extract[:4200],
+                            })
             if hits:
                 api_log(f"Search (Wikipedia:{lang_host} q='{q_for_wiki[:35]}') -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
         except Exception:
@@ -646,22 +650,22 @@ def _search_jikan_anime_manga_sync(query: str, max_results: int = 2) -> list[dic
         req = urllib.request.Request(url, headers={"User-Agent": "YukinonBot/2.0"})
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        for item in (data.get("data") or [])[:max_results]:
-            title = item.get("title") or "Unknown"
-            title_jp = item.get("title_japanese") or ""
-            score = item.get("score") or "N/A"
-            status = item.get("status") or "Unknown"
-            episodes_or_ch = item.get("episodes") or item.get("chapters") or "?"
-            synopsis = (item.get("synopsis") or "").strip()[:1200]
-            mal_url = item.get("url") or ""
-            hits.append({
-                "title": f"[MyAnimeList {media_type.upper()}] {title} ({title_jp})",
-                "href": mal_url,
-                "body": (
-                    f"Type: {item.get('type')} | Score: {score}/10 | Status: {status} | "
-                    f"Episodes/Chapters: {episodes_or_ch}\nSynopsis: {synopsis}"
-                ),
-            })
+            for item in (data.get("data") or [])[:max_results]:
+                title = item.get("title") or "Unknown"
+                title_jp = item.get("title_japanese") or ""
+                score = item.get("score") or "N/A"
+                status = item.get("status") or "Unknown"
+                episodes_or_ch = item.get("episodes") or item.get("chapters") or "?"
+                synopsis = (item.get("synopsis") or "").strip()[:1200]
+                mal_url = item.get("url") or ""
+                hits.append({
+                    "title": f"[MyAnimeList {media_type.upper()}] {title} ({title_jp})",
+                    "href": mal_url,
+                    "body": (
+                        f"Type: {item.get('type')} | Score: {score}/10 | Status: {status} | "
+                        f"Episodes/Chapters: {episodes_or_ch}\nSynopsis: {synopsis}"
+                    ),
+                })
         if hits:
             api_log(f"Search (Jikan MAL:{media_type}) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception:
@@ -687,18 +691,18 @@ def _search_steam_games_sync(query: str, max_results: int = 2) -> list[dict]:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=7) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        for item in (data.get("items") or [])[:max_results]:
-            gid = item.get("id")
-            name = item.get("name") or "Unknown Game"
-            price_info = item.get("price") or {}
-            final_thb = (price_info.get("final", 0) / 100.0) if price_info else 0
-            price_str = f"{final_thb:,.2f} THB" if final_thb > 0 else "Free-to-Play / TBA"
-            store_url = f"{HTTPS}store.steampowered.com/app/{gid}" if gid else ""
-            hits.append({
-                "title": f"[Steam Store TH] {name}",
-                "href": store_url,
-                "body": f"Game: {name} | Steam Thailand Price: {price_str} | AppID: {gid}",
-            })
+            for item in (data.get("items") or [])[:max_results]:
+                gid = item.get("id")
+                name = item.get("name") or "Unknown Game"
+                price_info = item.get("price") or {}
+                final_thb = (price_info.get("final", 0) / 100.0) if price_info else 0
+                price_str = f"{final_thb:,.2f} THB" if final_thb > 0 else "Free-to-Play / TBA"
+                store_url = f"{HTTPS}store.steampowered.com/app/{gid}" if gid else ""
+                hits.append({
+                    "title": f"[Steam Store TH] {name}",
+                    "href": store_url,
+                    "body": f"Game: {name} | Steam Thailand Price: {price_str} | AppID: {gid}",
+                })
         if hits:
             api_log(f"Search (Steam Store) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception:
@@ -764,12 +768,12 @@ def run_safe_web_search_sync(query: str, max_results: int = 5) -> str:
             )
             with urllib.request.urlopen(t_req, timeout=10) as resp:
                 t_data = json.loads(resp.read().decode("utf-8"))
-            for r in t_data.get("results", []):
-                hits.append({
-                    "title": r.get("title", ""),
-                    "href": r.get("url", ""),
-                    "body": r.get("content", ""),
-                })
+                for r in t_data.get("results", []):
+                    hits.append({
+                        "title": r.get("title", ""),
+                        "href": r.get("url", ""),
+                        "body": r.get("content", ""),
+                    })
             if hits:
                 api_log(f"Search (Tavily) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
         except Exception as e:

@@ -612,10 +612,10 @@ def _parse_manga_pages_batch_json(
             if any(b for b, _ in results):
                 return results
 
-    if expected_pages == 1 and isinstance(parsed, dict) and "bubbles" in parsed:
-        bubbles = _normalize_and_validate_bubbles(parsed.get("bubbles") or [])
-        summary = str(parsed.get("summary") or "").strip()
-        return [(bubbles, summary)]
+        if expected_pages == 1 and isinstance(parsed, dict) and "bubbles" in parsed:
+            bubbles = _normalize_and_validate_bubbles(parsed.get("bubbles") or [])
+            summary = str(parsed.get("summary") or "").strip()
+            return [(bubbles, summary)]
 
     if expected_pages == 1:
         b, s = _parse_manga_bubbles_json(raw_text)
@@ -628,11 +628,10 @@ async def extract_and_translate_manga_pages_batch(
     pages_input: list[tuple[bytes, str]], target_lang_name: str
 ) -> list[tuple[list[dict], str]]:
     """
-    Processes 2 to 12 manga pages (including multi-part X/Twitter threads) in a SINGLE unified
-    multimodal batch call:
-    - Tier 1: `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> `gemini-3.8-flash` (Self-healing, 15 RPM, 250K TPM, 500 RPD)
-    - Tier 2: `gemini-4-hydrogen` (250K TPM Heavy Specialist with `thinkingLevel: "LOW"`)
-    - Tier 3: Paced `Semaphore(2)` per-page fallback
+    Processes 2 to 12 manga pages (including multi-part X/Twitter threads) in a unified batch:
+      - Tier 1: `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` (`thinkingLevel: "MINIMAL"`)
+      - Tier 2: `gemini-4-hydrogen` (65,536 maxOutputTokens, no sampling params, `thinkingLevel: "LOW"`)
+      - Tier 3: Paced `Semaphore(2)` per-page fallback
     """
     num_pages = len(pages_input)
     if num_pages == 0:
@@ -700,14 +699,14 @@ CRITICAL RULES:
 
             timeout_sec = min(120, 40 + (7 * num_pages))
 
-            # Tier 1: Gemini 3.5 Flash-Lite -> Gemini 3.1 Flash-Lite -> Self-Healing (250K TPM, 15 RPM, 500 RPD)
+            # Tier 1: Gemini 3.5 Flash-Lite -> Gemini 3.1 Flash-Lite (`thinkingLevel: "MINIMAL"`)
             lite_batch_payload = {
                 "contents": [{"parts": parts}],
                 "generationConfig": {
                     "temperature": 0.1,
                     "maxOutputTokens": 16384,
                     "responseMimeType": "application/json",
-                    "thinkingConfig": {"thinkingBudget": 0},
+                    "thinkingConfig": {"thinkingLevel": "MINIMAL"},
                 },
             }
             try:
@@ -734,12 +733,11 @@ CRITICAL RULES:
             except Exception as e:
                 print(f"Gemini Lite Manga Batch warning ({type(e).__name__}): {e}", flush=True)
 
-            # Tier 2: Gemini 4 Hydrogen Heavy Specialist fallback (`thinkingLevel: "LOW"`)
+            # Tier 2: Gemini 4 Hydrogen Heavy Specialist fallback (no sampling params, 65536 cap, `thinkingLevel: "LOW"`)
             hydrogen_payload = {
                 "contents": [{"parts": parts}],
                 "generationConfig": {
-                    "temperature": 0.1,
-                    "maxOutputTokens": 16384,
+                    "maxOutputTokens": 65536,
                     "responseMimeType": "application/json",
                     "thinkingConfig": {"thinkingLevel": "LOW"},
                 },
@@ -908,7 +906,7 @@ CRITICAL RULES:
             "generationConfig": {
                 "temperature": 0.1,
                 "responseMimeType": "application/json",
-                "thinkingConfig": {"thinkingBudget": 0},
+                "thinkingConfig": {"thinkingLevel": "MINIMAL"},
             },
         }
         try:
@@ -1700,7 +1698,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
                 src_txt = re.sub(r"\s+", " ", (b.get("source_text") or "")).strip()
                 tr_txt = re.sub(r"\s+", " ", (b.get("translated_text") or "")).strip()
                 if tr_txt:
-                    transcript_lines.append(f"**[#{idx} | {speaker}]** `{src_txt}`\n ↳ **{tr_txt}**")
+                    transcript_lines.append(f"**[#{idx} | {speaker}]** `{src_txt}`\n  ↳ **{tr_txt}**")
 
             try:
                 rendered_png = await asyncio.to_thread(
@@ -1714,7 +1712,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
                             filename=f"translated_p{page_idx}_{base_name}.png",
                         )
                     )
-                await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.05)
             except Exception as e:
                 print(f"Manga page {page_idx} rendering fallback to text-only: {e}", flush=True)
 
@@ -1733,12 +1731,12 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
         else:
             await send_chunked_response(channel, transcript_text, reply_to=msg)
 
-    for df in discord_files:
-        try:
-            df.close()
-        except Exception:
-            pass
-    discord_files.clear()
-    pages_input.clear()
-    rendered_png = raw_bytes = None
-    release_unused_memory()
+        for df in discord_files:
+            try:
+                df.close()
+            except Exception:
+                pass
+        discord_files.clear()
+        pages_input.clear()
+        rendered_png = raw_bytes = None
+        release_unused_memory()

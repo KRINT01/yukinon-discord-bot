@@ -1313,14 +1313,16 @@ def _compress_image_for_vision_ocr_sync(raw_bytes: bytes, max_dim: int = 1280, q
 async def _call_gemini_multi_image_batch(
     encoded_images: list[tuple[str, str, str]],
     batch_prompt: str,
-    timeout_sec: int = 26,
-    max_output_tokens: int = 2048,
+    timeout_sec: int = 24,
+    max_output_tokens: int = 2560,
+    page_offset: int = 0,
 ) -> str:
     if not GEMINI_API_KEY:
         return ""
     parts = [{"text": batch_prompt}]
     for idx, (b64_img, mime_type, fname) in enumerate(encoded_images, 1):
-        parts.append({"text": f"=== Image {idx}/{len(encoded_images)} (`{fname}`) ==="})
+        p_num = page_offset + idx
+        parts.append({"text": f"=== Page {p_num} (`{fname}`) ==="})
         parts.append({"inlineData": {"mimeType": mime_type, "data": b64_img}})
 
     payload = {
@@ -1328,7 +1330,7 @@ async def _call_gemini_multi_image_batch(
         "generationConfig": {
             "temperature": 0.1,
             "maxOutputTokens": max_output_tokens,
-            "thinkingConfig": {"thinkingLevel": "LOW"},
+            "thinkingConfig": {"thinkingLevel": "MINIMAL"},
         },
     }
     try:
@@ -1336,16 +1338,15 @@ async def _call_gemini_multi_image_batch(
             payload,
             timeout_sec=timeout_sec,
             purpose=f"MultiImageOCR({len(encoded_images)}p)",
-            prefer_full_flash=True,
             max_models=2,
-            max_wall_sec=float(timeout_sec + 14),
+            max_wall_sec=float(timeout_sec + 12),
         )
         if data:
             resp_parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
             out_txt = "\n".join(p.get("text", "") for p in resp_parts if p.get("text") and not p.get("thought", False)).strip()
             out_txt = re.sub(r"<think>[\s\S]*?</think>", "", out_txt).strip()
             if out_txt:
-                return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{out_txt}"
+                return out_txt
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -1357,7 +1358,8 @@ async def _call_ai_studio_gemma_multi_image_batch(
     encoded_images: list[tuple[str, str, str]],
     batch_prompt: str,
     timeout_sec: int = 22,
-    max_output_tokens: int = 2048,
+    max_output_tokens: int = 2560,
+    page_offset: int = 0,
 ) -> str:
     """Tier 2 Google AI Studio Gemma 4 multi-image batch backup (uses fast 26B MoE)."""
     if not GEMINI_API_KEY:
@@ -1369,7 +1371,8 @@ async def _call_ai_studio_gemma_multi_image_batch(
 
     parts = [{"text": batch_prompt}]
     for idx, (b64_img, mime_type, fname) in enumerate(encoded_images, 1):
-        parts.append({"text": f"=== Image {idx}/{len(encoded_images)} (`{fname}`) ==="})
+        p_num = page_offset + idx
+        parts.append({"text": f"=== Page {p_num} (`{fname}`) ==="})
         parts.append({"inlineData": {"mimeType": mime_type, "data": b64_img}})
 
     session = get_http_session()
@@ -1401,7 +1404,7 @@ async def _call_ai_studio_gemma_multi_image_batch(
                     out_txt = re.sub(r"<think>[\s\S]*?</think>", "", out_txt).strip()
                     if out_txt:
                         api_log(f"MultiImageOCR (Tier 2 AI Studio Gemma) -> {model_id} 200 OK ({elapsed:.2f}s)")
-                        return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{out_txt}"
+                        return out_txt
                 api_log(f"MultiImageOCR (Tier 2 AI Studio Gemma) -> {model_id} HTTP {resp.status} ({elapsed:.2f}s)")
         except asyncio.CancelledError:
             raise
@@ -1413,8 +1416,9 @@ async def _call_ai_studio_gemma_multi_image_batch(
 async def _call_cf_multi_image_batch(
     encoded_images: list[tuple[str, str, str]],
     batch_prompt: str,
-    timeout_sec: int = 26,
-    max_tokens: int = 2048,
+    timeout_sec: int = 24,
+    max_tokens: int = 2560,
+    page_offset: int = 0,
 ) -> str:
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
         return ""
@@ -1426,7 +1430,8 @@ async def _call_cf_multi_image_batch(
     }
     user_content: list[dict] = [{"type": "text", "text": batch_prompt}]
     for idx, (b64_img, mime_type, fname) in enumerate(encoded_images, 1):
-        user_content.append({"type": "text", "text": f"=== Image {idx}/{len(encoded_images)} (`{fname}`) ==="})
+        p_num = page_offset + idx
+        user_content.append({"type": "text", "text": f"=== Page {p_num} (`{fname}`) ==="})
         user_content.append({"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}})
 
     cf_payload = {
@@ -1457,7 +1462,7 @@ async def _call_cf_multi_image_batch(
                     content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
                     if content:
                         api_log(f"MultiImageOCR (Tier 3 CF) -> {CF_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
-                        return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{content}"
+                        return content
             api_log(f"MultiImageOCR (Tier 3 CF) -> HTTP {resp.status} ({elapsed:.2f}s)")
     except asyncio.CancelledError:
         raise
@@ -1466,22 +1471,19 @@ async def _call_cf_multi_image_batch(
     return ""
 
 
-async def extract_multi_images_batch_ocr(
-    images_list: list[tuple[bytes, str, str]],
-    post_meta_hint: str = "",
+async def _process_single_encoded_chunk(
+    encoded_chunk: list[tuple[str, str, str]],
+    total_pages: int,
+    page_offset: int,
+    post_meta_hint: str,
+    out_tokens: int,
 ) -> str:
-    """
-    Inspects 2 to 12 sequential comic/illustration pages together in a SINGLE multimodal batch call
-    using Gemini 3.8 Flash (`thinkingLevel: LOW`) with bounded 14s hedged backup.
-    """
-    target_list = images_list[:MAX_BATCH_IMAGES]
-    if len(target_list) < 2:
-        return ""
-
+    start_p = page_offset + 1
+    end_p = page_offset + len(encoded_chunk)
     batch_prompt = (
-        f"You are analyzing a sequential multi-image post/comic (Pages 1 to {len(target_list)}) for Yukino Yukinoshita.\n"
+        f"You are analyzing Pages {start_p} to {end_p} (of a {total_pages}-page sequential comic/post) for Yukino Yukinoshita.\n"
         + (f"Post Metadata / Caption Context:\n{post_meta_hint[:1400]}\n\n" if post_meta_hint else "")
-        + "Examine ALL pages together in sequence so you maintain strict character & franchise consistency across every page:\n"
+        + "Examine these pages together in sequence so you maintain strict character & franchise consistency:\n"
         "1. [Series / Franchise & Character Identification — STRICT EVIDENCE RULE]:\n"
         "   - Verify concrete visual traits (hair/eye color, signature hair accessories/ornaments, outfits, presence or absence of floating halos) "
         "and cross-check with the post caption/tags before naming ANY franchise or character.\n"
@@ -1491,19 +1493,106 @@ async def extract_multi_images_batch_ocr(
         "   - If the franchise or character names are not 100% certain from the visuals or caption, write 'Unknown / Unconfirmed Series' "
         "and describe the characters strictly by appearance rather than guessing.\n"
         "2. [Page-by-Page Story & Panel-by-Panel Dialogue/SFX (Right-to-Left, Top-to-Bottom)]:\n"
-        "   - For each page (Page 1, Page 2, ...), summarize the visual events and list all dialogue, thoughts, "
+        f"   - For each page (Page {start_p} .. Page {end_p}), summarize the visual events and list all dialogue, thoughts, "
         "and key SFX in Japanese reading order tagged with the speaker."
     )
 
+    has_gemini = bool(GEMINI_API_KEY)
+    has_cf = bool(CF_ACCOUNT_ID and CF_API_TOKEN)
+    gemini_timeout = 24
+    backup_timeout = 22
+
+    async def _run_backup() -> str:
+        if has_gemini:
+            gemma_res = await _call_ai_studio_gemma_multi_image_batch(
+                encoded_chunk,
+                batch_prompt,
+                timeout_sec=backup_timeout,
+                max_output_tokens=out_tokens,
+                page_offset=page_offset,
+            )
+            if gemma_res:
+                return gemma_res
+        if has_cf:
+            return await _call_cf_multi_image_batch(
+                encoded_chunk,
+                batch_prompt,
+                timeout_sec=backup_timeout,
+                max_tokens=out_tokens,
+                page_offset=page_offset,
+            )
+        return ""
+
+    if not has_gemini:
+        return await _run_backup()
+
+    gemini_task = asyncio.create_task(
+        _call_gemini_multi_image_batch(
+            encoded_chunk,
+            batch_prompt,
+            timeout_sec=gemini_timeout,
+            max_output_tokens=out_tokens,
+            page_offset=page_offset,
+        )
+    )
+    done, _ = await asyncio.wait({gemini_task}, timeout=12.0)
+    if gemini_task in done:
+        try:
+            res = gemini_task.result()
+            if res:
+                return res
+        except Exception:
+            pass
+        return await _run_backup()
+
+    api_log(f"Hedge (MultiImageOCR p{start_p}-{end_p}) -> Gemini >12s; racing backup batch in parallel")
+    backup_task = asyncio.create_task(_run_backup())
+    tasks = {gemini_task, backup_task}
+    try:
+        while tasks:
+            done_set, pending_set = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for finished in done_set:
+                tasks.discard(finished)
+                try:
+                    out = finished.result()
+                except Exception:
+                    out = ""
+                if out:
+                    for p in pending_set:
+                        p.cancel()
+                    if pending_set:
+                        await asyncio.gather(*pending_set, return_exceptions=True)
+                    return out
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    return ""
+
+
+async def extract_multi_images_batch_ocr(
+    images_list: list[tuple[bytes, str, str]],
+    post_meta_hint: str = "",
+) -> str:
+    """
+    Inspects 2 to 12 sequential comic/illustration pages using `gemini-3.5-flash-lite`
+    (`thinkingLevel: "MINIMAL"`). Automatically splits 6..12 page threads into parallel
+    <=5-page mini-batches so payload sizes stay small and finish in ~4-8 seconds.
+    """
+    target_list = images_list[:MAX_BATCH_IMAGES]
+    if len(target_list) < 2:
+        return ""
+
     n_imgs = len(target_list)
-    if n_imgs >= 9:
-        target_dim, target_q, out_tokens = 720, 74, 3584
-    elif n_imgs >= 5:
-        target_dim, target_q, out_tokens = 768, 76, 3072
+    if n_imgs >= 6:
+        target_dim, target_q, out_tokens = 800, 78, 2560
     elif n_imgs >= 3:
-        target_dim, target_q, out_tokens = 832, 80, 2048
+        target_dim, target_q, out_tokens = 864, 82, 2048
     else:
-        target_dim, target_q, out_tokens = 896, 84, 2048
+        target_dim, target_q, out_tokens = 928, 85, 2048
 
     encoded_images: list[tuple[str, str, str]] = []
     for raw_b, fname, _ in target_list:
@@ -1518,68 +1607,32 @@ async def extract_multi_images_batch_ocr(
     if len(encoded_images) < 2:
         return ""
 
-    has_gemini = bool(GEMINI_API_KEY)
-    has_cf = bool(CF_ACCOUNT_ID and CF_API_TOKEN)
-    gemini_timeout = min(30, 16 + len(encoded_images))
-    backup_timeout = min(26, 15 + len(encoded_images))
-
-    async def _run_batch_backup_chain() -> str:
-        if has_gemini:
-            gemma_res = await _call_ai_studio_gemma_multi_image_batch(
-                encoded_images, batch_prompt, timeout_sec=backup_timeout, max_output_tokens=out_tokens
-            )
-            if gemma_res:
-                return gemma_res
-        if has_cf:
-            return await _call_cf_multi_image_batch(
-                encoded_images, batch_prompt, timeout_sec=backup_timeout, max_tokens=out_tokens
-            )
-        return ""
-
     try:
-        if not has_gemini:
-            return await _run_batch_backup_chain()
-
-        gemini_task = asyncio.create_task(
-            _call_gemini_multi_image_batch(
-                encoded_images, batch_prompt, timeout_sec=gemini_timeout, max_output_tokens=out_tokens
+        total_p = len(encoded_images)
+        # Split 6..12 images into parallel mini-batches of <=5 pages so payloads never stall
+        if total_p <= 5:
+            single_out = await _process_single_encoded_chunk(
+                encoded_images, total_p, 0, post_meta_hint, out_tokens
             )
+            if single_out:
+                return f"=== Unified Multi-Image Visual & OCR Analysis ({total_p} Images) ===\n{single_out}"
+            return ""
+
+        chunk_size = 5
+        chunks = [
+            (offset, encoded_images[offset : offset + chunk_size])
+            for offset in range(0, total_p, chunk_size)
+        ]
+        chunk_results = await asyncio.gather(
+            *[
+                _process_single_encoded_chunk(ch, total_p, offset, post_meta_hint, out_tokens)
+                for offset, ch in chunks
+            ]
         )
-        done, _ = await asyncio.wait({gemini_task}, timeout=14.0)
-        if gemini_task in done:
-            try:
-                res = gemini_task.result()
-                if res:
-                    return res
-            except Exception:
-                pass
-            return await _run_batch_backup_chain()
-
-        api_log(f"Hedge (MultiImageOCR {len(encoded_images)}p) -> Gemini >14s; racing backup batch in parallel")
-        backup_task = asyncio.create_task(_run_batch_backup_chain())
-        tasks = {gemini_task, backup_task}
-        try:
-            while tasks:
-                done_set, pending_set = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                for finished in done_set:
-                    tasks.discard(finished)
-                    try:
-                        out = finished.result()
-                    except Exception:
-                        out = ""
-                    if out:
-                        for p in pending_set:
-                            p.cancel()
-                        if pending_set:
-                            await asyncio.gather(*pending_set, return_exceptions=True)
-                        return out
-        finally:
-            for t in tasks:
-                if not t.done():
-                    t.cancel()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-
+        valid_sections = [res for res in chunk_results if res]
+        if len(valid_sections) == len(chunks):
+            merged = "\n\n".join(valid_sections)
+            return f"=== Unified Multi-Image Visual & OCR Analysis ({total_p} Images) ===\n{merged}"
         return ""
     finally:
         encoded_images.clear()
@@ -1602,14 +1655,13 @@ async def _call_gemini_single_image_vision(
         "generationConfig": {
             "temperature": 0.1,
             "maxOutputTokens": 2048,
-            "thinkingConfig": {"thinkingLevel": "LOW"},
+            "thinkingConfig": {"thinkingLevel": "MINIMAL"},
         },
     }
     data = await call_gemini_generate_content_self_healing(
         payload,
         timeout_sec=12,
         purpose=purpose,
-        prefer_full_flash=True,
         max_models=2,
         max_wall_sec=16.0,
     )
@@ -1671,7 +1723,7 @@ async def extract_image_via_transient_ocr(
 
     vision_result = ""
 
-    # Tier 1: Gemini 3.8 Flash / 3.6 Flash (Fast 2-4s single-image vision)
+    # Tier 1: Gemini 3.5 Flash-Lite -> Gemini 3.1 Flash-Lite
     if GEMINI_API_KEY:
         vision_result = await _call_gemini_single_image_vision(ocr_prompt, mime_type, b64_img)
 

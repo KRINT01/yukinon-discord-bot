@@ -62,10 +62,10 @@ from search_engine import (
 )
 
 GEMINI_MODEL_HINT_REGEX = re.compile(r"models/([a-zA-Z0-9._-]+)")
-# Exclude legacy 1.5/2.0/2.5/omni endpoints and non-text endpoints so self-healing never wastes time on 404/429 models
+# Exclude legacy 1.5/2.0/2.5/omni/latest aliases and non-text endpoints so routing stays deterministic on 3.5/3.1/3.6
 GEMINI_EXCLUDED_SUBSTRINGS = (
     "image", "tts", "audio", "live", "embedding", "aqa", "bison", "gecko",
-    "decision", "hydrogen", "preview", "omni", "2.5", "2.0", "1.5"
+    "decision", "hydrogen", "preview", "omni", "2.5", "2.0", "1.5", "latest", "3.7", "3.8"
 )
 
 GROQ_EXCLUDED_SUBSTRINGS = (
@@ -126,10 +126,15 @@ def _compact_messages_for_token_budget(messages: list, max_est_tokens: int = 450
 
 def _adapt_gemini_thinking_config_for_model(payload: dict, model_id: str) -> dict:
     """
-    Adapts `thinkingConfig` per Gemini model family:
-      - `gemini-3.8-flash`, `gemini-3.7-flash`, and `gemini-4-*` support `LOW`, `MEDIUM`, `HIGH`
-        (passing `MINIMAL` or `thinkingBudget` returns HTTP 400 INVALID_ARGUMENT).
-      - `gemini-3.6-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite` support `MINIMAL` and `LOW`.
+    Normalizes `generationConfig` per official Google AI Studio specs:
+      1) `gemini-4-hydrogen` / `gemini-4-*`:
+         - Strips `temperature`, `topP`, `topK` (Hydrogen ignores/rejects custom sampling params).
+         - Raises `maxOutputTokens` to `65536` (shared 1M unified input+thinking+output window).
+         - Uses `thinkingLevel` (`LOW`, `MEDIUM`, `HIGH`, `XHIGH`; rejects `MINIMAL`).
+      2) `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-3.6-flash`:
+         - Uses `thinkingLevel` (`MINIMAL`, `LOW`, `MEDIUM`, `HIGH`) and removes legacy `thinkingBudget`.
+      3) `gemini-3.8-flash` / `gemini-3.7-flash`:
+         - Uses `thinkingLevel` (`LOW`, `MEDIUM`, `HIGH`; never `MINIMAL`).
     """
     work_payload = json.loads(json.dumps(payload))
     gen_cfg = work_payload.get("generationConfig")
@@ -137,29 +142,37 @@ def _adapt_gemini_thinking_config_for_model(payload: dict, model_id: str) -> dic
         return work_payload
 
     lower_m = (model_id or "").lower()
+    is_gemini_4 = lower_m.startswith("gemini-4")
+    no_minimal_models = is_gemini_4 or lower_m.startswith(("gemini-3.8", "gemini-3.7"))
+    minimal_capable_models = lower_m.startswith(("gemini-3.6", "gemini-3.5", "gemini-3.1"))
+
+    if is_gemini_4:
+        # Remove sampling parameters per Gemini 4 Hydrogen migration guide
+        gen_cfg.pop("temperature", None)
+        gen_cfg.pop("topP", None)
+        gen_cfg.pop("topK", None)
+        # Raise low caps to 65,536 synchronous single-request cap
+        cur_max = int(gen_cfg.get("maxOutputTokens") or 0)
+        if cur_max < 65536:
+            gen_cfg["maxOutputTokens"] = 65536
+
     t_cfg = gen_cfg.get("thinkingConfig")
-    if not isinstance(t_cfg, dict):
-        return work_payload
-
-    no_minimal_models = any(
-        lower_m.startswith(prefix)
-        for prefix in ("gemini-3.8", "gemini-3.7", "gemini-4")
-    )
-    minimal_capable_models = any(
-        lower_m.startswith(prefix)
-        for prefix in ("gemini-3.6", "gemini-3.5", "gemini-3.1")
-    )
-
-    if no_minimal_models:
+    if isinstance(t_cfg, dict):
         if "thinkingBudget" in t_cfg:
-            t_cfg.pop("thinkingBudget", None)
-        cur_level = str(t_cfg.get("thinkingLevel") or "").upper()
-        if not cur_level or cur_level == "MINIMAL":
-            t_cfg["thinkingLevel"] = "LOW"
-    elif minimal_capable_models:
-        if "thinkingBudget" in t_cfg and "thinkingLevel" not in t_cfg:
             budget = int(t_cfg.pop("thinkingBudget") or 0)
-            t_cfg["thinkingLevel"] = "MINIMAL" if budget <= 64 else "LOW"
+            if "thinkingLevel" not in t_cfg:
+                if no_minimal_models:
+                    t_cfg["thinkingLevel"] = "LOW"
+                else:
+                    t_cfg["thinkingLevel"] = "MINIMAL" if budget <= 64 else "LOW"
+
+        if no_minimal_models:
+            cur_level = str(t_cfg.get("thinkingLevel") or "").upper()
+            if not cur_level or cur_level == "MINIMAL":
+                t_cfg["thinkingLevel"] = "LOW"
+        elif minimal_capable_models:
+            if "thinkingLevel" not in t_cfg:
+                t_cfg["thinkingLevel"] = "MINIMAL"
 
     return work_payload
 
@@ -240,10 +253,15 @@ async def call_gemini_hydrogen_generate(
 
 async def call_gemini_hydrogen_chat(
     messages: list,
-    temperature: float = 0.25,
-    max_output_tokens: int = 4096,
+    thinking_level: str = "LOW",
     purpose: str = "HydrogenChat",
 ) -> str:
+    """
+    Calls `gemini-4-hydrogen` per the official Gemini 4 Hydrogen API specification:
+      - No `temperature` / `topP` / `topK` sampling parameters
+      - `maxOutputTokens: 65536` (shared 1M unified context window)
+      - `thinkingLevel`: `"LOW"` (fast heavy docs) or `"MEDIUM"` (deep code/reasoning)
+    """
     if not _can_use_gemini_hydrogen():
         return ""
 
@@ -274,12 +292,12 @@ async def call_gemini_hydrogen_chat(
     if contents[-1]["role"] != "user":
         contents.append({"role": "user", "parts": [{"text": "Please respond to the above."}]})
 
+    safe_level = thinking_level.upper() if thinking_level.upper() in ("LOW", "MEDIUM", "HIGH", "XHIGH") else "LOW"
     payload = {
         "contents": contents,
         "generationConfig": {
-            "temperature": temperature,
-            "maxOutputTokens": max_output_tokens,
-            "thinkingConfig": {"thinkingLevel": "LOW"},
+            "maxOutputTokens": 65536,
+            "thinkingConfig": {"thinkingLevel": safe_level},
         },
     }
     if sys_parts:
@@ -585,39 +603,23 @@ async def discover_active_gemma_models(vision_required: bool = False) -> list[st
     return candidates or list(dict.fromkeys(x for x in default_list if x))
 
 
-async def _discover_active_gemini_flash_model(
-    force_remote: bool = False, prefer_full_flash: bool = False
-) -> list[str]:
+async def _discover_active_gemini_flash_model(force_remote: bool = False) -> list[str]:
     """
-    Orders Gemini Flash models based on workload:
-      - `prefer_full_flash=True` (Multi-image Vision / Manga OCR): prioritizes full Flash models
-        (`gemini-3.8-flash` -> `gemini-3.6-flash` -> `gemini-flash-latest`) BEFORE `Flash-Lite`,
-        since full Flash handles multi-page visual reasoning reliably without stalling.
-      - `prefer_full_flash=False` (Text / Fact-check / Search): prioritizes high-quota Flash-Lite
-        (`gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite`) -> full Flash.
+    Deterministic priority order for Gemini Flash models (15 RPM, 250K TPM, 500 RPD):
+      1. `gemini-3.5-flash-lite` (Primary — highest throughput & reliability)
+      2. `gemini-3.1-flash-lite` (Secondary Flash-Lite fallback)
+      3. `gemini-3.6-flash` (Tertiary Flash fallback)
     """
     global _GEMINI_DISCOVERED_MODELS_CACHE, _GEMINI_MODELS_LAST_FETCH_TS
     now = time.time()
 
-    if prefer_full_flash:
-        preferred_seed = [
-            "gemini-3.8-flash",
-            "gemini-3.6-flash",
-            "gemini-flash-latest",
-            GEMINI_SEARCH_MODEL,
-            GEMINI_FALLBACK_MODEL,
-        ]
-    else:
-        preferred_seed = [
-            state.active_gemini_model if (state.active_gemini_model and "preview" not in state.active_gemini_model) else None,
-            GEMINI_SEARCH_MODEL,
-            GEMINI_FALLBACK_MODEL,
-            "gemini-3.5-flash-lite",
-            "gemini-3.1-flash-lite",
-            "gemini-3.8-flash",
-            "gemini-3.6-flash",
-            "gemini-flash-latest",
-        ]
+    preferred_seed = [
+        GEMINI_SEARCH_MODEL or "gemini-3.5-flash-lite",
+        GEMINI_FALLBACK_MODEL or "gemini-3.1-flash-lite",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-3.6-flash",
+    ]
 
     seen = set()
     deduped = [x for x in preferred_seed if x and not (x in seen or seen.add(x))]
@@ -716,51 +718,43 @@ async def call_gemma_ai_studio_chat(
             "generationConfig": {
                 "temperature": temperature,
                 "maxOutputTokens": max_output_tokens,
-                "thinkingConfig": {"thinkingBudget": 0},
             },
         }
 
-        for attempt in range(2):
-            t0 = time.monotonic()
-            try:
-                async with session.post(
-                    url, json=payload, timeout=aiohttp.ClientTimeout(total=24)
-                ) as resp:
-                    status = resp.status
-                    body_text = await resp.text()
-                    elapsed = time.monotonic() - t0
+        t0 = time.monotonic()
+        try:
+            async with session.post(
+                url, json=payload, timeout=aiohttp.ClientTimeout(total=20)
+            ) as resp:
+                status = resp.status
+                body_text = await resp.text()
+                elapsed = time.monotonic() - t0
 
-                    if status == 200:
-                        data = json.loads(body_text)
-                        parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-                        text_parts = [
-                            p.get("text", "") for p in parts
-                            if p.get("text") and not p.get("thought", False)
-                        ]
-                        out = "\n".join(text_parts).strip()
-                        out = re.sub(r"<think>[\s\S]*?</think>", "", out).strip()
-                        out = re.sub(r"<\|thought\|>[\s\S]*?<\|/thought\|>", "", out).strip()
-                        if out:
-                            state.active_gemma_model = model_id
-                            api_log(f"Gemma AI Studio ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
-                            return out
+                if status == 200:
+                    data = json.loads(body_text)
+                    parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                    text_parts = [
+                        p.get("text", "") for p in parts
+                        if p.get("text") and not p.get("thought", False)
+                    ]
+                    out = "\n".join(text_parts).strip()
+                    out = re.sub(r"<think>[\s\S]*?</think>", "", out).strip()
+                    out = re.sub(r"<\|thought\|>[\s\S]*?<\|/thought\|>", "", out).strip()
+                    if out:
+                        state.active_gemma_model = model_id
+                        api_log(f"Gemma AI Studio ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
+                        return out
 
-                    if status in (400, 500) and "thinkingConfig" in payload.get("generationConfig", {}) and attempt == 0:
-                        payload["generationConfig"].pop("thinkingConfig", None)
-                        continue
-
-                    if status == 429:
-                        _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 60.0
-                    elif status in (404, 500, 503):
-                        _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 180.0
-                    api_log(f"Gemma AI Studio ({purpose}) -> {model_id} HTTP {status} ({elapsed:.2f}s)")
-                    break
-            except Exception as e:
-                _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 120.0
-                api_log(f"Gemma AI Studio ({purpose}) -> {model_id} failed ({type(e).__name__})")
-                if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
-                    return ""
-                break
+                if status == 429:
+                    _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 60.0
+                elif status in (404, 500, 503):
+                    _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 180.0
+                api_log(f"Gemma AI Studio ({purpose}) -> {model_id} HTTP {status} ({elapsed:.2f}s)")
+        except Exception as e:
+            _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 120.0
+            api_log(f"Gemma AI Studio ({purpose}) -> {model_id} failed ({type(e).__name__})")
+            if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+                return ""
 
     return ""
 
@@ -791,7 +785,6 @@ async def call_gemma_ai_studio_vision(
         gen_cfg = {
             "temperature": 0.1,
             "maxOutputTokens": 2048,
-            "thinkingConfig": {"thinkingBudget": 0},
         }
         if response_mime_type:
             gen_cfg["responseMimeType"] = response_mime_type
@@ -832,8 +825,7 @@ async def call_gemma_ai_studio_vision(
                             api_log(f"Gemma AI Studio ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
                             return out
 
-                    if status in (400, 500) and attempt == 0:
-                        payload["generationConfig"].pop("thinkingConfig", None)
+                    if status in (400, 500) and "responseMimeType" in payload.get("generationConfig", {}) and attempt == 0:
                         payload["generationConfig"].pop("responseMimeType", None)
                         continue
 
@@ -853,26 +845,22 @@ async def call_gemma_ai_studio_vision(
 
 async def call_gemini_generate_content_self_healing(
     payload: dict,
-    timeout_sec: int = 25,
+    timeout_sec: int = 20,
     purpose: str = "Generate",
-    prefer_full_flash: bool = False,
-    max_models: int = 3,
+    max_models: int = 2,
     max_wall_sec: float | None = None,
 ) -> dict | None:
     """
-    Bounded self-healing Gemini caller with model-specific `thinkingLevel` adaptation,
-    circuit-breaker cooldowns on `TimeoutError`/`429`/`503`, and a strict `max_models` &
-    `max_wall_sec` cap so a slow endpoint never spirals into multi-minute cascades.
+    Deterministic, bounded Gemini Flash-Lite caller (`gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite`)
+    with `thinkingLevel` normalization, short cooldowns on transient 503/timeout, and strict wall-time caps.
     """
     if not GEMINI_API_KEY:
         return None
 
-    candidate_models = await _discover_active_gemini_flash_model(
-        force_remote=False, prefer_full_flash=prefer_full_flash
-    )
+    candidate_models = await _discover_active_gemini_flash_model(force_remote=False)
     tried = set()
     wall_start = time.monotonic()
-    wall_budget = max_wall_sec if max_wall_sec is not None else float(timeout_sec * 2 + 6)
+    wall_budget = max_wall_sec if max_wall_sec is not None else float(timeout_sec * 2 + 4)
 
     session = get_http_session()
     idx = 0
@@ -910,7 +898,7 @@ async def call_gemini_generate_content_self_healing(
                     elapsed = time.monotonic() - t0
 
                     if status == 200:
-                        if not prefer_full_flash and state.active_gemini_model != model_id:
+                        if state.active_gemini_model != model_id:
                             state.active_gemini_model = model_id
                         api_log(f"Gemini ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
                         return json.loads(body_text)
@@ -920,9 +908,9 @@ async def call_gemini_generate_content_self_healing(
                         continue
 
                     if status == 429:
-                        _GEMINI_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 60.0
+                        _GEMINI_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 45.0
                     elif status in (500, 503):
-                        _GEMINI_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 90.0
+                        _GEMINI_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 30.0
                     elif status == 404:
                         _GEMINI_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 3600.0
 
@@ -943,7 +931,7 @@ async def call_gemini_generate_content_self_healing(
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                _GEMINI_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 90.0
+                _GEMINI_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 30.0
                 api_log(f"Gemini ({purpose}) -> {model_id} failed ({type(e).__name__}); trying next model")
                 break
 
@@ -954,7 +942,7 @@ async def call_gemini_chat_messages(
     messages: list,
     temperature: float = 0.25,
     purpose: str = "FactSearchChat",
-    prefer_full_flash: bool = False,
+    thinking_level: str = "LOW",
 ) -> str:
     if not GEMINI_API_KEY:
         return ""
@@ -983,7 +971,7 @@ async def call_gemini_chat_messages(
         "generationConfig": {
             "temperature": temperature,
             "maxOutputTokens": 4096,
-            "thinkingConfig": {"thinkingLevel": "LOW"},
+            "thinkingConfig": {"thinkingLevel": thinking_level.upper()},
         },
     }
     if sys_parts:
@@ -991,11 +979,10 @@ async def call_gemini_chat_messages(
 
     data = await call_gemini_generate_content_self_healing(
         payload,
-        timeout_sec=22,
+        timeout_sec=18,
         purpose=purpose,
-        prefer_full_flash=prefer_full_flash,
         max_models=2,
-        max_wall_sec=30.0,
+        max_wall_sec=26.0,
     )
     if data:
         parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
@@ -1563,7 +1550,7 @@ async def query_local_ollama_chat(
         if is_coding:
             if len(user_content) > 13000:
                 ans = await call_gemini_hydrogen_chat(
-                    messages, temperature=temperature, max_output_tokens=4096, purpose="HeavyCode"
+                    messages, thinking_level="MEDIUM", purpose="HeavyCode"
                 )
                 if ans:
                     return ans
@@ -1599,10 +1586,10 @@ async def query_local_ollama_chat(
             except Exception as e:
                 print(f"Modal GPU coding error: {e}")
 
-        # HEAVY DOCUMENT SPECIALIST (>12.5K chars: full PDFs, Word docs, Excel sheets)
+        # HEAVY DOCUMENT SPECIALIST (>12.5K chars: full PDFs, Word docs, Excel sheets, 10-page threads)
         if not is_coding and len(user_content) > 12500:
             ans = await call_gemini_hydrogen_chat(
-                messages, temperature=0.25, max_output_tokens=3072, purpose="HeavyDoc"
+                messages, thinking_level="LOW", purpose="HeavyDoc"
             )
             if ans:
                 return ans
@@ -1612,13 +1599,13 @@ async def query_local_ollama_chat(
             target_temp = 0.2 if (did_search or is_user_correction) else temperature
 
             if is_japanese_or_social_media:
-                # Prioritize Gemini Flash (natural Japanese + Yukino roleplay, 1M context) -> Gemma 4 -> CF Gemma
+                # Primary: `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> Gemma 4 -> CF Gemma
                 if GEMINI_API_KEY:
                     ans = await call_gemini_chat_messages(
                         messages,
                         temperature=target_temp,
                         purpose="MangaSocialChat",
-                        prefer_full_flash=True,
+                        thinking_level="LOW",
                     )
                     if ans:
                         return ans
@@ -1672,7 +1659,9 @@ async def query_local_ollama_chat(
 
                 if GEMINI_API_KEY:
                     try:
-                        ans = await call_gemini_chat_messages(messages, temperature=target_temp, purpose="FactSearchChat")
+                        ans = await call_gemini_chat_messages(
+                            messages, temperature=target_temp, purpose="FactSearchChat", thinking_level="MINIMAL"
+                        )
                         if ans:
                             return ans
                     except Exception as e:
