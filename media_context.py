@@ -54,9 +54,9 @@ from llm import (
     call_gemini_generate_content_self_healing,
 )
 
-MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024   # 25 MB cap (supports standard Discord PDF/doc uploads safely)
+MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024  # 25 MB cap (supports standard Discord PDF/doc uploads safely)
 MAX_EMBED_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB per embedded image cap for 512MB Render container
-MAX_BATCH_IMAGES = 12                     # 12-image cap across multi-part threads and batch requests (safe within 512MB RAM)
+MAX_BATCH_IMAGES = 12  # 12-image cap across multi-part threads and batch requests (safe within 512MB RAM)
 
 TWITTER_STATUS_URL_REGEX = re.compile(
     r"https?://(?:www\.|mobile\.)?(?:x\.com|twitter\.com|fixupx\.com|fxtwitter\.com|vxtwitter\.com|fixvx\.com|twittpr\.com)/([^/\s]+)/status/(\d+)",
@@ -260,7 +260,7 @@ def extract_key_stack_trace_windows(log_text: str, max_chars: int = 28000) -> st
     return f"{head}\n\n... [ truncated intermediate trace frames ] ...\n\n{tail}"
 
 
-def format_code_or_log_attachment(text: str, is_log: bool, max_chars: int = 120000) -> str:
+def format_code\_or\_log\_attachment(text: str, is_log: bool, max_chars: int = 120000) -> str:
     if is_log or STACK_TRACE_SIGNATURE_REGEX.search(text[:8000]):
         return extract_key_stack_trace_windows(text, max_chars=28000)
 
@@ -768,58 +768,58 @@ async def _fetch_pixiv_artwork_info(illust_id: str) -> tuple[str, list[str]]:
                 return "", []
             body = payload.get("body") or {}
 
-        title = (body.get("title") or "").strip()
-        user_name = (body.get("userName") or "").strip()
-        user_id = str(body.get("userId") or "").strip()
-        page_count = int(body.get("pageCount") or 1)
-        desc_raw = re.sub(r"<[^>]+>", " ", body.get("description") or "").strip()
-        desc_clean = re.sub(r"\s+", " ", desc_raw)[:600]
+            title = (body.get("title") or "").strip()
+            user_name = (body.get("userName") or "").strip()
+            user_id = str(body.get("userId") or "").strip()
+            page_count = int(body.get("pageCount") or 1)
+            desc_raw = re.sub(r"<[^>]+>", " ", body.get("description") or "").strip()
+            desc_clean = re.sub(r"\s+", " ", desc_raw)[:600]
 
-        tags_list = []
-        for t_obj in ((body.get("tags") or {}).get("tags") or [])[:15]:
-            if isinstance(t_obj, dict):
-                t_jp = t_obj.get("tag") or ""
-                t_en = ((t_obj.get("translation") or {}).get("en")) or ""
-                tags_list.append(f"{t_jp} ({t_en})" if t_en else t_jp)
+            tags_list = []
+            for t_obj in ((body.get("tags") or {}).get("tags") or [])[:15]:
+                if isinstance(t_obj, dict):
+                    t_jp = t_obj.get("tag") or ""
+                    t_en = ((t_obj.get("translation") or {}).get("en")) or ""
+                    tags_list.append(f"{t_jp} ({t_en})" if t_en else t_jp)
 
-        image_urls = []
-        urls_obj = body.get("urls") or {}
-        primary_u = urls_obj.get("regular") or urls_obj.get("small") or urls_obj.get("original")
-        if primary_u:
-            image_urls.append(primary_u)
+            image_urls = []
+            urls_obj = body.get("urls") or {}
+            primary_u = urls_obj.get("regular") or urls_obj.get("small") or urls_obj.get("original")
+            if primary_u:
+                image_urls.append(primary_u)
 
-        if page_count > 1:
-            try:
-                async with session.get(pages_url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as p_resp:
-                    if p_resp.status == 200:
-                        p_data = await p_resp.json(content_type=None)
-                        p_items = p_data.get("body") or []
-                        extracted_pages = []
-                        for item in p_items[:MAX_BATCH_IMAGES]:
-                            u_map = (item.get("urls") or {}) if isinstance(item, dict) else {}
-                            pu = u_map.get("regular") or u_map.get("small")
-                            if pu:
-                                extracted_pages.append(pu)
-                        if extracted_pages:
-                            image_urls = extracted_pages
-            except Exception:
-                pass
+            if page_count > 1:
+                try:
+                    async with session.get(pages_url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as p_resp:
+                        if p_resp.status == 200:
+                            p_data = await p_resp.json(content_type=None)
+                            p_items = p_data.get("body") or []
+                            extracted_pages = []
+                            for item in p_items[:MAX_BATCH_IMAGES]:
+                                u_map = (item.get("urls") or {}) if isinstance(item, dict) else {}
+                                pu = u_map.get("regular") or u_map.get("small")
+                                if pu:
+                                    extracted_pages.append(pu)
+                            if extracted_pages:
+                                image_urls = extracted_pages
+                except Exception:
+                    pass
 
-        lines = [
-            f"Platform: Pixiv | Artwork URL: {HTTPS}www.pixiv.net/artworks/{illust_id}",
-            f"Artwork Title / Caption: {title}",
-            f"Artist / Illustrator: {user_name} (Pixiv User ID: {user_id})",
-            f"Total Pages: {page_count}",
-        ]
-        if tags_list:
-            lines.append(f"Tags: {', '.join(tags_list)}")
-        if desc_clean:
-            lines.append(f"Artist Caption: {desc_clean}")
+            lines = [
+                f"Platform: Pixiv | Artwork URL: {HTTPS}www.pixiv.net/artworks/{illust_id}",
+                f"Artwork Title / Caption: {title}",
+                f"Artist / Illustrator: {user_name} (Pixiv User ID: {user_id})",
+                f"Total Pages: {page_count}",
+            ]
+            if tags_list:
+                lines.append(f"Tags: {', '.join(tags_list)}")
+            if desc_clean:
+                lines.append(f"Artist Caption: {desc_clean}")
 
-        api_log(
-            f"Embed Link (Pixiv AJAX) -> illust={illust_id}, pages={len(image_urls)} ({time.monotonic() - t0:.2f}s)"
-        )
-        return "\n".join(lines), image_urls[:MAX_BATCH_IMAGES]
+            api_log(
+                f"Embed Link (Pixiv AJAX) -> illust={illust_id}, pages={len(image_urls)} ({time.monotonic() - t0:.2f}s)"
+            )
+            return "\n".join(lines), image_urls[:MAX_BATCH_IMAGES]
     except Exception as e:
         api_log(f"Embed Link (Pixiv AJAX) -> skipped ({type(e).__name__})")
         return "", []
@@ -898,7 +898,7 @@ def _extract_native_discord_embeds_data(embeds: list[discord.Embed]) -> tuple[li
                 if clean_img and dkey not in seen_dedup_keys:
                     seen_dedup_keys.add(dkey)
                     image_urls.append(clean_img)
-                    break
+                break
 
         if parts:
             meta_blocks.append(f"[Discord Embed #{idx}]\n" + "\n".join(parts))
@@ -957,9 +957,9 @@ async def collect_embedded_images_and_metadata(
             if tw_meta:
                 resolved_social_api_post = True
                 metadata_sections.append(f"=== Embedded X (Twitter) Post Metadata & Caption ===\n{tw_meta}")
-            for p_url in tw_photos:
-                _queue_img(p_url)
-            continue
+                for p_url in tw_photos:
+                    _queue_img(p_url)
+                continue
 
         px_m = PIXIV_ILLUST_URL_REGEX.search(url)
         if px_m:
@@ -969,9 +969,9 @@ async def collect_embedded_images_and_metadata(
             if px_meta:
                 resolved_social_api_post = True
                 metadata_sections.append(f"=== Embedded Pixiv Artwork Metadata & Caption ===\n{px_meta}")
-            for p_url in px_photos:
-                _queue_img(p_url, referer=f"{HTTPS}www.pixiv.net/artworks/{illust_id}")
-            continue
+                for p_url in px_photos:
+                    _queue_img(p_url, referer=f"{HTTPS}www.pixiv.net/artworks/{illust_id}")
+                continue
 
         bsky_m = BSKY_POST_URL_REGEX.search(url)
         if bsky_m:
@@ -980,9 +980,9 @@ async def collect_embedded_images_and_metadata(
             if b_meta:
                 resolved_social_api_post = True
                 metadata_sections.append(f"=== Embedded Bluesky Post Metadata & Caption ===\n{b_meta}")
-            for p_url in b_photos:
-                _queue_img(p_url)
-            continue
+                for p_url in b_photos:
+                    _queue_img(p_url)
+                continue
 
         if DIRECT_IMAGE_URL_REGEX.match(url):
             handled_urls.add(url)
@@ -1038,10 +1038,10 @@ def fetch_youtube_context_sync(
                 req = urllib.request.Request(oe_endpoint, headers={"User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(req, timeout=8) as resp:
                     oe_data = json.loads(resp.read().decode("utf-8"))
-                title = title or (oe_data.get("title") or "").strip()
-                author = author or (oe_data.get("author_name") or "").strip()
-                if title and author:
-                    break
+                    title = title or (oe_data.get("title") or "").strip()
+                    author = author or (oe_data.get("author_name") or "").strip()
+                    if title and author:
+                        break
             except Exception:
                 continue
 
@@ -1057,19 +1057,19 @@ def fetch_youtube_context_sync(
             with urllib.request.urlopen(req_page, timeout=10) as resp:
                 html_str = resp.read().decode("utf-8", errors="replace")
 
-            if not title:
-                t_m = re.search(r'<meta\s+name="title"\s+content="([^"]+)"', html_str)
-                if t_m:
-                    title = t_m.group(1).strip()
+                if not title:
+                    t_m = re.search(r'<meta\s+name="title"\s+content="([^"]+)"', html_str)
+                    if t_m:
+                        title = t_m.group(1).strip()
 
-            desc_m = re.search(r'"shortDescription"\s*:\s*"((?:\\.|[^"\\])*)"', html_str)
-            if desc_m:
-                try:
-                    full_d = json.loads(f'"{desc_m.group(1)}"').strip()
-                except Exception:
-                    full_d = desc_m.group(1).replace("\\n", "\n").strip()
-                if len(full_d) > len(description):
-                    description = full_d
+                desc_m = re.search(r'"shortDescription"\s*:\s*"((?:\\.|[^"\\])*)"', html_str)
+                if desc_m:
+                    try:
+                        full_d = json.loads(f'"{desc_m.group(1)}"').strip()
+                    except Exception:
+                        full_d = desc_m.group(1).replace("\\n", "\n").strip()
+                    if len(full_d) > len(description):
+                        description = full_d
         except Exception as e:
             api_log(f"YouTube HTML metadata note ({video_id}): {type(e).__name__}")
 
@@ -1148,42 +1148,42 @@ async def _search_saucenao_async(raw_bytes: bytes, filename: str) -> str:
                 return ""
             data = await resp.json(content_type=None)
 
-        results = data.get("results") or []
-        matches = []
-        for item in results:
-            hdr = item.get("header") or {}
-            sim = float(hdr.get("similarity") or 0.0)
-            if sim < 68.0:
-                continue
-            d = item.get("data") or {}
-            title = d.get("title") or d.get("source") or d.get("eng_name") or d.get("jp_name") or ""
-            part = d.get("part") or ""
-            author = d.get("member_name") or d.get("author") or d.get("creator") or ""
-            if isinstance(author, list):
-                author = ", ".join(str(x) for x in author)
-            characters = d.get("characters") or ""
-            material = d.get("material") or ""
-            pixiv_id = d.get("pixiv_id")
-            ext_urls = d.get("ext_urls") or []
-            if pixiv_id and not any("pixiv.net" in u for u in ext_urls):
-                ext_urls.insert(0, f"{HTTPS}www.pixiv.net/artworks/{pixiv_id}")
+            results = data.get("results") or []
+            matches = []
+            for item in results:
+                hdr = item.get("header") or {}
+                sim = float(hdr.get("similarity") or 0.0)
+                if sim < 68.0:
+                    continue
+                d = item.get("data") or {}
+                title = d.get("title") or d.get("source") or d.get("eng_name") or d.get("jp_name") or ""
+                part = d.get("part") or ""
+                author = d.get("member_name") or d.get("author") or d.get("creator") or ""
+                if isinstance(author, list):
+                    author = ", ".join(str(x) for x in author)
+                characters = d.get("characters") or ""
+                material = d.get("material") or ""
+                pixiv_id = d.get("pixiv_id")
+                ext_urls = d.get("ext_urls") or []
+                if pixiv_id and not any("pixiv.net" in u for u in ext_urls):
+                    ext_urls.insert(0, f"{HTTPS}www.pixiv.net/artworks/{pixiv_id}")
 
-            info_parts = [f"Similarity: {sim:.1f}%"]
-            if title:
-                info_parts.append(f"Title/Source: {title}{f' ({part})' if part else ''}")
-            if material:
-                info_parts.append(f"Series/Material: {material}")
-            if characters:
-                info_parts.append(f"Character(s): {characters}")
-            if author:
-                info_parts.append(f"Artist/Author: {author}")
-            if ext_urls:
-                info_parts.append(f"URLs: {' | '.join(ext_urls[:2])}")
-            matches.append("- " + " | ".join(info_parts))
+                info_parts = [f"Similarity: {sim:.1f}%"]
+                if title:
+                    info_parts.append(f"Title/Source: {title}{f' ({part})' if part else ''}")
+                if material:
+                    info_parts.append(f"Series/Material: {material}")
+                if characters:
+                    info_parts.append(f"Character(s): {characters}")
+                if author:
+                    info_parts.append(f"Artist/Author: {author}")
+                if ext_urls:
+                    info_parts.append(f"URLs: {' | '.join(ext_urls[:2])}")
+                matches.append("- " + " | ".join(info_parts))
 
-        if matches:
-            api_log(f"ReverseImage (SauceNAO) -> {len(matches)} match(es) ({time.monotonic() - t0:.2f}s)")
-            return "=== SauceNAO Reverse Image Matches (Pixiv / Manga / Art) ===\n" + "\n".join(matches[:3])
+            if matches:
+                api_log(f"ReverseImage (SauceNAO) -> {len(matches)} match(es) ({time.monotonic() - t0:.2f}s)")
+                return "=== SauceNAO Reverse Image Matches (Pixiv / Manga / Art) ===\n" + "\n".join(matches[:3])
     except Exception as e:
         api_log(f"ReverseImage (SauceNAO) -> skipped ({type(e).__name__})")
     return ""
@@ -1214,31 +1214,31 @@ async def _search_iqdb_keyless_async(raw_bytes: bytes, filename: str) -> str:
                 return ""
             html_text = await resp.text()
 
-        if "Best match" not in html_text:
-            return ""
-        sim_m = re.search(r"(\d+)%\s*similarity", html_text)
-        if not sim_m or int(sim_m.group(1)) < 72:
-            return ""
-        sim_pct = int(sim_m.group(1))
+            if "Best match" not in html_text:
+                return ""
+            sim_m = re.search(r"(\d+)%\s*similarity", html_text)
+            if not sim_m or int(sim_m.group(1)) < 72:
+                return ""
+            sim_pct = int(sim_m.group(1))
 
-        link_m = re.search(
-            r"Best match.*?href=[\"']((?:https?:)?//[^\"']+)[\"'][^>]*>\s*<img[^>]*alt=[\"']([^\"']*)[\"']",
-            html_text,
-            re.DOTALL | re.IGNORECASE,
-        )
-        if not link_m:
-            return ""
-        match_url = link_m.group(1)
-        if match_url.startswith("//"):
-            match_url = "https:" + match_url
-        alt_tags = link_m.group(2).strip()
+            link_m = re.search(
+                r"Best match.*?href=[\"']((?:https?:)?//[^\"']+)[\"'][^>]*>\s*<img[^>]*alt=[\"']([^\"']*)[\"']",
+                html_text,
+                re.DOTALL | re.IGNORECASE,
+            )
+            if not link_m:
+                return ""
+            match_url = link_m.group(1)
+            if match_url.startswith("//"):
+                match_url = "https:" + match_url
+            alt_tags = link_m.group(2).strip()
 
-        api_log(f"ReverseImage (IQDB Keyless) -> {sim_pct}% match ({time.monotonic() - t0:.2f}s)")
-        return (
-            f"=== IQDB Reverse Illustration Match ===\n"
-            f"- Similarity: {sim_pct}% | Source Archive URL: {match_url}\n"
-            f"- Detected Tags / Character / Series: {alt_tags}"
-        )
+            api_log(f"ReverseImage (IQDB Keyless) -> {sim_pct}% match ({time.monotonic() - t0:.2f}s)")
+            return (
+                f"=== IQDB Reverse Illustration Match ===\n"
+                f"- Similarity: {sim_pct}% | Source Archive URL: {match_url}\n"
+                f"- Detected Tags / Character / Series: {alt_tags}"
+            )
     except Exception:
         return ""
 
@@ -1258,41 +1258,41 @@ async def _search_tracemoe_async(raw_bytes: bytes, mime_type: str) -> str:
                 return ""
             data = await resp.json()
 
-        docs = data.get("result") or []
-        if not docs:
-            return ""
-        top = docs[0]
-        sim = float(top.get("similarity") or 0.0) * 100.0
-        if sim < 87.0:
-            return ""
+            docs = data.get("result") or []
+            if not docs:
+                return ""
+            top = docs[0]
+            sim = float(top.get("similarity") or 0.0) * 100.0
+            if sim < 87.0:
+                return ""
 
-        anilist = top.get("anilist") or {}
-        title_obj = anilist.get("title") if isinstance(anilist, dict) else {}
-        romaji = (title_obj or {}).get("romaji") or ""
-        english = (title_obj or {}).get("english") or ""
-        native = (title_obj or {}).get("native") or ""
-        mal_id = anilist.get("idMal") if isinstance(anilist, dict) else None
-        ani_id = anilist.get("id") if isinstance(anilist, dict) else None
+            anilist = top.get("anilist") or {}
+            title_obj = anilist.get("title") if isinstance(anilist, dict) else {}
+            romaji = (title_obj or {}).get("romaji") or ""
+            english = (title_obj or {}).get("english") or ""
+            native = (title_obj or {}).get("native") or ""
+            mal_id = anilist.get("idMal") if isinstance(anilist, dict) else None
+            ani_id = anilist.get("id") if isinstance(anilist, dict) else None
 
-        ep = top.get("episode") or "Movie/OVA"
-        from_sec = int(float(top.get("from") or 0))
-        mm, ss = divmod(from_sec, 60)
-        hh, mm = divmod(mm, 60)
-        ts_str = f"{hh:02d}:{mm:02d}:{ss:02d}" if hh > 0 else f"{mm:02d}:{ss:02d}"
+            ep = top.get("episode") or "Movie/OVA"
+            from_sec = int(float(top.get("from") or 0))
+            mm, ss = divmod(from_sec, 60)
+            hh, mm = divmod(mm, 60)
+            ts_str = f"{hh:02d}:{mm:02d}:{ss:02d}" if hh > 0 else f"{mm:02d}:{ss:02d}"
 
-        mal_link = f"{HTTPS}myanimelist.net/anime/{mal_id}" if mal_id else (
-            f"{HTTPS}anilist.co/anime/{ani_id}" if ani_id else ""
-        )
-        api_log(f"ReverseImage (trace.moe) -> '{romaji or native}' Ep.{ep} at {ts_str} ({sim:.1f}%, {time.monotonic() - t0:.2f}s)")
-        return (
-            f"=== trace.moe Anime Screenshot Match ===\n"
-            f"- Anime Title: {romaji} / {english} ({native})\n"
-            f"- Episode: {ep} | Exact Scene Timestamp: {ts_str} | Similarity: {sim:.1f}%\n"
-            + (f"- Reference Link: {mal_link}" if mal_link else "")
-        ).strip()
+            mal_link = f"{HTTPS}myanimelist.net/anime/{mal_id}" if mal_id else (
+                f"{HTTPS}anilist.co/anime/{ani_id}" if ani_id else ""
+            )
+            api_log(f"ReverseImage (trace.moe) -> '{romaji or native}' Ep.{ep} at {ts_str} ({sim:.1f}%, {time.monotonic() - t0:.2f}s)")
+            return (
+                f"=== trace.moe Anime Screenshot Match ===\n"
+                f"- Anime Title: {romaji} / {english} ({native})\n"
+                f"- Episode: {ep} | Exact Scene Timestamp: {ts_str} | Similarity: {sim:.1f}%\n"
+                + (f"- Reference Link: {mal_link}" if mal_link else "")
+            ).strip()
     except Exception as e:
         api_log(f"ReverseImage (trace.moe) -> skipped ({type(e).__name__})")
-    return ""
+        return ""
 
 
 def _compress_image_for_vision_ocr_sync(raw_bytes: bytes, max_dim: int = 1280, quality: int = 90) -> tuple[str, str, bool]:
@@ -1313,7 +1313,7 @@ def _compress_image_for_vision_ocr_sync(raw_bytes: bytes, max_dim: int = 1280, q
 async def _call_gemini_multi_image_batch(
     encoded_images: list[tuple[str, str, str]],
     batch_prompt: str,
-    timeout_sec: int = 38,
+    timeout_sec: int = 26,
     max_output_tokens: int = 2048,
 ) -> str:
     if not GEMINI_API_KEY:
@@ -1328,12 +1328,17 @@ async def _call_gemini_multi_image_batch(
         "generationConfig": {
             "temperature": 0.1,
             "maxOutputTokens": max_output_tokens,
-            "thinkingConfig": {"thinkingBudget": 0},
+            "thinkingConfig": {"thinkingLevel": "LOW"},
         },
     }
     try:
         data = await call_gemini_generate_content_self_healing(
-            payload, timeout_sec=timeout_sec, purpose=f"MultiImageOCR({len(encoded_images)}p)"
+            payload,
+            timeout_sec=timeout_sec,
+            purpose=f"MultiImageOCR({len(encoded_images)}p)",
+            prefer_full_flash=True,
+            max_models=2,
+            max_wall_sec=float(timeout_sec + 14),
         )
         if data:
             resp_parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
@@ -1351,14 +1356,15 @@ async def _call_gemini_multi_image_batch(
 async def _call_ai_studio_gemma_multi_image_batch(
     encoded_images: list[tuple[str, str, str]],
     batch_prompt: str,
-    timeout_sec: int = 32,
+    timeout_sec: int = 22,
     max_output_tokens: int = 2048,
 ) -> str:
-    """Tier 2 Google AI Studio Gemma 4 multi-image batch backup (14.4K RPD)."""
+    """Tier 2 Google AI Studio Gemma 4 multi-image batch backup (uses fast 26B MoE)."""
     if not GEMINI_API_KEY:
         return ""
     gemma_models = await discover_active_gemma_models(vision_required=True)
-    candidates = sorted(gemma_models, key=lambda x: (0 if "26b" in x else 1))
+    # Prefer fast 26B MoE (`gemma-4-26b-a4b-it`) for multi-image batches so dense 31B doesn't time out
+    candidates = [m for m in gemma_models if "26b" in m] or gemma_models[:1]
     if not candidates:
         return ""
 
@@ -1368,7 +1374,7 @@ async def _call_ai_studio_gemma_multi_image_batch(
         parts.append({"inlineData": {"mimeType": mime_type, "data": b64_img}})
 
     session = get_http_session()
-    for model_id in candidates:
+    for model_id in candidates[:1]:
         url = clean_url(
             f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
             f"{model_id}:generateContent?key={GEMINI_API_KEY}"
@@ -1408,7 +1414,7 @@ async def _call_ai_studio_gemma_multi_image_batch(
 async def _call_cf_multi_image_batch(
     encoded_images: list[tuple[str, str, str]],
     batch_prompt: str,
-    timeout_sec: int = 32,
+    timeout_sec: int = 26,
     max_tokens: int = 2048,
 ) -> str:
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
@@ -1467,7 +1473,7 @@ async def extract_multi_images_batch_ocr(
 ) -> str:
     """
     Inspects 2 to 12 sequential comic/illustration pages together in a SINGLE multimodal batch call
-    with strict anti-hallucination franchise verification and staggered 18s hedged backup.
+    using Gemini 3.8 Flash (`thinkingLevel: LOW`) with bounded 14s hedged backup.
     """
     target_list = images_list[:MAX_BATCH_IMAGES]
     if len(target_list) < 2:
@@ -1515,19 +1521,19 @@ async def extract_multi_images_batch_ocr(
 
     has_gemini = bool(GEMINI_API_KEY)
     has_cf = bool(CF_ACCOUNT_ID and CF_API_TOKEN)
-    gemini_timeout = min(65, 26 + (4 * len(encoded_images)))
-    cf_timeout = min(50, 24 + (3 * len(encoded_images)))
+    gemini_timeout = min(30, 16 + len(encoded_images))
+    backup_timeout = min(26, 15 + len(encoded_images))
 
     async def _run_batch_backup_chain() -> str:
         if has_gemini:
             gemma_res = await _call_ai_studio_gemma_multi_image_batch(
-                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_output_tokens=out_tokens
+                encoded_images, batch_prompt, timeout_sec=backup_timeout, max_output_tokens=out_tokens
             )
             if gemma_res:
                 return gemma_res
         if has_cf:
             return await _call_cf_multi_image_batch(
-                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=out_tokens
+                encoded_images, batch_prompt, timeout_sec=backup_timeout, max_tokens=out_tokens
             )
         return ""
 
@@ -1540,7 +1546,7 @@ async def extract_multi_images_batch_ocr(
                 encoded_images, batch_prompt, timeout_sec=gemini_timeout, max_output_tokens=out_tokens
             )
         )
-        done, _ = await asyncio.wait({gemini_task}, timeout=18.0)
+        done, _ = await asyncio.wait({gemini_task}, timeout=14.0)
         if gemini_task in done:
             try:
                 res = gemini_task.result()
@@ -1550,7 +1556,7 @@ async def extract_multi_images_batch_ocr(
                 pass
             return await _run_batch_backup_chain()
 
-        api_log(f"Hedge (MultiImageOCR {len(encoded_images)}p) -> Gemini >18s; racing backup batch in parallel")
+        api_log(f"Hedge (MultiImageOCR {len(encoded_images)}p) -> Gemini >14s; racing backup batch in parallel")
         backup_task = asyncio.create_task(_run_batch_backup_chain())
         tasks = {gemini_task, backup_task}
         try:
@@ -1578,6 +1584,41 @@ async def extract_multi_images_batch_ocr(
         return ""
     finally:
         encoded_images.clear()
+
+
+async def _call_gemini_single_image_vision(
+    ocr_prompt: str, mime_type: str, b64_img: str, purpose: str = "Image OCR Tier 1 Gemini"
+) -> str:
+    if not GEMINI_API_KEY:
+        return ""
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": ocr_prompt},
+                    {"inlineData": {"mimeType": mime_type, "data": b64_img}},
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 2048,
+            "thinkingConfig": {"thinkingLevel": "LOW"},
+        },
+    }
+    data = await call_gemini_generate_content_self_healing(
+        payload,
+        timeout_sec=12,
+        purpose=purpose,
+        prefer_full_flash=True,
+        max_models=2,
+        max_wall_sec=16.0,
+    )
+    if not data:
+        return ""
+    parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+    out = "\n".join(p.get("text", "") for p in parts if p.get("text") and not p.get("thought", False)).strip()
+    return re.sub(r"<think>[\s\S]*?</think>", "", out).strip()
 
 
 async def extract_image_via_transient_ocr(
@@ -1612,7 +1653,7 @@ async def extract_image_via_transient_ocr(
         "1. [Identification & Panel-by-Panel Visual Context]:\n"
         "   - If Comic / Manga / Fanart: Identify the Anime/Game/Manga Series and Character names ONLY if clearly supported by "
         "unmistakable visual features (hair ornaments, outfits, halos/no halos) or the post caption above. NEVER mix character names "
-        "from one franchise with a different franchise title, and NEVER guess when ambiguous—write 'Unknown / Unconfirmed Series' instead! "
+        "from one franchise with a different franchise title, and NEVER invent nonsensical style names or guess when ambiguous—write 'Unknown / Unconfirmed Series' instead! "
         "Describe what is happening visually in each panel in traditional Japanese reading order (Top-to-Bottom, Right-to-Left).\n"
         "   - If Code / Terminal / Stack Trace / UI Screenshot: Describe the exact error message, HTTP status, UI component, or terminal output shown.\n"
         "   - If Real-World Photo/Product/Hardware: Identify the Brand, Product Line, Model Name/Number, and distinguishing physical features.\n"
@@ -1631,12 +1672,25 @@ async def extract_image_via_transient_ocr(
 
     vision_result = ""
 
-    # Tier 1: Cloudflare Workers AI Vision
-    cf_ocr = await call_cloudflare_vision_chat(ocr_prompt, mime_type, b64_img, purpose="Image OCR Tier 1 CF")
-    if cf_ocr:
-        vision_result = cf_ocr
+    # Tier 1: Gemini 3.8 Flash / 3.6 Flash (Fast 2-4s single-image vision)
+    if GEMINI_API_KEY:
+        vision_result = await _call_gemini_single_image_vision(ocr_prompt, mime_type, b64_img)
 
-    # Tier 2: Groq LPU Vision
+    # Tier 2: Cloudflare Workers AI Vision (`@cf/google/gemma-4-26b-a4b-it`)
+    if not vision_result:
+        cf_ocr = await call_cloudflare_vision_chat(ocr_prompt, mime_type, b64_img, purpose="Image OCR Tier 2 CF")
+        if cf_ocr:
+            vision_result = cf_ocr
+
+    # Tier 3: Google AI Studio Gemma 4 Vision (`gemma-4-26b-a4b-it`)
+    if not vision_result:
+        gemma_ocr = await call_gemma_ai_studio_vision(
+            ocr_prompt, mime_type, b64_img, timeout_sec=12, purpose="Image OCR Tier 3 AI Studio"
+        )
+        if gemma_ocr:
+            vision_result = gemma_ocr
+
+    # Tier 4: Groq LPU Vision (`qwen/qwen3.8-27b`)
     if not vision_result and GROQ_API_KEY:
         groq_candidates = await discover_active_groq_vision_models()
         groq_host = "api." + "groq.com"
@@ -1664,7 +1718,7 @@ async def extract_image_via_transient_ocr(
                     "max_tokens": 3072,
                 }
                 async with session.post(
-                    chat_url, headers=headers, json=groq_vision_payload, timeout=aiohttp.ClientTimeout(total=25)
+                    chat_url, headers=headers, json=groq_vision_payload, timeout=aiohttp.ClientTimeout(total=20)
                 ) as resp:
                     elapsed = time.monotonic() - t0
                     if resp.status == 200:
@@ -1673,22 +1727,14 @@ async def extract_image_via_transient_ocr(
                         content = g_data["choices"][0]["message"]["content"].strip()
                         content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
                         if content:
-                            api_log(f"Image OCR (Tier 2 Groq) -> {g_mod} 200 OK ({elapsed:.2f}s)")
+                            api_log(f"Image OCR (Tier 4 Groq) -> {g_mod} 200 OK ({elapsed:.2f}s)")
                             vision_result = content
                             break
-                    api_log(f"Image OCR (Tier 2 Groq) -> {g_mod} HTTP {resp.status}; fallback to Tier 3")
+                    api_log(f"Image OCR (Tier 4 Groq) -> {g_mod} HTTP {resp.status}; fallback to Tier 5")
             except Exception as e:
-                api_log(f"Image OCR (Tier 2 Groq) -> {g_mod} failed ({type(e).__name__}); fallback to Tier 3")
+                api_log(f"Image OCR (Tier 4 Groq) -> {g_mod} failed ({type(e).__name__}); fallback to Tier 5")
 
-    # Tier 3: Google AI Studio Gemma 4 Vision
-    if not vision_result:
-        gemma_ocr = await call_gemma_ai_studio_vision(
-            ocr_prompt, mime_type, b64_img, timeout_sec=12, purpose="Image OCR Tier 3"
-        )
-        if gemma_ocr:
-            vision_result = gemma_ocr
-
-    # Tier 4: Modal T4 GPU
+    # Tier 5: Modal T4 GPU
     if not vision_result:
         payload = {
             "model": ACTIVE_VISION_MODEL,
@@ -1714,10 +1760,10 @@ async def extract_image_via_transient_ocr(
                         data = await resp.json()
                         content = data.get("message", {}).get("content", "").strip()
                         if content:
-                            api_log(f"Image OCR (Tier 4 Modal) -> {ACTIVE_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
+                            api_log(f"Image OCR (Tier 5 Modal) -> {ACTIVE_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
                             vision_result = content
         except Exception as e:
-            api_log(f"Image OCR (Tier 4 Modal) -> {ACTIVE_VISION_MODEL} failed ({type(e).__name__})")
+            api_log(f"Image OCR (Tier 5 Modal) -> {ACTIVE_VISION_MODEL} failed ({type(e).__name__})")
 
     out_parts = []
     if reverse_tasks:
@@ -1838,7 +1884,7 @@ async def extract_all_context(
                 )
             elif fname.endswith(IMAGE_EXTENSIONS) and len(image_att_batch) < MAX_BATCH_IMAGES:
                 image_att_batch.append((raw_bytes, att.filename, ""))
-            raw_bytes = None
+                raw_bytes = None
         except Exception as e:
             blocks.append(f"[Error reading `{att.filename}`: {e}]")
 
@@ -1852,15 +1898,25 @@ async def extract_all_context(
                 blocks.append(batch_vis)
         if processed_image_count == 0:
             total_att_imgs = len(image_att_batch)
-            for idx, (img_b, img_fn, _) in enumerate(image_att_batch, 1):
+            sem = asyncio.Semaphore(3)
+
+            async def _ocr_att_item(idx: int, img_b: bytes, img_fn: str) -> tuple[int, str, str]:
+                async with sem:
+                    ocr_out = await extract_image_via_transient_ocr(
+                        img_b,
+                        img_fn,
+                        run_source_lookup=(idx <= 2),
+                        post_meta_hint=message.content or "",
+                        page_label=f"Page {idx} of {total_att_imgs}" if total_att_imgs > 1 else "",
+                    )
+                    return idx, img_fn, ocr_out
+
+            att_tasks = [
+                _ocr_att_item(idx, img_b, img_fn)
+                for idx, (img_b, img_fn, _) in enumerate(image_att_batch, 1)
+            ]
+            for idx, img_fn, ocr_out in await asyncio.gather(*att_tasks):
                 processed_image_count += 1
-                ocr_out = await extract_image_via_transient_ocr(
-                    img_b,
-                    img_fn,
-                    run_source_lookup=(idx <= 2),
-                    post_meta_hint=message.content or "",
-                    page_label=f"Page {idx} of {total_att_imgs}" if total_att_imgs > 1 else "",
-                )
                 if STACK_TRACE_SIGNATURE_REGEX.search(ocr_out):
                     has_code_file = True
                 blocks.append(f"=== Image #{idx} Inspection & Source Lookup (`{img_fn}`) ===\n{ocr_out}")
@@ -1890,26 +1946,32 @@ async def extract_all_context(
 
         if not batch_done:
             total_emb_imgs = len(target_embed_imgs)
-            for idx, (emb_bytes, emb_fname, emb_url) in enumerate(target_embed_imgs, 1):
-                if processed_image_count >= MAX_BATCH_IMAGES:
-                    break
+            sem = asyncio.Semaphore(3)
+
+            async def _ocr_embed_item(idx: int, emb_bytes: bytes, emb_fname: str, emb_url: str) -> str:
+                async with sem:
+                    try:
+                        do_lookup = (not has_authoritative_social_meta) and (idx <= 2)
+                        ocr_out = await extract_image_via_transient_ocr(
+                            emb_bytes,
+                            emb_fname,
+                            run_source_lookup=do_lookup,
+                            post_meta_hint=meta_hint,
+                            page_label=f"Page {idx} of {total_emb_imgs}" if total_emb_imgs > 1 else "",
+                        )
+                        return f"=== Embedded Image #{idx} Inspection & Source Lookup (`{emb_fname}` | `{emb_url}`) ===\n{ocr_out}"
+                    except Exception as e:
+                        return f"[Error inspecting embedded image `{emb_fname}`: {e}]"
+
+            emb_tasks = [
+                _ocr_embed_item(idx, emb_bytes, emb_fname, emb_url)
+                for idx, (emb_bytes, emb_fname, emb_url) in enumerate(target_embed_imgs, 1)
+            ]
+            for res_block in await asyncio.gather(*emb_tasks):
                 processed_image_count += 1
-                try:
-                    do_lookup = (not has_authoritative_social_meta) and (idx <= 2)
-                    ocr_out = await extract_image_via_transient_ocr(
-                        emb_bytes,
-                        emb_fname,
-                        run_source_lookup=do_lookup,
-                        post_meta_hint=meta_hint,
-                        page_label=f"Page {idx} of {total_emb_imgs}" if total_emb_imgs > 1 else "",
-                    )
-                    if STACK_TRACE_SIGNATURE_REGEX.search(ocr_out):
-                        has_code_file = True
-                    blocks.append(
-                        f"=== Embedded Image #{idx} Inspection & Source Lookup (`{emb_fname}` | `{emb_url}`) ===\n{ocr_out}"
-                    )
-                except Exception as e:
-                    blocks.append(f"[Error inspecting embedded image `{emb_fname}`: {e}]")
+                if STACK_TRACE_SIGNATURE_REGEX.search(res_block):
+                    has_code_file = True
+                blocks.append(res_block)
 
     if parsed_heavy_doc or embed_images:
         embed_images.clear()

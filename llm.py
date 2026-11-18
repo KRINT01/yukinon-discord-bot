@@ -62,9 +62,10 @@ from search_engine import (
 )
 
 GEMINI_MODEL_HINT_REGEX = re.compile(r"models/([a-zA-Z0-9._-]+)")
-# Allow Flash-Lite models (`gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`) while excluding non-text/specialized endpoints
+# Exclude legacy 1.5/2.0/2.5/omni endpoints and non-text endpoints so self-healing never wastes time on 404/429 models
 GEMINI_EXCLUDED_SUBSTRINGS = (
-    "image", "tts", "audio", "live", "embedding", "aqa", "bison", "gecko", "decision", "hydrogen", "preview"
+    "image", "tts", "audio", "live", "embedding", "aqa", "bison", "gecko",
+    "decision", "hydrogen", "preview", "omni", "2.5", "2.0", "1.5"
 )
 
 GROQ_EXCLUDED_SUBSTRINGS = (
@@ -125,8 +126,10 @@ def _compact_messages_for_token_budget(messages: list, max_est_tokens: int = 450
 
 def _adapt_gemini_thinking_config_for_model(payload: dict, model_id: str) -> dict:
     """
-    Adapts `thinkingConfig` for Gemini 3.5+ / 3.6 / 3.8 / 4 models which use
-    `thinkingLevel` (`MINIMAL`, `LOW`, `MEDIUM`, `HIGH`) instead of `thinkingBudget`.
+    Adapts `thinkingConfig` per Gemini model family:
+      - `gemini-3.8-flash`, `gemini-3.7-flash`, and `gemini-4-*` support `LOW`, `MEDIUM`, `HIGH`
+        (passing `MINIMAL` or `thinkingBudget` returns HTTP 400 INVALID_ARGUMENT).
+      - `gemini-3.6-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite` support `MINIMAL` and `LOW`.
     """
     work_payload = json.loads(json.dumps(payload))
     gen_cfg = work_payload.get("generationConfig")
@@ -134,15 +137,30 @@ def _adapt_gemini_thinking_config_for_model(payload: dict, model_id: str) -> dic
         return work_payload
 
     lower_m = (model_id or "").lower()
-    is_modern_level_model = any(
+    t_cfg = gen_cfg.get("thinkingConfig")
+    if not isinstance(t_cfg, dict):
+        return work_payload
+
+    no_minimal_models = any(
         lower_m.startswith(prefix)
-        for prefix in ("gemini-3.5", "gemini-3.6", "gemini-3.8", "gemini-4")
+        for prefix in ("gemini-3.8", "gemini-3.7", "gemini-4")
     )
-    if is_modern_level_model:
-        t_cfg = gen_cfg.get("thinkingConfig")
-        if isinstance(t_cfg, dict) and "thinkingBudget" in t_cfg and "thinkingLevel" not in t_cfg:
+    minimal_capable_models = any(
+        lower_m.startswith(prefix)
+        for prefix in ("gemini-3.6", "gemini-3.5", "gemini-3.1")
+    )
+
+    if no_minimal_models:
+        if "thinkingBudget" in t_cfg:
+            t_cfg.pop("thinkingBudget", None)
+        cur_level = str(t_cfg.get("thinkingLevel") or "").upper()
+        if not cur_level or cur_level == "MINIMAL":
+            t_cfg["thinkingLevel"] = "LOW"
+    elif minimal_capable_models:
+        if "thinkingBudget" in t_cfg and "thinkingLevel" not in t_cfg:
             budget = int(t_cfg.pop("thinkingBudget") or 0)
             t_cfg["thinkingLevel"] = "MINIMAL" if budget <= 64 else "LOW"
+
     return work_payload
 
 
@@ -528,7 +546,7 @@ async def discover_active_groq_vision_models() -> list[str]:
 async def discover_active_gemma_models(vision_required: bool = False) -> list[str]:
     global _GEMMA_AVAILABLE_MODELS_CACHE, _GEMMA_MODELS_LAST_FETCH_TS
     default_list = (
-        [GEMMA_VISION_MODEL, "gemma-4-26b-a4b-it", "gemma-4-31b-it"]
+        [GEMMA_VISION_MODEL, "gemma-4-26b-a4b-it"]
         if vision_required
         else [state.active_gemma_model, GEMMA_CHAT_MODEL, "gemma-4-31b-it", "gemma-4-26b-a4b-it"]
     )
@@ -567,26 +585,40 @@ async def discover_active_gemma_models(vision_required: bool = False) -> list[st
     return candidates or list(dict.fromkeys(x for x in default_list if x))
 
 
-async def _discover_active_gemini_flash_model(force_remote: bool = False) -> list[str]:
+async def _discover_active_gemini_flash_model(
+    force_remote: bool = False, prefer_full_flash: bool = False
+) -> list[str]:
     """
-    Orders Gemini Flash-Lite & Flash models with generous free-tier quotas first:
-      1. `gemini-3.5-flash-lite` (15 RPM, 250K TPM, 500 RPD)
-      2. `gemini-3.1-flash-lite` (15 RPM, 250K TPM, 500 RPD)
-      3. `gemini-3.8-flash` / `gemini-3.6-flash` / `gemini-flash-latest` (self-healing catalog discovery)
+    Orders Gemini Flash models based on workload:
+      - `prefer_full_flash=True` (Multi-image Vision / Manga OCR): prioritizes full Flash models
+        (`gemini-3.8-flash` -> `gemini-3.6-flash` -> `gemini-flash-latest`) BEFORE `Flash-Lite`,
+        since full Flash handles multi-page visual reasoning reliably without stalling.
+      - `prefer_full_flash=False` (Text / Fact-check / Search): prioritizes high-quota Flash-Lite
+        (`gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite`) -> full Flash.
     """
     global _GEMINI_DISCOVERED_MODELS_CACHE, _GEMINI_MODELS_LAST_FETCH_TS
     now = time.time()
 
-    preferred_seed = [
-        state.active_gemini_model if (state.active_gemini_model and "preview" not in state.active_gemini_model) else None,
-        GEMINI_SEARCH_MODEL,
-        GEMINI_FALLBACK_MODEL,
-        "gemini-3.5-flash-lite",
-        "gemini-3.1-flash-lite",
-        "gemini-3.8-flash",
-        "gemini-3.6-flash",
-        "gemini-flash-latest",
-    ]
+    if prefer_full_flash:
+        preferred_seed = [
+            "gemini-3.8-flash",
+            "gemini-3.6-flash",
+            "gemini-flash-latest",
+            GEMINI_SEARCH_MODEL,
+            GEMINI_FALLBACK_MODEL,
+        ]
+    else:
+        preferred_seed = [
+            state.active_gemini_model if (state.active_gemini_model and "preview" not in state.active_gemini_model) else None,
+            GEMINI_SEARCH_MODEL,
+            GEMINI_FALLBACK_MODEL,
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+            "gemini-3.8-flash",
+            "gemini-3.6-flash",
+            "gemini-flash-latest",
+        ]
+
     seen = set()
     deduped = [x for x in preferred_seed if x and not (x in seen or seen.add(x))]
 
@@ -614,7 +646,7 @@ async def _discover_active_gemini_flash_model(force_remote: bool = False) -> lis
             print(f"Gemini model auto-discovery warning: {e}")
 
     for name in _GEMINI_DISCOVERED_MODELS_CACHE:
-        if name not in seen:
+        if name not in seen and not any(bad in name.lower() for bad in GEMINI_EXCLUDED_SUBSTRINGS):
             seen.add(name)
             deduped.append(name)
 
@@ -738,7 +770,7 @@ async def call_gemma_ai_studio_vision(
     mime_type: str,
     b64_img: str,
     response_mime_type: str = None,
-    timeout_sec: int = 22,
+    timeout_sec: int = 16,
     purpose: str = "GemmaVision",
 ) -> str:
     if not GEMINI_API_KEY:
@@ -820,22 +852,36 @@ async def call_gemma_ai_studio_vision(
 
 
 async def call_gemini_generate_content_self_healing(
-    payload: dict, timeout_sec: int = 25, purpose: str = "Generate"
+    payload: dict,
+    timeout_sec: int = 25,
+    purpose: str = "Generate",
+    prefer_full_flash: bool = False,
+    max_models: int = 3,
+    max_wall_sec: float | None = None,
 ) -> dict | None:
     """
-    Self-healing Gemini caller defaulting to `gemini-3.5-flash-lite` (15 RPM, 250K TPM, 500 RPD)
-    -> `gemini-3.1-flash-lite` (15 RPM, 250K TPM, 500 RPD) -> live self-healing discovery
-    (`gemini-3.8-flash`, `gemini-3.6-flash`, etc.).
+    Bounded self-healing Gemini caller with model-specific `thinkingLevel` adaptation,
+    circuit-breaker cooldowns on `TimeoutError`/`429`/`503`, and a strict `max_models` &
+    `max_wall_sec` cap so a slow endpoint never spirals into multi-minute cascades.
     """
     if not GEMINI_API_KEY:
         return None
 
-    candidate_models = await _discover_active_gemini_flash_model(force_remote=False)
+    candidate_models = await _discover_active_gemini_flash_model(
+        force_remote=False, prefer_full_flash=prefer_full_flash
+    )
     tried = set()
+    wall_start = time.monotonic()
+    wall_budget = max_wall_sec if max_wall_sec is not None else float(timeout_sec * 2 + 6)
 
     session = get_http_session()
     idx = 0
-    while idx < len(candidate_models):
+    while idx < len(candidate_models) and len(tried) < max_models:
+        elapsed_wall = time.monotonic() - wall_start
+        remaining_wall = wall_budget - elapsed_wall
+        if remaining_wall <= 2.0:
+            break
+
         model_id = candidate_models[idx]
         idx += 1
         if not model_id or model_id in tried:
@@ -851,19 +897,20 @@ async def call_gemini_generate_content_self_healing(
             f"{model_id}:generateContent?key={GEMINI_API_KEY}"
         )
         work_payload = _adapt_gemini_thinking_config_for_model(payload, model_id)
+        per_call_timeout = min(float(timeout_sec), max(4.0, remaining_wall))
 
         for attempt in range(2):
             t0 = time.monotonic()
             try:
                 async with session.post(
-                    url, json=work_payload, timeout=aiohttp.ClientTimeout(total=timeout_sec)
+                    url, json=work_payload, timeout=aiohttp.ClientTimeout(total=per_call_timeout)
                 ) as resp:
                     status = resp.status
                     body_text = await resp.text()
                     elapsed = time.monotonic() - t0
 
                     if status == 200:
-                        if state.active_gemini_model != model_id:
+                        if not prefer_full_flash and state.active_gemini_model != model_id:
                             state.active_gemini_model = model_id
                         api_log(f"Gemini ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
                         return json.loads(body_text)
@@ -876,6 +923,8 @@ async def call_gemini_generate_content_self_healing(
                         _GEMINI_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 60.0
                     elif status in (500, 503):
                         _GEMINI_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 90.0
+                    elif status == 404:
+                        _GEMINI_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 3600.0
 
                     if status in (404, 400):
                         hint_matches = GEMINI_MODEL_HINT_REGEX.findall(body_text)
@@ -886,11 +935,7 @@ async def call_gemini_generate_content_self_healing(
                                 and not any(b in hinted_model.lower() for b in GEMINI_EXCLUDED_SUBSTRINGS)
                             ):
                                 candidate_models.insert(idx, hinted_model)
-                        if not _GEMINI_DISCOVERED_MODELS_CACHE:
-                            for live_m in await _discover_active_gemini_flash_model(force_remote=True):
-                                if live_m not in tried and live_m not in candidate_models:
-                                    candidate_models.append(live_m)
-                        api_log(f"Gemini ({purpose}) -> {model_id} HTTP {status}; trying next model")
+                        api_log(f"Gemini ({purpose}) -> {model_id} HTTP {status}: {body_text[:110]}; trying next model")
                         break
                     else:
                         api_log(f"Gemini ({purpose}) -> {model_id} HTTP {status}; trying next model")
@@ -898,7 +943,7 @@ async def call_gemini_generate_content_self_healing(
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                _GEMINI_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 60.0
+                _GEMINI_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 90.0
                 api_log(f"Gemini ({purpose}) -> {model_id} failed ({type(e).__name__}); trying next model")
                 break
 
@@ -906,7 +951,10 @@ async def call_gemini_generate_content_self_healing(
 
 
 async def call_gemini_chat_messages(
-    messages: list, temperature: float = 0.25, purpose: str = "FactSearchChat"
+    messages: list,
+    temperature: float = 0.25,
+    purpose: str = "FactSearchChat",
+    prefer_full_flash: bool = False,
 ) -> str:
     if not GEMINI_API_KEY:
         return ""
@@ -935,13 +983,20 @@ async def call_gemini_chat_messages(
         "generationConfig": {
             "temperature": temperature,
             "maxOutputTokens": 4096,
-            "thinkingConfig": {"thinkingBudget": 128},
+            "thinkingConfig": {"thinkingLevel": "LOW"},
         },
     }
     if sys_parts:
         payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(sys_parts)}]}
 
-    data = await call_gemini_generate_content_self_healing(payload, timeout_sec=25, purpose=purpose)
+    data = await call_gemini_generate_content_self_healing(
+        payload,
+        timeout_sec=22,
+        purpose=purpose,
+        prefer_full_flash=prefer_full_flash,
+        max_models=2,
+        max_wall_sec=30.0,
+    )
     if data:
         parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
         out = "\n".join(p.get("text", "") for p in parts if p.get("text") and not p.get("thought", False)).strip()
@@ -1012,7 +1067,7 @@ async def call_cloudflare_gemma_chat(
 
 
 async def _run_fast_groq_hedge(messages: list, temperature: float, purpose: str) -> str:
-    """Fast ~1.4s Groq LPU backup launched if primary Cloudflare Gemma 4 exceeds the 14s hedge window."""
+    """Fast ~1.4s Groq LPU backup launched if primary Cloudflare Gemma 4 exceeds the hedge window."""
     if not GROQ_API_KEY:
         return ""
     for g_mod in await get_groq_search_and_chat_candidates():
@@ -1499,7 +1554,7 @@ async def query_local_ollama_chat(
                 "content": (
                     f"[SYSTEM NOTE — PERSONA & TOPIC ANCHOR]: You are Yukino Yukinoshita (female; NEVER use 'ครับ', only 'ค่ะ'/'นะคะ'). "
                     f"Current active topic: '{active_topic or 'General'}'. "
-                    "Speak naturally in first person ('ฉัน'); NEVER write a meta-heading like 'ความคิดเห็นในสไตล์ยูกิโนะ'."
+                    "Speak naturally in first person ('ฉัน'); NEVER write meta-headings like 'ความคิดเห็นในสไตล์ยูกิโนะ' or 'ความรู้สึกของฉัน'."
                 ),
             })
         messages.append({"role": "user", "content": user_content})
@@ -1557,18 +1612,29 @@ async def query_local_ollama_chat(
             target_temp = 0.2 if (did_search or is_user_correction) else temperature
 
             if is_japanese_or_social_media:
+                # Prioritize Gemini Flash (natural Japanese + Yukino roleplay, 1M context) -> Gemma 4 -> CF Gemma
+                if GEMINI_API_KEY:
+                    ans = await call_gemini_chat_messages(
+                        messages,
+                        temperature=target_temp,
+                        purpose="MangaSocialChat",
+                        prefer_full_flash=True,
+                    )
+                    if ans:
+                        return ans
+
+                ans = await call_gemma_ai_studio_chat(
+                    messages, temperature=target_temp, max_output_tokens=1800, purpose="MangaSocialChat"
+                )
+                if ans:
+                    return ans
+
                 ans = await _call_cf_gemma_hedged_with_groq(
                     messages,
                     temperature=target_temp,
                     max_tokens=1800,
                     purpose="MangaSocialChat",
-                    hedge_delay_sec=14.0,
-                )
-                if ans:
-                    return ans
-
-                ans = await call_gemma_ai_studio_chat(
-                    messages, temperature=target_temp, max_output_tokens=1800, purpose="MangaSocialChat"
+                    hedge_delay_sec=24.0,
                 )
                 if ans:
                     return ans
@@ -1604,13 +1670,13 @@ async def query_local_ollama_chat(
                 if ans:
                     return ans
 
-            if GEMINI_API_KEY:
-                try:
-                    ans = await call_gemini_chat_messages(messages, temperature=target_temp, purpose="FactSearchChat")
-                    if ans:
-                        return ans
-                except Exception as e:
-                    print(f"Gemini FactSearchChat fallback warning: {e}")
+                if GEMINI_API_KEY:
+                    try:
+                        ans = await call_gemini_chat_messages(messages, temperature=target_temp, purpose="FactSearchChat")
+                        if ans:
+                            return ans
+                    except Exception as e:
+                        print(f"Gemini FactSearchChat fallback warning: {e}")
 
         # PATH C: Casual Chat, Weather & Voice Chat
         chat_temp = 0.25 if (did_search or is_user_correction or is_weather_query) else temperature
