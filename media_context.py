@@ -55,7 +55,7 @@ from llm import (
 
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024   # 25 MB cap (supports standard Discord PDF/doc uploads safely)
 MAX_EMBED_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB per embedded image cap for 512MB Render container
-MAX_BATCH_IMAGES = 10                     # Strict 10-image cap across multi-part threads and batch requests
+MAX_BATCH_IMAGES = 12                     # 12-image cap across multi-part threads and batch requests (safe within 512MB RAM)
 
 TWITTER_STATUS_URL_REGEX = re.compile(
     r"https?://(?:www\.|mobile\.)?(?:x\.com|twitter\.com|fixupx\.com|fxtwitter\.com|vxtwitter\.com|fixvx\.com|twittpr\.com)/([^/\s]+)/status/(\d+)",
@@ -75,40 +75,32 @@ DIRECT_IMAGE_URL_REGEX = re.compile(
 )
 
 # Detects part/thread continuation markers on Part 1:
-# - Fractions: 1/2, 1/3, １／２
-# - Page ranges: 1〜3, 1～3, 1~3, 1-3, 1−3, 1ー3, (1〜3), 【1〜3】, 1〜3枚目, 1〜3p
-# - Circled/Japanese/English markers: ①, Part 1, Pt.1, その1, 1話, 前編, つづく, →
 _X_PART_1_SIGNAL_REGEX = re.compile(
-    r"(?:(?:^|[^\d０-９])[1１]\s*[/／]\s*(?:10|１０|[2-9２-９])(?=$|[^\d０-９])|"
-    r"(?:^|[^\d０-９])[1１]\s*[〜～~–—−\-ー]\s*(?:10|１０|[2-9２-９])(?=$|[^\d０-９])|"
+    r"(?:(?:^|[^\d０-９])[1１]\s*[/／]\s*(?:1[0-2]|１[０-２]|[2-9２-９])(?=$|[^\d０-９])|"
+    r"(?:^|[^\d０-９])[1１]\s*[〜～~–—−\-ー]\s*(?:1[0-2]|１[０-２]|[2-9２-９])(?=$|[^\d０-９])|"
     r"[①❶⑴]|(?:^|[\s(【\[（第])[1１]\s*話|その\s*[1１]|part\s*1\b|pt\.?\s*1\b|"
     r"前編|上巻|つづく|続く|続きます|リプに続|ツリーに続|→\s*$)",
     re.IGNORECASE,
 )
 
 # Detects continuation markers on Part 2+:
-# - Fractions: 2/2, 2/3, 3/3
-# - Page ranges starting at 2..10: 4〜5, 4～6, 5〜8, (4〜5), 【4〜5】, 4-5, 4~5
-# - Standalone bracketed/unit page numbers >= 2: (4), 【4】, 4枚目, 4p, 4話
-# - Circled/Japanese/English markers: ②, ③, Part 2, その2, 後編, 中編, 続き
 _X_NEXT_PART_CAPTION_REGEX = re.compile(
-    r"(?:(?:^|[^\d０-９])(?:10|１０|[2-9２-９])\s*[/／]\s*(?:10|１０|[2-9２-９])(?=$|[^\d０-９])|"
-    r"(?:^|[^\d０-９])(?:10|１０|[2-9２-９])\s*[〜～~–—−\-ー]\s*(?:1[0-9]|１[０-９]|[2-9２-９])(?=$|[^\d０-９])|"
-    r"(?:^|[\s(【\[（第])(?:10|１０|[2-9２-９])(?:\s*(?:枚目|p|P|話)|\s*[)】\]）])|"
+    r"(?:(?:^|[^\d０-９])(?:1[0-2]|１[０-２]|[2-9２-９])\s*[/／]\s*(?:1[0-2]|１[０-２]|[2-9２-９])(?=$|[^\d０-９])|"
+    r"(?:^|[^\d０-９])(?:1[0-2]|１[０-２]|[2-9２-９])\s*[〜～~–—−\-ー]\s*(?:1[0-9]|１[０-９]|[2-9２-９])(?=$|[^\d０-９])|"
+    r"(?:^|[\s(【\[（第])(?:1[0-2]|１[０-２]|[2-9２-９])(?:\s*(?:枚目|p|P|話)|\s*[)】\]）])|"
     r"[②③④⑤⑥⑦⑧⑨⑩❷❸❹❺❻❼❽❾❿⑵⑶⑷⑸⑹⑺⑻⑼⑽]|"
-    r"その\s*(?:10|１０|[2-9２-９])|part\s*(?:[2-9]|10)\b|pt\.?\s*(?:[2-9]|10)\b|後編|中編|下巻|続き|続編)",
+    r"その\s*(?:1[0-2]|１[０-２]|[2-9２-９])|part\s*(?:[2-9]|1[0-2])\b|pt\.?\s*(?:[2-9]|1[0-2])\b|後編|中編|下巻|続き|続編)",
     re.IGNORECASE,
 )
 
 _X_PAGE_RANGE_EXTRACT_REGEX = re.compile(
-    r"(?:^|[^\d０-９])([1-9１-９]|10|１０)\s*[〜～~–—−\-ー]\s*([1-9１-９]|1[0-9]|１[０-９])(?=$|[^\d０-９])"
+    r"(?:^|[^\d０-９])([1-9１-９]|1[0-2]|１[０-２])\s*[〜～~–—−\-ー]\s*([1-9１-９]|1[0-9]|１[０-９])(?=$|[^\d０-９])"
 )
 
 _FULLWIDTH_DIGIT_TRANS = str.maketrans("０１２３４５６７８９", "0123456789")
 
 
 def _extract_x_page_range_bounds(text: str) -> tuple[int, int] | None:
-    """Extracts `(start_page, end_page)` from notations like `1〜3` or `4〜5`."""
     if not text:
         return None
     m = _X_PAGE_RANGE_EXTRACT_REGEX.search(text)
@@ -125,11 +117,6 @@ def _extract_x_page_range_bounds(text: str) -> tuple[int, int] | None:
 
 
 def _is_image_only_or_minimal_reply(tweet_obj: dict) -> bool:
-    """
-    Returns True when a self-reply attaches images (`photos >= 1`) and has either no caption
-    (`text == ""`) or only minimal non-promotional text (emojis, hashtags, `t.co` media links,
-    or short continuation labels like `続き` / `おまけ`).
-    """
     if not tweet_obj.get("photos"):
         return False
     raw_txt = tweet_obj.get("text") or ""
@@ -378,10 +365,6 @@ async def _download_remote_image_safe(url: str, referer: str = "") -> tuple[byte
 
 
 def _normalize_fxtwitter_tweet_obj(tweet: dict, fallback_screen_name: str = "", fallback_id: str = "") -> dict:
-    """
-    Normalizes both FxEmbed v1 (`tweet`) and FxEmbed v2 (`status`) JSON payloads into a
-    unified internal structure without crashing if `replying_to` is either a `str` or a `dict`.
-    """
     if isinstance(tweet.get("status"), dict) and "id" not in tweet:
         tweet = tweet["status"]
 
@@ -394,7 +377,6 @@ def _normalize_fxtwitter_tweet_obj(tweet: dict, fallback_screen_name: str = "", 
     t_text = str(tweet.get("text") or "").strip()
     t_url = str(tweet.get("url") or f"{HTTPS}x.com/{a_handle or 'i'}/status/{tid}").strip()
 
-    # Handle both v1 (`replying_to` str + `replying_to_status` str) and v2 (`replying_to` dict or `in_reply_to_*`)
     raw_rep_to = tweet.get("replying_to")
     rep_to_handle = ""
     rep_to_status = str(
@@ -534,7 +516,6 @@ async def _fetch_single_x_tweet_normalized(screen_name: str, tweet_id: str) -> d
 
 
 def _collect_tweet_dicts_from_fxembed_v2_payload(payload, depth: int = 0) -> list[dict]:
-    """Recursively extracts raw v1/v2 status dicts from FxEmbed `/2/thread`, `/2/conversation`, and `/2/profile/.../statuses`."""
     if depth > 6:
         return []
     found: list[dict] = []
@@ -557,13 +538,6 @@ def _collect_tweet_dicts_from_fxembed_v2_payload(payload, depth: int = 0) -> lis
 
 
 async def _fetch_x_thread_candidates_from_fxembed_v2(tweet_id: str, author_handle: str) -> list[dict]:
-    """
-    Queries FxEmbed v2 endpoints in parallel (~0.5–1.5s total, zero slow web scraping):
-      - `GET /2/thread/{tweet_id}`
-      - `GET /2/conversation/{tweet_id}`
-      - `GET /2/profile/{author_handle}/statuses`
-      - `GET /2/profile/{author_handle}/media`
-    """
     if not tweet_id:
         return []
     session = get_http_session()
@@ -608,17 +582,6 @@ async def _fetch_x_thread_candidates_from_fxembed_v2(tweet_id: str, author_handl
 
 
 async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[str, list[str]]:
-    """
-    Resolves an X (Twitter) status URL AND automatically detects/reconstructs
-    directly connected self-reply continuation threads across all formats:
-      - Fraction markers: `1/2` -> `2/2` -> `3/3`
-      - Page range markers: `1〜3` -> `4〜5`, `1～4` -> `5～8`, `1-3` -> `4-5`
-      - Circled / Part / Japanese markers: `①` -> `②`, `Part 1` -> `Part 2`, `その1` -> `その2`
-      - Captionless / image-only self-replies: Part 1 has images + `replies > 0` and Part 2
-        is an image-only reply (`text == ""` or minimal emoji/hashtag with `photos >= 1`)
-      - Backward parent walk if Part 2 / Part 3 is pasted directly
-      - Merges captions chronologically and caps total images strictly at `MAX_BATCH_IMAGES` (10).
-    """
     t0 = time.monotonic()
     anchor_tweet = await _fetch_single_x_tweet_normalized(screen_name, tweet_id)
     if not anchor_tweet:
@@ -628,7 +591,6 @@ async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[s
     author_handle = anchor_tweet["author_handle"] or screen_name
     visited_ids: set[str] = {anchor_tweet["id"]}
 
-    # 1. Backward Parent Walk (if user pasted Part 2 or Part 3 directly—whether captioned or image-only)
     parent_chain: list[dict] = []
     curr = anchor_tweet
     for _ in range(4):
@@ -648,7 +610,6 @@ async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[s
     parent_chain.reverse()
     ordered_tweets: list[dict] = parent_chain + [anchor_tweet]
 
-    # 2. Forward Continuation Walk (Part 1 -> Part 2 -> Part 3 ...)
     tail_tweet = ordered_tweets[-1]
     has_explicit_part_marker = any(_X_PART_1_SIGNAL_REGEX.search(t["text"]) for t in ordered_tweets)
     has_forward_signal = bool(
@@ -673,7 +634,6 @@ async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[s
             curr_tail = ordered_tweets[-1]
             curr_range = _extract_x_page_range_bounds(curr_tail["text"])
 
-            # Tier A: Direct self-reply (`replying_to_status == curr_tail["id"]`) with images OR continuation marker
             direct_children = [
                 cand for cand in thread_pool
                 if cand["id"] not in visited_ids
@@ -682,11 +642,6 @@ async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[s
                 and (len(cand["photos"]) >= 1 or _X_NEXT_PART_CAPTION_REGEX.search(cand["text"]))
             ]
 
-            # Tier B: Same-author candidate from `/2/conversation` or `/2/profile/.../statuses`
-            # matching either:
-            #   (i) same `conversation_id == root_conv_id` and `replying_to == author_handle`
-            #   (ii) sequential page-range marker (`1〜3` -> `4〜5`, `2/2`, `②`)
-            #   (iii) captionless / image-only reply posted within 30 mins after `curr_tail`
             if not direct_children:
                 curr_ts = curr_tail.get("created_timestamp") or 0
                 for cand in thread_pool:
@@ -737,7 +692,6 @@ async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[s
             visited_ids.add(next_part["id"])
             ordered_tweets.append(next_part)
 
-    # 3. Merge Metadata & Photo URLs sequentially up to MAX_BATCH_IMAGES (10)
     merged_photo_urls: list[str] = []
     seen_photo_keys: set[str] = set()
     for tw in ordered_tweets:
@@ -1033,9 +987,6 @@ async def collect_embedded_images_and_metadata(
             handled_urls.add(url)
             _queue_img(url)
 
-    # Only fall back to Discord's native link embed images if no authoritative social API
-    # (FxTwitter / Pixiv / Bluesky) already resolved the post's images—prevents duplicate
-    # Discord proxy thumbnails from inflating a 3-image tweet into 4 images.
     if not resolved_social_api_post or not candidate_image_urls:
         for m in target_msgs:
             if not m.embeds:
@@ -1457,7 +1408,7 @@ async def extract_multi_images_batch_ocr(
     post_meta_hint: str = "",
 ) -> str:
     """
-    Inspects 2 to 10 sequential comic/illustration pages together in a SINGLE multimodal batch call
+    Inspects 2 to 12 sequential comic/illustration pages together in a SINGLE multimodal batch call
     with a staggered 18s hedged backup.
     """
     target_list = images_list[:MAX_BATCH_IMAGES]
@@ -1479,7 +1430,9 @@ async def extract_multi_images_batch_ocr(
     )
 
     n_imgs = len(target_list)
-    if n_imgs >= 5:
+    if n_imgs >= 9:
+        target_dim, target_q, out_tokens = 720, 74, 3584
+    elif n_imgs >= 5:
         target_dim, target_q, out_tokens = 768, 76, 3072
     elif n_imgs >= 3:
         target_dim, target_q, out_tokens = 832, 80, 2048
@@ -1501,8 +1454,8 @@ async def extract_multi_images_batch_ocr(
 
     has_gemini = bool(GEMINI_API_KEY)
     has_cf = bool(CF_ACCOUNT_ID and CF_API_TOKEN)
-    gemini_timeout = min(60, 26 + (4 * len(encoded_images)))
-    cf_timeout = min(45, 24 + (3 * len(encoded_images)))
+    gemini_timeout = min(65, 26 + (4 * len(encoded_images)))
+    cf_timeout = min(50, 24 + (3 * len(encoded_images)))
 
     try:
         if not has_gemini and has_cf:
