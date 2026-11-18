@@ -74,17 +74,73 @@ DIRECT_IMAGE_URL_REGEX = re.compile(
     re.IGNORECASE,
 )
 
-# Detects part/thread continuation markers in X/Twitter captions (e.g., 1/2, ①, Part 1, その1, つづく, →)
+# Detects part/thread continuation markers on Part 1:
+# - Fractions: 1/2, 1/3, １／２
+# - Page ranges: 1〜3, 1～3, 1~3, 1-3, 1−3, 1ー3, (1〜3), 【1〜3】, 1〜3枚目, 1〜3p
+# - Circled/Japanese/English markers: ①, Part 1, Pt.1, その1, 1話, 前編, つづく, →
 _X_PART_1_SIGNAL_REGEX = re.compile(
-    r"(?:(?:^|[\s(【\[（])1\s*/\s*[2-9]\b|[①❶⑴]|(?:^|[\s(【\[（])1\s*話|"
-    r"その\s*[1１]|part\s*1\b|pt\.?\s*1\b|前編|つづく|続く|続きます|リプに続|ツリーに続|→\s*$)",
+    r"(?:(?:^|[^\d０-９])[1１]\s*[/／]\s*(?:10|１０|[2-9２-９])(?=$|[^\d０-９])|"
+    r"(?:^|[^\d０-９])[1１]\s*[〜～~–—−\-ー]\s*(?:10|１０|[2-9２-９])(?=$|[^\d０-９])|"
+    r"[①❶⑴]|(?:^|[\s(【\[（第])[1１]\s*話|その\s*[1１]|part\s*1\b|pt\.?\s*1\b|"
+    r"前編|上巻|つづく|続く|続きます|リプに続|ツリーに続|→\s*$)",
     re.IGNORECASE,
 )
+
+# Detects continuation markers on Part 2+:
+# - Fractions: 2/2, 2/3, 3/3
+# - Page ranges starting at 2..10: 4〜5, 4～6, 5〜8, (4〜5), 【4〜5】, 4-5, 4~5
+# - Standalone bracketed/unit page numbers >= 2: (4), 【4】, 4枚目, 4p, 4話
+# - Circled/Japanese/English markers: ②, ③, Part 2, その2, 後編, 中編, 続き
 _X_NEXT_PART_CAPTION_REGEX = re.compile(
-    r"(?:(?:^|[\s(【\[（])[2-9]\s*/\s*[2-9]\b|[②③④⑤❷❸❹❺⑵⑶⑷⑸]|"
-    r"その\s*[2-9２-９]|part\s*[2-9]\b|pt\.?\s*[2-9]\b|後編|中編|続き)",
+    r"(?:(?:^|[^\d０-９])(?:10|１０|[2-9２-９])\s*[/／]\s*(?:10|１０|[2-9２-９])(?=$|[^\d０-９])|"
+    r"(?:^|[^\d０-９])(?:10|１０|[2-9２-９])\s*[〜～~–—−\-ー]\s*(?:1[0-9]|１[０-９]|[2-9２-９])(?=$|[^\d０-９])|"
+    r"(?:^|[\s(【\[（第])(?:10|１０|[2-9２-９])(?:\s*(?:枚目|p|P|話)|\s*[)】\]）])|"
+    r"[②③④⑤⑥⑦⑧⑨⑩❷❸❹❺❻❼❽❾❿⑵⑶⑷⑸⑹⑺⑻⑼⑽]|"
+    r"その\s*(?:10|１０|[2-9２-９])|part\s*(?:[2-9]|10)\b|pt\.?\s*(?:[2-9]|10)\b|後編|中編|下巻|続き|続編)",
     re.IGNORECASE,
 )
+
+_X_PAGE_RANGE_EXTRACT_REGEX = re.compile(
+    r"(?:^|[^\d０-９])([1-9１-９]|10|１０)\s*[〜～~–—−\-ー]\s*([1-9１-９]|1[0-9]|１[０-９])(?=$|[^\d０-９])"
+)
+
+_FULLWIDTH_DIGIT_TRANS = str.maketrans("０１２３４５６７８９", "0123456789")
+
+
+def _extract_x_page_range_bounds(text: str) -> tuple[int, int] | None:
+    """Extracts `(start_page, end_page)` from notations like `1〜3` or `4〜5`."""
+    if not text:
+        return None
+    m = _X_PAGE_RANGE_EXTRACT_REGEX.search(text)
+    if not m:
+        return None
+    try:
+        s_num = int(m.group(1).translate(_FULLWIDTH_DIGIT_TRANS))
+        e_num = int(m.group(2).translate(_FULLWIDTH_DIGIT_TRANS))
+        if 1 <= s_num <= e_num <= 20:
+            return s_num, e_num
+    except Exception:
+        pass
+    return None
+
+
+def _is_image_only_or_minimal_reply(tweet_obj: dict) -> bool:
+    """
+    Returns True when a self-reply attaches images (`photos >= 1`) and has either no caption
+    (`text == ""`) or only minimal non-promotional text (e.g., emojis, hashtags, `t.co` media links,
+    or short continuation labels like `続き` / `おまけ`).
+    """
+    if not tweet_obj.get("photos"):
+        return False
+    raw_txt = tweet_obj.get("text") or ""
+    if re.search(r"https?://(?!t\.co/)\S+", raw_txt, re.IGNORECASE):
+        return False
+    cleaned = re.sub(r"https?://t\.co/\S+", " ", raw_txt, flags=re.IGNORECASE)
+    cleaned = re.sub(r"@[A-Za-z0-9_]+", " ", cleaned)
+    cleaned = re.sub(r"#\S+", " ", cleaned)
+    cleaned = re.sub(r"[\s\u3000.…,、。!！?？・ー〜～~()（）【】\[\]]+", "", cleaned)
+    return len(cleaned) <= 6
+
 
 _SFX_TOKEN_REGEX = re.compile(
     r"^(?:タッ|ドシッ|ドッ|ドドン|ピュ+|ピシャ+ン|ズシ+|ズゥ+ン|ズーン|ヴォ+|ブル+|ムチ+|ムク+|"
@@ -491,40 +547,45 @@ async def _search_x_continuation_candidates_via_web(
     author_handle: str, root_tweet_id: str, root_caption: str
 ) -> list[dict]:
     """
-    Fallback discovery when Part 1 explicitly indicates a continuation (`1/2`, `①`, `Part 1`, `→`)
-    but `/2/thread/{id}` did not return child self-replies: searches `site:x.com/{handle}/status`
-    and verifies candidate tweets via FxTwitter (`replying_to_status` or matching `2/` / `②` marker).
+    Fallback discovery when Part 1 indicates a continuation (`1〜3`, `1/2`, `①`, `Part 1`, `→`)
+    OR has `replies > 0` with photos (for captionless/image-only self-replies) and `/2/thread/{id}`
+    did not return child self-replies. Searches `site:x.com/{handle}/status` and verifies candidate
+    tweets via FxTwitter (`replying_to_status`, page range sequence, or image-only reply).
     """
     if not author_handle:
         return []
 
     clean_cap = re.sub(r"https?://\S+", " ", root_caption or "")
-    clean_cap = re.sub(r"[【】\[\]()（）①②③④⑤1-9/0-9#]", " ", clean_cap)
+    clean_cap = re.sub(r"[【】\[\]()（）①②③④⑤1-9１-９/0-9#〜～~–—−\-ー]", " ", clean_cap)
     keywords = [w.strip() for w in clean_cap.split() if len(w.strip()) >= 2][:3]
     kw_str = " ".join(keywords)
-    q = f"site:x.com/{author_handle}/status {kw_str}".strip()
+    queries = [f"site:x.com/{author_handle}/status {kw_str}".strip()]
+    if kw_str:
+        queries.append(f"site:x.com/{author_handle}/status")
 
-    try:
-        search_res = await asyncio.to_thread(run_safe_web_search_sync, q, 5)
-    except Exception:
-        return []
-    if not search_res:
-        return []
-
-    found_ids = []
-    for m in re.finditer(
-        rf"https?://(?:www\.|mobile\.)?(?:x\.com|twitter\.com)/{re.escape(author_handle)}/status/(\d+)",
-        search_res,
-        re.IGNORECASE,
-    ):
-        cand_id = m.group(1)
-        if cand_id != root_tweet_id and cand_id not in found_ids:
-            found_ids.append(cand_id)
+    found_ids: list[str] = []
+    for q in queries:
+        if len(found_ids) >= 4:
+            break
+        try:
+            search_res = await asyncio.to_thread(run_safe_web_search_sync, q, 5)
+        except Exception:
+            continue
+        if not search_res:
+            continue
+        for m in re.finditer(
+            rf"https?://(?:www\.|mobile\.)?(?:x\.com|twitter\.com)/{re.escape(author_handle)}/status/(\d+)",
+            search_res,
+            re.IGNORECASE,
+        ):
+            cand_id = m.group(1)
+            if cand_id != root_tweet_id and cand_id not in found_ids:
+                found_ids.append(cand_id)
 
     if not found_ids:
         return []
 
-    tasks = [_fetch_single_x_tweet_normalized(author_handle, cid) for cid in found_ids[:3]]
+    tasks = [_fetch_single_x_tweet_normalized(author_handle, cid) for cid in found_ids[:4]]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     verified = []
     for item in results:
@@ -536,11 +597,14 @@ async def _search_x_continuation_candidates_via_web(
 async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[str, list[str]]:
     """
     Resolves an X (Twitter) status URL AND automatically detects/reconstructs
-    directly connected self-reply continuation threads:
-      - Backward walk if the user pasted Part 2 / Part 3 (`replying_to_status` -> Part 1)
-      - Forward walk if the user pasted Part 1 (`1/...`, `①`, `Part 1`, `→`, or `replies > 0`)
-      - Merges captions chronologically (`[Part 1 Caption]`, `[Part 2 Caption]`, ...)
-      - Collects images across all parts in sequence, capped strictly at `MAX_BATCH_IMAGES` (10).
+    directly connected self-reply continuation threads across all formats:
+      - Fraction markers: `1/2` -> `2/2` -> `3/3`
+      - Page range markers: `1〜3` -> `4〜5`, `1～4` -> `5～8`, `1-3` -> `4-5`
+      - Circled / Part / Japanese markers: `①` -> `②`, `Part 1` -> `Part 2`, `その1` -> `その2`
+      - Captionless / image-only self-replies: Part 1 has images + `replies > 0` and Part 2
+        is an image-only reply (`text == ""` or minimal emoji/hashtag with `photos >= 1`)
+      - Backward parent walk if Part 2 / Part 3 is pasted directly
+      - Merges captions chronologically and caps total images strictly at `MAX_BATCH_IMAGES` (10).
     """
     t0 = time.monotonic()
     anchor_tweet = await _fetch_single_x_tweet_normalized(screen_name, tweet_id)
@@ -551,10 +615,10 @@ async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[s
     author_handle = anchor_tweet["author_handle"] or screen_name
     visited_ids: set[str] = {anchor_tweet["id"]}
 
-    # 1. Backward Parent Walk (if user pasted Part 2 or Part 3 directly)
+    # 1. Backward Parent Walk (if user pasted Part 2 or Part 3 directly—whether captioned or image-only)
     parent_chain: list[dict] = []
     curr = anchor_tweet
-    for _ in range(3):
+    for _ in range(4):
         p_id = curr.get("replying_to_status") or ""
         p_to = (curr.get("replying_to") or "").lower()
         if not p_id or p_id in visited_ids or (author_handle and p_to != author_handle.lower()):
@@ -573,43 +637,79 @@ async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[s
 
     # 2. Forward Continuation Walk (Part 1 -> Part 2 -> Part 3 ...)
     tail_tweet = ordered_tweets[-1]
+    has_explicit_part_marker = any(_X_PART_1_SIGNAL_REGEX.search(t["text"]) for t in ordered_tweets)
     has_forward_signal = bool(
-        _X_PART_1_SIGNAL_REGEX.search(tail_tweet["text"])
-        or any(_X_PART_1_SIGNAL_REGEX.search(t["text"]) for t in ordered_tweets)
-        or (tail_tweet["replies_count"] > 0 and len(tail_tweet["photos"]) >= 2)
+        has_explicit_part_marker
+        or (tail_tweet["replies_count"] > 0 and len(tail_tweet["photos"]) >= 1)
     )
 
-    if has_forward_signal and len(ordered_tweets) < 5:
+    if has_forward_signal and len(ordered_tweets) < 6:
         thread_pool = await _fetch_x_thread_candidates_from_fxembed_v2(tail_tweet["id"], author_handle)
-        if not thread_pool and any(_X_PART_1_SIGNAL_REGEX.search(t["text"]) for t in ordered_tweets):
+        if not thread_pool and ordered_tweets[0]["id"] != tail_tweet["id"]:
+            thread_pool = await _fetch_x_thread_candidates_from_fxembed_v2(ordered_tweets[0]["id"], author_handle)
+        if not thread_pool:
             thread_pool = await _search_x_continuation_candidates_via_web(
                 author_handle, tail_tweet["id"], tail_tweet["text"]
             )
 
-        # Follow strict `replying_to_status == curr_tail.id` self-reply links first
-        for _ in range(4):
-            if len(ordered_tweets) >= 5:
+        for _ in range(5):
+            if len(ordered_tweets) >= 6:
                 break
             curr_tail = ordered_tweets[-1]
+            curr_range = _extract_x_page_range_bounds(curr_tail["text"])
+
+            # Tier A: Direct self-reply (`replying_to_status == curr_tail["id"]`) with images OR continuation marker
             direct_children = [
                 cand for cand in thread_pool
                 if cand["id"] not in visited_ids
                 and (not author_handle or cand["author_handle"].lower() == author_handle.lower())
                 and cand.get("replying_to_status") == curr_tail["id"]
+                and (len(cand["photos"]) >= 1 or _X_NEXT_PART_CAPTION_REGEX.search(cand["text"]))
             ]
-            # Secondary match: same-author reply to author with explicit Part 2 / ② / 2/N marker when parent ID was omitted
-            if not direct_children and _X_PART_1_SIGNAL_REGEX.search(curr_tail["text"]):
-                direct_children = [
-                    cand for cand in thread_pool
-                    if cand["id"] not in visited_ids
-                    and (not author_handle or cand["author_handle"].lower() == author_handle.lower())
-                    and _X_NEXT_PART_CAPTION_REGEX.search(cand["text"])
-                ]
+
+            # Tier B: Same-conversation candidate where `replying_to_status` was omitted by decoder,
+            # matching either explicit next-part/range markers (`4〜5`, `2/2`, `②`) OR an image-only reply
+            # posted shortly after `curr_tail`.
+            if not direct_children:
+                curr_ts = curr_tail.get("created_timestamp") or 0
+                for cand in thread_pool:
+                    if cand["id"] in visited_ids:
+                        continue
+                    if author_handle and cand["author_handle"].lower() != author_handle.lower():
+                        continue
+                    cand_parent = cand.get("replying_to_status") or ""
+                    if cand_parent and cand_parent not in visited_ids:
+                        continue
+
+                    cand_has_marker = bool(_X_NEXT_PART_CAPTION_REGEX.search(cand["text"]))
+                    cand_is_img_only = _is_image_only_or_minimal_reply(cand)
+                    if not (cand_has_marker or cand_is_img_only):
+                        continue
+
+                    cand_ts = cand.get("created_timestamp") or 0
+                    if curr_ts and cand_ts and not (0 <= cand_ts - curr_ts <= 7200):
+                        continue
+                    direct_children.append(cand)
+
             if not direct_children:
                 break
-            direct_children.sort(
-                key=lambda x: (x.get("created_timestamp") or 0, int(x["id"]) if x["id"].isdigit() else 0)
-            )
+
+            def _child_sort_key(c: dict):
+                # Prioritize exact sequential page-range continuation (e.g. `1〜3` -> `4〜5`)
+                range_bonus = 1
+                if curr_range:
+                    c_range = _extract_x_page_range_bounds(c["text"])
+                    if c_range and c_range[0] == curr_range[1] + 1:
+                        range_bonus = 0
+                img_bonus = 0 if c.get("photos") else 1
+                return (
+                    range_bonus,
+                    img_bonus,
+                    c.get("created_timestamp") or 0,
+                    int(c["id"]) if c["id"].isdigit() else 0,
+                )
+
+            direct_children.sort(key=_child_sort_key)
             next_part = direct_children[0]
             visited_ids.add(next_part["id"])
             ordered_tweets.append(next_part)
@@ -654,9 +754,10 @@ async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[s
             f"Total Collected Images Across Thread: {len(merged_photo_urls)} (capped at {MAX_BATCH_IMAGES})",
         ]
         for idx, tw in enumerate(ordered_tweets, 1):
+            cap_disp = tw["text"] or "(Image-only continuation reply — no text caption)"
             lines.append(
                 f"\n[Part {idx}/{len(ordered_tweets)} — {tw['url']} ({len(tw['photos'])} photo(s))]\n"
-                f"Caption: {tw['text'] or '(No text caption)'}"
+                f"Caption: {cap_disp}"
             )
             q_obj = tw.get("quote")
             if q_obj and q_obj.get("text"):
