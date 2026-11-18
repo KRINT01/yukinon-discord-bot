@@ -460,15 +460,23 @@ async def on_message(message: discord.Message):
             await message.channel.send(instant_dt)
             return
 
+    text_without_urls = URL_REGEX.sub("", clean_prompt).strip()
+    is_bare_link_only = bool(has_embedded_media_or_link and not text_without_urls and not all_msg_atts)
+
     # Single-pass attachment preload + Pre-Flight Multimodal Orchestrator (`gemini-decision-1`)
+    # Skip `PreRoute` on bare link-only messages since `Route` will run with full link/OCR context right after.
     preloaded_att_bytes, low_res_imgs = (
         await _preload_image_attachments_and_thumb(all_msg_atts) if has_image_att else ({}, [])
     )
-    pre_plan = await orchestrate_message_with_decision_1(
-        clean_prompt,
-        has_code_attachment=has_code_att,
-        inline_images_b64=low_res_imgs,
-        purpose="PreRoute",
+    pre_plan = (
+        None
+        if is_bare_link_only
+        else await orchestrate_message_with_decision_1(
+            clean_prompt,
+            has_code_attachment=has_code_att,
+            inline_images_b64=low_res_imgs,
+            purpose="PreRoute",
+        )
     )
     pre_route = (pre_plan or {}).get("route", "")
     pre_conf = float((pre_plan or {}).get("route_confidence") or 0.0)
@@ -527,8 +535,6 @@ async def on_message(message: discord.Message):
         )
         preloaded_att_bytes.clear()
 
-        # Deduplicate `gemini-decision-1` calls: reuse `pre_plan` whenever confidence >= 0.85
-        # and no external links/embeds, PDFs/Docs, or voice clips introduced unseen text.
         needs_refined_route = (
             pre_plan is None
             or pre_conf < 0.85
@@ -557,7 +563,6 @@ async def on_message(message: discord.Message):
         else:
             use_coder = regex_coder
 
-        text_without_urls = URL_REGEX.sub("", clean_prompt).strip()
         if clean_prompt and not text_without_urls and extracted_ctx:
             user_request = (
                 f"{clean_prompt}\n"
