@@ -1,8 +1,10 @@
 import os
 import io
 import re
+import json
 import time
 import wave
+import base64
 import logging
 import audioop
 import tempfile
@@ -27,6 +29,8 @@ from config import (
     TTS_RATE,
     STT_PRIMARY_LANG,
     DDGS_PROXY,
+    GEMINI_API_KEY,
+    GEMINI_TRANSCRIBE_LIVE_MODEL,
     GROQ_API_KEY,
     GROQ_STT_MODEL,
     ACTIVE_FAST_MODEL,
@@ -40,10 +44,11 @@ from config import (
     state,
     davey,
     clean_url,
+    api_log,
     get_http_session,
 )
 from persona import sanitize_yukino_output, VOICE_SYSTEM_PROMPT
-from llm import query_local_ollama_chat
+from llm import query_local_ollama_chat, orchestrate_message_with_decision_1
 
 # Silence noisy RTCP SenderReport logs (type=200) and opus flush warnings from discord-ext-voice-recv
 logging.getLogger("discord.ext.voice_recv").setLevel(logging.ERROR)
@@ -57,6 +62,7 @@ PCM_SILENCE_20MS = b"\x00" * 3840
 # Host constants split to prevent chat/markdown auto-linkers from mangling URLs
 GTRANS_HOST = "translate." + "googleapis.com"
 GROQ_API_HOST = "api." + "groq.com"
+GEMINI_WS_HOST = "generativelanguage." + "googleapis.com"
 
 # Spoken test phrases (including common STT phonetic variations like ชัด/แชท, ตัดสอบ/ทดสอบ, หยิน/ยิน)
 VOICE_TEST_PHRASE_REGEX = re.compile(
@@ -67,10 +73,11 @@ VOICE_TEST_PHRASE_REGEX = re.compile(
     re.IGNORECASE,
 )
 
-# Vocabulary hint for Whisper so Thai commands & Yukino's names are spelled accurately
+# Vocabulary hint for Whisper & Gemini 3.5 Transcribe Live so Thai/English commands & names are spelled accurately
 WHISPER_THAI_PROMPT_HINT = (
-    "ยูกิโนะ ยูกิน่อน สวัสดีค่ะ แนะนำตัวหน่อย ได้ยินไหม ถ้าได้ยินแล้วพิมพ์ตอบในแชท "
-    "ทดสอบไมค์ เทสเสียง ทดสอบ วันนี้วันอะไร ตอนนี้เวลากี่โมง อากาศวันนี้เป็นยังไง"
+    "ยูกิโนะ ยูกิน่อน Yukino Yukinon สวัสดีค่ะ แนะนำตัวหน่อย ได้ยินไหม ถ้าได้ยินแล้วพิมพ์ตอบในแชท "
+    "ทดสอบไมค์ เทสเสียง ทดสอบ วันนี้วันอะไร ตอนนี้เวลากี่โมง อากาศวันนี้เป็นยังไง "
+    "จด OT สรุป OT ดูความจำ ยูกิพีเดีย Yukipedia PSO2 NGS แปลมังงะ"
 )
 
 STT_PHONETIC_FIXES = (
@@ -83,6 +90,9 @@ STT_PHONETIC_FIXES = (
     (re.compile(r"ตัดสอบ"), "ทดสอบ"),
     (re.compile(r"^เธอสิ่ง(กัน)?$"), "เทสเสียง"),
     (re.compile(r"^สอบสิ่ง$"), "ทดสอบเสียง"),
+    (re.compile(r"\bจด\s*โอที\b", re.IGNORECASE), "จด OT"),
+    (re.compile(r"\bสรุป\s*โอที\b", re.IGNORECASE), "สรุป OT"),
+    (re.compile(r"\bลบ\s*โอที\b", re.IGNORECASE), "ลบ OT"),
 )
 
 _NATIVE_DPY_VOICE_WS_RECEIVED = _dpy_gateway.DiscordVoiceWebSocket.received_message
@@ -326,8 +336,6 @@ try:
                     if user_id:
                         uid_int = int(user_id)
                         self._cached_id = uid_int
-                        # Only attempt DAVE decrypt if the packet has the 0xFAFA magic trailer!
-                        # Unencrypted comfort-noise / silence packets sent by Discord do not end with 0xFAFA.
                         is_dave_framed = raw_payload.endswith(b"\xfa\xfa")
                         if is_dave_framed:
                             packet.decrypted_data = bytes(
@@ -383,7 +391,6 @@ def _format_colloquial_thai_time(hh: int, mm: int) -> str:
     elif 16 <= hh <= 18:
         hour_phrase = f"{THAI_DAY_NUMBER_WORDS[hh - 12]}โมงเย็น"
     else:
-        # 19:00 (หนึ่งทุ่ม) to 23:00 (ห้าทุ่ม)
         hour_phrase = f"{THAI_DAY_NUMBER_WORDS[hh - 18]}ทุ่ม"
 
     if mm == 0:
@@ -396,18 +403,10 @@ def _format_colloquial_thai_time(hh: int, mm: int) -> str:
 
 
 def _normalize_thai_dates_and_times_for_tts(text: str) -> str:
-    """
-    Converts formal dates/times into natural conversational Thai speech:
-    - Strips parenthetical '(ค.ศ. 2026)' and '(เวลาประเทศไทย UTC+7)'
-    - Strips 'พ.ศ.' / 'พุทธศักราช' so '14 พฤศจิกายน พ.ศ. 2569' reads as 'สิบสี่ พฤศจิกายน 2569'
-    - Converts '02:35 น.' -> 'ตีสอง 35 นาที', '00:00 น.' -> 'เที่ยงคืนตรง', '22:30 น.' -> 'สี่ทุ่มครึ่ง'
-    """
-    # 1. Remove parenthetical ISO/CE date and timezone notes
     s = re.sub(r"\(\s*ค\.ศ\.[^)]*\)", " ", text)
     s = re.sub(r"\(\s*B\.E\.[^)]*\)", " ", s)
     s = re.sub(r"\(\s*เวลาประเทศไทย[^)]*\)", " ", s)
 
-    # 2. Convert 24-hour time 'HH:MM น.' (or 'เวลา HH:MM') into natural colloquial Thai time
     def _time_repl(m):
         hh = int(m.group(1))
         mm = int(m.group(2))
@@ -417,7 +416,6 @@ def _normalize_thai_dates_and_times_for_tts(text: str) -> str:
 
     s = re.sub(r"\b(\d{1,2}):(\d{2})\s*(?:น\.)?", _time_repl, s)
 
-    # 3. Convert 'ที่ <1-31>' into Thai words ('วันเสาร์ที่สิบสี่') so TTS never inserts an extra 'วันที่'
     def _day_num_repl(m):
         prefix = m.group(1)
         day_int = int(m.group(2))
@@ -425,8 +423,6 @@ def _normalize_thai_dates_and_times_for_tts(text: str) -> str:
         return f"{prefix}{day_word} "
 
     s = re.sub(r"(ที่)\s*(\d{1,2})\b", _day_num_repl, s)
-
-    # 4. Drop 'พ.ศ.' / 'พุทธศักราช' so the year is read naturally as '2569'
     s = re.sub(r"(?:พ\.ศ\.|พุทธศักราช)\s*(\d{4})", r"\1", s)
     return s
 
@@ -461,10 +457,6 @@ def _split_tts_chunks(text: str, max_len: int = 190) -> list[str]:
 
 
 def _master_tts_audio_sync(mp3_bytes: bytes, extra_af: str = "") -> bytes:
-    """
-    Applies a warm, natural broadcast mastering filter (softens 3.2kHz robotic sibilance,
-    normalizes loudness, and outputs clean 48kHz stereo CBR MP3).
-    """
     base_af = "equalizer=f=3200:t=q:w=1.2:g=-2.5,acompressor=threshold=-18dB:ratio=2:attack=15:release=150,volume=1.35"
     full_af = f"{extra_af},{base_af}" if extra_af else base_af
     proc = subprocess.run(
@@ -502,7 +494,6 @@ async def _fallback_google_tts_with_yukino_pitch(spoken_text: str, lang_code: st
     if not raw_mp3_parts:
         return b""
 
-    # Sped up to atempo=1.15 (~1.20x total with asetrate=1.04) so Google TTS matches natural speaking speed
     steady_af = "asetrate=24000*1.04,aresample=48000,atempo=1.15"
     try:
         return await asyncio.to_thread(_master_tts_audio_sync, bytes(raw_mp3_parts), steady_af)
@@ -521,7 +512,6 @@ async def synthesize_tts_mp3_bytes(text: str) -> bytes:
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
             mp3_path = tmp_mp3.name
         try:
-            # Avoid passing +0Hz/+0% which edge-tts rejects; only pass rate/pitch if non-zero
             comm_kwargs = {"text": spoken_text, "voice": voice_name, "proxy": DDGS_PROXY}
             if TTS_RATE and TTS_RATE not in ("+0%", "-0%", "0%"):
                 comm_kwargs["rate"] = TTS_RATE
@@ -538,7 +528,6 @@ async def synthesize_tts_mp3_bytes(text: str) -> bytes:
                 except Exception:
                     return raw_edge_mp3
         except Exception as e:
-            # Cooldown for 30m when Render's IP is throttled by Microsoft so voice doesn't flip-flop mid-session
             state.edge_tts_cooldown_until = time.time() + 1800
             print(f"edge-tts unavailable ({e}); locking to steady Google TTS + Yukino filter for 30m...", flush=True)
         finally:
@@ -634,7 +623,178 @@ WHISPER_HALLUCINATIONS = {
 }
 
 
+def _extract_pcm16k_from_wav_bytes(wav_bytes: bytes) -> tuple[bytes, int]:
+    """Extracts raw 16-bit mono PCM bytes and sample rate from a WAV buffer."""
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        rate = wf.getframerate() or 16000
+        pcm = wf.readframes(wf.getnframes())
+    return pcm, rate
+
+
+async def transcribe_wav_bytes_gemini_live(wav_bytes: bytes) -> str:
+    """
+    Tier 1 Primary STT: Streams 16kHz mono PCM audio to `gemini-3.5-transcribe-live`
+    over Google AI Studio's Multimodal Live WebSocket (`BidiGenerateContent`) with
+    custom vocabulary biasing for Thai/English/Japanese commands and character names.
+    Unlimited RPM / Unlimited RPD (20K TPM).
+    """
+    if not GEMINI_API_KEY or not GEMINI_TRANSCRIBE_LIVE_MODEL:
+        return ""
+    if time.time() < state.gemini_transcribe_live_cooldown_until:
+        return ""
+
+    try:
+        pcm_bytes, sample_rate = _extract_pcm16k_from_wav_bytes(wav_bytes)
+    except Exception:
+        return ""
+
+    if len(pcm_bytes) < 3200:
+        return ""
+
+    ws_url = (
+        f"wss://{GEMINI_WS_HOST}/ws/"
+        f"google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+        f"?key={GEMINI_API_KEY}"
+    )
+
+    setup_msg = {
+        "setup": {
+            "model": f"models/{GEMINI_TRANSCRIBE_LIVE_MODEL}",
+            "generationConfig": {
+                "responseModalities": ["TEXT"],
+                "temperature": 0.0,
+            },
+            "systemInstruction": {
+                "parts": [
+                    {
+                        "text": (
+                            "You are a strict, verbatim speech-to-text transcriber for Thai, English, and Japanese voice commands. "
+                            "Output ONLY the exact spoken words in plain text without answering, translating, or adding commentary. "
+                            f"Domain & Custom Vocabulary Bias: {WHISPER_THAI_PROMPT_HINT}"
+                        )
+                    }
+                ]
+            },
+        }
+    }
+
+    t0 = time.monotonic()
+    session = get_http_session()
+    try:
+        async with session.ws_connect(ws_url, timeout=10.0) as ws:
+            await ws.send_json(setup_msg)
+
+            setup_ok = False
+            setup_deadline = time.monotonic() + 3.5
+            while time.monotonic() < setup_deadline:
+                rem = max(0.2, setup_deadline - time.monotonic())
+                msg = await ws.receive(timeout=rem)
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    if "setupComplete" in data:
+                        setup_ok = True
+                        break
+                    if "error" in data:
+                        raise RuntimeError(str(data["error"])[:160])
+                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    break
+
+            if not setup_ok:
+                raise RuntimeError("Live STT setup handshake incomplete")
+
+            padded_pcm = pcm_bytes + (b"\x00" * (sample_rate * 2 * 4 // 10))
+            chunk_size = 3200
+            for offset in range(0, len(padded_pcm), chunk_size):
+                chunk = padded_pcm[offset : offset + chunk_size]
+                await ws.send_json({
+                    "realtimeInput": {
+                        "mediaChunks": [
+                            {
+                                "mimeType": f"audio/pcm;rate={sample_rate}",
+                                "data": base64.b64encode(chunk).decode("ascii"),
+                            }
+                        ]
+                    }
+                })
+
+            await ws.send_json({"clientContent": {"turnComplete": True}})
+
+            transcript_parts: list[str] = []
+            read_deadline = time.monotonic() + 7.5
+            while time.monotonic() < read_deadline:
+                rem = max(0.2, read_deadline - time.monotonic())
+                try:
+                    msg = await ws.receive(timeout=rem)
+                except asyncio.TimeoutError:
+                    break
+
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    if "error" in data:
+                        raise RuntimeError(str(data["error"])[:160])
+                    sc = data.get("serverContent") or {}
+                    model_turn = sc.get("modelTurn") or {}
+                    for part in model_turn.get("parts") or []:
+                        if isinstance(part, dict) and part.get("text") and not part.get("thought", False):
+                            transcript_parts.append(part["text"])
+                    input_tr = sc.get("inputTranscription") or {}
+                    if isinstance(input_tr, dict) and input_tr.get("text"):
+                        transcript_parts.append(input_tr["text"])
+                    if sc.get("turnComplete"):
+                        break
+                elif msg.type == aiohttp.WSMsgType.BINARY:
+                    try:
+                        data = json.loads(msg.data.decode("utf-8"))
+                        sc = data.get("serverContent") or {}
+                        for part in (sc.get("modelTurn") or {}).get("parts") or []:
+                            if isinstance(part, dict) and part.get("text") and not part.get("thought", False):
+                                transcript_parts.append(part["text"])
+                        if sc.get("turnComplete"):
+                            break
+                    except Exception:
+                        pass
+                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    break
+
+            raw_transcript = re.sub(r"\s+", " ", "".join(transcript_parts)).strip()
+            fixed_transcript = _apply_phonetic_fixes(raw_transcript)
+            elapsed = time.monotonic() - t0
+            if (
+                fixed_transcript
+                and len(fixed_transcript) >= 2
+                and fixed_transcript.lower() not in WHISPER_HALLUCINATIONS
+                and not NOISE_HALLUCINATION_REGEX.search(fixed_transcript)
+            ):
+                api_log(
+                    f"Gemini Transcribe Live -> {GEMINI_TRANSCRIBE_LIVE_MODEL} 200 OK "
+                    f"({elapsed:.2f}s): '{fixed_transcript[:80]}'"
+                )
+                return fixed_transcript
+            return ""
+    except Exception as e:
+        err_s = str(e)
+        if "429" in err_s or "quota" in err_s.lower():
+            state.gemini_transcribe_live_cooldown_until = time.time() + 60.0
+        else:
+            state.gemini_transcribe_live_cooldown_until = time.time() + 45.0
+        api_log(
+            f"Gemini Transcribe Live -> {GEMINI_TRANSCRIBE_LIVE_MODEL} fallback "
+            f"({type(e).__name__}: {err_s[:90]})"
+        )
+        return ""
+
+
 async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
+    """
+    3-Tier Hybrid Speech-to-Text Pipeline:
+      - Tier 1: `gemini-3.5-transcribe-live` (Real-time Live API WebSocket, Unlimited RPM/RPD, custom Thai/EN/JP vocab)
+      - Tier 2: Groq `whisper-large-v3` (with segment logprob / no_speech_prob VAD filter)
+      - Tier 3: Google SpeechRecognition (`th-TH` / `en-US` cross-check)
+    """
+    live_txt = await transcribe_wav_bytes_gemini_live(wav_bytes)
+    if live_txt:
+        return live_txt
+
     whisper_candidate = ""
     low_confidence = False
 
@@ -663,7 +823,6 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
                         comp_ratio = float(seg.get("compression_ratio", 1.0))
                         seg_text = (seg.get("text") or "").strip()
 
-                        # Only drop if no_speech is very high OR logprob is extremely low (< -1.35)
                         if no_speech > 0.60 or avg_logprob < -1.35 or comp_ratio > 2.4:
                             print(
                                 f"[Voice VAD Filter] Dropped noise segment '{seg_text}' "
@@ -682,7 +841,6 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
         except Exception as e:
             print(f"Groq Whisper STT error (falling back to Google STT): {e}", flush=True)
 
-    # If Whisper had low confidence on a short Thai phrase (or returned empty), cross-check with Google Thai STT
     if not whisper_candidate or low_confidence:
         google_txt = await asyncio.to_thread(transcribe_wav_bytes_google_sync, wav_bytes)
         if google_txt:
@@ -716,9 +874,25 @@ def convert_audio_bytes_to_wav_sync(raw_bytes: bytes) -> bytes:
     return proc.stdout
 
 
+def _strip_wake_word_prefix(text: str) -> str:
+    """Strips leading wake word ('ยูกิโนะ ...' / 'Yukino, ...') so voice commands parse cleanly."""
+    for w in sorted(VOICE_WAKE_WORDS, key=len, reverse=True):
+        m = re.match(rf"^{re.escape(w)}[\s,、!！?？:：-]+(.+)$", text, flags=re.IGNORECASE)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return text
+
+
 async def handle_spoken_voice_command(
     guild: discord.Guild, text_channel, speaker_user, speaker_name: str, spoken_text: str
 ):
+    from user_memory import (
+        is_ot_command_text,
+        process_ot_request,
+        is_memory_command_text,
+        process_memory_request,
+    )
+
     cleaned = _apply_phonetic_fixes(spoken_text)
     if (
         len(cleaned) < 2
@@ -728,7 +902,7 @@ async def handle_spoken_voice_command(
         return
     print(f"[Voice STT] {speaker_name} spoke: '{cleaned}' (wake_word_required={voice_wake_word_enabled[guild.id]})", flush=True)
 
-    # Instant Voice-Test Trigger (Always replies in chat even if wakeword is on)
+    # 1. Instant Voice-Test Trigger (Always replies in chat even if wakeword is on)
     if VOICE_TEST_PHRASE_REGEX.search(cleaned):
         test_reply = (
             f"ฉันได้ยินเสียงพูดในห้องเสียงชัดเจนแล้วค่ะ (ข้อความที่ได้ยินคือ: **\"{cleaned}\"**) "
@@ -749,15 +923,44 @@ async def handle_spoken_voice_command(
             print(f"[Voice STT] Ignored '{cleaned}' (no wake word detected; use !wakeword off to disable).", flush=True)
             return
 
+    command_body = _strip_wake_word_prefix(cleaned)
+    chan_id = text_channel.id if text_channel else 0
+
+    class _VoiceProxyMsg:
+        def __init__(self):
+            self.author = speaker_user
+            self.channel = text_channel
+            self.guild = guild
+            self.content = command_body
+
+    # 2. Voice Overtime (OT) Command ('ยูกิโนะ จด OT ...' / 'สรุป OT')
+    if speaker_user and is_ot_command_text(command_body, channel_id=chan_id, user_id=speaker_user.id):
+        ot_reply = await process_ot_request(_VoiceProxyMsg(), command_body)
+        if text_channel:
+            await text_channel.send(f"**[🎙️ `{speaker_name}`]:** {cleaned}\n{ot_reply}")
+        await speak_in_voice_channel(guild, ot_reply, fallback_channel=text_channel)
+        return
+
+    # 3. Voice Persistent Memory Command ('จำไว้ว่า...' / 'ดูความจำ')
+    if speaker_user and is_memory_command_text(command_body):
+        mem_reply, _ = await process_memory_request(_VoiceProxyMsg(), command_body)
+        if text_channel:
+            await text_channel.send(f"**[🎙️ `{speaker_name}`]:** {cleaned}\n{mem_reply}")
+        await speak_in_voice_channel(guild, mem_reply, fallback_channel=text_channel)
+        return
+
+    # 4. Voice Search, Weather, Yukipedia & General Conversation (Decision-1 Orchestrated)
+    dec_plan = await orchestrate_message_with_decision_1(command_body, purpose="VoiceRoute")
     answer, _ = await query_local_ollama_chat(
-        f"{speaker_name} พูดในห้องเสียงว่า: {cleaned}",
+        f"{speaker_name} พูดในห้องเสียงว่า: {command_body}",
         model=ACTIVE_FAST_MODEL,
         system_prompt=VOICE_SYSTEM_PROMPT,
         channel_id=text_channel.id if text_channel else None,
-        temperature=0.55,
+        temperature=0.45,
         allow_agentic_search=True,
         speaker_user=speaker_user,
         speaker_name=speaker_name,
+        decision_plan=dec_plan,
     )
     if text_channel:
         await text_channel.send(f"**[🎙️ `{speaker_name}`]:** {cleaned}\n**[🔊 Yukinon Voice]:** {answer}")
@@ -765,7 +968,6 @@ async def handle_spoken_voice_command(
 
 
 class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
-    # Lowered RMS threshold from 150 -> 55 to match normal speaking volume (rms=55..225)
     SPEECH_FRAME_RMS_THRESHOLD = 55
     MIN_ACTIVE_SPEECH_FRAMES = 8
 
@@ -775,7 +977,6 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
         self.text_channel = text_channel
         self._vc_ref = vc
         self._lock = threading.Lock()
-        # 400ms pre-roll buffer (20 frames x 20ms) so initial consonants are never clipped
         self.pre_roll_buffers = defaultdict(lambda: deque(maxlen=20))
         self.user_buffers = defaultdict(bytearray)
         self.speech_frame_counts = defaultdict(int)
@@ -832,7 +1033,6 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
 
         with self._lock:
             if frame_rms >= self.SPEECH_FRAME_RMS_THRESHOLD:
-                # If starting a new utterance, prepend the 400ms pre-roll frames so the first syllable is intact
                 if speaker not in self.user_buffers or len(self.user_buffers[speaker]) == 0:
                     for pre_frame in self.pre_roll_buffers[speaker]:
                         self.user_buffers[speaker].extend(pre_frame)

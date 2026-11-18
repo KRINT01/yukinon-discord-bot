@@ -36,6 +36,7 @@ from config import (
     GEMINI_API_KEY,
     GEMINI_DECISION_MODEL,
     GEMINI_HEAVY_MODEL,
+    GEMINI_TRANSCRIBE_LIVE_MODEL,
     OPENCLAW_GATEWAY_URL,
     AUDIO_EXTENSIONS,
     CUSTOM_EMOJI_REGEX,
@@ -70,6 +71,8 @@ from user_memory import (
     resolve_user_mentions_and_build_dossier,
     is_ot_command_text,
     process_ot_request,
+    is_memory_command_text,
+    process_memory_request,
     build_monthly_ot_summary_markdown,
     _parse_stored_ot_date,
     user_profiles,
@@ -98,6 +101,7 @@ from agent import (
 from ui_interactions import (
     CodeReviewActionView,
     OTActionView,
+    MemoryActionView,
     build_contextual_suggestion_view,
     parse_ot_record_metadata,
     get_previous_month_info,
@@ -131,10 +135,6 @@ def _encode_low_res_decision_thumb_sync(raw_bytes: bytes) -> str:
 async def _preload_image_attachments_and_thumb(
     all_msg_atts: list[discord.Attachment],
 ) -> tuple[dict[int, bytes], list[tuple[str, str]]]:
-    """
-    Reads attached images once into an `{attachment.id: bytes}` cache so `PreRoute`
-    and `extract_all_context()` share the exact same bytes without downloading twice.
-    """
     preloaded: dict[int, bytes] = {}
     img_atts = [
         a for a in all_msg_atts
@@ -174,6 +174,7 @@ def _collect_health_metrics() -> dict:
     gemini_cd = max(0, int(state.gemini_grounding_cooldown_until - now))
     decision_cd = max(0, int(state.gemini_decision_cooldown_until - now))
     hydrogen_cd = max(0, int(state.gemini_hydrogen_cooldown_until - now))
+    live_stt_cd = max(0, int(state.gemini_transcribe_live_cooldown_until - now))
     edge_cd = max(0, int(state.edge_tts_cooldown_until - now))
     cached_files_count = sum(len(q) for q in channel_last_attachment.values())
 
@@ -196,6 +197,7 @@ def _collect_health_metrics() -> dict:
             "ram_usage_pct": ram_pct,
             "active_chat_channels": len(channel_memory),
             "cached_attachments": cached_files_count,
+            "stored_user_profiles": len(user_profiles),
         },
         "ai_backends": {
             "modal_ollama_configured": bool(OLLAMA_BASE_URL),
@@ -213,6 +215,8 @@ def _collect_health_metrics() -> dict:
             "gemini_decision_cooldown_sec": decision_cd,
             "gemini_heavy_specialist": GEMINI_HEAVY_MODEL if GEMINI_API_KEY else None,
             "gemini_hydrogen_cooldown_sec": hydrogen_cd,
+            "gemini_transcribe_live_model": GEMINI_TRANSCRIBE_LIVE_MODEL if GEMINI_API_KEY else None,
+            "gemini_transcribe_live_cooldown_sec": live_stt_cd,
             "gemma_active_model": getattr(state, "active_gemma_model", None) if GEMINI_API_KEY else None,
             "gemini_active_model": state.active_gemini_model if GEMINI_API_KEY else None,
             "gemini_grounding_cooldown_sec": gemini_cd,
@@ -247,12 +251,12 @@ async def handle_root(request: web.Request) -> web.Response:
         <h2>❄️ Yukino Yukinoshita Discord Bot (Enterprise, Decision-Orchestrated & Multi-Cloud Edition)</h2>
         <p><b>System Time (TH):</b> {m['system_time_th']}</p>
         <p><b>Discord Gateway:</b> {gw_status}</p>
-        <p><b>Voice & DAVE E2EE:</b> {d['active_voice_sessions']} active session(s) | DAVE Ready: {d['dave_e2ee_ready']}{edge_cd_note}</p>
+        <p><b>Voice & DAVE E2EE:</b> {d['active_voice_sessions']} active session(s) | DAVE Ready: {d['dave_e2ee_ready']} | Live STT: <code>{ai['gemini_transcribe_live_model']}</code>{edge_cd_note}</p>
         <p><b>Container RAM:</b> {mem['bot_ram_mb']} MB / {mem['render_limit_mb']} MB ({mem['ram_usage_pct']}%) |
-           <b>Cached Contexts:</b> {mem['active_chat_channels']} chat(s), {mem['cached_attachments']} file(s)</p>
+           <b>Cached Contexts:</b> {mem['active_chat_channels']} chat(s), {mem['cached_attachments']} file(s), {mem['stored_user_profiles']} profile(s)</p>
         <hr style="border: 0; border-top: 1px solid #e5e7eb; margin: 16px 0;">
         <p><b>Autonomous Agent / OpenClaw:</b> {"Connected" if OPENCLAW_GATEWAY_URL else "Decision-1 + 8-Skill Agent Active (OpenClaw Gateway on Standby)"}</p>
-        <p><b>Google AI Studio:</b> {"Enabled (Orchestrator: <code>" + str(ai['gemini_decision_orchestrator']) + "</code> | Heavy Specialist: <code>" + str(ai['gemini_heavy_specialist']) + "</code> | Gemma 4: <code>" + str(ai['gemma_active_model']) + "</code> | Flash: <code>" + str(ai['gemini_active_model']) + "</code>)" + gemini_cd_note if ai['gemini_enabled'] else "Disabled"}</p>
+        <p><b>Google AI Studio:</b> {"Enabled (Orchestrator: <code>" + str(ai['gemini_decision_orchestrator']) + "</code> | Heavy Specialist: <code>" + str(ai['gemini_heavy_specialist']) + "</code> | Live STT: <code>" + str(ai['gemini_transcribe_live_model']) + "</code> | Gemma 4: <code>" + str(ai['gemma_active_model']) + "</code> | Flash-Lite: <code>" + str(ai['gemini_active_model']) + "</code>)" + gemini_cd_note if ai['gemini_enabled'] else "Disabled"}</p>
         <p><b>Cloudflare Workers AI:</b> {"Enabled (Code: <code>" + CF_CODE_MODEL + "</code> | Fast: <code>" + CF_CHAT_FAST_MODEL + "</code> | Vision/Gemma: <code>" + str(ai['cloudflare_gemma_model']) + "</code> | Image: <code>" + str(ai['cloudflare_image_model']) + "</code>)" if ai['cloudflare_enabled'] else "Disabled"}</p>
         <p><b>Groq LPU Acceleration:</b> {"Enabled (Code: <code>" + GROQ_CODE_MODEL + "</code> | Search: <code>" + str(ai['groq_search_model']) + "</code> | Vision: <code>" + str(ai['groq_vision_model']) + "</code>)" if ai['groq_enabled'] else "Disabled"}</p>
         <p><b>Modal GPU Ollama:</b> {"Configured" if ai['modal_ollama_configured'] else "Not Configured"} (Fallback: <code>{ai['fast_model']}</code>)</p>
@@ -406,11 +410,12 @@ async def on_message(message: discord.Message):
         channel_id=message.channel.id,
         user_id=message.author.id,
     )
+    is_mem_trigger = is_memory_command_text(message.content)
 
     ref_msg = await resolve_referenced_message(message) if message.reference else None
     is_reply = bool(ref_msg and bot.user and ref_msg.author.id == bot.user.id)
     has_audio = any(a.filename.lower().endswith(AUDIO_EXTENSIONS) for a in message.attachments)
-    if not (is_dm or is_ai_chan or is_mentioned or is_reply or has_audio or is_ot_trigger):
+    if not (is_dm or is_ai_chan or is_mentioned or is_reply or has_audio or is_ot_trigger or is_mem_trigger):
         return
 
     clean_prompt = re.sub(rf"<@!?{bot.user.id}>", "", message.content).strip()
@@ -429,6 +434,13 @@ async def on_message(message: discord.Message):
             )
         else:
             clean_prompt = inherited
+
+    # 0A. Persistent User Memory Viewer & Editor ('ดูความจำ', 'จำไว้ว่า...', 'แก้หัวข้อที่ชอบ...', etc.)
+    if is_memory_command_text(clean_prompt):
+        mem_reply, target_uid = await process_memory_request(message, clean_prompt)
+        mem_view = MemoryActionView(requester_id=message.author.id, target_uid=target_uid)
+        await _send_response_with_interactive_view(message.channel, mem_reply, mem_view, reply_to=message)
+        return
 
     clean_prompt, mentioned_dossier = resolve_user_mentions_and_build_dossier(
         clean_prompt,
@@ -476,7 +488,7 @@ async def on_message(message: discord.Message):
     pre_route = (pre_plan or {}).get("route", "")
     pre_conf = float((pre_plan or {}).get("route_confidence") or 0.0)
 
-    # 0A. Overtime (OT) Logger & Monthly Table Summarizer
+    # 0B. Overtime (OT) Logger & Monthly Table Summarizer
     if is_ot_command_text(clean_prompt, channel_id=message.channel.id, user_id=message.author.id) or (
         pre_route == "ot_log" and pre_conf >= 0.82
     ):
@@ -491,7 +503,7 @@ async def on_message(message: discord.Message):
         await _send_response_with_interactive_view(message.channel, ot_reply, ot_view, reply_to=message)
         return
 
-    # 0. Natural Chat "Yukipedia Mode" Trigger
+    # 0C. Natural Chat "Yukipedia Mode" Trigger
     if YUKIPEDIA_INTENT_PATTERN.search(clean_prompt):
         preloaded_att_bytes.clear()
         await process_yukipedia_request(message, clean_prompt)
@@ -763,9 +775,10 @@ async def voice_status_command(ctx):
     uids = dave_s.get_user_ids() if (dave_s and hasattr(dave_s, "get_user_ids")) else []
     await ctx.send(
         f"🎙️ **สถานะห้องเสียง (`{vc.channel.name}`):**\n"
+        f"- **Primary Live STT:** `{GEMINI_TRANSCRIBE_LIVE_MODEL}` (Fallback: Groq Whisper-v3 + Google STT)\n"
         f"- **DAVE E2EE Status:** `{status}` | **Ready:** `{ready}` | **Can Encrypt:** `{can_enc}`\n"
         f"- **MLS Group User IDs:** `{uids}`\n"
-        f"- **ลองพูดในไมค์ว่า:** `\"ถ้าได้ยินแล้วพิมพ์ตอบในแชท\"` หรือ `\"เทสเสียง\"` เพื่อทดสอบไมค์ได้ทันทีค่ะ"
+        f"- **ลองพูดในไมค์ว่า:** `\"ถ้าได้ยินแล้วพิมพ์ตอบในแชท\"` หรือสั่งค้นหา/จด OT ด้วยเสียงได้ทันทีค่ะ"
     )
 
 
@@ -920,7 +933,8 @@ async def status_command(ctx):
         f"- **Cached Contexts:** `{mem['active_chat_channels']}` แชท | "
         f"`{mem['cached_attachments']}` ไฟล์แนบ | "
         f"`{active_topics_count}` หัวข้อสนทนา | "
-        f"`{notes_count}` บันทึกช่วยจำ"
+        f"`{notes_count}` บันทึกช่วยจำ | "
+        f"`{mem['stored_user_profiles']}` โปรไฟล์ผู้ใช้"
     )
 
 
@@ -976,6 +990,14 @@ async def ot_command(ctx, *, args: str = ""):
         else None
     )
     await _send_response_with_interactive_view(ctx.channel, reply, ot_view, reply_to=ctx.message)
+
+
+@bot.command(name="memory", aliases=["memo", "profile", "ความจำ"])
+async def memory_command(ctx, *, args: str = ""):
+    query = args.strip() or "ดูความจำ"
+    reply, target_uid = await process_memory_request(ctx.message, query)
+    mem_view = MemoryActionView(requester_id=ctx.author.id, target_uid=target_uid)
+    await _send_response_with_interactive_view(ctx.channel, reply, mem_view, reply_to=ctx.message)
 
 
 @bot.command(name="agent", aliases=["claw", "auto"])

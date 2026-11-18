@@ -15,6 +15,7 @@ from config import (
     get_cached_channel_attachments,
 )
 from persona import (
+    is_owner_user,
     FAST_SYSTEM_PROMPT,
     CODE_SYSTEM_PROMPT,
     YUKIPEDIA_SYSTEM_PROMPT,
@@ -34,6 +35,10 @@ from image_engine import (
 )
 from user_memory import (
     user_profiles,
+    ensure_user_profile_exists,
+    update_user_memory_fields,
+    format_user_memory_card,
+    process_memory_request,
     process_ot_request,
     build_monthly_ot_summary_markdown,
     _parse_stored_ot_date,
@@ -71,7 +76,7 @@ def _strip_internal_prompt_hints(text: str) -> str:
 
 
 def _extract_clean_artist_or_topic_hint(cached_ctx: str, bot_reply: str) -> str:
-    """Extracts clean artist handle/name (e.g. 'きりんまる @kirinmarun Pixiv') from metadata or reply for follow-up searches."""
+    """Extracts clean artist handle/name from metadata or reply for follow-up searches."""
     for src in (cached_ctx or "", bot_reply or ""):
         m_auth = re.search(r"Author / Artist:\s*([^\n(|]+)(?:\(@([A-Za-z0-9_]+)\))?", src)
         if m_auth:
@@ -270,11 +275,6 @@ class CodeReviewActionView(AutoDisappearingView):
 # 2. DYNAMIC DOMAIN-TAILORED SUGGESTION VIEW
 # ==============================================================================
 class GeneralAssistantActionView(AutoDisappearingView):
-    """
-    Dynamically constructs 2-3 context-matched suggestion buttons tailored to the exact
-    domain (Documents/PDFs, Art/Social Embeds, Gaming, News/Finance, or Product/Advice).
-    """
-
     def __init__(
         self,
         channel_id: int,
@@ -339,14 +339,12 @@ class GeneralAssistantActionView(AutoDisappearingView):
         await interaction.response.defer(thinking=True)
         cached_ctx = get_cached_channel_attachments(self.channel_id, max_total_chars=25000)
 
-        # Build a clean search hint if searching for artist/related works so formatting words never leak into DDGS
         search_hint_tag = ""
         if use_search:
             artist_hint = _extract_clean_artist_or_topic_hint(cached_ctx, self.bot_reply)
             if artist_hint and ("ศิลปิน" in btn_label or "ผลงาน" in btn_label):
                 search_hint_tag = f"\n[SEARCH_HINT: {artist_hint}]"
 
-        # Run Decision 1 orchestrator on the button follow-up
         dec_plan = await orchestrate_message_with_decision_1(
             f"Follow-up action ({btn_label}): {instruction}",
             extracted_ctx=cached_ctx[:2500],
@@ -396,10 +394,6 @@ def build_contextual_suggestion_view(
     source_message: discord.Message | None = None,
     decision_plan: dict | None = None,
 ) -> GeneralAssistantActionView:
-    """
-    Selects the exact set of interactive buttons using the `gemini-decision-1` orchestrator's
-    `button_domain` classification (with deterministic tag/keyword fallback).
-    """
     ctx_lower = (extracted_ctx or "").lower()
     combined = f"{user_query} {bot_reply}".lower()
 
@@ -407,7 +401,6 @@ def build_contextual_suggestion_view(
     if decision_plan and float(decision_plan.get("route_confidence") or 0.0) >= 0.65:
         dec_domain = str(decision_plan.get("button_domain") or "").strip().lower()
 
-    # Resolve domain: Orchestrator verdict first, deterministic fallback second
     if dec_domain in ("document", "social_art", "game", "news"):
         domain = dec_domain
     elif any(
@@ -433,7 +426,6 @@ def build_contextual_suggestion_view(
     else:
         domain = "general"
 
-    # 1. Documents, Spreadsheets, Web Articles & YouTube Videos
     if domain == "document":
         specs = [
             (
@@ -460,7 +452,6 @@ def build_contextual_suggestion_view(
         ]
         return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs, source_message=source_message)
 
-    # 2. Embedded Social Posts (X / Twitter, Pixiv, Bluesky), Artwork & Anime/Manga
     if domain == "social_art":
         has_foreign_dialogue = bool(re.search(r"[ぁ-んァ-ヶ一-龯]", extracted_ctx or ""))
         specs = []
@@ -506,7 +497,6 @@ def build_contextual_suggestion_view(
         )
         return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs, source_message=source_message)
 
-    # 3. Video Games / Builds / Mechanics
     if domain == "game":
         specs = [
             (
@@ -533,7 +523,6 @@ def build_contextual_suggestion_view(
         ]
         return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs, source_message=source_message)
 
-    # 4. News / Market / Financial Updates
     if domain == "news":
         specs = [
             (
@@ -560,7 +549,6 @@ def build_contextual_suggestion_view(
         ]
         return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs, source_message=source_message)
 
-    # 5. Hardware / Gear / Comparisons / General Recommendations
     specs = [
         (
             "เทียบข้อดี-ข้อเสีย",
@@ -588,7 +576,123 @@ def build_contextual_suggestion_view(
 
 
 # ==============================================================================
-# 3. INTERACTIVE OVERTIME (OT) MODAL & ACTION BUTTONS
+# 3. INTERACTIVE PERSISTENT USER MEMORY MODAL & ACTION BUTTONS
+# ==============================================================================
+class MemoryEditModal(discord.ui.Modal, title="แก้ไขความจำถาวร (User Memory)"):
+    display_name_input = discord.ui.TextInput(
+        label="ชื่อที่แสดงในความจำ (Display Name)",
+        placeholder="เช่น Partner (Owner) หรือชื่อเล่น",
+        required=True,
+        max_length=36,
+    )
+    favorite_topics_input = discord.ui.TextInput(
+        label="หัวข้อที่ชอบ (คั่นด้วยเครื่องหมายจุลภาค ,)",
+        style=discord.TextStyle.paragraph,
+        placeholder="เช่น PSO2 NGS, Anime & Manga, Software & Coding, Specialty Coffee",
+        required=False,
+        max_length=400,
+    )
+    custom_notes_input = discord.ui.TextInput(
+        label="บันทึกความจำ / ข้อมูลจำเพาะ (แยกบรรทัดหรือ ;)",
+        style=discord.TextStyle.paragraph,
+        placeholder="พิมพ์ข้อมูลจำเพาะหรือความชอบส่วนตัวทีละบรรทัด หรือคั่นด้วย ;",
+        required=False,
+        max_length=800,
+    )
+    recent_topics_input = discord.ui.TextInput(
+        label="เรื่องที่คุยล่าสุด (แยกบรรทัดหรือ ;)",
+        style=discord.TextStyle.paragraph,
+        placeholder="พิมพ์หัวข้อที่คุยล่าสุดทีละบรรทัด หรือคั่นด้วย ;",
+        required=False,
+        max_length=500,
+    )
+
+    def __init__(self, target_uid: str):
+        super().__init__()
+        self.target_uid = str(target_uid)
+        prof = ensure_user_profile_exists(self.target_uid)
+        self.display_name_input.default = prof.get("display_name") or ""
+        self.favorite_topics_input.default = ", ".join(prof.get("favorite_topics") or [])
+        self.custom_notes_input.default = "\n".join(prof.get("custom_notes") or [])
+        self.recent_topics_input.default = "\n".join(prof.get("recent_topics") or [])
+
+    async def on_submit(self, interaction: discord.Interaction):
+        new_disp = self.display_name_input.value.strip()
+        raw_favs = self.favorite_topics_input.value.strip()
+        raw_notes = self.custom_notes_input.value.strip()
+        raw_recents = self.recent_topics_input.value.strip()
+
+        new_favs = [x.strip() for x in re.split(r"[,;،\n]+", raw_favs) if x.strip()] if raw_favs else []
+        new_notes = [x.strip() for x in re.split(r"[;\n]+", raw_notes) if x.strip()] if raw_notes else []
+        new_recents = [x.strip() for x in re.split(r"[;\n]+", raw_recents) if x.strip()] if raw_recents else []
+
+        await update_user_memory_fields(
+            self.target_uid,
+            display_name=new_disp or None,
+            favorite_topics=new_favs,
+            custom_notes=new_notes,
+            recent_topics=new_recents,
+        )
+
+        card_text = format_user_memory_card(
+            self.target_uid,
+            header_title="บันทึกการแก้ไขความจำถาวร (#yukinon-memory) เรียบร้อยแล้วค่ะ",
+        )
+        view = MemoryActionView(requester_id=interaction.user.id, target_uid=self.target_uid)
+        await interaction.response.send_message(card_text, view=view)
+        try:
+            view.message = await interaction.original_response()
+        except Exception:
+            pass
+
+
+class MemoryActionView(AutoDisappearingView):
+    def __init__(self, requester_id: int, target_uid: str):
+        super().__init__(timeout=300.0)
+        self.requester_id = int(requester_id)
+        self.target_uid = str(target_uid)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id and not is_owner_user(interaction.user):
+            await interaction.response.send_message(
+                "ปุ่มแก้ไขความจำนี้สงวนไว้สำหรับเจ้าของข้อมูลเท่านั้นนะคะ", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="แก้ไขความจำ (Edit)", style=discord.ButtonStyle.primary, emoji="✏️")
+    async def btn_edit_memory(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(MemoryEditModal(target_uid=self.target_uid))
+
+    @discord.ui.button(label="ล้างเรื่องล่าสุด", style=discord.ButtonStyle.secondary, emoji="🧹")
+    async def btn_clear_recent(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await update_user_memory_fields(self.target_uid, recent_topics=[])
+        card_text = format_user_memory_card(
+            self.target_uid, header_title="ล้างรายการเรื่องที่คุยล่าสุดเรียบร้อยแล้วค่ะ"
+        )
+        await interaction.response.edit_message(content=card_text, view=self)
+
+    @discord.ui.button(label="รีเซ็ตความจำ", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def btn_reset_memory(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await update_user_memory_fields(
+            self.target_uid,
+            favorite_topics=[],
+            custom_notes=[],
+            recent_topics=[],
+        )
+        card_text = format_user_memory_card(
+            self.target_uid, header_title="รีเซ็ตความจำถาวรเรียบร้อยแล้วค่ะ (คงข้อมูล OT ไว้ให้ครบ)"
+        )
+        await interaction.response.edit_message(content=card_text, view=self)
+
+
+def parse_memory_record_metadata(mem_reply_text: str) -> str:
+    m = re.search(r"\[MEM_RECORD:\s*uid=(\d+)\s*\]", mem_reply_text or "")
+    return m.group(1).strip() if m else ""
+
+
+# ==============================================================================
+# 4. INTERACTIVE OVERTIME (OT) MODAL & ACTION BUTTONS
 # ==============================================================================
 class OTEditModal(discord.ui.Modal, title="แก้ไขรายการบันทึก OT"):
     date_input = discord.ui.TextInput(
@@ -715,9 +819,69 @@ def parse_ot_record_metadata(ot_reply_text: str) -> tuple[str, str, str]:
 
 
 # ==============================================================================
-# 4. NATIVE SLASH COMMANDS & RIGHT-CLICK CONTEXT MENUS
+# 5. NATIVE SLASH COMMANDS & RIGHT-CLICK CONTEXT MENUS
 # ==============================================================================
 def register_app_commands(bot: discord.ext.commands.Bot):
+    @bot.tree.command(name="memory", description="ดู แก้ไข เพิ่ม หรือรีเซ็ตข้อมูลความจำถาวร (user_profiles.json)")
+    @app_commands.describe(
+        action="เลือกการทำงานกับความจำถาวร",
+        value="ข้อความสำหรับเพิ่มบันทึกหรือเพิ่มหัวข้อที่ชอบ (กรณีเลือก Add)",
+        member="เลือกสมาชิกที่ต้องการดู/แก้ไข (เฉพาะเจ้าของบอท เว้นว่างเพื่อดูของตัวเอง)",
+    )
+    @app_commands.choices(
+        action=[
+            app_commands.Choice(name="ดูข้อมูลความจำ (View & Buttons)", value="view"),
+            app_commands.Choice(name="เปิดหน้าต่างแก้ไข (Edit Modal)", value="edit_modal"),
+            app_commands.Choice(name="เพิ่มบันทึกความจำ (Add Note)", value="add_note"),
+            app_commands.Choice(name="เพิ่มหัวข้อที่ชอบ (Add Topic)", value="add_topic"),
+            app_commands.Choice(name="ล้างเรื่องล่าสุด (Clear Recent)", value="clear_recent"),
+        ]
+    )
+    async def slash_memory(
+        interaction: discord.Interaction,
+        action: str = "view",
+        value: str = "",
+        member: discord.Member | None = None,
+    ):
+        target_user = member if (member is not None and is_owner_user(interaction.user)) else interaction.user
+        target_uid = str(target_user.id)
+        owner_flag = is_owner_user(target_user)
+        raw_disp = getattr(target_user, "display_name", "") or getattr(target_user, "name", "")
+        ensure_user_profile_exists(
+            target_uid,
+            display_name="Partner (Owner)" if owner_flag else raw_disp,
+            username=getattr(target_user, "name", ""),
+            is_owner=owner_flag,
+        )
+
+        if action == "edit_modal":
+            await interaction.response.send_modal(MemoryEditModal(target_uid=target_uid))
+            return
+
+        class _ProxyMemMsg:
+            def __init__(self):
+                self.author = interaction.user
+                self.channel = interaction.channel
+                self.guild = interaction.guild
+
+        mention_prefix = f"<@{target_uid}> " if target_uid != str(interaction.user.id) else ""
+        if action == "add_note" and value.strip():
+            cmd_str = f"{mention_prefix}เพิ่มบันทึก {value.strip()}"
+        elif action == "add_topic" and value.strip():
+            cmd_str = f"{mention_prefix}เพิ่มหัวข้อที่ชอบ {value.strip()}"
+        elif action == "clear_recent":
+            cmd_str = f"{mention_prefix}ล้างเรื่องล่าสุด"
+        else:
+            cmd_str = f"{mention_prefix}ดูความจำ"
+
+        reply, resolved_uid = await process_memory_request(_ProxyMemMsg(), cmd_str)
+        view = MemoryActionView(requester_id=interaction.user.id, target_uid=resolved_uid)
+        await interaction.response.send_message(reply, view=view)
+        try:
+            view.message = await interaction.original_response()
+        except Exception:
+            pass
+
     @bot.tree.command(name="code", description="วิเคราะห์โค้ด, Stack Trace, SQL หรือ Manifest ตามมาตรฐาน Enterprise")
     @app_commands.describe(
         focus="เลือกความเชี่ยวชาญเฉพาะทางที่ต้องการเน้น",

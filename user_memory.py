@@ -113,7 +113,7 @@ async def restore_user_profiles_from_discord(bot: discord.Client):
 
 
 async def backup_user_profiles_to_discord(force: bool = False):
-    """Backs up user_profiles.json to the private Discord backup channel (throttled to at most once every 3 mins)."""
+    """Backs up user_profiles.json to the private Discord backup channel (throttled to at most once every 3 mins unless force=True)."""
     global _DIRTY_SINCE_LAST_BACKUP, _LAST_CLOUD_BACKUP_TS
     if not _DIRTY_SINCE_LAST_BACKUP and not force:
         return
@@ -147,6 +147,52 @@ async def backup_user_profiles_to_discord(force: bool = False):
         print(f"[User Memory] Cloud backup note: {e}", flush=True)
 
 
+def ensure_user_profile_exists(
+    uid_str: str,
+    display_name: str = "",
+    username: str = "",
+    is_owner: bool = False,
+) -> dict:
+    """Returns an existing or newly initialized user profile dict with normalized list fields."""
+    now_str = get_current_thai_datetime_str()
+    clean_disp = re.sub(r"[^\w\u0E00-\u0E7F\s().-]", "", display_name or "").strip()[:36]
+    default_disp = "Partner (Owner)" if is_owner else (clean_disp or f"User_{uid_str[-4:]}")
+
+    prof = user_profiles.get(uid_str)
+    if not isinstance(prof, dict):
+        prof = {
+            "user_id": uid_str,
+            "display_name": default_disp,
+            "username": username,
+            "is_owner": is_owner,
+            "interaction_count": 1,
+            "first_seen": now_str,
+            "last_seen": now_str,
+            "favorite_topics": [],
+            "custom_notes": [],
+            "recent_topics": [],
+        }
+        user_profiles[uid_str] = prof
+
+    prof.setdefault("user_id", uid_str)
+    if not prof.get("display_name"):
+        prof["display_name"] = default_disp
+    if username and not prof.get("username"):
+        prof["username"] = username
+    if is_owner:
+        prof["is_owner"] = True
+    prof.setdefault("interaction_count", 1)
+    prof.setdefault("first_seen", now_str)
+    prof.setdefault("last_seen", now_str)
+    if not isinstance(prof.get("favorite_topics"), list):
+        prof["favorite_topics"] = []
+    if not isinstance(prof.get("custom_notes"), list):
+        prof["custom_notes"] = []
+    if not isinstance(prof.get("recent_topics"), list):
+        prof["recent_topics"] = []
+    return prof
+
+
 def record_user_interaction(
     user,
     user_prompt: str,
@@ -164,22 +210,18 @@ def record_user_interaction(
     raw_display = getattr(user, "display_name", "") or getattr(user, "name", "Unknown")
     clean_display = re.sub(r"[^\w\u0E00-\u0E7F\s.-]", "", raw_display).strip()[:32] or "Member"
 
-    profile = user_profiles.get(uid_str) or {
-        "user_id": uid_str,
-        "display_name": "Partner (Owner)" if owner_flag else clean_display,
-        "username": getattr(user, "name", ""),
-        "is_owner": owner_flag,
-        "interaction_count": 0,
-        "first_seen": now_str,
-        "last_seen": now_str,
-        "favorite_topics": [],
-        "custom_notes": [],
-        "recent_topics": [],
-    }
+    is_new = uid_str not in user_profiles
+    profile = ensure_user_profile_exists(
+        uid_str,
+        display_name="Partner (Owner)" if owner_flag else clean_display,
+        username=getattr(user, "name", ""),
+        is_owner=owner_flag,
+    )
 
-    profile["display_name"] = "Partner (Owner)" if owner_flag else clean_display
+    if not owner_flag:
+        profile["display_name"] = clean_display
     profile["is_owner"] = owner_flag
-    profile["interaction_count"] = int(profile.get("interaction_count", 0)) + 1
+    profile["interaction_count"] = 1 if is_new else (int(profile.get("interaction_count", 0)) + 1)
     profile["last_seen"] = now_str
 
     favs = list(profile.get("favorite_topics") or [])
@@ -192,7 +234,7 @@ def record_user_interaction(
         if pattern.search(user_prompt) and label not in favs:
             favs.append(label)
 
-    profile["favorite_topics"] = favs[-8:]
+    profile["favorite_topics"] = favs[-10:]
 
     clean_q = re.sub(r"\s+", " ", user_prompt).strip()
     if len(clean_q) > 6:
@@ -200,14 +242,14 @@ def record_user_interaction(
         snippet = clean_q[:90]
         if not recents or recents[-1] != snippet:
             recents.append(snippet)
-        profile["recent_topics"] = recents[-4:]
+        profile["recent_topics"] = recents[-6:]
 
     if learned_memo:
         notes = list(profile.get("custom_notes") or [])
-        clean_memo = learned_memo.strip()[:120]
+        clean_memo = learned_memo.strip()[:140]
         if clean_memo and clean_memo not in notes:
             notes.append(clean_memo)
-        profile["custom_notes"] = notes[-6:]
+        profile["custom_notes"] = notes[-10:]
 
     user_profiles[uid_str] = profile
     _DIRTY_SINCE_LAST_BACKUP = True
@@ -226,7 +268,8 @@ def get_speaker_memory_context(user) -> str:
     if not profile or int(profile.get("interaction_count", 0)) <= 1:
         if not is_owner_user(user):
             return "- ประวัติการคุย: นี่เป็นการพูดคุยครั้งแรกๆ กับสมาชิกคนนี้ในเซิร์ฟเวอร์"
-        return ""
+        if not profile:
+            return ""
 
     cnt = profile.get("interaction_count", 1)
     favs = ", ".join(profile.get("favorite_topics") or []) or "ทั่วไป"
@@ -326,6 +369,280 @@ def resolve_user_mentions_and_build_dossier(
 
 
 # ==============================================================================
+# EDITABLE PERSISTENT USER MEMORY (`user_profiles.json` in `#yukinon-memory`)
+# ==============================================================================
+MEMORY_COMMAND_REGEX = re.compile(
+    r"^(?:"
+    r"(?:ดู|เช็ค|เปิด|แสดง|สรุป|แก้|แก้ไข|อัปเดต|ลบ|ล้าง|รีเซ็ต)\s*(?:ข้อมูล)?(?:ความจำ|โปรไฟล์|บันทึกความจำ)\b|"
+    r"(?:ความจำ|โปรไฟล์)(?:ของฉัน|ส่วนตัว)\b|"
+    r"(?:จำไว้ว่า|ช่วยจำว่า|บันทึกความจำว่า|เพิ่มบันทึก|เพิ่มโน้ต|เพิ่มหัวข้อที่ชอบ|เพิ่มความสนใจ)\b|"
+    r"(?:แก้|แก้ไข|อัปเดต|ลบ|ล้าง)\s*(?:หัวข้อที่ชอบ|ความสนใจ|บันทึก|โน้ต|เรื่องล่าสุด|หัวข้อล่าสุด|ชื่อแสดงผล)\b|"
+    r"(?:view|show|edit|update|clear|reset)\s+(?:my\s+)?(?:memory|profile)\b|"
+    r"remember\s+that\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def is_memory_command_text(text: str) -> bool:
+    if not text:
+        return False
+    cleaned = re.sub(r"<@!?\d+>", "", text).strip()
+    return bool(MEMORY_COMMAND_REGEX.search(cleaned))
+
+
+def _dedupe_clean_list(items: list[str], max_items: int = 12, max_item_len: int = 140) -> list[str]:
+    out: list[str] = []
+    seen_lower: set[str] = set()
+    for raw in items:
+        s = re.sub(r"\s+", " ", str(raw or "")).strip()[:max_item_len]
+        if s and s.lower() not in seen_lower:
+            seen_lower.add(s.lower())
+            out.append(s)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+async def update_user_memory_fields(
+    target_uid: str,
+    display_name: str | None = None,
+    favorite_topics: list[str] | None = None,
+    custom_notes: list[str] | None = None,
+    recent_topics: list[str] | None = None,
+) -> dict:
+    """Updates specified fields on `user_profiles[target_uid]`, saves locally, and force-syncs `#yukinon-memory`."""
+    global _DIRTY_SINCE_LAST_BACKUP
+    prof = ensure_user_profile_exists(target_uid)
+    if display_name is not None and display_name.strip():
+        clean_disp = re.sub(r"[^\w\u0E00-\u0E7F\s().-]", "", display_name).strip()[:36]
+        if clean_disp:
+            prof["display_name"] = clean_disp
+    if favorite_topics is not None:
+        prof["favorite_topics"] = _dedupe_clean_list(favorite_topics, max_items=12, max_item_len=80)
+    if custom_notes is not None:
+        prof["custom_notes"] = _dedupe_clean_list(custom_notes, max_items=12, max_item_len=150)
+    if recent_topics is not None:
+        prof["recent_topics"] = _dedupe_clean_list(recent_topics, max_items=8, max_item_len=120)
+
+    prof["last_seen"] = get_current_thai_datetime_str()
+    user_profiles[target_uid] = prof
+    _DIRTY_SINCE_LAST_BACKUP = True
+    save_user_profiles_local()
+    await backup_user_profiles_to_discord(force=True)
+    return prof
+
+
+def format_user_memory_card(target_uid: str, header_title: str = "แฟ้มความจำผู้ใช้ (Persistent User Memory)") -> str:
+    prof = ensure_user_profile_exists(target_uid)
+    disp = prof.get("display_name") or f"User_{target_uid[-4:]}"
+    cnt = int(prof.get("interaction_count") or 1)
+    last_seen = prof.get("last_seen") or "-"
+
+    favs = prof.get("favorite_topics") or []
+    notes = prof.get("custom_notes") or []
+    recents = prof.get("recent_topics") or []
+
+    fav_str = ", ".join(f"`{x}`" for x in favs) if favs else "*(ยังไม่มีข้อมูล)*"
+    notes_lines = (
+        "\n".join(f"  `{i}.` {n}" for i, n in enumerate(notes, 1))
+        if notes
+        else "  *(ยังไม่มีบันทึกความจำ)*"
+    )
+    recent_lines = (
+        "\n".join(f"  `{i}.` {r}" for i, r in enumerate(recents, 1))
+        if recents
+        else "  *(ยังไม่มีประวัติหัวข้อล่าสุด)*"
+    )
+
+    return (
+        f"🧠 **[{header_title}]**\n"
+        f"- **ชื่อที่บันทึก (Display Name):** `{disp}` (คุยกันแล้ว `{cnt}` ครั้ง | อัปเดต: `{last_seen}`)\n"
+        f"- **หัวข้อที่ชอบ (Favorite Topics):** {fav_str}\n"
+        f"- **บันทึกความจำ (Custom Notes):**\n{notes_lines}\n"
+        f"- **เรื่องที่คุยล่าสุด (Recent Topics):**\n{recent_lines}\n"
+        f"-# [MEM_RECORD: uid={target_uid}]"
+    )
+
+
+async def process_memory_request(message, raw_text: str) -> tuple[str, str]:
+    """
+    Handles viewing, adding, editing, deleting, and resetting Persistent User Memory
+    (`user_profiles.json` stored in `#yukinon-memory`), returning `(reply_text, target_uid)`.
+    """
+    speaker = message.author
+    target_uid = str(speaker.id)
+    target_member = speaker
+
+    bot_id_str = str(state.bot.user.id) if (state.bot and state.bot.user) else ""
+    if is_owner_user(speaker):
+        for m_id in USER_MENTION_REGEX.findall(raw_text):
+            if m_id != bot_id_str:
+                target_uid = m_id
+                if getattr(message, "guild", None) and m_id.isdigit():
+                    found_m = message.guild.get_member(int(m_id))
+                    if found_m:
+                        target_member = found_m
+                break
+
+    owner_flag = is_owner_user(target_member) if target_member is not None else False
+    raw_disp = getattr(target_member, "display_name", "") or getattr(target_member, "name", "")
+    prof = ensure_user_profile_exists(
+        target_uid,
+        display_name="Partner (Owner)" if owner_flag else raw_disp,
+        username=getattr(target_member, "name", ""),
+        is_owner=owner_flag,
+    )
+
+    text = re.sub(r"<@!?\d+>", "", raw_text.strip()).strip()
+    text = re.sub(r"^!(?:memory|memo|profile|ความจำ)\b\s*", "", text, flags=re.IGNORECASE).strip()
+
+    if re.match(r"^(?:รีเซ็ต|ล้าง)\s*(?:ข้อมูล)?(?:ความจำ|โปรไฟล์)(?:ทั้งหมด|ของฉัน)?$", text, re.IGNORECASE) or text.lower() in ("reset", "clear", "reset all", "clear all"):
+        await update_user_memory_fields(
+            target_uid,
+            favorite_topics=[],
+            custom_notes=[],
+            recent_topics=[],
+        )
+        return (
+            format_user_memory_card(target_uid, header_title="รีเซ็ตความจำถาวรเรียบร้อยแล้วค่ะ (คงข้อมูล OT ไว้ให้ครบ)"),
+            target_uid,
+        )
+
+    if re.match(r"^(?:ลบ|ล้าง)\s*(?:เรื่องล่าสุด|หัวข้อล่าสุด)(?:ทั้งหมด)?$", text, re.IGNORECASE) or text.lower() in ("clear recent", "clear recent_topics"):
+        await update_user_memory_fields(target_uid, recent_topics=[])
+        return (
+            format_user_memory_card(target_uid, header_title="ล้างรายการเรื่องที่คุยล่าสุดเรียบร้อยแล้วค่ะ"),
+            target_uid,
+        )
+
+    m_add_note = re.match(
+        r"^(?:จำไว้ว่า|ช่วยจำว่า|บันทึกความจำว่า|เพิ่มบันทึก|เพิ่มโน้ต|add\s+note|remember\s+that)\s*[:：-]?\s*(.+)$",
+        text,
+        re.IGNORECASE,
+    )
+    if m_add_note:
+        new_note = m_add_note.group(1).strip()
+        notes = list(prof.get("custom_notes") or [])
+        notes.append(new_note)
+        await update_user_memory_fields(target_uid, custom_notes=notes)
+        return (
+            format_user_memory_card(target_uid, header_title="เพิ่มบันทึกความจำลงในระบบเรียบร้อยแล้วค่ะ"),
+            target_uid,
+        )
+
+    m_add_fav = re.match(
+        r"^(?:เพิ่มหัวข้อที่ชอบ|เพิ่มความสนใจ|add\s+topic)\s*[:：-]?\s*(.+)$",
+        text,
+        re.IGNORECASE,
+    )
+    if m_add_fav:
+        raw_items = [x.strip() for x in re.split(r"[,;،]+", m_add_fav.group(1)) if x.strip()]
+        favs = list(prof.get("favorite_topics") or []) + raw_items
+        await update_user_memory_fields(target_uid, favorite_topics=favs)
+        return (
+            format_user_memory_card(target_uid, header_title="เพิ่มหัวข้อที่ชอบเรียบร้อยแล้วค่ะ"),
+            target_uid,
+        )
+
+    m_edit_fav = re.match(
+        r"^(?:แก้|แก้ไข|อัปเดต)\s*(?:หัวข้อที่ชอบ|ความสนใจ)\s*[:：-]?\s*(.+)$",
+        text,
+        re.IGNORECASE,
+    )
+    if m_edit_fav:
+        val = m_edit_fav.group(1).strip()
+        new_favs = [] if val in ("-", "ว่าง", "none", "clear") else [x.strip() for x in re.split(r"[,;،]+", val) if x.strip()]
+        await update_user_memory_fields(target_uid, favorite_topics=new_favs)
+        return (
+            format_user_memory_card(target_uid, header_title="อัปเดตหัวข้อที่ชอบเรียบร้อยแล้วค่ะ"),
+            target_uid,
+        )
+
+    m_edit_notes = re.match(
+        r"^(?:แก้|แก้ไข|อัปเดต)\s*(?:บันทึกความจำ|บันทึก|โน้ต)\s*[:：-]?\s*(.+)$",
+        text,
+        re.IGNORECASE,
+    )
+    if m_edit_notes:
+        val = m_edit_notes.group(1).strip()
+        new_notes = [] if val in ("-", "ว่าง", "none", "clear") else [x.strip() for x in re.split(r"[;\n]+", val) if x.strip()]
+        await update_user_memory_fields(target_uid, custom_notes=new_notes)
+        return (
+            format_user_memory_card(target_uid, header_title="อัปเดตบันทึกความจำเรียบร้อยแล้วค่ะ"),
+            target_uid,
+        )
+
+    m_edit_recent = re.match(
+        r"^(?:แก้|แก้ไข|อัปเดต)\s*(?:เรื่องล่าสุด|หัวข้อล่าสุด)\s*[:：-]?\s*(.+)$",
+        text,
+        re.IGNORECASE,
+    )
+    if m_edit_recent:
+        val = m_edit_recent.group(1).strip()
+        new_recents = [] if val in ("-", "ว่าง", "none", "clear") else [x.strip() for x in re.split(r"[;\n]+", val) if x.strip()]
+        await update_user_memory_fields(target_uid, recent_topics=new_recents)
+        return (
+            format_user_memory_card(target_uid, header_title="อัปเดตเรื่องที่คุยล่าสุดเรียบร้อยแล้วค่ะ"),
+            target_uid,
+        )
+
+    m_edit_name = re.match(
+        r"^(?:แก้|แก้ไข|อัปเดต)\s*(?:ชื่อแสดงผล|ชื่อในความจำ)\s*[:：-]?\s*(.+)$",
+        text,
+        re.IGNORECASE,
+    )
+    if m_edit_name:
+        await update_user_memory_fields(target_uid, display_name=m_edit_name.group(1).strip())
+        return (
+            format_user_memory_card(target_uid, header_title="อัปเดตชื่อที่แสดงในความจำเรียบร้อยแล้วค่ะ"),
+            target_uid,
+        )
+
+    m_del_note = re.match(
+        r"^(?:ลบ|ยกเลิก)\s*(?:บันทึกความจำ|บันทึก|โน้ต)\s*[:：-]?\s*(.+)$",
+        text,
+        re.IGNORECASE,
+    )
+    if m_del_note:
+        target_tok = m_del_note.group(1).strip()
+        notes = list(prof.get("custom_notes") or [])
+        if target_tok.lower() in ("ทั้งหมด", "all"):
+            notes = []
+        elif target_tok.isdigit() and 1 <= int(target_tok) <= len(notes):
+            notes.pop(int(target_tok) - 1)
+        else:
+            notes = [n for n in notes if target_tok.lower() not in n.lower()]
+        await update_user_memory_fields(target_uid, custom_notes=notes)
+        return (
+            format_user_memory_card(target_uid, header_title="ลบรายการบันทึกความจำเรียบร้อยแล้วค่ะ"),
+            target_uid,
+        )
+
+    m_del_fav = re.match(
+        r"^(?:ลบ|ยกเลิก)\s*(?:หัวข้อที่ชอบ|ความสนใจ)\s*[:：-]?\s*(.+)$",
+        text,
+        re.IGNORECASE,
+    )
+    if m_del_fav:
+        target_tok = m_del_fav.group(1).strip()
+        favs = list(prof.get("favorite_topics") or [])
+        if target_tok.lower() in ("ทั้งหมด", "all"):
+            favs = []
+        elif target_tok.isdigit() and 1 <= int(target_tok) <= len(favs):
+            favs.pop(int(target_tok) - 1)
+        else:
+            favs = [f for f in favs if target_tok.lower() not in f.lower()]
+        await update_user_memory_fields(target_uid, favorite_topics=favs)
+        return (
+            format_user_memory_card(target_uid, header_title="ลบหัวข้อที่ชอบเรียบร้อยแล้วค่ะ"),
+            target_uid,
+        )
+
+    return format_user_memory_card(target_uid), target_uid
+
+
+# ==============================================================================
 # OVERTIME (OT) TRACKER & MONTHLY TABLE SUMMARIZER
 # ==============================================================================
 OT_TRIGGER_REGEX = re.compile(
@@ -338,10 +655,6 @@ OT_SUMMARY_REGEX = re.compile(
 )
 OT_DELETE_REGEX = re.compile(
     r"^(?:ลบ|ยกเลิก)\s*(?:เวลา\s*)?ot\b",
-    re.IGNORECASE,
-)
-OT_EDIT_DETAIL_ONLY_REGEX = re.compile(
-    r"^(?:แก้|อัปเดต|แก้ไข)\s*(?:รายละเอียด|งาน)?\s*(?:เวลา\s*)?ot\b",
     re.IGNORECASE,
 )
 WEEKEND_TIME_REPLY_REGEX = re.compile(
@@ -528,57 +841,6 @@ def _format_hours_human(hours_val: float) -> str:
     return f"{h} ชม. {m} นาที ({hours_val:.2f} ชม.)"
 
 
-def build_monthly_ot_summary_markdown(ot_logs: list[dict], target_year: int, target_month: int) -> str:
-    month_entries = []
-    for e in ot_logs:
-        pk = _parse_stored_ot_date(e.get("date", ""))
-        if pk and pk[0] == target_year and pk[1] == target_month:
-            month_entries.append(e)
-
-    month_entries.sort(key=lambda x: _parse_stored_ot_date(x.get("date", "")) or (0, 0, 0))
-
-    month_th = THAI_MONTHS[target_month]
-    year_be = target_year + 543
-
-    if not month_entries:
-        return (
-            f"📊 **สรุปเวลาทำ OT ประจำเดือน{month_th} พ.ศ. {year_be}**\n"
-            f"ยังไม่มีรายการบันทึก OT ในเดือน{month_th}เลยค่ะ หากวันไหนอยู่ทำงานล่วงเวลา พิมพ์ `จด OT <รายละเอียดงาน>` ทิ้งไว้ได้เลยนะคะ"
-        )
-
-    table_lines = [
-        f"📊 **ตารางสรุปเวลาทำ OT ประจำเดือน{month_th} พ.ศ. {year_be} ({target_month:02d}/{year_be})**",
-        "",
-        "| ลำดับ | วันที่ | เวลาที่บันทึก (OT) | จำนวนชั่วโมง | รายละเอียดงาน |",
-        "| :---: | :---: | :---: | :---: | :--- |",
-    ]
-    total_hours = 0.0
-    for idx, entry in enumerate(month_entries, 1):
-        d_th = _normalize_stored_date_to_thai_ddmmyyyy(entry.get("date", ""))
-        n_start = _format_time_dot(entry.get("noted_start", "18.00"))
-        n_end = _format_time_dot(entry.get("noted_end", "-"))
-        hrs = float(entry.get("hours") or 0.0)
-        total_hours += hrs
-        hrs_label = f"{int(hrs)} ชม." if hrs.is_integer() else f"{hrs:.2f} ชม."
-        det = (entry.get("detail") or "-").replace("|", "\\|")
-        table_lines.append(
-            f"| {idx} | {d_th} | {n_start} - {n_end} | {hrs_label} | {det} |"
-        )
-
-    days_count = len(month_entries)
-    avg_hours = total_hours / days_count if days_count else 0.0
-    total_human = _format_hours_human(total_hours)
-
-    table_lines.extend([
-        "",
-        "**📌 สรุปยอดรวมประจำเดือน:**",
-        f"- **จำนวนวันที่ทำ OT:** `{days_count} วัน`",
-        f"- **รวมชั่วโมง OT ทั้งสิ้น:** **`{total_human}`** (เฉลี่ยวันละ `{avg_hours:.1f} ชม.`)",
-        "-# พักผ่อนให้เพียงพอด้วยนะคะ อย่าโหมงานหนักจนเสียสุขภาพล่ะ",
-    ])
-    return "\n".join(table_lines)
-
-
 async def recover_ot_logs_from_work_channels(bot: discord.Client):
     recovered_count = 0
     pattern = re.compile(
@@ -602,13 +864,7 @@ async def recover_ot_logs_from_work_channels(bot: discord.Client):
                         start_s, end_s = (slot_s.split("-") + ["18.00", "21.00"])[:2]
                         start_s = _format_time_dot(start_s)
                         end_s = _format_time_dot(end_s)
-                        prof = user_profiles.setdefault(uid_s, {
-                            "user_id": uid_s,
-                            "display_name": "Partner (Owner)",
-                            "is_owner": True,
-                            "interaction_count": 1,
-                            "ot_logs": [],
-                        })
+                        prof = ensure_user_profile_exists(uid_s)
                         ot_list = prof.setdefault("ot_logs", [])
                         if not any(_parse_stored_ot_date(x.get("date", "")) == parsed_key for x in ot_list):
                             ot_list.append({
@@ -707,6 +963,56 @@ async def _save_and_format_ot_entry(
     )
 
 
+def build_monthly_ot_summary_markdown(ot_logs: list[dict], target_year: int, target_month: int) -> str:
+    month_entries = []
+    for e in ot_logs:
+        pk = _parse_stored_ot_date(e.get("date", ""))
+        if pk and pk[0] == target_year and pk[1] == target_month:
+            month_entries.append(e)
+
+    month_entries.sort(key=lambda x: _parse_stored_ot_date(x.get("date", "")) or (0, 0, 0))
+    month_th = THAI_MONTHS[target_month]
+    year_be = target_year + 543
+
+    if not month_entries:
+        return (
+            f"📊 **สรุปเวลาทำ OT ประจำเดือน{month_th} พ.ศ. {year_be}**\n"
+            f"ยังไม่มีรายการบันทึก OT ในเดือน{month_th}เลยค่ะ หากวันไหนอยู่ทำงานล่วงเวลา พิมพ์ `จด OT <รายละเอียดงาน>` ทิ้งไว้ได้เลยนะคะ"
+        )
+
+    table_lines = [
+        f"📊 **ตารางสรุปเวลาทำ OT ประจำเดือน{month_th} พ.ศ. {year_be} ({target_month:02d}/{year_be})**",
+        "",
+        "| ลำดับ | วันที่ | เวลาที่บันทึก (OT) | จำนวนชั่วโมง | รายละเอียดงาน |",
+        "| :---: | :---: | :---: | :---: | :--- |",
+    ]
+    total_hours = 0.0
+    for idx, entry in enumerate(month_entries, 1):
+        d_th = _normalize_stored_date_to_thai_ddmmyyyy(entry.get("date", ""))
+        n_start = _format_time_dot(entry.get("noted_start", "18.00"))
+        n_end = _format_time_dot(entry.get("noted_end", "-"))
+        hrs = float(entry.get("hours") or 0.0)
+        total_hours += hrs
+        hrs_label = f"{int(hrs)} ชม." if hrs.is_integer() else f"{hrs:.2f} ชม."
+        det = (entry.get("detail") or "-").replace("|", "\\|")
+        table_lines.append(
+            f"| {idx} | {d_th} | {n_start} - {n_end} | {hrs_label} | {det} |"
+        )
+
+    days_count = len(month_entries)
+    avg_hours = total_hours / days_count if days_count else 0.0
+    total_human = _format_hours_human(total_hours)
+
+    table_lines.extend([
+        "",
+        "**📌 สรุปยอดรวมประจำเดือน:**",
+        f"- **จำนวนวันที่ทำ OT:** `{days_count} วัน`",
+        f"- **รวมชั่วโมง OT ทั้งสิ้น:** **`{total_human}`** (เฉลี่ยวันละ `{avg_hours:.1f} ชม.`)",
+        "-# พักผ่อนให้เพียงพอด้วยนะคะ อย่าโหมงานหนักจนเสียสุขภาพล่ะ",
+    ])
+    return "\n".join(table_lines)
+
+
 async def process_ot_request(message: discord.Message, raw_text: str) -> str:
     global _DIRTY_SINCE_LAST_BACKUP
     user = message.author
@@ -725,7 +1031,6 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
     prof = user_profiles[uid_str]
     ot_logs: list[dict] = list(prof.get("ot_logs") or [])
 
-    # 0. Handle reply to pending weekend/backdated prompt
     if _has_active_pending_weekend_ot(chan_id, user.id) and not OT_TRIGGER_REGEX.search(text):
         if text.lower() in ("ยกเลิก", "cancel"):
             pending_weekend_ot.pop(pending_key, None)
@@ -786,7 +1091,6 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
                 time_note=note_label,
             )
 
-    # 1. Delete OT entry
     if OT_DELETE_REGEX.search(text) or text.lower().startswith(("delete ", "remove ", "ลบ")):
         pending_weekend_ot.pop(pending_key, None)
         del_body = re.sub(r"^(?:ลบ|ยกเลิก|delete|remove)\s*(?:เวลา\s*)?(?:ot)?\s*", "", text, flags=re.IGNORECASE).strip()
@@ -809,7 +1113,6 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
             return f"🗑️ ลบรายการบันทึก OT ของวันที่ **`{target_date_th}`** ออกให้เรียบร้อยแล้วค่ะ"
         return f"ไม่พบรายการบันทึก OT ของวันที่ **`{target_date_th}`** ในระบบค่ะ"
 
-    # 2. Summarize OT
     if not text or OT_SUMMARY_REGEX.search(text) or text.lower().startswith(("summary", "list", "table", "สรุป", "ดู", "ตาราง")):
         target_year = default_work_dt.year
         target_month = default_work_dt.month
@@ -838,30 +1141,6 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
 
         return build_monthly_ot_summary_markdown(ot_logs, target_year, target_month)
 
-    # 2.5 Update description only for an existing OT date ('แก้ OT วันที่ 5 แก้ไขระบบ Report')
-    if OT_EDIT_DETAIL_ONLY_REGEX.search(text):
-        edit_body = OT_EDIT_DETAIL_ONLY_REGEX.sub("", text).strip()
-        custom_edit_dt, rem_edit = _extract_custom_date_from_text(edit_body, default_work_dt)
-        target_dt = custom_edit_dt or default_work_dt
-        has_time_in_edit = bool(re.match(r"^\d{1,2}[:.]\d{2}", rem_edit))
-        if rem_edit and not has_time_in_edit:
-            target_key = (target_dt.year, target_dt.month, target_dt.day)
-            for existing_entry in ot_logs:
-                if _parse_stored_ot_date(existing_entry.get("date", "")) == target_key:
-                    return await _save_and_format_ot_entry(
-                        prof,
-                        ot_logs,
-                        uid_str,
-                        target_dt,
-                        existing_entry.get("noted_start", "18.00"),
-                        existing_entry.get("noted_end", "20.00"),
-                        float(existing_entry.get("hours") or 1.0),
-                        rem_edit.strip(" -:"),
-                        has_new_detail=True,
-                        time_note="*(อัปเดตรายละเอียดงาน)*",
-                    )
-
-    # 3. Log / Update OT entry
     detail_str = re.sub(
         r"^(?:จด|บันทึก|ลง|เพิ่ม|แก้|อัปเดต)\s*(?:เวลา\s*)?ot\b\s*",
         "",
@@ -875,7 +1154,6 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
     target_date_th = _format_date_thai_ddmmyyyy(work_dt)
     is_weekend = (work_dt.weekday() >= 5)
 
-    # Pattern A: Explicit start-end range in HH.MM or HH:MM
     range_time_m = re.match(
         r"^(?:ตั้งแต่(?:\s*เวลา)?|เริ่ม(?:\s*เวลา)?)?\s*(\d{1,2})[:.](\d{2})\s*(?:น\.?)?\s*(?:-|ถึง|to)\s*(\d{1,2})[:.](\d{2})(?:\s*น\.?)?\s*(.*)",
         detail_str,
@@ -907,7 +1185,6 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
             time_note=note_str,
         )
 
-    # Branch 3A: Weekend or custom backdated date
     if is_weekend or is_custom_date:
         wknd_start_m = re.match(
             r"^(?:เริ่ม(?:\s*เวลา)?|ตั้งแต่(?:\s*เวลา)?)\s*(\d{1,2})(?:[:.](\d{2}))?\s*(?:น\.?|โมง)?\s*(.*)",
@@ -985,7 +1262,6 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
             f"นายเริ่มทำ OT ตั้งแต่กี่โมงคะ? **(พิมพ์ตอบแค่เวลาเริ่ม เช่น `09.00` หรือช่วงเวลา `09.00 - 17.00` ได้เลยค่ะ เดี๋ยวฉันบันทึกให้ทันทีค่ะ)**"
         )
 
-    # Branch 3B: Current workday rule (Mon-Fri: 17.00 -> Now shifted +1h to 18.00)
     explicit_hrs_m = re.match(
         r"^(\d+(?:\.\d+)?)\s*(?:ชั่วโมง|ชม\.?|hrs?\.?|hours?|h)\b\s*(.*)",
         detail_str,
@@ -1041,5 +1317,5 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
         ot_hours,
         clean_detail,
         has_new_detail=bool(detail_str.strip()),
-        time_note=f"*(เวลาเลิกจริง {actual_finish_str} น. | คิดจาก 17.00 - {actual_finish_str} น.)*",
+        time_note=f"*(เวลาเลิกจริง {actual_finish_str} น. | คิดจาก 17.00 → เลื่อน +1 ชม. เป็น 18.00 - {noted_end_str} น.)*",
     )
