@@ -174,8 +174,6 @@ def _collect_health_metrics() -> dict:
     gemini_cd = max(0, int(state.gemini_grounding_cooldown_until - now))
     decision_cd = max(0, int(state.gemini_decision_cooldown_until - now))
     hydrogen_cd = max(0, int(state.gemini_hydrogen_cooldown_until - now))
-    today_th = datetime.now(ZoneInfo("Asia/Bangkok")).strftime("%Y-%m-%d")
-    hydrogen_rpd_used = state.gemini_hydrogen_rpd_count if state.gemini_hydrogen_rpd_date == today_th else 0
     edge_cd = max(0, int(state.edge_tts_cooldown_until - now))
     cached_files_count = sum(len(q) for q in channel_last_attachment.values())
 
@@ -214,7 +212,6 @@ def _collect_health_metrics() -> dict:
             "gemini_decision_orchestrator": GEMINI_DECISION_MODEL if GEMINI_API_KEY else None,
             "gemini_decision_cooldown_sec": decision_cd,
             "gemini_heavy_specialist": GEMINI_HEAVY_MODEL if GEMINI_API_KEY else None,
-            "gemini_hydrogen_rpd_used": f"{hydrogen_rpd_used}/18" if GEMINI_API_KEY else None,
             "gemini_hydrogen_cooldown_sec": hydrogen_cd,
             "gemma_active_model": getattr(state, "active_gemma_model", None) if GEMINI_API_KEY else None,
             "gemini_active_model": state.active_gemini_model if GEMINI_API_KEY else None,
@@ -255,7 +252,7 @@ async def handle_root(request: web.Request) -> web.Response:
            <b>Cached Contexts:</b> {mem['active_chat_channels']} chat(s), {mem['cached_attachments']} file(s)</p>
         <hr style="border: 0; border-top: 1px solid #e5e7eb; margin: 16px 0;">
         <p><b>Autonomous Agent / OpenClaw:</b> {"Connected" if OPENCLAW_GATEWAY_URL else "Decision-1 + 8-Skill Agent Active (OpenClaw Gateway on Standby)"}</p>
-        <p><b>Google AI Studio:</b> {"Enabled (Orchestrator: <code>" + str(ai['gemini_decision_orchestrator']) + "</code> | Heavy Specialist: <code>" + str(ai['gemini_heavy_specialist']) + "</code> [" + str(ai['gemini_hydrogen_rpd_used']) + " RPD] | Gemma 4: <code>" + str(ai['gemma_active_model']) + "</code> | Flash: <code>" + str(ai['gemini_active_model']) + "</code>)" + gemini_cd_note if ai['gemini_enabled'] else "Disabled"}</p>
+        <p><b>Google AI Studio:</b> {"Enabled (Orchestrator: <code>" + str(ai['gemini_decision_orchestrator']) + "</code> | Heavy Specialist: <code>" + str(ai['gemini_heavy_specialist']) + "</code> | Gemma 4: <code>" + str(ai['gemma_active_model']) + "</code> | Flash: <code>" + str(ai['gemini_active_model']) + "</code>)" + gemini_cd_note if ai['gemini_enabled'] else "Disabled"}</p>
         <p><b>Cloudflare Workers AI:</b> {"Enabled (Code: <code>" + CF_CODE_MODEL + "</code> | Fast: <code>" + CF_CHAT_FAST_MODEL + "</code> | Vision/Gemma: <code>" + str(ai['cloudflare_gemma_model']) + "</code> | Image: <code>" + str(ai['cloudflare_image_model']) + "</code>)" if ai['cloudflare_enabled'] else "Disabled"}</p>
         <p><b>Groq LPU Acceleration:</b> {"Enabled (Code: <code>" + GROQ_CODE_MODEL + "</code> | Search: <code>" + str(ai['groq_search_model']) + "</code> | Vision: <code>" + str(ai['groq_vision_model']) + "</code>)" if ai['groq_enabled'] else "Disabled"}</p>
         <p><b>Modal GPU Ollama:</b> {"Configured" if ai['modal_ollama_configured'] else "Not Configured"} (Fallback: <code>{ai['fast_model']}</code>)</p>
@@ -463,8 +460,6 @@ async def on_message(message: discord.Message):
     text_without_urls = URL_REGEX.sub("", clean_prompt).strip()
     is_bare_link_only = bool(has_embedded_media_or_link and not text_without_urls and not all_msg_atts)
 
-    # Single-pass attachment preload + Pre-Flight Multimodal Orchestrator (`gemini-decision-1`)
-    # Skip `PreRoute` on bare link-only messages since `Route` will run with full link/OCR context right after.
     preloaded_att_bytes, low_res_imgs = (
         await _preload_image_attachments_and_thumb(all_msg_atts) if has_image_att else ({}, [])
     )

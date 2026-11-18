@@ -48,6 +48,7 @@ from search_engine import (
 )
 from llm import (
     discover_active_groq_vision_models,
+    discover_active_gemma_models,
     call_gemma_ai_studio_vision,
     call_cloudflare_vision_chat,
     call_gemini_generate_content_self_healing,
@@ -1336,7 +1337,7 @@ async def _call_gemini_multi_image_batch(
         )
         if data:
             resp_parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-            out_txt = "\n".join(p.get("text", "") for p in resp_parts if p.get("text")).strip()
+            out_txt = "\n".join(p.get("text", "") for p in resp_parts if p.get("text") and not p.get("thought", False)).strip()
             out_txt = re.sub(r"<think>[\s\S]*?</think>", "", out_txt).strip()
             if out_txt:
                 return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{out_txt}"
@@ -1344,6 +1345,63 @@ async def _call_gemini_multi_image_batch(
         raise
     except Exception as e:
         api_log(f"MultiImageOCR Tier 1 Gemini -> error ({type(e).__name__})")
+    return ""
+
+
+async def _call_ai_studio_gemma_multi_image_batch(
+    encoded_images: list[tuple[str, str, str]],
+    batch_prompt: str,
+    timeout_sec: int = 32,
+    max_output_tokens: int = 2048,
+) -> str:
+    """Tier 2 Google AI Studio Gemma 4 multi-image batch backup (14.4K RPD)."""
+    if not GEMINI_API_KEY:
+        return ""
+    gemma_models = await discover_active_gemma_models(vision_required=True)
+    candidates = sorted(gemma_models, key=lambda x: (0 if "26b" in x else 1))
+    if not candidates:
+        return ""
+
+    parts = [{"text": batch_prompt}]
+    for idx, (b64_img, mime_type, fname) in enumerate(encoded_images, 1):
+        parts.append({"text": f"=== Image {idx}/{len(encoded_images)} (`{fname}`) ==="})
+        parts.append({"inlineData": {"mimeType": mime_type, "data": b64_img}})
+
+    session = get_http_session()
+    for model_id in candidates:
+        url = clean_url(
+            f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
+            f"{model_id}:generateContent?key={GEMINI_API_KEY}"
+        )
+        payload = {
+            "contents": [{"parts": parts}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": max_output_tokens,
+            },
+        }
+        t0 = time.monotonic()
+        try:
+            async with session.post(
+                url, json=payload, timeout=aiohttp.ClientTimeout(total=timeout_sec)
+            ) as resp:
+                elapsed = time.monotonic() - t0
+                if resp.status == 200:
+                    data = await resp.json()
+                    resp_parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                    out_txt = "\n".join(
+                        p.get("text", "") for p in resp_parts
+                        if p.get("text") and not p.get("thought", False)
+                    ).strip()
+                    out_txt = re.sub(r"<think>[\s\S]*?</think>", "", out_txt).strip()
+                    if out_txt:
+                        api_log(f"MultiImageOCR (Tier 2 AI Studio Gemma) -> {model_id} 200 OK ({elapsed:.2f}s)")
+                        return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{out_txt}"
+                api_log(f"MultiImageOCR (Tier 2 AI Studio Gemma) -> {model_id} HTTP {resp.status} ({elapsed:.2f}s)")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            api_log(f"MultiImageOCR (Tier 2 AI Studio Gemma) -> {model_id} error ({type(e).__name__})")
     return ""
 
 
@@ -1393,13 +1451,13 @@ async def _call_cf_multi_image_batch(
                     content = (choices[0].get("message") or {}).get("content") or ""
                     content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
                     if content:
-                        api_log(f"MultiImageOCR (Tier 2 CF) -> {CF_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
+                        api_log(f"MultiImageOCR (Tier 3 CF) -> {CF_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
                         return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{content}"
-            api_log(f"MultiImageOCR (Tier 2 CF) -> HTTP {resp.status} ({elapsed:.2f}s)")
+            api_log(f"MultiImageOCR (Tier 3 CF) -> HTTP {resp.status} ({elapsed:.2f}s)")
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        api_log(f"MultiImageOCR (Tier 2 CF) -> error ({type(e).__name__})")
+        api_log(f"MultiImageOCR (Tier 3 CF) -> error ({type(e).__name__})")
     return ""
 
 
@@ -1409,7 +1467,7 @@ async def extract_multi_images_batch_ocr(
 ) -> str:
     """
     Inspects 2 to 12 sequential comic/illustration pages together in a SINGLE multimodal batch call
-    with a staggered 18s hedged backup.
+    with strict anti-hallucination franchise verification and staggered 18s hedged backup.
     """
     target_list = images_list[:MAX_BATCH_IMAGES]
     if len(target_list) < 2:
@@ -1418,12 +1476,15 @@ async def extract_multi_images_batch_ocr(
     batch_prompt = (
         f"You are analyzing a sequential multi-image post/comic (Pages 1 to {len(target_list)}) for Yukino Yukinoshita.\n"
         + (f"Post Metadata / Caption Context:\n{post_meta_hint[:1400]}\n\n" if post_meta_hint else "")
-        + "Examine ALL pages together in sequence so you maintain strict character consistency across every page:\n"
-        "1. [Series / Franchise & Character Identification]:\n"
-        "   - State the Anime, Game, or Manga franchise and Character names ONLY if clearly supported by visual cues "
-        "(e.g., halos -> Blue Archive) or the post caption (e.g., ノアコ = Noa & Ako).\n"
-        "   - CRITICAL ANTI-HALLUCINATION RULE: Keep the SAME characters consistent across pages! "
-        "NEVER invent or guess extra characters from the same franchise (such as Arona, Ui, or Shiroko) unless they are clearly and unmistakably drawn in that panel.\n"
+        + "Examine ALL pages together in sequence so you maintain strict character & franchise consistency across every page:\n"
+        "1. [Series / Franchise & Character Identification — STRICT EVIDENCE RULE]:\n"
+        "   - Verify concrete visual traits (hair/eye color, signature hair accessories/ornaments, outfits, presence or absence of floating halos) "
+        "and cross-check with the post caption/tags before naming ANY franchise or character.\n"
+        "   - NEVER mix characters from one franchise with the title/protagonist of a different franchise! "
+        "(For example: do NOT label a post as 'Blue Archive' or call a male character 'Sensei' unless floating halos above characters' heads "
+        "or explicit Blue Archive names are actually visible; if characters are Firefly/Hotaru and Caelus, the franchise is 'Honkai: Star Rail').\n"
+        "   - If the franchise or character names are not 100% certain from the visuals or caption, write 'Unknown / Unconfirmed Series' "
+        "and describe the characters strictly by appearance rather than guessing.\n"
         "2. [Page-by-Page Story & Panel-by-Panel Dialogue/SFX (Right-to-Left, Top-to-Bottom)]:\n"
         "   - For each page (Page 1, Page 2, ...), summarize the visual events and list all dialogue, thoughts, "
         "and key SFX in Japanese reading order tagged with the speaker."
@@ -1457,17 +1518,22 @@ async def extract_multi_images_batch_ocr(
     gemini_timeout = min(65, 26 + (4 * len(encoded_images)))
     cf_timeout = min(50, 24 + (3 * len(encoded_images)))
 
-    try:
-        if not has_gemini and has_cf:
+    async def _run_batch_backup_chain() -> str:
+        if has_gemini:
+            gemma_res = await _call_ai_studio_gemma_multi_image_batch(
+                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_output_tokens=out_tokens
+            )
+            if gemma_res:
+                return gemma_res
+        if has_cf:
             return await _call_cf_multi_image_batch(
                 encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=out_tokens
             )
-        if has_gemini and not has_cf:
-            return await _call_gemini_multi_image_batch(
-                encoded_images, batch_prompt, timeout_sec=gemini_timeout, max_output_tokens=out_tokens
-            )
-        if not has_gemini and not has_cf:
-            return ""
+        return ""
+
+    try:
+        if not has_gemini:
+            return await _run_batch_backup_chain()
 
         gemini_task = asyncio.create_task(
             _call_gemini_multi_image_batch(
@@ -1482,17 +1548,11 @@ async def extract_multi_images_batch_ocr(
                     return res
             except Exception:
                 pass
-            return await _call_cf_multi_image_batch(
-                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=out_tokens
-            )
+            return await _run_batch_backup_chain()
 
-        api_log(f"Hedge (MultiImageOCR {len(encoded_images)}p) -> Gemini >18s; racing Cloudflare batch in parallel")
-        cf_task = asyncio.create_task(
-            _call_cf_multi_image_batch(
-                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=out_tokens
-            )
-        )
-        tasks = {gemini_task, cf_task}
+        api_log(f"Hedge (MultiImageOCR {len(encoded_images)}p) -> Gemini >18s; racing backup batch in parallel")
+        backup_task = asyncio.create_task(_run_batch_backup_chain())
+        tasks = {gemini_task, backup_task}
         try:
             while tasks:
                 done_set, pending_set = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -1551,8 +1611,8 @@ async def extract_image_via_transient_ocr(
         "Provide your output in 3 concise, well-structured sections:\n"
         "1. [Identification & Panel-by-Panel Visual Context]:\n"
         "   - If Comic / Manga / Fanart: Identify the Anime/Game/Manga Series and Character names ONLY if clearly supported by "
-        "unmistakable visual features or the post caption above. NEVER guess or invent other characters from the same franchise "
-        "when a character is distorted or ambiguous—describe them by appearance or as the same character from the caption instead! "
+        "unmistakable visual features (hair ornaments, outfits, halos/no halos) or the post caption above. NEVER mix character names "
+        "from one franchise with a different franchise title, and NEVER guess when ambiguous—write 'Unknown / Unconfirmed Series' instead! "
         "Describe what is happening visually in each panel in traditional Japanese reading order (Top-to-Bottom, Right-to-Left).\n"
         "   - If Code / Terminal / Stack Trace / UI Screenshot: Describe the exact error message, HTTP status, UI component, or terminal output shown.\n"
         "   - If Real-World Photo/Product/Hardware: Identify the Brand, Product Line, Model Name/Number, and distinguishing physical features.\n"

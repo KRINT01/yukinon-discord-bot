@@ -528,7 +528,6 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
 
         box = item.get("box_2d") or item.get("bbox") or item.get("box")
         norm_box = None
-        # Never place box_2d on floating SFX over characters/artwork (keep SFX in text transcript only)
         if not is_sfx:
             if isinstance(box, (list, tuple)) and len(box) == 4:
                 try:
@@ -551,10 +550,6 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
 
 
 def _repair_truncated_manga_batch_json(raw_target: str) -> dict | None:
-    """
-    Recovers completed page objects if an 8-12 page batch JSON hit maxOutputTokens
-    mid-way through the final page so valid pages are never discarded.
-    """
     if '"pages"' not in raw_target:
         return None
     last_close_brace = raw_target.rfind("}")
@@ -635,9 +630,9 @@ async def extract_and_translate_manga_pages_batch(
     """
     Processes 2 to 12 manga pages (including multi-part X/Twitter threads) in a SINGLE unified
     multimodal batch call:
-    - Tier 1: `gemini-4-hydrogen` (250K TPM Heavy Multi-Page Batch Specialist with `thinkingLevel: "LOW"`)
-    - Tier 2: `gemini-3-flash-preview` (Self-healing Flash fallback with `thinkingBudget`)
-    - Tier 3: Concurrent `Semaphore(2)` per-page fallback
+    - Tier 1: `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> `gemini-3.8-flash` (Self-healing, 15 RPM, 250K TPM, 500 RPD)
+    - Tier 2: `gemini-4-hydrogen` (250K TPM Heavy Specialist with `thinkingLevel: "LOW"`)
+    - Tier 3: Paced `Semaphore(2)` per-page fallback
     """
     num_pages = len(pages_input)
     if num_pages == 0:
@@ -648,11 +643,11 @@ async def extract_and_translate_manga_pages_batch(
         return [(b, s)]
 
     if num_pages >= 9:
-        batch_dim, batch_q, batch_thinking = 832, 78, 64
+        batch_dim, batch_q = 832, 78
     elif num_pages >= 5:
-        batch_dim, batch_q, batch_thinking = 928, 82, 96
+        batch_dim, batch_q = 928, 82
     else:
-        batch_dim, batch_q, batch_thinking = 1080, 88, 192
+        batch_dim, batch_q = 1080, 88
 
     b64_pages = []
     for raw_b, fname in pages_input:
@@ -703,55 +698,21 @@ CRITICAL RULES:
                 parts.append({"text": f"=== PAGE {idx} ({fname}) ==="})
                 parts.append({"inlineData": {"mimeType": mime_type, "data": b64_img}})
 
-            timeout_sec = min(135, 50 + (9 * num_pages))
+            timeout_sec = min(120, 40 + (7 * num_pages))
 
-            # Tier 1: Gemini 4 Hydrogen (uses thinkingLevel="LOW" so it doesn't stall at default "HIGH" thinking)
-            hydrogen_payload = {
+            # Tier 1: Gemini 3.5 Flash-Lite -> Gemini 3.1 Flash-Lite -> Self-Healing (250K TPM, 15 RPM, 500 RPD)
+            lite_batch_payload = {
                 "contents": [{"parts": parts}],
                 "generationConfig": {
                     "temperature": 0.1,
                     "maxOutputTokens": 16384,
                     "responseMimeType": "application/json",
-                    "thinkingConfig": {"thinkingLevel": "LOW"},
-                },
-            }
-            try:
-                h_data = await call_gemini_hydrogen_generate(
-                    hydrogen_payload, timeout_sec=timeout_sec, purpose=f"MangaBatch({num_pages}p)"
-                )
-                if h_data:
-                    resp_parts = (
-                        ((h_data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-                    )
-                    raw_json_str = "\n".join(
-                        p.get("text", "") for p in resp_parts
-                        if p.get("text") and not p.get("thought", False)
-                    ).strip()
-                    batch_results = _parse_manga_pages_batch_json(raw_json_str, num_pages)
-                    if any(bubbles for bubbles, _ in batch_results):
-                        total_b = sum(len(b) for b, _ in batch_results)
-                        print(
-                            f"[Manga Vision Batch] Completed {num_pages} page(s) in 1 request via Tier 1 Hydrogen "
-                            f"({GEMINI_HEAVY_MODEL}) - {total_b} total bubbles",
-                            flush=True,
-                        )
-                        return batch_results
-            except Exception as e:
-                print(f"Gemini Hydrogen Manga Batch warning ({type(e).__name__}): {e}", flush=True)
-
-            # Tier 2: Gemini Flash Self-Healing Batch Fallback
-            flash_payload = {
-                "contents": [{"parts": parts}],
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "maxOutputTokens": 16384,
-                    "responseMimeType": "application/json",
-                    "thinkingConfig": {"thinkingBudget": batch_thinking},
+                    "thinkingConfig": {"thinkingBudget": 0},
                 },
             }
             try:
                 data = await call_gemini_generate_content_self_healing(
-                    flash_payload, timeout_sec=timeout_sec, purpose=f"MangaBatchFallback({num_pages}p)"
+                    lite_batch_payload, timeout_sec=timeout_sec, purpose=f"MangaBatch({num_pages}p)"
                 )
                 if data:
                     resp_parts = (
@@ -765,25 +726,61 @@ CRITICAL RULES:
                     if any(bubbles for bubbles, _ in batch_results):
                         total_b = sum(len(b) for b, _ in batch_results)
                         print(
-                            f"[Manga Vision Batch] Completed {num_pages} page(s) in 1 request via Tier 2 Gemini Flash "
+                            f"[Manga Vision Batch] Completed {num_pages} page(s) in 1 request via Tier 1 Gemini "
                             f"({state.active_gemini_model}) - {total_b} total bubbles",
                             flush=True,
                         )
                         return batch_results
             except Exception as e:
-                print(f"Gemini Flash Manga Batch warning ({type(e).__name__}): {e}", flush=True)
+                print(f"Gemini Lite Manga Batch warning ({type(e).__name__}): {e}", flush=True)
+
+            # Tier 2: Gemini 4 Hydrogen Heavy Specialist fallback (`thinkingLevel: "LOW"`)
+            hydrogen_payload = {
+                "contents": [{"parts": parts}],
+                "generationConfig": {
+                    "temperature": 0.1,
+                    "maxOutputTokens": 16384,
+                    "responseMimeType": "application/json",
+                    "thinkingConfig": {"thinkingLevel": "LOW"},
+                },
+            }
+            try:
+                h_data = await call_gemini_hydrogen_generate(
+                    hydrogen_payload, timeout_sec=timeout_sec, purpose=f"MangaBatchHydrogen({num_pages}p)"
+                )
+                if h_data:
+                    resp_parts = (
+                        ((h_data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                    )
+                    raw_json_str = "\n".join(
+                        p.get("text", "") for p in resp_parts
+                        if p.get("text") and not p.get("thought", False)
+                    ).strip()
+                    batch_results = _parse_manga_pages_batch_json(raw_json_str, num_pages)
+                    if any(bubbles for bubbles, _ in batch_results):
+                        total_b = sum(len(b) for b, _ in batch_results)
+                        print(
+                            f"[Manga Vision Batch] Completed {num_pages} page(s) in 1 request via Tier 2 Hydrogen "
+                            f"({GEMINI_HEAVY_MODEL}) - {total_b} total bubbles",
+                            flush=True,
+                        )
+                        return batch_results
+            except Exception as e:
+                print(f"Gemini Hydrogen Manga Batch warning ({type(e).__name__}): {e}", flush=True)
     finally:
         b64_pages.clear()
 
-    # Tier 3: Concurrent per-page fallback (2 pages at a time)
+    # Tier 3: Paced concurrent per-page fallback (respects 15 RPM limit without burst 429s)
     sem = asyncio.Semaphore(2)
 
-    async def _bounded_single(rb: bytes, fn: str) -> tuple[list[dict], str]:
+    async def _bounded_single(idx_p: int, rb: bytes, fn: str) -> tuple[list[dict], str]:
         async with sem:
+            if idx_p > 1:
+                await asyncio.sleep(0.35)
             return await extract_and_translate_manga_bubbles(rb, fn, target_lang_name)
 
     fallback_results = await asyncio.gather(
-        *[_bounded_single(raw_b, fname) for raw_b, fname in pages_input]
+        *[_bounded_single(i, raw_b, fname) for i, (raw_b, fname) in enumerate(pages_input, 1)]
     )
     return list(fallback_results)
 
@@ -911,7 +908,7 @@ CRITICAL RULES:
             "generationConfig": {
                 "temperature": 0.1,
                 "responseMimeType": "application/json",
-                "thinkingConfig": {"thinkingBudget": 192},
+                "thinkingConfig": {"thinkingBudget": 0},
             },
         }
         try:
@@ -920,7 +917,9 @@ CRITICAL RULES:
                 parts = (
                     ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
                 )
-                raw_json_str = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+                raw_json_str = "\n".join(
+                    p.get("text", "") for p in parts if p.get("text") and not p.get("thought", False)
+                ).strip()
                 bubbles, summary = _parse_manga_bubbles_json(raw_json_str)
                 if bubbles:
                     print(
@@ -1082,10 +1081,6 @@ def _wrap_text_to_pixel_width(
 def _detect_bubble_polarity(
     base_gray: Image.Image, x1: int, y1: int, x2: int, y2: int
 ) -> bool:
-    """
-    Returns True if the bubble/panel region at (x1, y1, x2, y2) is a Dark/Charcoal background
-    (median luminance < 125), or False if it is a Light/White bubble.
-    """
     bw = x2 - x1
     bh = y2 - y1
     if bw < 10 or bh < 10:
@@ -1153,12 +1148,6 @@ def _find_best_enclosed_white_bubble(
     ry2_rel: int,
     has_kanji_kana: bool = True,
 ) -> Image.Image | None:
-    """
-    Fast 0.5x-scale enclosed white speech bubble finder:
-    - Rejects blank white cheeks/faces/backgrounds by checking enclosed character loops (`holes_area`).
-    - Accepts thin-font speech bubbles (such as `お、大盛り過ぎない？`) where `holes_area >= 5`
-      at 0.5x scale so they never miss enclosed bubble cleaning.
-    """
     ww, wh = sub_gray.size
     if ww < 16 or wh < 16:
         return None
@@ -1266,10 +1255,6 @@ def _find_best_enclosed_white_bubble(
 
 
 def _sample_dark_bubble_bg_rgb_and_lum(img: Image.Image, base_gray: Image.Image, x1: int, y1: int, x2: int, y2: int) -> tuple[tuple[int, int, int], int]:
-    """
-    Samples the true background color (pure black OR charcoal gray) around the text box
-    so dark/charcoal panels are filled with their EXACT matching background color.
-    """
     width, height = img.size
     sx1 = max(0, x1 - 4)
     sy1 = max(0, y1 - 4)
@@ -1322,9 +1307,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
     ry2_rel = min(wh - 2, y2 - wy1)
     rel_cx = (rx1_rel + rx2_rel) // 2
 
-    # =========================================================================
-    # CASE A: DARK OR CHARCOAL BUBBLE / PANEL
-    # =========================================================================
     if is_dark_bubble:
         dark_fill_rgb, bg_lum = _sample_dark_bubble_bg_rgb_and_lum(img, base_gray, raw_x1, raw_y1, raw_x2, raw_y2)
         fg_text_rgb = (250, 250, 250)
@@ -1389,9 +1371,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
             stroke_rgb,
         )
 
-    # =========================================================================
-    # CASE B: ENCLOSED WHITE SPEECH BUBBLE
-    # =========================================================================
     filled_bubble = _find_best_enclosed_white_bubble(
         sub_gray, rx1_rel, ry1_rel, rx2_rel, ry2_rel, has_kanji_kana=has_kanji_kana
     )
@@ -1455,9 +1434,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
                 (255, 255, 255),
             )
 
-    # =========================================================================
-    # CASE C: OPEN-SIDED WHITE SPEECH BUBBLE (Strictly Clamped to `box_2d`)
-    # =========================================================================
     tx_b1 = max(2, rx1_rel - 6)
     ty_b1 = max(2, ry1_rel - 6)
     tx_b2 = min(ww - 2, rx2_rel + 6)
@@ -1738,14 +1714,12 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
                             filename=f"translated_p{page_idx}_{base_name}.png",
                         )
                     )
-                # Yield briefly between CPU-heavy Pillow renders so Discord Gateway heartbeat never lags
                 await asyncio.sleep(0.05)
             except Exception as e:
                 print(f"Manga page {page_idx} rendering fallback to text-only: {e}", flush=True)
 
         transcript_text = "\n".join(transcript_lines)
 
-        # Discord allows up to 10 attachments per single message; split into chunks of 10 when >10 pages
         if discord_files:
             file_chunks = [discord_files[i : i + 10] for i in range(0, len(discord_files), 10)]
             if len(transcript_text) <= 1950:
