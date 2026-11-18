@@ -260,7 +260,7 @@ def extract_key_stack_trace_windows(log_text: str, max_chars: int = 28000) -> st
     return f"{head}\n\n... [ truncated intermediate trace frames ] ...\n\n{tail}"
 
 
-def format_code\_or\_log\_attachment(text: str, is_log: bool, max_chars: int = 120000) -> str:
+def format_code_or_log_attachment(text: str, is_log: bool, max_chars: int = 120000) -> str:
     if is_log or STACK_TRACE_SIGNATURE_REGEX.search(text[:8000]):
         return extract_key_stack_trace_windows(text, max_chars=28000)
 
@@ -1363,7 +1363,6 @@ async def _call_ai_studio_gemma_multi_image_batch(
     if not GEMINI_API_KEY:
         return ""
     gemma_models = await discover_active_gemma_models(vision_required=True)
-    # Prefer fast 26B MoE (`gemma-4-26b-a4b-it`) for multi-image batches so dense 31B doesn't time out
     candidates = [m for m in gemma_models if "26b" in m] or gemma_models[:1]
     if not candidates:
         return ""
