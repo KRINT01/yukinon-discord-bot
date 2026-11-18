@@ -55,7 +55,7 @@ from persona import (
 from search_engine import (
     detect_weather_intent,
     detect_web_search_intent,
-    update\_and\_get\_channel\_topic,
+    update_and_get_channel_topic,
     build_contextual_search_query,
     fetch_live_weather_context,
     run_safe_web_search_sync,
@@ -126,8 +126,7 @@ def _compact_messages_for_token_budget(messages: list, max_est_tokens: int = 450
 def _adapt_gemini_thinking_config_for_model(payload: dict, model_id: str) -> dict:
     """
     Adapts `thinkingConfig` for Gemini 3.5+ / 3.6 / 3.8 / 4 models which use
-    `thinkingLevel` (`MINIMAL`, `LOW`, `MEDIUM`, `HIGH`) instead of `thinkingBudget`,
-    and strips unsupported sampling overrides on 3.5+ Flash-Lite.
+    `thinkingLevel` (`MINIMAL`, `LOW`, `MEDIUM`, `HIGH`) instead of `thinkingBudget`.
     """
     work_payload = json.loads(json.dumps(payload))
     gen_cfg = work_payload.get("generationConfig")
@@ -928,7 +927,6 @@ async def call_gemini_chat_messages(
     if not contents:
         return ""
 
-    # Gemini 3.5+ requires the final turn to have role "user"
     if contents[-1]["role"] != "user":
         contents.append({"role": "user", "parts": [{"text": "Please respond to the above."}]})
 
