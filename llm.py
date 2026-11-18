@@ -62,7 +62,7 @@ from search_engine import (
 )
 
 GEMINI_MODEL_HINT_REGEX = re.compile(r"models/([a-zA-Z0-9._-]+)")
-# Exclude legacy 1.5/2.0/2.5/omni/latest aliases and non-text endpoints so routing stays deterministic on 3.5/3.1/3.6
+# Exclude legacy 1.5/2.0/2.5/omni/latest aliases and non-text endpoints so routing stays deterministic on 3.1/3.5/3.6
 GEMINI_EXCLUDED_SUBSTRINGS = (
     "image", "tts", "audio", "live", "embedding", "aqa", "bison", "gecko",
     "decision", "hydrogen", "preview", "omni", "2.5", "2.0", "1.5", "latest", "3.7", "3.8"
@@ -131,7 +131,7 @@ def _adapt_gemini_thinking_config_for_model(payload: dict, model_id: str) -> dic
          - Strips `temperature`, `topP`, `topK` (Hydrogen ignores/rejects custom sampling params).
          - Raises `maxOutputTokens` to `65536` (shared 1M unified input+thinking+output window).
          - Uses `thinkingLevel` (`LOW`, `MEDIUM`, `HIGH`, `XHIGH`; rejects `MINIMAL`).
-      2) `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-3.6-flash`:
+      2) `gemini-3.1-flash-lite`, `gemini-3.5-flash-lite`, `gemini-3.6-flash`:
          - Uses `thinkingLevel` (`MINIMAL`, `LOW`, `MEDIUM`, `HIGH`) and removes legacy `thinkingBudget`.
       3) `gemini-3.8-flash` / `gemini-3.7-flash`:
          - Uses `thinkingLevel` (`LOW`, `MEDIUM`, `HIGH`; never `MINIMAL`).
@@ -147,11 +147,9 @@ def _adapt_gemini_thinking_config_for_model(payload: dict, model_id: str) -> dic
     minimal_capable_models = lower_m.startswith(("gemini-3.6", "gemini-3.5", "gemini-3.1"))
 
     if is_gemini_4:
-        # Remove sampling parameters per Gemini 4 Hydrogen migration guide
         gen_cfg.pop("temperature", None)
         gen_cfg.pop("topP", None)
         gen_cfg.pop("topK", None)
-        # Raise low caps to 65,536 synchronous single-request cap
         cur_max = int(gen_cfg.get("maxOutputTokens") or 0)
         if cur_max < 65536:
             gen_cfg["maxOutputTokens"] = 65536
@@ -606,19 +604,19 @@ async def discover_active_gemma_models(vision_required: bool = False) -> list[st
 async def _discover_active_gemini_flash_model(force_remote: bool = False) -> list[str]:
     """
     Deterministic priority order for Gemini Flash models (15 RPM, 250K TPM, 500 RPD):
-      1. `gemini-3.5-flash-lite` (Primary — highest throughput & reliability)
-      2. `gemini-3.1-flash-lite` (Secondary Flash-Lite fallback)
+      1. `gemini-3.1-flash-lite` (Primary — highest reliability and success rate)
+      2. `gemini-3.5-flash-lite` (Secondary Flash-Lite fallback)
       3. `gemini-3.6-flash` (Tertiary Flash fallback)
     """
     global _GEMINI_DISCOVERED_MODELS_CACHE, _GEMINI_MODELS_LAST_FETCH_TS
     now = time.time()
 
     preferred_seed = [
-        GEMINI_SEARCH_MODEL or "gemini-3.5-flash-lite",
-        GEMINI_FALLBACK_MODEL or "gemini-3.1-flash-lite",
-        "gemini-3.5-flash-lite",
         "gemini-3.1-flash-lite",
+        "gemini-3.5-flash-lite",
         "gemini-3.6-flash",
+        GEMINI_SEARCH_MODEL,
+        GEMINI_FALLBACK_MODEL,
     ]
 
     seen = set()
@@ -851,7 +849,7 @@ async def call_gemini_generate_content_self_healing(
     max_wall_sec: float | None = None,
 ) -> dict | None:
     """
-    Deterministic, bounded Gemini Flash-Lite caller (`gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite`)
+    Deterministic, bounded Gemini Flash-Lite caller (`gemini-3.1-flash-lite` -> `gemini-3.5-flash-lite`)
     with `thinkingLevel` normalization, short cooldowns on transient 503/timeout, and strict wall-time caps.
     """
     if not GEMINI_API_KEY:
@@ -1599,7 +1597,7 @@ async def query_local_ollama_chat(
             target_temp = 0.2 if (did_search or is_user_correction) else temperature
 
             if is_japanese_or_social_media:
-                # Primary: `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> Gemma 4 -> CF Gemma
+                # Primary: `gemini-3.1-flash-lite` -> `gemini-3.5-flash-lite` -> Gemma 4 -> CF Gemma
                 if GEMINI_API_KEY:
                     ans = await call_gemini_chat_messages(
                         messages,

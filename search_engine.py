@@ -36,7 +36,6 @@ from config import (
     TAVILY_API_KEY,
     DDGS_PROXY,
     GEMINI_API_KEY,
-    GEMINI_SEARCH_MODEL,
     channel_memory,
     channel_active_topic,
     channel_last_weather,
@@ -493,53 +492,53 @@ def _search_google_ai_studio_grounded_sync(query: str) -> str:
             "thinkingConfig": {"thinkingLevel": "MINIMAL"},
         },
     }
-    model_id = GEMINI_SEARCH_MODEL or "gemini-3.5-flash-lite"
-    url = clean_url(
-        f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
-        f"{model_id}:generateContent?key={GEMINI_API_KEY}"
-    )
-    t0 = time.monotonic()
-    try:
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
+    for model_id in ("gemini-3.1-flash-lite", "gemini-3.5-flash-lite"):
+        url = clean_url(
+            f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
+            f"{model_id}:generateContent?key={GEMINI_API_KEY}"
         )
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            elapsed = time.monotonic() - t0
-            candidates = data.get("candidates") or []
-            if not candidates:
-                return ""
-            cand = candidates[0]
-            parts = (cand.get("content") or {}).get("parts") or []
-            summary_text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+        t0 = time.monotonic()
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                elapsed = time.monotonic() - t0
+                candidates = data.get("candidates") or []
+                if not candidates:
+                    continue
+                cand = candidates[0]
+                parts = (cand.get("content") or {}).get("parts") or []
+                summary_text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
 
-            chunks = (cand.get("groundingMetadata") or {}).get("groundingChunks") or []
-            sources = []
-            for idx, ch in enumerate(chunks[:5], 1):
-                web_info = ch.get("web") or {}
-                uri = web_info.get("uri", "")
-                title = web_info.get("title", "Source")
-                if uri:
-                    sources.append(f"[{idx}] {title}: {uri}")
+                chunks = (cand.get("groundingMetadata") or {}).get("groundingChunks") or []
+                sources = []
+                for idx, ch in enumerate(chunks[:5], 1):
+                    web_info = ch.get("web") or {}
+                    uri = web_info.get("uri", "")
+                    title = web_info.get("title", "Source")
+                    if uri:
+                        sources.append(f"[{idx}] {title}: {uri}")
 
-            if summary_text:
-                api_log(f"Search (Gemini Grounding) -> {model_id} 200 OK ({elapsed:.2f}s)")
-                sources_block = "\n".join(sources)
-                return (
-                    f'<untrusted_web_search_results query="{query}" engine="google_search_grounding">\n'
-                    f"Verified Google Search Summary:\n{summary_text}\n\n"
-                    f"Sources:\n{sources_block}\n"
-                    f"</untrusted_web_search_results>"
-                )
-    except Exception as e:
-        err_str = str(e)
-        if "429" in err_str:
-            state.gemini_grounding_cooldown_until = time.time() + 1800
-            api_log(f"Search (Gemini Grounding) -> {model_id} HTTP 429 (cooldown 30m)")
-        else:
+                if summary_text:
+                    api_log(f"Search (Gemini Grounding) -> {model_id} 200 OK ({elapsed:.2f}s)")
+                    sources_block = "\n".join(sources)
+                    return (
+                        f'<untrusted_web_search_results query="{query}" engine="google_search_grounding">\n'
+                        f"Verified Google Search Summary:\n{summary_text}\n\n"
+                        f"Sources:\n{sources_block}\n"
+                        f"</untrusted_web_search_results>"
+                    )
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str:
+                state.gemini_grounding_cooldown_until = time.time() + 1800
+                api_log(f"Search (Gemini Grounding) -> {model_id} HTTP 429 (cooldown 30m)")
+                break
             api_log(f"Search (Gemini Grounding) -> {model_id} skipped ({err_str})")
     return ""
 
