@@ -601,11 +601,11 @@ async def extract_and_translate_manga_pages_batch(
     pages_input: list[tuple[bytes, str]], target_lang_name: str
 ) -> list[tuple[list[dict], str]]:
     """
-    Processes 2 to 10 manga pages in a SINGLE unified multimodal batch call:
+    Processes 2 to 10 manga pages (including multi-part X/Twitter threads) in a SINGLE unified
+    multimodal batch call:
     - Tier 1: `gemini-4-hydrogen` (250K TPM Heavy Multi-Page Batch Specialist)
-    - Tier 2: `gemini-3-flash-preview` (Self-healing Flash fallback if Hydrogen hits 5 RPM / 20 RPD)
+    - Tier 2: `gemini-3-flash-preview` (Self-healing Flash fallback if Hydrogen hits 5 RPM / 20 RPD / 503)
     - Tier 3: Concurrent `Semaphore(2)` per-page fallback
-    For `num_pages == 1`, delegates straight to `extract_and_translate_manga_bubbles()` to preserve Hydrogen's 20 RPD.
     """
     num_pages = len(pages_input)
     if num_pages == 0:
@@ -615,9 +615,14 @@ async def extract_and_translate_manga_pages_batch(
         b, s = await extract_and_translate_manga_bubbles(pages_input[0][0], pages_input[0][1], target_lang_name)
         return [(b, s)]
 
+    # Scale resolution/thinking budget cleanly when translating 6-10 pages across multi-part threads
+    batch_dim = 896 if num_pages >= 6 else 1024
+    batch_q = 82 if num_pages >= 6 else 86
+    batch_thinking = 64 if num_pages >= 6 else 128
+
     b64_pages = []
     for raw_b, fname in pages_input:
-        b64_str = await asyncio.to_thread(_prepare_manga_image_for_vision, raw_b, 1024, 86)
+        b64_str = await asyncio.to_thread(_prepare_manga_image_for_vision, raw_b, batch_dim, batch_q)
         b64_pages.append((b64_str, fname))
 
     mime_type = "image/jpeg"
@@ -656,66 +661,69 @@ CRITICAL RULES:
 }}
 """.strip()
 
-    if GEMINI_API_KEY:
-        parts = [{"text": manga_batch_instruction}]
-        for idx, (b64_img, fname) in enumerate(b64_pages, 1):
-            parts.append({"text": f"=== PAGE {idx} ({fname}) ==="})
-            parts.append({"inlineData": {"mimeType": mime_type, "data": b64_img}})
+    try:
+        if GEMINI_API_KEY:
+            parts = [{"text": manga_batch_instruction}]
+            for idx, (b64_img, fname) in enumerate(b64_pages, 1):
+                parts.append({"text": f"=== PAGE {idx} ({fname}) ==="})
+                parts.append({"inlineData": {"mimeType": mime_type, "data": b64_img}})
 
-        gemini_payload = {
-            "contents": [{"parts": parts}],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 8192,
-                "responseMimeType": "application/json",
-                "thinkingConfig": {"thinkingBudget": 128},
-            },
-        }
-        timeout_sec = min(115, 45 + (14 * num_pages))
+            gemini_payload = {
+                "contents": [{"parts": parts}],
+                "generationConfig": {
+                    "temperature": 0.1,
+                    "maxOutputTokens": 8192,
+                    "responseMimeType": "application/json",
+                    "thinkingConfig": {"thinkingBudget": batch_thinking},
+                },
+            }
+            timeout_sec = min(120, 45 + (10 * num_pages))
 
-        # Tier 1: Gemini 4 Hydrogen (250K TPM Multi-Page Batch Specialist)
-        try:
-            h_data = await call_gemini_hydrogen_generate(
-                gemini_payload, timeout_sec=timeout_sec, purpose=f"MangaBatch({num_pages}p)"
-            )
-            if h_data:
-                resp_parts = (
-                    ((h_data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+            # Tier 1: Gemini 4 Hydrogen (250K TPM Multi-Page Batch Specialist)
+            try:
+                h_data = await call_gemini_hydrogen_generate(
+                    gemini_payload, timeout_sec=timeout_sec, purpose=f"MangaBatch({num_pages}p)"
                 )
-                raw_json_str = "\n".join(p.get("text", "") for p in resp_parts if p.get("text")).strip()
-                batch_results = _parse_manga_pages_batch_json(raw_json_str, num_pages)
-                if any(bubbles for bubbles, _ in batch_results):
-                    total_b = sum(len(b) for b, _ in batch_results)
-                    print(
-                        f"[Manga Vision Batch] Completed {num_pages} page(s) in 1 request via Tier 1 Hydrogen "
-                        f"({GEMINI_HEAVY_MODEL}) - {total_b} total bubbles",
-                        flush=True,
+                if h_data:
+                    resp_parts = (
+                        ((h_data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
                     )
-                    return batch_results
-        except Exception as e:
-            print(f"Gemini Hydrogen Manga Batch warning ({type(e).__name__}): {e}", flush=True)
+                    raw_json_str = "\n".join(p.get("text", "") for p in resp_parts if p.get("text")).strip()
+                    batch_results = _parse_manga_pages_batch_json(raw_json_str, num_pages)
+                    if any(bubbles for bubbles, _ in batch_results):
+                        total_b = sum(len(b) for b, _ in batch_results)
+                        print(
+                            f"[Manga Vision Batch] Completed {num_pages} page(s) in 1 request via Tier 1 Hydrogen "
+                            f"({GEMINI_HEAVY_MODEL}) - {total_b} total bubbles",
+                            flush=True,
+                        )
+                        return batch_results
+            except Exception as e:
+                print(f"Gemini Hydrogen Manga Batch warning ({type(e).__name__}): {e}", flush=True)
 
-        # Tier 2: Gemini Flash Self-Healing Batch Fallback
-        try:
-            data = await call_gemini_generate_content_self_healing(
-                gemini_payload, timeout_sec=timeout_sec, purpose=f"MangaBatchFallback({num_pages}p)"
-            )
-            if data:
-                resp_parts = (
-                    ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+            # Tier 2: Gemini Flash Self-Healing Batch Fallback
+            try:
+                data = await call_gemini_generate_content_self_healing(
+                    gemini_payload, timeout_sec=timeout_sec, purpose=f"MangaBatchFallback({num_pages}p)"
                 )
-                raw_json_str = "\n".join(p.get("text", "") for p in resp_parts if p.get("text")).strip()
-                batch_results = _parse_manga_pages_batch_json(raw_json_str, num_pages)
-                if any(bubbles for bubbles, _ in batch_results):
-                    total_b = sum(len(b) for b, _ in batch_results)
-                    print(
-                        f"[Manga Vision Batch] Completed {num_pages} page(s) in 1 request via Tier 2 Gemini Flash "
-                        f"({state.active_gemini_model}) - {total_b} total bubbles",
-                        flush=True,
+                if data:
+                    resp_parts = (
+                        ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
                     )
-                    return batch_results
-        except Exception as e:
-            print(f"Gemini Flash Manga Batch warning ({type(e).__name__}): {e}", flush=True)
+                    raw_json_str = "\n".join(p.get("text", "") for p in resp_parts if p.get("text")).strip()
+                    batch_results = _parse_manga_pages_batch_json(raw_json_str, num_pages)
+                    if any(bubbles for bubbles, _ in batch_results):
+                        total_b = sum(len(b) for b, _ in batch_results)
+                        print(
+                            f"[Manga Vision Batch] Completed {num_pages} page(s) in 1 request via Tier 2 Gemini Flash "
+                            f"({state.active_gemini_model}) - {total_b} total bubbles",
+                            flush=True,
+                        )
+                        return batch_results
+            except Exception as e:
+                print(f"Gemini Flash Manga Batch warning ({type(e).__name__}): {e}", flush=True)
+    finally:
+        b64_pages.clear()
 
     # Tier 3: Concurrent per-page fallback (2 pages at a time)
     sem = asyncio.Semaphore(2)
@@ -1560,7 +1568,8 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
 async def process_manga_translation_request(ctx_or_message, user_prompt: str):
     """
     Translates 1 to 10 manga pages from direct Discord attachments OR embedded links
-    (X/Twitter, Pixiv/phixiv, Bluesky, Discord embeds, or direct image URLs).
+    (including multi-part X/Twitter threads up to 10 images total, Pixiv/phixiv, Bluesky,
+    Discord embeds, or direct image URLs).
     """
     from media_context import resolve_referenced_message, collect_embedded_images_and_metadata
 

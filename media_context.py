@@ -55,6 +55,7 @@ from llm import (
 
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024   # 25 MB cap (supports standard Discord PDF/doc uploads safely)
 MAX_EMBED_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB per embedded image cap for 512MB Render container
+MAX_BATCH_IMAGES = 10                     # Strict 10-image cap across multi-part threads and batch requests
 
 TWITTER_STATUS_URL_REGEX = re.compile(
     r"https?://(?:www\.|mobile\.)?(?:x\.com|twitter\.com|fixupx\.com|fxtwitter\.com|vxtwitter\.com|fixvx\.com|twittpr\.com)/([^/\s]+)/status/(\d+)",
@@ -70,6 +71,18 @@ BSKY_POST_URL_REGEX = re.compile(
 )
 DIRECT_IMAGE_URL_REGEX = re.compile(
     r"https?://[^\s<>'\"]+\.(?:jpg|jpeg|png|webp)(?:\?[^\s<>'\"]*)?",
+    re.IGNORECASE,
+)
+
+# Detects part/thread continuation markers in X/Twitter captions (e.g., 1/2, ①, Part 1, その1, つづく, →)
+_X_PART_1_SIGNAL_REGEX = re.compile(
+    r"(?:(?:^|[\s(【\[（])1\s*/\s*[2-9]\b|[①❶⑴]|(?:^|[\s(【\[（])1\s*話|"
+    r"その\s*[1１]|part\s*1\b|pt\.?\s*1\b|前編|つづく|続く|続きます|リプに続|ツリーに続|→\s*$)",
+    re.IGNORECASE,
+)
+_X_NEXT_PART_CAPTION_REGEX = re.compile(
+    r"(?:(?:^|[\s(【\[（])[2-9]\s*/\s*[2-9]\b|[②③④⑤❷❸❹❺⑵⑶⑷⑸]|"
+    r"その\s*[2-9２-９]|part\s*[2-9]\b|pt\.?\s*[2-9]\b|後編|中編|続き)",
     re.IGNORECASE,
 )
 
@@ -308,8 +321,58 @@ async def _download_remote_image_safe(url: str, referer: str = "") -> tuple[byte
         return None
 
 
-async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[str, list[str]]:
-    t0 = time.monotonic()
+def _normalize_fxtwitter_tweet_obj(tweet: dict, fallback_screen_name: str = "", fallback_id: str = "") -> dict:
+    """Normalizes a FxTwitter / FxEmbed APITweet dict into a clean internal structure."""
+    author = tweet.get("author") or {}
+    a_name = (author.get("name") or "").strip()
+    a_handle = (author.get("screen_name") or fallback_screen_name or "").strip()
+    tid = str(tweet.get("id") or fallback_id or "").strip()
+    t_text = (tweet.get("text") or "").strip()
+    t_url = (tweet.get("url") or f"{HTTPS}x.com/{a_handle or 'i'}/status/{tid}").strip()
+
+    photo_urls = []
+    media = tweet.get("media") or {}
+    for ph in media.get("photos") or []:
+        if isinstance(ph, dict) and ph.get("url"):
+            photo_urls.append(ph["url"])
+    if not photo_urls:
+        for m_item in media.get("all") or []:
+            if isinstance(m_item, dict):
+                u = m_item.get("url") or m_item.get("thumbnail_url")
+                if u and m_item.get("type") in ("photo", "image", "gif", "video"):
+                    photo_urls.append(u)
+
+    quote_info = None
+    quote = tweet.get("quote")
+    if isinstance(quote, dict):
+        q_auth = quote.get("author") or {}
+        q_handle = (q_auth.get("screen_name") or "").strip()
+        q_text = (quote.get("text") or "").strip()
+        q_photos = []
+        for qph in (quote.get("media") or {}).get("photos") or []:
+            if isinstance(qph, dict) and qph.get("url"):
+                q_photos.append(qph["url"])
+        quote_info = {"handle": q_handle, "text": q_text, "photos": q_photos}
+
+    return {
+        "id": tid,
+        "author_name": a_name,
+        "author_handle": a_handle,
+        "text": t_text,
+        "url": t_url,
+        "created_at": (tweet.get("created_at") or "").strip(),
+        "created_timestamp": int(tweet.get("created_timestamp") or 0),
+        "likes": tweet.get("likes"),
+        "retweets": tweet.get("retweets"),
+        "replies_count": int(tweet.get("replies") or 0),
+        "replying_to": (tweet.get("replying_to") or "").strip(),
+        "replying_to_status": str(tweet.get("replying_to_status") or "").strip(),
+        "photos": photo_urls,
+        "quote": quote_info,
+    }
+
+
+async def _fetch_single_x_tweet_normalized(screen_name: str, tweet_id: str) -> dict | None:
     session = get_http_session()
     user_seg = screen_name or "i"
     endpoints = (
@@ -319,7 +382,7 @@ async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[s
         f"{HTTPS}api.vxtwitter.com/status/{tweet_id}",
     )
     req_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "User-Agent": "YukinonDiscordBot/2.0 (FxEmbed Client)",
         "Accept": "application/json",
     }
     for ep in endpoints:
@@ -327,85 +390,283 @@ async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[s
             async with session.get(
                 ep,
                 headers=req_headers,
-                timeout=aiohttp.ClientTimeout(total=8),
+                timeout=aiohttp.ClientTimeout(total=7),
             ) as resp:
                 if resp.status != 200:
                     continue
                 data = await resp.json(content_type=None)
                 if not isinstance(data, dict):
                     continue
-
                 tweet = data.get("tweet")
                 if isinstance(tweet, dict):
-                    author = tweet.get("author") or {}
-                    a_name = author.get("name") or ""
-                    a_handle = author.get("screen_name") or screen_name or ""
-                    t_text = (tweet.get("text") or "").strip()
-                    t_url = tweet.get("url") or f"{HTTPS}x.com/{a_handle or 'i'}/status/{tweet_id}"
-                    created = tweet.get("created_at") or ""
-                    likes = tweet.get("likes")
-                    retweets = tweet.get("retweets")
-
-                    photo_urls = []
-                    media = tweet.get("media") or {}
-                    for ph in media.get("photos") or []:
-                        if isinstance(ph, dict) and ph.get("url"):
-                            photo_urls.append(ph["url"])
-                    if not photo_urls:
-                        for m_item in media.get("all") or []:
-                            if isinstance(m_item, dict):
-                                u = m_item.get("url") or m_item.get("thumbnail_url")
-                                if u and m_item.get("type") in ("photo", "image", "gif", "video"):
-                                    photo_urls.append(u)
-
-                    lines = [
-                        f"Platform: X (Twitter) | Post URL: {t_url}",
-                        f"Author / Artist: {a_name} (@{a_handle})" if a_handle else f"Author / Artist: {a_name}",
-                        f"Post Caption / Title Text: {t_text or '(No text caption)'}",
-                    ]
-                    if created:
-                        lines.append(f"Posted At: {created}")
-                    if likes is not None or retweets is not None:
-                        lines.append(f"Engagement: {likes or 0} Likes | {retweets or 0} Reposts")
-
-                    quote = tweet.get("quote")
-                    if isinstance(quote, dict):
-                        q_auth = quote.get("author") or {}
-                        q_handle = q_auth.get("screen_name") or ""
-                        q_text = (quote.get("text") or "").strip()
-                        if q_text:
-                            lines.append(f"Quoted Post (@{q_handle}):\n{q_text}")
-                        if not photo_urls:
-                            for qph in (quote.get("media") or {}).get("photos") or []:
-                                if isinstance(qph, dict) and qph.get("url"):
-                                    photo_urls.append(qph["url"])
-
-                    api_log(
-                        f"Embed Link (FxTwitter) -> tweet={tweet_id}, caption_len={len(t_text)}, photos={len(photo_urls)} ({time.monotonic() - t0:.2f}s)"
+                    return _normalize_fxtwitter_tweet_obj(
+                        tweet, fallback_screen_name=screen_name, fallback_id=tweet_id
                     )
-                    return "\n".join(lines), photo_urls
-
                 if "text" in data or "mediaURLs" in data:
-                    u_name = data.get("user_name") or ""
-                    u_screen = data.get("user_screen_name") or screen_name or ""
+                    u_name = (data.get("user_name") or "").strip()
+                    u_screen = (data.get("user_screen_name") or screen_name or "").strip()
                     t_text = (data.get("text") or "").strip()
                     media_urls = [
                         u for u in (data.get("mediaURLs") or [])
-                        if isinstance(u, str) and any(ext in u.lower() for ext in (".jpg", ".jpeg", ".png", ".webp", "pbs.twimg.com/media"))
+                        if isinstance(u, str) and any(
+                            ext in u.lower() for ext in (".jpg", ".jpeg", ".png", ".webp", "pbs.twimg.com/media")
+                        )
                     ]
-                    lines = [
-                        f"Platform: X (Twitter) | Post URL: {HTTPS}x.com/{u_screen or 'i'}/status/{tweet_id}",
-                        f"Author / Artist: {u_name} (@{u_screen})" if u_screen else f"Author / Artist: {u_name}",
-                        f"Post Caption / Title Text: {t_text or '(No text caption)'}",
-                    ]
-                    api_log(
-                        f"Embed Link (vxTwitter) -> tweet={tweet_id}, caption_len={len(t_text)}, photos={len(media_urls)} ({time.monotonic() - t0:.2f}s)"
-                    )
-                    return "\n".join(lines), media_urls
+                    return {
+                        "id": str(tweet_id),
+                        "author_name": u_name,
+                        "author_handle": u_screen,
+                        "text": t_text,
+                        "url": f"{HTTPS}x.com/{u_screen or 'i'}/status/{tweet_id}",
+                        "created_at": "",
+                        "created_timestamp": 0,
+                        "likes": data.get("likes"),
+                        "retweets": data.get("retweets"),
+                        "replies_count": int(data.get("replies") or 0),
+                        "replying_to": (data.get("replyingTo") or "").strip(),
+                        "replying_to_status": str(data.get("replyingToID") or "").strip(),
+                        "photos": media_urls,
+                        "quote": None,
+                    }
         except Exception:
             continue
-    api_log(f"Embed Link (X/Twitter API) -> fallback to Discord native embed for tweet={tweet_id}")
-    return "", []
+    return None
+
+
+def _collect_tweet_dicts_from_thread_payload(payload) -> list[dict]:
+    """Recursively extracts raw tweet dicts from FxEmbed v2 `/2/thread/{id}` responses."""
+    found: list[dict] = []
+    if isinstance(payload, list):
+        for item in payload:
+            found.extend(_collect_tweet_dicts_from_thread_payload(item))
+    elif isinstance(payload, dict):
+        if "id" in payload and ("text" in payload or "author" in payload):
+            found.append(payload)
+        for key in ("thread", "tweets", "conversation", "replies", "children", "items", "data"):
+            val = payload.get(key)
+            if isinstance(val, (list, dict)):
+                found.extend(_collect_tweet_dicts_from_thread_payload(val))
+        if isinstance(payload.get("tweet"), dict):
+            found.extend(_collect_tweet_dicts_from_thread_payload(payload["tweet"]))
+    return found
+
+
+async def _fetch_x_thread_candidates_from_fxembed_v2(tweet_id: str, author_handle: str) -> list[dict]:
+    """Queries FxEmbed v2 `/2/thread/{tweet_id}` to fetch unrolled thread replies by the same author."""
+    if not tweet_id:
+        return []
+    session = get_http_session()
+    req_headers = {
+        "User-Agent": "YukinonDiscordBot/2.0 (FxEmbed Client)",
+        "Accept": "application/json",
+    }
+    endpoints = (
+        f"{HTTPS}api.fxtwitter.com/2/thread/{tweet_id}",
+        f"{HTTPS}api.fxtwitter.com/2/status/{tweet_id}",
+    )
+    for ep in endpoints:
+        try:
+            async with session.get(
+                ep, headers=req_headers, timeout=aiohttp.ClientTimeout(total=6)
+            ) as resp:
+                if resp.status != 200:
+                    continue
+                data = await resp.json(content_type=None)
+                raw_tweets = _collect_tweet_dicts_from_thread_payload(data)
+                if not raw_tweets:
+                    continue
+                normalized_by_id: dict[str, dict] = {}
+                for rt in raw_tweets:
+                    nt = _normalize_fxtwitter_tweet_obj(rt, fallback_screen_name=author_handle)
+                    if nt["id"] and nt["id"] not in normalized_by_id:
+                        normalized_by_id[nt["id"]] = nt
+                if len(normalized_by_id) > 1:
+                    return list(normalized_by_id.values())
+        except Exception:
+            continue
+    return []
+
+
+async def _search_x_continuation_candidates_via_web(
+    author_handle: str, root_tweet_id: str, root_caption: str
+) -> list[dict]:
+    """
+    Fallback discovery when Part 1 explicitly indicates a continuation (`1/2`, `①`, `Part 1`, `→`)
+    but `/2/thread/{id}` did not return child self-replies: searches `site:x.com/{handle}/status`
+    and verifies candidate tweets via FxTwitter (`replying_to_status` or matching `2/` / `②` marker).
+    """
+    if not author_handle:
+        return []
+
+    clean_cap = re.sub(r"https?://\S+", " ", root_caption or "")
+    clean_cap = re.sub(r"[【】\[\]()（）①②③④⑤1-9/0-9#]", " ", clean_cap)
+    keywords = [w.strip() for w in clean_cap.split() if len(w.strip()) >= 2][:3]
+    kw_str = " ".join(keywords)
+    q = f"site:x.com/{author_handle}/status {kw_str}".strip()
+
+    try:
+        search_res = await asyncio.to_thread(run_safe_web_search_sync, q, 5)
+    except Exception:
+        return []
+    if not search_res:
+        return []
+
+    found_ids = []
+    for m in re.finditer(
+        rf"https?://(?:www\.|mobile\.)?(?:x\.com|twitter\.com)/{re.escape(author_handle)}/status/(\d+)",
+        search_res,
+        re.IGNORECASE,
+    ):
+        cand_id = m.group(1)
+        if cand_id != root_tweet_id and cand_id not in found_ids:
+            found_ids.append(cand_id)
+
+    if not found_ids:
+        return []
+
+    tasks = [_fetch_single_x_tweet_normalized(author_handle, cid) for cid in found_ids[:3]]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    verified = []
+    for item in results:
+        if isinstance(item, dict) and item.get("id"):
+            verified.append(item)
+    return verified
+
+
+async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[str, list[str]]:
+    """
+    Resolves an X (Twitter) status URL AND automatically detects/reconstructs
+    directly connected self-reply continuation threads:
+      - Backward walk if the user pasted Part 2 / Part 3 (`replying_to_status` -> Part 1)
+      - Forward walk if the user pasted Part 1 (`1/...`, `①`, `Part 1`, `→`, or `replies > 0`)
+      - Merges captions chronologically (`[Part 1 Caption]`, `[Part 2 Caption]`, ...)
+      - Collects images across all parts in sequence, capped strictly at `MAX_BATCH_IMAGES` (10).
+    """
+    t0 = time.monotonic()
+    anchor_tweet = await _fetch_single_x_tweet_normalized(screen_name, tweet_id)
+    if not anchor_tweet:
+        api_log(f"Embed Link (X/Twitter API) -> fallback to Discord native embed for tweet={tweet_id}")
+        return "", []
+
+    author_handle = anchor_tweet["author_handle"] or screen_name
+    visited_ids: set[str] = {anchor_tweet["id"]}
+
+    # 1. Backward Parent Walk (if user pasted Part 2 or Part 3 directly)
+    parent_chain: list[dict] = []
+    curr = anchor_tweet
+    for _ in range(3):
+        p_id = curr.get("replying_to_status") or ""
+        p_to = (curr.get("replying_to") or "").lower()
+        if not p_id or p_id in visited_ids or (author_handle and p_to != author_handle.lower()):
+            break
+        parent_tweet = await _fetch_single_x_tweet_normalized(author_handle, p_id)
+        if not parent_tweet:
+            break
+        if author_handle and parent_tweet["author_handle"].lower() != author_handle.lower():
+            break
+        visited_ids.add(parent_tweet["id"])
+        parent_chain.append(parent_tweet)
+        curr = parent_tweet
+
+    parent_chain.reverse()
+    ordered_tweets: list[dict] = parent_chain + [anchor_tweet]
+
+    # 2. Forward Continuation Walk (Part 1 -> Part 2 -> Part 3 ...)
+    tail_tweet = ordered_tweets[-1]
+    has_forward_signal = bool(
+        _X_PART_1_SIGNAL_REGEX.search(tail_tweet["text"])
+        or any(_X_PART_1_SIGNAL_REGEX.search(t["text"]) for t in ordered_tweets)
+        or (tail_tweet["replies_count"] > 0 and len(tail_tweet["photos"]) >= 2)
+    )
+
+    if has_forward_signal and len(ordered_tweets) < 5:
+        thread_pool = await _fetch_x_thread_candidates_from_fxembed_v2(tail_tweet["id"], author_handle)
+        if not thread_pool and any(_X_PART_1_SIGNAL_REGEX.search(t["text"]) for t in ordered_tweets):
+            thread_pool = await _search_x_continuation_candidates_via_web(
+                author_handle, tail_tweet["id"], tail_tweet["text"]
+            )
+
+        # Follow strict `replying_to_status == curr_tail.id` self-reply links first
+        for _ in range(4):
+            if len(ordered_tweets) >= 5:
+                break
+            curr_tail = ordered_tweets[-1]
+            direct_children = [
+                cand for cand in thread_pool
+                if cand["id"] not in visited_ids
+                and (not author_handle or cand["author_handle"].lower() == author_handle.lower())
+                and cand.get("replying_to_status") == curr_tail["id"]
+            ]
+            # Secondary match: same-author reply to author with explicit Part 2 / ② / 2/N marker when parent ID was omitted
+            if not direct_children and _X_PART_1_SIGNAL_REGEX.search(curr_tail["text"]):
+                direct_children = [
+                    cand for cand in thread_pool
+                    if cand["id"] not in visited_ids
+                    and (not author_handle or cand["author_handle"].lower() == author_handle.lower())
+                    and _X_NEXT_PART_CAPTION_REGEX.search(cand["text"])
+                ]
+            if not direct_children:
+                break
+            direct_children.sort(
+                key=lambda x: (x.get("created_timestamp") or 0, int(x["id"]) if x["id"].isdigit() else 0)
+            )
+            next_part = direct_children[0]
+            visited_ids.add(next_part["id"])
+            ordered_tweets.append(next_part)
+
+    # 3. Merge Metadata & Photo URLs sequentially up to MAX_BATCH_IMAGES (10)
+    merged_photo_urls: list[str] = []
+    seen_photo_keys: set[str] = set()
+    for tw in ordered_tweets:
+        p_list = list(tw["photos"])
+        if not p_list and tw.get("quote") and tw["quote"].get("photos"):
+            p_list = list(tw["quote"]["photos"])
+        for pu in p_list:
+            dkey = _normalize_image_dedup_key(pu)
+            if pu and dkey not in seen_photo_keys and len(merged_photo_urls) < MAX_BATCH_IMAGES:
+                seen_photo_keys.add(dkey)
+                merged_photo_urls.append(pu)
+
+    primary = ordered_tweets[0]
+    a_disp = (
+        f"{primary['author_name']} (@{primary['author_handle']})"
+        if primary["author_handle"]
+        else primary["author_name"]
+    )
+
+    if len(ordered_tweets) == 1:
+        lines = [
+            f"Platform: X (Twitter) | Post URL: {primary['url']}",
+            f"Author / Artist: {a_disp}",
+            f"Post Caption / Title Text: {primary['text'] or '(No text caption)'}",
+        ]
+        if primary["created_at"]:
+            lines.append(f"Posted At: {primary['created_at']}")
+        if primary["likes"] is not None or primary["retweets"] is not None:
+            lines.append(f"Engagement: {primary['likes'] or 0} Likes | {primary['retweets'] or 0} Reposts")
+        q_obj = primary.get("quote")
+        if q_obj and q_obj.get("text"):
+            lines.append(f"Quoted Post (@{q_obj['handle']}):\n{q_obj['text']}")
+    else:
+        lines = [
+            f"Platform: X (Twitter) Multi-Part Thread ({len(ordered_tweets)} Connected Parts) | Root URL: {primary['url']}",
+            f"Author / Artist: {a_disp}",
+            f"Total Collected Images Across Thread: {len(merged_photo_urls)} (capped at {MAX_BATCH_IMAGES})",
+        ]
+        for idx, tw in enumerate(ordered_tweets, 1):
+            lines.append(
+                f"\n[Part {idx}/{len(ordered_tweets)} — {tw['url']} ({len(tw['photos'])} photo(s))]\n"
+                f"Caption: {tw['text'] or '(No text caption)'}"
+            )
+            q_obj = tw.get("quote")
+            if q_obj and q_obj.get("text"):
+                lines.append(f"Quoted Post (@{q_obj['handle']}): {q_obj['text']}")
+
+    api_log(
+        f"Embed Link (FxTwitter) -> tweet={tweet_id}, parts={len(ordered_tweets)}, "
+        f"photos={len(merged_photo_urls)} ({time.monotonic() - t0:.2f}s)"
+    )
+    return "\n".join(lines), merged_photo_urls
 
 
 async def _fetch_pixiv_artwork_info(illust_id: str) -> tuple[str, list[str]]:
@@ -455,7 +716,7 @@ async def _fetch_pixiv_artwork_info(illust_id: str) -> tuple[str, list[str]]:
                         p_data = await p_resp.json(content_type=None)
                         p_items = p_data.get("body") or []
                         extracted_pages = []
-                        for item in p_items[:6]:
+                        for item in p_items[:MAX_BATCH_IMAGES]:
                             u_map = (item.get("urls") or {}) if isinstance(item, dict) else {}
                             pu = u_map.get("regular") or u_map.get("small")
                             if pu:
@@ -479,7 +740,7 @@ async def _fetch_pixiv_artwork_info(illust_id: str) -> tuple[str, list[str]]:
         api_log(
             f"Embed Link (Pixiv AJAX) -> illust={illust_id}, pages={len(image_urls)} ({time.monotonic() - t0:.2f}s)"
         )
-        return "\n".join(lines), image_urls
+        return "\n".join(lines), image_urls[:MAX_BATCH_IMAGES]
     except Exception as e:
         api_log(f"Embed Link (Pixiv AJAX) -> skipped ({type(e).__name__})")
         return "", []
@@ -569,8 +830,9 @@ def _extract_native_discord_embeds_data(embeds: list[discord.Embed]) -> tuple[li
 async def collect_embedded_images_and_metadata(
     message: discord.Message,
     ref_msg: discord.Message | None = None,
-    max_images: int = 4,
+    max_images: int = MAX_BATCH_IMAGES,
 ) -> tuple[list[tuple[bytes, str, str]], list[str], set[str]]:
+    effective_cap = min(MAX_BATCH_IMAGES, max(1, max_images))
     downloaded_images: list[tuple[bytes, str, str]] = []
     metadata_sections: list[str] = []
     handled_urls: set[str] = set()
@@ -578,6 +840,8 @@ async def collect_embedded_images_and_metadata(
     seen_dedup_keys: set[str] = set()
 
     def _queue_img(u: str, referer: str = ""):
+        if len(candidate_image_urls) >= effective_cap:
+            return
         cu = clean_url(u)
         dkey = _normalize_image_dedup_key(cu)
         if cu and dkey not in seen_dedup_keys:
@@ -660,10 +924,10 @@ async def collect_embedded_images_and_metadata(
     if candidate_image_urls:
         tasks = [
             _download_remote_image_safe(img_u, referer=ref)
-            for img_u, ref in candidate_image_urls[:max_images]
+            for img_u, ref in candidate_image_urls[:effective_cap]
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        for (img_u, _), res in zip(candidate_image_urls[:max_images], results):
+        for (img_u, _), res in zip(candidate_image_urls[:effective_cap], results):
             if isinstance(res, tuple) and len(res) == 2:
                 raw_b, fname = res
                 downloaded_images.append((raw_b, fname, img_u))
@@ -963,7 +1227,10 @@ def _compress_image_for_vision_ocr_sync(raw_bytes: bytes, max_dim: int = 1280, q
 
 
 async def _call_gemini_multi_image_batch(
-    encoded_images: list[tuple[str, str, str]], batch_prompt: str, timeout_sec: int = 38
+    encoded_images: list[tuple[str, str, str]],
+    batch_prompt: str,
+    timeout_sec: int = 38,
+    max_output_tokens: int = 2048,
 ) -> str:
     if not GEMINI_API_KEY:
         return ""
@@ -976,7 +1243,7 @@ async def _call_gemini_multi_image_batch(
         "contents": [{"parts": parts}],
         "generationConfig": {
             "temperature": 0.1,
-            "maxOutputTokens": 2048,
+            "maxOutputTokens": max_output_tokens,
             "thinkingConfig": {"thinkingBudget": 0},
         },
     }
@@ -998,7 +1265,10 @@ async def _call_gemini_multi_image_batch(
 
 
 async def _call_cf_multi_image_batch(
-    encoded_images: list[tuple[str, str, str]], batch_prompt: str, timeout_sec: int = 32
+    encoded_images: list[tuple[str, str, str]],
+    batch_prompt: str,
+    timeout_sec: int = 32,
+    max_tokens: int = 2048,
 ) -> str:
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
         return ""
@@ -1023,7 +1293,7 @@ async def _call_cf_multi_image_batch(
             {"role": "user", "content": user_content},
         ],
         "temperature": 0.1,
-        "max_tokens": 2048,
+        "max_tokens": max_tokens,
         "chat_template_kwargs": {"enable_thinking": False},
     }
     t0 = time.monotonic()
@@ -1055,18 +1325,19 @@ async def extract_multi_images_batch_ocr(
     post_meta_hint: str = "",
 ) -> str:
     """
-    Inspects 2-4 sequential comic/illustration pages together in a SINGLE multimodal batch call
+    Inspects 2 to 10 sequential comic/illustration pages together in a SINGLE multimodal batch call
     with a staggered 18s hedged backup:
-    - Starts Gemini 3 Flash (`thinkingBudget: 0`, `832px` @ `q=80`) first.
-    - If Gemini hasn't returned by 18s, launches Cloudflare `@cf/google/gemma-4-26b-a4b-it`
-      multi-image batch in parallel and takes whichever finishes first, cancelling the slower task.
+    - Supports up to `MAX_BATCH_IMAGES` (10) images across multi-part X/Twitter threads.
+    - Starts Gemini 3 Flash (`thinkingBudget: 0`) first and launches Cloudflare Gemma 4 batch
+      as a hedged backup at 18s, taking whichever finishes first and cancelling the slower task.
     """
-    if len(images_list) < 2:
+    target_list = images_list[:MAX_BATCH_IMAGES]
+    if len(target_list) < 2:
         return ""
 
     batch_prompt = (
-        f"You are analyzing a sequential multi-image post/comic (Pages 1 to {len(images_list)}) for Yukino Yukinoshita.\n"
-        + (f"Post Metadata / Caption Context:\n{post_meta_hint[:1000]}\n\n" if post_meta_hint else "")
+        f"You are analyzing a sequential multi-image post/comic (Pages 1 to {len(target_list)}) for Yukino Yukinoshita.\n"
+        + (f"Post Metadata / Caption Context:\n{post_meta_hint[:1400]}\n\n" if post_meta_hint else "")
         + "Examine ALL pages together in sequence so you maintain strict character consistency across every page:\n"
         "1. [Series / Franchise & Character Identification]:\n"
         "   - State the Anime, Game, or Manga franchise and Character names ONLY if clearly supported by visual cues "
@@ -1078,11 +1349,16 @@ async def extract_multi_images_batch_ocr(
         "and key SFX in Japanese reading order tagged with the speaker."
     )
 
-    target_dim = 832 if len(images_list) >= 3 else 896
-    target_q = 80 if len(images_list) >= 3 else 84
+    n_imgs = len(target_list)
+    if n_imgs >= 5:
+        target_dim, target_q, out_tokens = 768, 76, 3072
+    elif n_imgs >= 3:
+        target_dim, target_q, out_tokens = 832, 80, 2048
+    else:
+        target_dim, target_q, out_tokens = 896, 84, 2048
 
     encoded_images: list[tuple[str, str, str]] = []
-    for raw_b, fname, _ in images_list[:4]:
+    for raw_b, fname, _ in target_list:
         try:
             b64_str, mime_type, _ = await asyncio.to_thread(
                 _compress_image_for_vision_ocr_sync, raw_b, target_dim, target_q
@@ -1096,57 +1372,70 @@ async def extract_multi_images_batch_ocr(
 
     has_gemini = bool(GEMINI_API_KEY)
     has_cf = bool(CF_ACCOUNT_ID and CF_API_TOKEN)
+    gemini_timeout = min(60, 26 + (4 * len(encoded_images)))
+    cf_timeout = min(45, 24 + (3 * len(encoded_images)))
 
-    if not has_gemini and has_cf:
-        return await _call_cf_multi_image_batch(encoded_images, batch_prompt, timeout_sec=35)
-    if has_gemini and not has_cf:
-        return await _call_gemini_multi_image_batch(encoded_images, batch_prompt, timeout_sec=42)
-    if not has_gemini and not has_cf:
-        return ""
-
-    gemini_task = asyncio.create_task(
-        _call_gemini_multi_image_batch(encoded_images, batch_prompt, timeout_sec=42)
-    )
-    done, _ = await asyncio.wait({gemini_task}, timeout=18.0)
-    if gemini_task in done:
-        try:
-            res = gemini_task.result()
-            if res:
-                return res
-        except Exception:
-            pass
-        # Gemini finished early with empty result -> run Cloudflare immediately
-        return await _call_cf_multi_image_batch(encoded_images, batch_prompt, timeout_sec=35)
-
-    # Hedge at 18s: launch Cloudflare multi-image batch in parallel and take FIRST_COMPLETED
-    api_log(f"Hedge (MultiImageOCR {len(encoded_images)}p) -> Gemini >18s; racing Cloudflare batch in parallel")
-    cf_task = asyncio.create_task(
-        _call_cf_multi_image_batch(encoded_images, batch_prompt, timeout_sec=35)
-    )
-    tasks = {gemini_task, cf_task}
     try:
-        while tasks:
-            done_set, pending_set = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for finished in done_set:
-                tasks.discard(finished)
-                try:
-                    out = finished.result()
-                except Exception:
-                    out = ""
-                if out:
-                    for p in pending_set:
-                        p.cancel()
-                    if pending_set:
-                        await asyncio.gather(*pending_set, return_exceptions=True)
-                    return out
-    finally:
-        for t in tasks:
-            if not t.done():
-                t.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        if not has_gemini and has_cf:
+            return await _call_cf_multi_image_batch(
+                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=out_tokens
+            )
+        if has_gemini and not has_cf:
+            return await _call_gemini_multi_image_batch(
+                encoded_images, batch_prompt, timeout_sec=gemini_timeout, max_output_tokens=out_tokens
+            )
+        if not has_gemini and not has_cf:
+            return ""
 
-    return ""
+        gemini_task = asyncio.create_task(
+            _call_gemini_multi_image_batch(
+                encoded_images, batch_prompt, timeout_sec=gemini_timeout, max_output_tokens=out_tokens
+            )
+        )
+        done, _ = await asyncio.wait({gemini_task}, timeout=18.0)
+        if gemini_task in done:
+            try:
+                res = gemini_task.result()
+                if res:
+                    return res
+            except Exception:
+                pass
+            return await _call_cf_multi_image_batch(
+                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=out_tokens
+            )
+
+        api_log(f"Hedge (MultiImageOCR {len(encoded_images)}p) -> Gemini >18s; racing Cloudflare batch in parallel")
+        cf_task = asyncio.create_task(
+            _call_cf_multi_image_batch(
+                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=out_tokens
+            )
+        )
+        tasks = {gemini_task, cf_task}
+        try:
+            while tasks:
+                done_set, pending_set = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for finished in done_set:
+                    tasks.discard(finished)
+                    try:
+                        out = finished.result()
+                    except Exception:
+                        out = ""
+                    if out:
+                        for p in pending_set:
+                            p.cancel()
+                        if pending_set:
+                            await asyncio.gather(*pending_set, return_exceptions=True)
+                        return out
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        return ""
+    finally:
+        encoded_images.clear()
 
 
 async def extract_image_via_transient_ocr(
@@ -1365,7 +1654,6 @@ async def extract_all_context(
             )
             continue
         try:
-            # Reuse preloaded bytes when available to avoid duplicate Discord CDN downloads
             if preloaded_attachments and att.id in preloaded_attachments:
                 raw_bytes = preloaded_attachments[att.id]
             else:
@@ -1406,7 +1694,7 @@ async def extract_all_context(
                     f"=== Attached Word Document: `{att.filename}` ===\n"
                     + await asyncio.to_thread(parse_docx_bytes, raw_bytes)
                 )
-            elif fname.endswith(IMAGE_EXTENSIONS) and len(image_att_batch) < 4:
+            elif fname.endswith(IMAGE_EXTENSIONS) and len(image_att_batch) < MAX_BATCH_IMAGES:
                 image_att_batch.append((raw_bytes, att.filename, ""))
             raw_bytes = None
         except Exception as e:
@@ -1437,17 +1725,15 @@ async def extract_all_context(
         image_att_batch.clear()
 
     embed_images, embed_meta_sections, handled_social_urls = await collect_embedded_images_and_metadata(
-        message, ref_msg=ref_msg, max_images=max(1, 4 - processed_image_count)
+        message, ref_msg=ref_msg, max_images=max(1, MAX_BATCH_IMAGES - processed_image_count)
     )
     for meta_sec in embed_meta_sections:
         blocks.append(meta_sec)
 
-    if embed_images and processed_image_count < 4:
-        remaining_slots = 4 - processed_image_count
+    if embed_images and processed_image_count < MAX_BATCH_IMAGES:
+        remaining_slots = MAX_BATCH_IMAGES - processed_image_count
         target_embed_imgs = embed_images[:remaining_slots]
         meta_hint = "\n".join(embed_meta_sections)
-        # Only skip reverse lookups when an authoritative social API (FxTwitter/Pixiv/Bluesky) already resolved the post;
-        # generic Discord link embeds still get reverse-image lookups on the first 2 images.
         has_authoritative_social_meta = any(s.startswith("=== Embedded ") for s in embed_meta_sections)
         batch_done = False
 
@@ -1463,7 +1749,7 @@ async def extract_all_context(
         if not batch_done:
             total_emb_imgs = len(target_embed_imgs)
             for idx, (emb_bytes, emb_fname, emb_url) in enumerate(target_embed_imgs, 1):
-                if processed_image_count >= 4:
+                if processed_image_count >= MAX_BATCH_IMAGES:
                     break
                 processed_image_count += 1
                 try:
