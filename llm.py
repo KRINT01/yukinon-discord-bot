@@ -132,7 +132,7 @@ def _adapt_gemini_thinking_config_for_model(payload: dict, model_id: str) -> dic
          - Strips `temperature`, `topP`, `topK` (Hydrogen ignores/rejects custom sampling params).
          - Raises `maxOutputTokens` to `65536` (shared 1M unified input+thinking+output window).
          - Uses `thinkingLevel` (`LOW`, `MEDIUM`, `HIGH`, `XHIGH`; rejects `MINIMAL`).
-      2) `gemini-3.1-flash-lite`, `gemini-3.5-flash-lite`, `gemini-3-flash-preview`, `gemini-3.6-flash`:
+      2) `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-3-flash-preview`, `gemini-3.6-flash`:
          - Uses `thinkingLevel` (`MINIMAL`, `LOW`, `MEDIUM`, `HIGH`) and removes legacy `thinkingBudget`.
       3) `gemini-3.8-flash` / `gemini-3.7-flash`:
          - Uses `thinkingLevel` (`LOW`, `MEDIUM`, `HIGH`; never `MINIMAL`).
@@ -605,17 +605,19 @@ async def discover_active_gemma_models(vision_required: bool = False) -> list[st
 async def _discover_active_gemini_flash_model(force_remote: bool = False) -> list[str]:
     """
     Deterministic priority order for Gemini Flash models:
-      1. `gemini-3.1-flash-lite` (Primary — highest throughput & reliability)
-      2. `gemini-3.5-flash-lite` (Secondary Flash-Lite fallback)
+      1. `gemini-3.5-flash-lite` (Primary — highest throughput & reliability)
+      2. `gemini-3.1-flash-lite` (Secondary Flash-Lite fallback)
       3. `gemini-3-flash-preview` (Tertiary Flash Preview fallback)
+      4. `gemini-3.6-flash` (Quaternary Flash fallback)
     """
     global _GEMINI_DISCOVERED_MODELS_CACHE, _GEMINI_MODELS_LAST_FETCH_TS
     now = time.time()
 
     preferred_seed = [
-        "gemini-3.1-flash-lite",
         "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
         "gemini-3-flash-preview",
+        "gemini-3.6-flash",
         GEMINI_SEARCH_MODEL,
         GEMINI_FALLBACK_MODEL,
         GEMINI_PREVIEW_MODEL,
@@ -852,7 +854,7 @@ async def call_gemini_generate_content_self_healing(
 ) -> dict | None:
     """
     Deterministic, bounded Gemini Flash caller:
-      `gemini-3.1-flash-lite` -> `gemini-3.5-flash-lite` -> `gemini-3-flash-preview`
+      `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> `gemini-3-flash-preview`
     with `thinkingLevel` normalization, short cooldowns on transient 503/timeout, and strict wall-time caps.
     """
     if not GEMINI_API_KEY:
@@ -1600,7 +1602,7 @@ async def query_local_ollama_chat(
             target_temp = 0.2 if (did_search or is_user_correction) else temperature
 
             if is_japanese_or_social_media:
-                # Tier 1: `gemini-3.1-flash-lite` -> `gemini-3.5-flash-lite` -> `gemini-3-flash-preview`
+                # Tier 1: `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> `gemini-3-flash-preview`
                 if GEMINI_API_KEY:
                     ans = await call_gemini_chat_messages(
                         messages,

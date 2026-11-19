@@ -70,12 +70,12 @@ CF_VISION_MODEL = os.getenv("CF_VISION_MODEL", "@cf/google/gemma-4-26b-a4b-it").
 CF_CODE_MODEL = os.getenv("CF_CODE_MODEL", "@cf/openai/gpt-oss-120b").strip()
 CF_CHAT_FAST_MODEL = os.getenv("CF_CHAT_FAST_MODEL", "@cf/openai/gpt-oss-20b").strip()
 
-# Google AI Studio Free Tier (Decisions API + Gemini 3.1 Flash-Lite -> 3.5 Flash-Lite -> 3 Flash Preview + Hydrogen + Gemma 4 + Live STT)
+# Google AI Studio Free Tier (Decisions API + Gemini 3.5 Flash-Lite -> 3.1 Flash-Lite -> 3 Flash Preview + Hydrogen + Gemma 4 + Live STT)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_DECISION_MODEL = os.getenv("GEMINI_DECISION_MODEL", "gemini-decision-1").strip()
 GEMINI_HEAVY_MODEL = os.getenv("GEMINI_HEAVY_MODEL", "gemini-4-hydrogen").strip()
-GEMINI_SEARCH_MODEL = os.getenv("GEMINI_SEARCH_MODEL", "gemini-3.1-flash-lite").strip()
-GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite").strip()
+GEMINI_SEARCH_MODEL = os.getenv("GEMINI_SEARCH_MODEL", "gemini-3.5-flash-lite").strip()
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite").strip()
 GEMINI_PREVIEW_MODEL = os.getenv("GEMINI_PREVIEW_MODEL", "gemini-3-flash-preview").strip()
 GEMINI_TRANSCRIBE_LIVE_MODEL = os.getenv("GEMINI_TRANSCRIBE_LIVE_MODEL", "gemini-3.5-transcribe-live").strip()
 GEMMA_CHAT_MODEL = os.getenv("GEMMA_CHAT_MODEL", "gemma-4-31b-it").strip()
@@ -134,7 +134,7 @@ class RuntimeState:
         self.bot = None
         self.http_session: aiohttp.ClientSession | None = None
         self.has_voice_recv: bool = False
-        self.active_gemini_model: str = "gemini-3.1-flash-lite"
+        self.active_gemini_model: str = "gemini-3.5-flash-lite"
         self.active_gemma_model: str = GEMMA_CHAT_MODEL
         self.active_groq_search_model: str = GROQ_SEARCH_MODEL
         self.active_groq_vision_model: str = GROQ_VISION_FALLBACK_MODEL
