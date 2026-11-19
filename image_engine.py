@@ -51,6 +51,71 @@ _FLASH_LITE_DISCOVERY_CACHE: list[str] = []
 _FLASH_LITE_DISCOVERY_TS: float = 0.0
 _FLASH_LITE_EXCLUDED = ("2.5", "2.0", "1.5", "latest", "image", "tts", "audio", "live", "embedding")
 
+# Strict JSON responseSchema for Gemini models so `box_2d` is ALWAYS emitted as a 4-integer [ymin, xmin, ymax, xmax] array
+MANGA_BATCH_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "pages": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "page_index": {"type": "INTEGER"},
+                    "summary": {"type": "STRING"},
+                    "bubbles": {
+                        "type": "ARRAY",
+                        "items": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "id": {"type": "INTEGER"},
+                                "speaker_or_note": {"type": "STRING"},
+                                "panel_position": {"type": "STRING"},
+                                "source_text": {"type": "STRING"},
+                                "translated_text": {"type": "STRING"},
+                                "box_2d": {
+                                    "type": "ARRAY",
+                                    "items": {"type": "INTEGER"},
+                                    "nullable": True,
+                                },
+                            },
+                            "required": ["id", "speaker_or_note", "source_text", "translated_text", "box_2d"],
+                        },
+                    },
+                },
+                "required": ["page_index", "summary", "bubbles"],
+            },
+        }
+    },
+    "required": ["pages"],
+}
+
+MANGA_SINGLE_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "summary": {"type": "STRING"},
+        "bubbles": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "id": {"type": "INTEGER"},
+                    "speaker_or_note": {"type": "STRING"},
+                    "panel_position": {"type": "STRING"},
+                    "source_text": {"type": "STRING"},
+                    "translated_text": {"type": "STRING"},
+                    "box_2d": {
+                        "type": "ARRAY",
+                        "items": {"type": "INTEGER"},
+                        "nullable": True,
+                    },
+                },
+                "required": ["id", "speaker_or_note", "source_text", "translated_text", "box_2d"],
+            },
+        },
+    },
+    "required": ["summary", "bubbles"],
+}
+
 # Garuda-Bold MUST come first because NotoSansThai-Bold on Debian/Ubuntu lacks ASCII '.', '!', '?', "'", '-', '0-9'
 MANGA_THAI_FONT_CANDIDATES = (
     "/usr/share/fonts/truetype/tlwg/Garuda-Bold.ttf",
@@ -510,7 +575,6 @@ def _sanitize_text_for_manga_font(text: str) -> str:
         .replace("？", "?")
     )
     s = re.sub(r"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\U00010000-\U0010FFFF]", "", s)
-    # Remove empty parentheses/brackets left behind after stripping CJK furigana (e.g. 'ซานไห่จิง ()')
     s = re.sub(r"\(\s*\)|\[\s*\]|'\s*'", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -588,6 +652,61 @@ async def _discover_manga_batch_models() -> list[tuple[str, bool]]:
     return chain
 
 
+def _extract_norm_box_2d(raw_box) -> list[float] | None:
+    """
+    Flexibly parses bounding boxes returned in any VLM format:
+      - Flat 4-element list/tuple: `[ymin, xmin, ymax, xmax]`
+      - Nested 1-element list: `[[ymin, xmin, ymax, xmax]]`
+      - Dict: `{"ymin": ..., "xmin": ..., "ymax": ..., "xmax": ...}` (or `y_min`/`top`/`y1` variants)
+      - String containing 4 numbers
+    Also auto-scales `[0.0..1.0]` normalized floats up to `[0..1000]` so boxes never collapse to 0px!
+    """
+    if raw_box is None:
+        return None
+
+    coords: list[float] | None = None
+    if isinstance(raw_box, (list, tuple)):
+        if len(raw_box) == 1 and isinstance(raw_box[0], (list, tuple)) and len(raw_box[0]) == 4:
+            raw_box = raw_box[0]
+        if len(raw_box) == 4:
+            try:
+                coords = [float(v) for v in raw_box]
+            except Exception:
+                coords = None
+    elif isinstance(raw_box, dict):
+        lower_d = {str(k).lower(): v for k, v in raw_box.items()}
+        y1 = lower_d.get("ymin", lower_d.get("y_min", lower_d.get("top", lower_d.get("y1"))))
+        x1 = lower_d.get("xmin", lower_d.get("x_min", lower_d.get("left", lower_d.get("x1"))))
+        y2 = lower_d.get("ymax", lower_d.get("y_max", lower_d.get("bottom", lower_d.get("y2"))))
+        x2 = lower_d.get("xmax", lower_d.get("x_max", lower_d.get("right", lower_d.get("x2"))))
+        if None not in (y1, x1, y2, x2):
+            try:
+                coords = [float(y1), float(x1), float(y2), float(x2)]
+            except Exception:
+                coords = None
+    elif isinstance(raw_box, str):
+        nums = re.findall(r"-?\d+(?:\.\d+)?", raw_box)
+        if len(nums) == 4:
+            try:
+                coords = [float(v) for v in nums]
+            except Exception:
+                coords = None
+
+    if not coords or len(coords) != 4:
+        return None
+
+    # Auto-convert [0.0..1.0] normalized float coordinates to [0..1000] scale
+    if all(0.0 <= v <= 1.0 for v in coords) and max(coords) > 0.0:
+        coords = [v * 1000.0 for v in coords]
+
+    # Reject degenerate/zero-area boxes
+    ymin, xmin, ymax, xmax = coords
+    if abs(ymax - ymin) < 2.0 or abs(xmax - xmin) < 2.0:
+        return None
+
+    return coords
+
+
 def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
     valid = []
     for idx, item in enumerate(raw_bubbles, 1):
@@ -629,19 +748,16 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
         spk_lower = str(speaker).strip().lower()
         is_sfx = any(k in spk_lower for k in ("sfx", "sound effect", "onomatopoeia", "เอฟเฟกต์"))
 
-        box = item.get("box_2d") or item.get("bbox") or item.get("box")
-        norm_box = None
-        if not is_sfx:
-            if isinstance(box, (list, tuple)) and len(box) == 4:
-                try:
-                    norm_box = [float(v) for v in box]
-                except Exception:
-                    norm_box = None
-            elif isinstance(box, str):
-                nums = re.findall(r"-?\d+(?:\.\d+)?", box)
-                if len(nums) == 4:
-                    norm_box = [float(v) for v in nums]
-
+        raw_box = (
+            item.get("box_2d")
+            or item.get("bbox")
+            or item.get("bbox_2d")
+            or item.get("bounding_box")
+            or item.get("box")
+            or item.get("coordinates")
+            or item.get("rect")
+        )
+        norm_box = None if is_sfx else _extract_norm_box_2d(raw_box)
         panel_pos = str(item.get("panel_position") or "").strip().lower()
 
         valid.append({
@@ -746,6 +862,8 @@ async def extract_and_translate_manga_pages_batch(
         `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> (newer discovered `flash-lite`)
         -> `gemma-4-31b-it` -> `gemma-4-26b-a4b-it`
         NEVER falls back to per-page `MangaSingle`!
+      - Enforces `MANGA_BATCH_RESPONSE_SCHEMA` on Gemini models and verifies `total_boxes > 0`
+        before accepting a response so boxless outputs never skip image rendering!
     Returns `(results, is_service_unavailable)`.
     """
     num_pages = len(pages_input)
@@ -761,7 +879,6 @@ async def extract_and_translate_manga_pages_batch(
     if not GEMINI_API_KEY:
         return [([], "") for _ in range(num_pages)], True
 
-    # Fast 1-pass vision resolution (960px for 9-12p, 1080px for 5-8p, 1280px for 2-4p)
     if num_pages >= 9:
         batch_dim, batch_q = 960, 82
     elif num_pages >= 5:
@@ -796,9 +913,9 @@ CRITICAL COMPLETENESS, NAME ACCURACY & BOUNDING-BOX RULES:
    - Adapt idioms, pronouns, tone, and emotion so the dialogue sounds natural in {target_lang_name} while fitting inside a speech bubble.
    - Use standard ASCII punctuation (`...`, `~`, `-`, single quotes `'`).
    - When translating to English, preserve Japanese honorifics attached directly with a hyphen and NO space (`-san`, `-kun`, `-chan`, `-sama`, `-sensei`, `-senpai`).
-3. Spatial Anchor & Bounding Boxes (`panel_position` + `box_2d`) — STRICT ALIGNMENT RULES:
-   - First identify `panel_position` on that specific page (`"top-right"`, `"top-left"`, `"middle-right"`, `"middle-left"`, `"bottom-right"`, `"bottom-left"`), then output `box_2d` (`[ymin, xmin, ymax, xmax]`, normalized 0..1000 relative to THAT single page).
-   - Provide `box_2d` for EVERY dialogue bubble, thought bubble, and narration/monologue caption box!
+3. Spatial Anchor & Bounding Boxes (`panel_position` + `box_2d`) — MANDATORY FOR IN-BUBBLE RENDERING:
+   - First identify `panel_position` on that specific page (`"top-right"`, `"top-left"`, `"middle-right"`, `"middle-left"`, `"bottom-right"`, `"bottom-left"`), then output `box_2d` as 4 INTEGERS `[ymin, xmin, ymax, xmax]` in `0..1000` scale relative to THAT single page.
+   - You MUST provide a non-null `[ymin, xmin, ymax, xmax]` `box_2d` for EVERY dialogue bubble, thought bubble, and narration/monologue caption box!
    - `box_2d` MUST tightly enclose the ENTIRE Japanese text block INSIDE that specific bubble (including all vertical columns in a multi-column caption box) — NEVER shift `box_2d` into a different panel, empty background, panel gutters, or character heads/bodies!
    - ONLY set `"box_2d": null` for floating handwritten SFX / sound effects (e.g. ドーン, トスッ, ポスン, ムチッ, スラ〜〜) or tiny unenclosed whispers drawn directly over a character's body/shirt outside a speech bubble!
    - NEVER merge two separate speech bubbles into a single `box_2d` and NEVER assign the same `box_2d` to two different bubbles!
@@ -815,13 +932,15 @@ CRITICAL COMPLETENESS, NAME ACCURACY & BOUNDING-BOX RULES:
           "panel_position": "top-right",
           "source_text": "Original Japanese text",
           "translated_text": "Natural {target_lang_name} translation",
-          "box_2d": [ymin, xmin, ymax, xmax]
+          "box_2d": [120, 450, 280, 620]
         }}
       ]
     }}
   ]
 }}
 """.strip()
+
+    fallback_text_only_results = None
 
     try:
         parts = [{"text": manga_batch_instruction}]
@@ -851,6 +970,7 @@ CRITICAL COMPLETENESS, NAME ACCURACY & BOUNDING-BOX RULES:
             }
             if not is_gemma:
                 gen_cfg["thinkingConfig"] = {"thinkingLevel": "LOW"}
+                gen_cfg["responseSchema"] = MANGA_BATCH_RESPONSE_SCHEMA
 
             payload = {"contents": [{"parts": parts}], "generationConfig": gen_cfg}
             max_attempts = 2
@@ -879,29 +999,51 @@ CRITICAL COMPLETENESS, NAME ACCURACY & BOUNDING-BOX RULES:
                                 if p.get("text") and not p.get("thought", False)
                             ).strip()
                             batch_results = _parse_manga_pages_batch_json(raw_json_str, num_pages)
-                            if any(bubbles or summary for bubbles, summary in batch_results):
-                                total_b = sum(len(b) for b, _ in batch_results)
+                            total_b = sum(len(b) for b, _ in batch_results)
+                            total_boxes = sum(
+                                1 for b_list, _ in batch_results for b in b_list
+                                if isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4
+                            )
+                            if total_b > 0 and total_boxes > 0:
                                 label = "Gemma AI Studio" if is_gemma else "Gemini"
-                                api_log(f"{label} (MangaBatch({num_pages}p)) -> {model_id} 200 OK ({elapsed:.2f}s)")
+                                api_log(
+                                    f"{label} (MangaBatch({num_pages}p)) -> {model_id} 200 OK "
+                                    f"({elapsed:.2f}s, {total_boxes}/{total_b} boxes)"
+                                )
                                 print(
                                     f"[Manga Vision Batch] Completed {num_pages} page(s) in 1 request via "
-                                    f"{model_id} - {total_b} total bubbles",
+                                    f"{model_id} - {total_b} total bubbles ({total_boxes} with box_2d)",
                                     flush=True,
                                 )
                                 return batch_results, False
+
+                            if total_b > 0 and total_boxes == 0:
+                                if fallback_text_only_results is None:
+                                    fallback_text_only_results = batch_results
+                                api_log(
+                                    f"MangaBatch({num_pages}p) -> {model_id} returned {total_b} bubbles "
+                                    f"with 0 valid box_2d ({elapsed:.2f}s); trying next model"
+                                )
+                                break
+
                             api_log(f"MangaBatch({num_pages}p) -> {model_id} returned empty JSON; trying next model")
                             break
 
                         # Handle unsupported config fields cleanly before moving to next model
                         if status == 400 and attempt == 0:
-                            if "thinkingConfig" in body_text and "thinkingConfig" in payload["generationConfig"]:
+                            changed = False
+                            if "responseSchema" in payload["generationConfig"] and ("schema" in body_text.lower() or "responseSchema" in body_text):
+                                payload["generationConfig"].pop("responseSchema", None)
+                                changed = True
+                            if "thinkingConfig" in payload["generationConfig"] and "thinkingConfig" in body_text:
                                 payload["generationConfig"].pop("thinkingConfig", None)
-                                continue
+                                changed = True
                             if is_gemma and "responseMimeType" in payload["generationConfig"]:
                                 payload["generationConfig"].pop("responseMimeType", None)
+                                changed = True
+                            if changed:
                                 continue
 
-                        # Brief 1.5s retry once on transient 503 overload
                         if status == 503 and attempt == 0 and (max_wall_budget - (time.monotonic() - wall_start)) > 20.0:
                             api_log(f"MangaBatch({num_pages}p) -> {model_id} HTTP 503 ({elapsed:.2f}s); retrying once")
                             await asyncio.sleep(1.5)
@@ -917,7 +1059,9 @@ CRITICAL COMPLETENESS, NAME ACCURACY & BOUNDING-BOX RULES:
     finally:
         b64_pages.clear()
 
-    # All models in the MangaBatch chain failed or timed out — do NOT fall back to MangaSingle!
+    if fallback_text_only_results is not None:
+        return fallback_text_only_results, False
+
     return [([], "") for _ in range(num_pages)], True
 
 
@@ -974,12 +1118,8 @@ def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
             re.DOTALL,
         )
         pos_m = re.search(r'"panel_position"\s*:\s*"([^"]+)"', block)
-        box_m = re.search(r'"(?:box_2d|bbox|box)"\s*:\s*\[([^\]]+)\]', block)
-        norm_box = None
-        if box_m:
-            nums = re.findall(r"-?\d+(?:\.\d+)?", box_m.group(1))
-            if len(nums) == 4:
-                norm_box = [float(v) for v in nums]
+        box_m = re.search(r'"(?:box_2d|bbox|bbox_2d|bounding_box|box)"\s*:\s*\[([^\]]+)\]', block)
+        norm_box = _extract_norm_box_2d(box_m.group(1)) if box_m else None
 
         raw_tr_val = tr_m.group(1).replace('\\"', '"').strip()
         extracted_bubbles.append({
@@ -1022,9 +1162,9 @@ CRITICAL RULES:
    - Keep character names, titles/ranks, and faction names consistent with the post context above and accurate Japanese phonetics.
    - Use standard ASCII punctuation (`...`, `~`, `-`, single quotes `'`).
    - When translating to English, preserve Japanese honorifics attached directly with a hyphen and NO space (`-san`, `-kun`, `-chan`, `-sama`, `-sensei`, `-senpai`).
-3. Spatial Anchor & Bounding Boxes (`panel_position` + `box_2d`) — STRICT ALIGNMENT RULES:
-   - First identify `panel_position` (`"top-right"`, `"top-left"`, `"middle-right"`, `"middle-left"`, `"bottom-right"`, `"bottom-left"`), then output `box_2d` (`[ymin, xmin, ymax, xmax]`, normalized 0..1000).
-   - Provide `box_2d` for EVERY dialogue bubble, thought bubble, and narration/monologue caption box!
+3. Spatial Anchor & Bounding Boxes (`panel_position` + `box_2d`) — MANDATORY FOR IN-BUBBLE RENDERING:
+   - First identify `panel_position` (`"top-right"`, `"top-left"`, `"middle-right"`, `"middle-left"`, `"bottom-right"`, `"bottom-left"`), then output `box_2d` as 4 INTEGERS `[ymin, xmin, ymax, xmax]` in `0..1000` scale.
+   - You MUST provide a non-null `[ymin, xmin, ymax, xmax]` `box_2d` for EVERY dialogue bubble, thought bubble, and narration/monologue caption box!
    - `box_2d` MUST tightly enclose the ENTIRE Japanese text block INSIDE that specific bubble (including all vertical columns in a multi-column caption box) — NEVER shift into a different panel, empty background, or character heads/bodies!
    - ONLY set `"box_2d": null` for floating handwritten SFX / sound effects or tiny unenclosed whispers drawn directly over a character's body/shirt outside a speech bubble!
    - NEVER merge two separate speech bubbles into a single `box_2d` and NEVER assign the same `box_2d` to two different bubbles!
@@ -1038,7 +1178,7 @@ CRITICAL RULES:
       "panel_position": "top-right",
       "source_text": "Original Japanese text",
       "translated_text": "Natural {target_lang_name} translation",
-      "box_2d": [ymin, xmin, ymax, xmax]
+      "box_2d": [120, 450, 280, 620]
     }}
   ]
 }}
@@ -1060,6 +1200,7 @@ CRITICAL RULES:
             "generationConfig": {
                 "temperature": 0.1,
                 "responseMimeType": "application/json",
+                "responseSchema": MANGA_SINGLE_RESPONSE_SCHEMA,
                 "thinkingConfig": {"thinkingLevel": "LOW"},
             },
         }
@@ -1080,11 +1221,15 @@ CRITICAL RULES:
                 ).strip()
                 bubbles, summary = _parse_manga_bubbles_json(raw_json_str)
                 if bubbles:
-                    print(
-                        f"[Manga Vision] Completed via Tier 1 Gemini ({state.active_gemini_model}) "
-                        f"- {len(bubbles)} bubbles"
-                    )
-                    return bubbles, summary
+                    has_boxes = any(isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4 for b in bubbles)
+                    if has_boxes:
+                        print(
+                            f"[Manga Vision] Completed via Tier 1 Gemini ({state.active_gemini_model}) "
+                            f"- {len(bubbles)} bubbles"
+                        )
+                        return bubbles, summary
+                    fallback_bubbles_no_boxes = bubbles
+                    fallback_summary = summary
         except Exception as e:
             print(f"Gemini Manga Vision warning ({type(e).__name__}): {e}")
 
@@ -1109,8 +1254,9 @@ CRITICAL RULES:
                 if has_boxes_and_text:
                     print(f"[Manga Vision] Completed via Tier 2 AI Studio Gemma 4 - {len(bubbles)} bubbles", flush=True)
                     return bubbles, summary
-                fallback_bubbles_no_boxes = bubbles
-                fallback_summary = summary
+                if not fallback_bubbles_no_boxes:
+                    fallback_bubbles_no_boxes = bubbles
+                    fallback_summary = summary
     except Exception as e:
         print(f"AI Studio Gemma 4 Manga Vision warning: {e}", flush=True)
 
@@ -1884,9 +2030,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
 
         # =====================================================================
         # CASE C: BORDER-TOUCHING WHITE OR SEMI-TRANSPARENT MIST BUBBLE
-        # (Strict `mean_sat < 10.0` rejects pale skin/hands/walls, while expanding
-        #  the erase margin ±14px vertically inside white-surrounded paper to
-        #  clean overhanging Japanese characters cleanly!)
         # =====================================================================
         tx_b1 = max(2, rx1_rel - 4)
         ty_b1 = max(2, ry1_rel - 4)
@@ -1925,7 +2068,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
         )
 
         if is_valid_pure_white or is_valid_mist_bubble:
-            # Expand erase clamp slightly (±14px Y, ±8px X) clipped against peer bubbles to catch overhanging strokes
             exp_x1 = max(2, max(peer_clip_x1 - wx1, rx1_rel - 8))
             exp_y1 = max(2, max(peer_clip_y1 - wy1, ry1_rel - 14))
             exp_x2 = min(ww - 2, min(peer_clip_x2 - wx1, rx2_rel + 8))
@@ -1943,7 +2085,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
             text_ink_mask.close()
 
             if is_valid_pure_white:
-                # Only erase ink surrounded by white paper (protects solid dark panel borders)
                 local_max = sub_gray.filter(ImageFilter.MaxFilter(7))
                 white_zone = local_max.point(lambda p: 255 if p >= 235 else 0)
                 local_max.close()
@@ -2136,6 +2277,10 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
             prepared_renders.append([lx1, ly1, lx2, ly2, fg_text, stroke_col, trans_text, hard_bounds])
 
         if not prepared_renders:
+            print(
+                f"[Manga Render] 0/{len(valid_boxes)} boxes passed bubble filter on {width}x{height} page",
+                flush=True,
+            )
             return None
 
         prepared_renders = _resolve_box_collisions(prepared_renders, min_gap=6)
@@ -2343,6 +2488,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
 
             await asyncio.sleep(0.25)
 
+        print(f"[Manga Render] Rendered {len(discord_files)}/{num_pages} translated image(s)", flush=True)
         transcript_text = "\n".join(transcript_lines)
 
         if discord_files:
