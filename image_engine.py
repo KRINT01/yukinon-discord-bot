@@ -528,6 +528,7 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
 
         box = item.get("box_2d") or item.get("bbox") or item.get("box")
         norm_box = None
+        # Never place box_2d on floating SFX over characters/artwork (keep SFX in text transcript only)
         if not is_sfx:
             if isinstance(box, (list, tuple)) and len(box) == 4:
                 try:
@@ -550,6 +551,10 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
 
 
 def _repair_truncated_manga_batch_json(raw_target: str) -> dict | None:
+    """
+    Recovers completed page objects if an 8-12 page batch JSON hit maxOutputTokens
+    mid-way through the final page so valid pages are never discarded.
+    """
     if '"pages"' not in raw_target:
         return None
     last_close_brace = raw_target.rfind("}")
@@ -624,34 +629,42 @@ def _parse_manga_pages_batch_json(
     return [([], "") for _ in range(expected_pages)]
 
 
-async def _run_manga_mini_batch_call(
-    chunk_pages: list[tuple[bytes, str]],
-    target_lang_name: str,
-    page_offset: int,
-    total_pages: int,
+async def extract_and_translate_manga_pages_batch(
+    pages_input: list[tuple[bytes, str]], target_lang_name: str
 ) -> list[tuple[list[dict], str]]:
     """
-    Processes a focused mini-batch of 2..4 pages at crisp 1024px resolution with
-    `gemini-3.1-flash-lite` (`thinkingLevel: "LOW"`) so spatial `box_2d` coordinates
-    never drift across pages or land outside speech bubbles.
+    Processes 1 to 12 manga pages (including multi-part X/Twitter threads) in a SINGLE unified
+    multimodal batch call (matching `image_engine_v8.py` architecture):
+      - Tier 1: `gemini-4-hydrogen` (`thinkingLevel: "LOW"`, `maxOutputTokens: 65536`, no sampling params)
+      - Tier 2: `gemini-3.1-flash-lite` -> `gemini-3.5-flash-lite` (`thinkingLevel: "LOW"`, `maxOutputTokens: 16384`)
+      - Tier 3: Concurrent `Semaphore(2)` per-page fallback
     """
-    chunk_len = len(chunk_pages)
-    batch_dim = 1080 if chunk_len <= 3 else 1024
-    batch_q = 88 if chunk_len <= 3 else 85
+    num_pages = len(pages_input)
+    if num_pages == 0:
+        return []
+
+    if num_pages == 1:
+        b, s = await extract_and_translate_manga_bubbles(pages_input[0][0], pages_input[0][1], target_lang_name)
+        return [(b, s)]
+
+    if num_pages >= 9:
+        batch_dim, batch_q = 832, 78
+    elif num_pages >= 5:
+        batch_dim, batch_q = 928, 82
+    else:
+        batch_dim, batch_q = 1080, 88
 
     b64_pages = []
-    for raw_b, fname in chunk_pages:
+    for raw_b, fname in pages_input:
         b64_str = await asyncio.to_thread(_prepare_manga_image_for_vision, raw_b, batch_dim, batch_q)
         b64_pages.append((b64_str, fname))
 
     mime_type = "image/jpeg"
-    start_p = page_offset + 1
-    end_p = page_offset + chunk_len
 
     manga_batch_instruction = f"""
 You are a professional Manga, Manhwa, and Comic Localizer.
-You are given {chunk_len} sequential manga page image(s) (Pages {start_p} to {end_p} of {total_pages}, labeled LOCAL PAGE 1 to LOCAL PAGE {chunk_len}).
-Analyze all pages in sequence so character names, pronouns, tone, and ongoing story stay consistent,
+You are given {num_pages} sequential manga page image(s) (labeled PAGE 1 to PAGE {num_pages}).
+Analyze all pages together in sequence so series title, character names, pronouns, tone, and ongoing story stay consistent across pages,
 and translate ALL speech bubbles, narration boxes, and SFX on every page into natural, idiomatic {target_lang_name}.
 
 CRITICAL RULES:
@@ -659,17 +672,17 @@ CRITICAL RULES:
 2. In-Context Localization & Honorifics:
    - Adapt idioms, pronouns, tone, and emotion so the dialogue sounds natural in {target_lang_name} while fitting inside a speech bubble. Do NOT use double quotes inside `translated_text` (use single quotes if needed).
    - When translating to English, ALWAYS preserve Japanese honorifics attached directly with a hyphen and NO space (translate さん as `-san`, くん/君 as `-kun`, ちゃん as `-chan`, 様/さま as `-sama`, 先生 as `-sensei`, 先輩 as `-senpai`).
-3. Speech Bubble Bounding Boxes (`box_2d`) — STRICT SPATIAL ACCURACY RULES:
-   - Provide `box_2d` (`[ymin, xmin, ymax, xmax]`, normalized 0..1000) ONLY for text enclosed inside an actual white or black speech bubble / caption box!
-   - `box_2d` MUST tightly enclose the Japanese text INSIDE the speech bubble (never point to empty white margin outside the bubble, and NEVER place `box_2d` over a character's face, hair, body, or background artwork!).
-   - For floating SFX / sound effects (e.g. ドーン, スラ〜〜, ほう…？) OR tiny unenclosed whispers/labels outside a speech bubble, ALWAYS set `"box_2d": null` so the artwork/character is NEVER overwritten!
-   - NEVER merge two separate speech bubbles into a single `box_2d`! Keep each speech bubble strictly separate.
-4. Return ONLY valid JSON matching this exact structure for all {chunk_len} page(s) (`page_index` 1..{chunk_len}):
+3. Speech Bubble Bounding Boxes (`box_2d`) — STRICT PLACEMENT RULES:
+   - ONLY provide `box_2d` (`[ymin, xmin, ymax, xmax]`, normalized 0..1000) for dialogue/narration inside an actual speech bubble or caption box!
+   - `box_2d` MUST tightly enclose the Japanese text INSIDE the bubble (never point to empty white margin outside the bubble, and NEVER place `box_2d` over a character's face, body, or background artwork!).
+   - For floating SFX / sound effects (e.g. ドーン, ドドン, スラ〜〜, ほう…？) OR tiny unenclosed whispers drawn directly over a character's body/shirt outside a speech bubble, ALWAYS set `"box_2d": null` so the artwork/character is NEVER overwritten!
+   - NEVER merge two separate speech bubbles (or a speech bubble + an outside whisper) into a single `box_2d`! Keep each speech bubble strictly separate.
+4. Return ONLY valid JSON matching this exact structure for all {num_pages} page(s) (write `summary` in {target_lang_name}):
 {{
   "pages": [
     {{
       "page_index": 1,
-      "summary": "Brief 1-sentence scene context for Local Page 1",
+      "summary": "Brief 1-sentence scene context for Page 1 in {target_lang_name}",
       "bubbles": [
         {{
           "id": 1,
@@ -688,46 +701,12 @@ CRITICAL RULES:
         if GEMINI_API_KEY:
             parts = [{"text": manga_batch_instruction}]
             for idx, (b64_img, fname) in enumerate(b64_pages, 1):
-                parts.append({"text": f"=== LOCAL PAGE {idx} ({fname}) ==="})
+                parts.append({"text": f"=== PAGE {idx} ({fname}) ==="})
                 parts.append({"inlineData": {"mimeType": mime_type, "data": b64_img}})
 
-            timeout_sec = 45 + (6 * chunk_len)
+            timeout_sec = min(135, 50 + (9 * num_pages))
 
-            # Tier 1: Gemini 3.1 Flash-Lite -> Gemini 3.5 Flash-Lite (`thinkingLevel: "LOW"` for spatial box_2d accuracy)
-            flash_batch_payload = {
-                "contents": [{"parts": parts}],
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "maxOutputTokens": 12288,
-                    "responseMimeType": "application/json",
-                    "thinkingConfig": {"thinkingLevel": "LOW"},
-                },
-            }
-            try:
-                data = await call_gemini_generate_content_self_healing(
-                    flash_batch_payload, timeout_sec=timeout_sec, purpose=f"MangaBatch({chunk_len}p)"
-                )
-                if data:
-                    resp_parts = (
-                        ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-                    )
-                    raw_json_str = "\n".join(
-                        p.get("text", "") for p in resp_parts
-                        if p.get("text") and not p.get("thought", False)
-                    ).strip()
-                    batch_results = _parse_manga_pages_batch_json(raw_json_str, chunk_len)
-                    if any(bubbles for bubbles, _ in batch_results):
-                        total_b = sum(len(b) for b, _ in batch_results)
-                        print(
-                            f"[Manga Vision Batch] Completed pages {start_p}-{end_p} via Tier 1 Gemini "
-                            f"({state.active_gemini_model}) - {total_b} bubbles",
-                            flush=True,
-                        )
-                        return batch_results
-            except Exception as e:
-                print(f"Gemini Flash Manga Mini-Batch warning ({type(e).__name__}): {e}", flush=True)
-
-            # Tier 2: Gemini 4 Hydrogen Heavy Specialist fallback (no sampling params, 65536 cap, `thinkingLevel: "LOW"`)
+            # Tier 1: Gemini 4 Hydrogen (no sampling params, 65536 maxOutputTokens, `thinkingLevel: "LOW"`)
             hydrogen_payload = {
                 "contents": [{"parts": parts}],
                 "generationConfig": {
@@ -738,7 +717,7 @@ CRITICAL RULES:
             }
             try:
                 h_data = await call_gemini_hydrogen_generate(
-                    hydrogen_payload, timeout_sec=timeout_sec, purpose=f"MangaBatchHydrogen({chunk_len}p)"
+                    hydrogen_payload, timeout_sec=timeout_sec, purpose=f"MangaBatch({num_pages}p)"
                 )
                 if h_data:
                     resp_parts = (
@@ -748,64 +727,65 @@ CRITICAL RULES:
                         p.get("text", "") for p in resp_parts
                         if p.get("text") and not p.get("thought", False)
                     ).strip()
-                    batch_results = _parse_manga_pages_batch_json(raw_json_str, chunk_len)
+                    batch_results = _parse_manga_pages_batch_json(raw_json_str, num_pages)
                     if any(bubbles for bubbles, _ in batch_results):
                         total_b = sum(len(b) for b, _ in batch_results)
                         print(
-                            f"[Manga Vision Batch] Completed pages {start_p}-{end_p} via Tier 2 Hydrogen "
-                            f"({GEMINI_HEAVY_MODEL}) - {total_b} bubbles",
+                            f"[Manga Vision Batch] Completed {num_pages} page(s) in 1 request via Tier 1 Hydrogen "
+                            f"({GEMINI_HEAVY_MODEL}) - {total_b} total bubbles",
                             flush=True,
                         )
                         return batch_results
             except Exception as e:
-                print(f"Gemini Hydrogen Manga Mini-Batch warning ({type(e).__name__}): {e}", flush=True)
+                print(f"Gemini Hydrogen Manga Batch warning ({type(e).__name__}): {e}", flush=True)
+
+            # Tier 2: Gemini 3.1 Flash-Lite -> Gemini 3.5 Flash-Lite (`thinkingLevel: "LOW"`)
+            flash_payload = {
+                "contents": [{"parts": parts}],
+                "generationConfig": {
+                    "temperature": 0.1,
+                    "maxOutputTokens": 16384,
+                    "responseMimeType": "application/json",
+                    "thinkingConfig": {"thinkingLevel": "LOW"},
+                },
+            }
+            try:
+                data = await call_gemini_generate_content_self_healing(
+                    flash_payload, timeout_sec=timeout_sec, purpose=f"MangaBatchFallback({num_pages}p)"
+                )
+                if data:
+                    resp_parts = (
+                        ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                    )
+                    raw_json_str = "\n".join(
+                        p.get("text", "") for p in resp_parts
+                        if p.get("text") and not p.get("thought", False)
+                    ).strip()
+                    batch_results = _parse_manga_pages_batch_json(raw_json_str, num_pages)
+                    if any(bubbles for bubbles, _ in batch_results):
+                        total_b = sum(len(b) for b, _ in batch_results)
+                        print(
+                            f"[Manga Vision Batch] Completed {num_pages} page(s) in 1 request via Tier 2 Gemini Flash "
+                            f"({state.active_gemini_model}) - {total_b} total bubbles",
+                            flush=True,
+                        )
+                        return batch_results
+            except Exception as e:
+                print(f"Gemini Flash Manga Batch warning ({type(e).__name__}): {e}", flush=True)
     finally:
         b64_pages.clear()
 
-    # Tier 3: Per-page fallback for this mini-batch
-    fallback_results = []
-    for raw_b, fname in chunk_pages:
-        b, s = await extract_and_translate_manga_bubbles(raw_b, fname, target_lang_name)
-        fallback_results.append((b, s))
-    return fallback_results
+    # Tier 3: Concurrent per-page fallback (2 pages at a time)
+    sem = asyncio.Semaphore(2)
 
+    async def _bounded_single(rb: bytes, fn: str) -> tuple[list[dict], str]:
+        async with sem:
+            return await extract_and_translate_manga_bubbles(rb, fn, target_lang_name)
 
-async def extract_and_translate_manga_pages_batch(
-    pages_input: list[tuple[bytes, str]], target_lang_name: str
-) -> list[tuple[list[dict], str]]:
-    """
-    Processes 1 to 12 manga pages:
-      - 1 page: dedicated single-page extractor (`thinkingLevel: "LOW"`)
-      - 2..4 pages: single crisp 1080px batch call (`thinkingLevel: "LOW"`)
-      - 5..12 pages: splits into parallel <=4-page mini-batches at 1024px (`thinkingLevel: "LOW"`)
-        so every page retains sharp bubble boundaries and zero cross-page coordinate drift.
-    """
-    num_pages = len(pages_input)
-    if num_pages == 0:
-        return []
-
-    if num_pages == 1:
-        b, s = await extract_and_translate_manga_bubbles(pages_input[0][0], pages_input[0][1], target_lang_name)
-        return [(b, s)]
-
-    if num_pages <= 4:
-        return await _run_manga_mini_batch_call(pages_input, target_lang_name, 0, num_pages)
-
-    chunk_size = 4
-    chunks = [
-        (offset, pages_input[offset : offset + chunk_size])
-        for offset in range(0, num_pages, chunk_size)
-    ]
-    chunk_outputs = await asyncio.gather(
-        *[
-            _run_manga_mini_batch_call(ch, target_lang_name, offset, num_pages)
-            for offset, ch in chunks
-        ]
+    fallback_results = await asyncio.gather(
+        *[_bounded_single(raw_b, fname) for raw_b, fname in pages_input]
     )
-    merged: list[tuple[list[dict], str]] = []
-    for part in chunk_outputs:
-        merged.extend(part)
-    return merged[:num_pages]
+    return list(fallback_results)
 
 
 def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
@@ -896,14 +876,14 @@ CRITICAL RULES:
 2. In-Context Localization & Honorifics:
    - Adapt idioms, pronouns, tone, and emotion so the dialogue sounds natural in {target_lang_name} while fitting inside a speech bubble. Do NOT use double quotes inside `translated_text` (use single quotes if needed).
    - When translating to English, ALWAYS preserve Japanese honorifics attached directly with a hyphen and NO space (translate さん as `-san`, くん/君 as `-kun`, ちゃん as `-chan`, 様/さま as `-sama`, 先生 as `-sensei`, 先輩 as `-senpai` — e.g., 'Melt-san', NEVER 'Melt- san' or 'Miss Melt').
-3. Speech Bubble Bounding Boxes (`box_2d`) — STRICT SPATIAL ACCURACY RULES:
-   - ONLY provide `box_2d` (`[ymin, xmin, ymax, xmax]`, normalized 0..1000) for dialogue/narration enclosed inside an actual speech bubble or caption box!
-   - `box_2d` MUST tightly wrap the Japanese text INSIDE the bubble (never point to empty white margin outside the bubble, and NEVER place `box_2d` over a character's face, body, or background artwork!).
-   - For floating SFX / sound effects (e.g. ドーン, スラ〜〜, ほう…？) OR tiny unenclosed whispers/labels outside a speech bubble, ALWAYS set `"box_2d": null` so the artwork/character is NEVER overwritten!
-   - NEVER merge two separate speech bubbles into a single `box_2d`! Keep each speech bubble strictly separate.
-4. Return ONLY valid JSON matching this exact structure (every bubble MUST have a non-empty `translated_text`):
+3. Speech Bubble Bounding Boxes (`box_2d`) — STRICT PLACEMENT RULES:
+   - ONLY provide `box_2d` (`[ymin, xmin, ymax, xmax]`, normalized 0..1000) for dialogue/narration inside an actual speech bubble or caption box!
+   - `box_2d` MUST tightly enclose the Japanese text INSIDE the bubble (never point to empty white margin outside the bubble, and NEVER place `box_2d` over a character's face, body, or background artwork!).
+   - For floating SFX / sound effects (e.g. ドーン, ドドン, スラ〜〜, ほう…？) OR tiny unenclosed whispers drawn directly over a character's body/shirt outside a speech bubble, ALWAYS set `"box_2d": null` so the artwork/character is NEVER overwritten!
+   - NEVER merge two separate speech bubbles (or a speech bubble + an outside whisper) into a single `box_2d`! Keep each speech bubble strictly separate.
+4. Return ONLY valid JSON matching this exact structure (every bubble MUST have a non-empty `translated_text`; write `summary` in {target_lang_name}):
 {{
-  "summary": "Brief 1-sentence scene context",
+  "summary": "Brief 1-sentence scene context in {target_lang_name}",
   "bubbles": [
     {{
       "id": 1,
@@ -1102,47 +1082,23 @@ def _wrap_text_to_pixel_width(
     return lines
 
 
-def _classify_bubble_region(
-    img_rgb: Image.Image, base_gray: Image.Image, x1: int, y1: int, x2: int, y2: int
-) -> str:
+def _detect_bubble_polarity(
+    base_gray: Image.Image, x1: int, y1: int, x2: int, y2: int
+) -> bool:
     """
-    Classifies a candidate `box_2d` region into:
-      - `"dark_bubble"`: True low-saturation dark/charcoal speech bubble with bright white text strokes inside
-        (rejects colorful character hair/clothes/skin so artwork is never painted over!).
-      - `"light_bubble"`: White/light speech bubble or paper area.
-      - `"invalid_artwork"`: Colorful/textured character artwork with neither a valid dark bubble nor white paper.
+    Returns True if the bubble/panel region at (x1, y1, x2, y2) is a Dark/Charcoal background
+    (median luminance < 125), or False if it is a Light/White bubble.
     """
     bw = x2 - x1
     bh = y2 - y1
     if bw < 10 or bh < 10:
-        return "invalid_artwork"
-
+        return False
     ix1, iy1 = x1 + 2, y1 + 2
     ix2, iy2 = x2 - 2, y2 - 2
-    sub_gray = base_gray.crop((ix1, iy1, ix2, iy2))
-    pixels = sorted(sub_gray.getdata())
-    if not pixels:
-        return "invalid_artwork"
-
-    n_px = len(pixels)
-    median_lum = pixels[n_px // 2]
-    bright_text_px = sum(1 for p in pixels if p >= 205)
-    white_paper_px = sum(1 for p in pixels if p >= 235)
-
-    # Check color saturation: genuine dark manga bubbles are grayscale/charcoal (low saturation),
-    # whereas character hair/outfits/skin/sparkles have higher HSV saturation.
-    sub_hsv = img_rgb.crop((ix1, iy1, ix2, iy2)).convert("HSV")
-    mean_sat = ImageStat.Stat(sub_hsv).mean[1]
-
-    if median_lum < 120:
-        if mean_sat < 36.0 and (bright_text_px / n_px) >= 0.008:
-            return "dark_bubble"
-        return "invalid_artwork"
-
-    if (white_paper_px / n_px) >= 0.42:
-        return "light_bubble"
-
-    return "invalid_artwork"
+    sub = base_gray.crop((ix1, iy1, ix2, iy2))
+    pixels = sorted(sub.getdata())
+    median_lum = pixels[len(pixels) // 2] if pixels else 255
+    return median_lum < 125
 
 
 def _compute_voronoi_lobe_bounds(
@@ -1200,6 +1156,12 @@ def _find_best_enclosed_white_bubble(
     ry2_rel: int,
     has_kanji_kana: bool = True,
 ) -> Image.Image | None:
+    """
+    Fast 0.5x-scale enclosed white speech bubble finder (exact `image_engine_v8.py` algorithm):
+      - Rejects blank white cheeks/faces/backgrounds by checking enclosed character loops (`holes_area`).
+      - Accepts thin-font speech bubbles where `holes_area >= 5` at 0.5x scale so they never miss
+        enclosed bubble cleaning.
+    """
     ww, wh = sub_gray.size
     if ww < 16 or wh < 16:
         return None
@@ -1307,6 +1269,10 @@ def _find_best_enclosed_white_bubble(
 
 
 def _sample_dark_bubble_bg_rgb_and_lum(img: Image.Image, base_gray: Image.Image, x1: int, y1: int, x2: int, y2: int) -> tuple[tuple[int, int, int], int]:
+    """
+    Samples the true background color (pure black OR charcoal gray) around the text box
+    so dark/charcoal panels are filled with their EXACT matching background color.
+    """
     width, height = img.size
     sx1 = max(0, x1 - 4)
     sy1 = max(0, y1 - 4)
@@ -1338,12 +1304,9 @@ def _erase_bubble_japanese_text_and_measure_lobe(
     raw_y1: int,
     raw_x2: int,
     raw_y2: int,
-    region_kind: str = "light_bubble",
+    is_dark_bubble: bool = False,
     has_kanji_kana: bool = True,
 ) -> tuple[int, int, int, int, tuple[int, int, int], tuple[int, int, int]] | None:
-    if region_kind == "invalid_artwork":
-        return None
-
     width, height = img.size
     x1, y1, x2, y2 = raw_x1, raw_y1, raw_x2, raw_y2
 
@@ -1362,7 +1325,18 @@ def _erase_bubble_japanese_text_and_measure_lobe(
     ry2_rel = min(wh - 2, y2 - wy1)
     rel_cx = (rx1_rel + rx2_rel) // 2
 
-    if region_kind == "dark_bubble":
+    # =========================================================================
+    # CASE A: DARK OR CHARCOAL BUBBLE / PANEL (Verify low color saturation + bright white text inside)
+    # =========================================================================
+    if is_dark_bubble:
+        sub_hsv = img.crop((x1, y1, x2, y2)).convert("HSV")
+        mean_sat = ImageStat.Stat(sub_hsv).mean[1]
+        box_pixels = list(base_gray.crop((x1, y1, x2, y2)).getdata())
+        bright_ratio = sum(1 for p in box_pixels if p >= 205) / max(1, len(box_pixels))
+        # Reject colorful character hair/clothes/skin that have no white text strokes
+        if mean_sat >= 42.0 or bright_ratio < 0.006:
+            return None
+
         dark_fill_rgb, bg_lum = _sample_dark_bubble_bg_rgb_and_lum(img, base_gray, raw_x1, raw_y1, raw_x2, raw_y2)
         fg_text_rgb = (250, 250, 250)
         stroke_rgb = (max(0, bg_lum - 20), max(0, bg_lum - 20), max(0, bg_lum - 20))
@@ -1426,6 +1400,9 @@ def _erase_bubble_japanese_text_and_measure_lobe(
             stroke_rgb,
         )
 
+    # =========================================================================
+    # CASE B: ENCLOSED WHITE SPEECH BUBBLE (Exact `image_engine_v8.py` Lobe Snap)
+    # =========================================================================
     filled_bubble = _find_best_enclosed_white_bubble(
         sub_gray, rx1_rel, ry1_rel, rx2_rel, ry2_rel, has_kanji_kana=has_kanji_kana
     )
@@ -1489,8 +1466,9 @@ def _erase_bubble_japanese_text_and_measure_lobe(
                 (255, 255, 255),
             )
 
-    # Case C: Open-sided white speech bubble — verify genuine dark text ink exists inside `box_2d`
-    # so blank white margins (with zero ink) or character artwork are never overwritten!
+    # =========================================================================
+    # CASE C: OPEN-SIDED WHITE SPEECH BUBBLE (Strictly Clamped to `box_2d`)
+    # =========================================================================
     tx_b1 = max(2, rx1_rel - 6)
     ty_b1 = max(2, ry1_rel - 6)
     tx_b2 = min(ww - 2, rx2_rel + 6)
@@ -1502,32 +1480,27 @@ def _erase_bubble_japanese_text_and_measure_lobe(
     pure_white_px = sum(box_hist[242:])
     white_ratio = pure_white_px / total_box_px
 
-    if white_ratio < 0.45:
-        return None
+    if white_ratio >= 0.45:
+        local_max = sub_gray.filter(ImageFilter.MaxFilter(7))
+        white_paper_zone = local_max.point(lambda p: 255 if p >= 242 else 0).filter(ImageFilter.MinFilter(3))
 
-    local_max = sub_gray.filter(ImageFilter.MaxFilter(7))
-    white_paper_zone = local_max.point(lambda p: 255 if p >= 242 else 0).filter(ImageFilter.MinFilter(3))
+        box_clamp = Image.new("L", (ww, wh), 0)
+        ImageDraw.Draw(box_clamp).rectangle([tx_b1, ty_b1, tx_b2, ty_b2], fill=255)
+        safe_open_zone = ImageChops.darker(white_paper_zone, box_clamp)
 
-    box_clamp = Image.new("L", (ww, wh), 0)
-    ImageDraw.Draw(box_clamp).rectangle([tx_b1, ty_b1, tx_b2, ty_b2], fill=255)
-    safe_open_zone = ImageChops.darker(white_paper_zone, box_clamp)
+        dark_strokes = sub_gray.point(lambda p: 255 if p < 238 else 0)
+        candidate_text_ink = ImageChops.darker(dark_strokes, safe_open_zone)
 
-    dark_strokes = sub_gray.point(lambda p: 255 if p < 220 else 0)
-    candidate_text_ink = ImageChops.darker(dark_strokes, safe_open_zone)
+        if candidate_text_ink.getbbox():
+            erase_c = ImageChops.darker(
+                candidate_text_ink.filter(ImageFilter.MaxFilter(5)),
+                box_clamp,
+            )
+            img.paste(Image.new("RGB", (ww, wh), (255, 255, 255)), (wx1, wy1), mask=erase_c)
+            return raw_x1, raw_y1, raw_x2, raw_y2, (15, 15, 15), (255, 255, 255)
 
-    ink_px = candidate_text_ink.crop((tx_b1, ty_b1, tx_b2, ty_b2)).histogram()[255]
-    ink_ratio = ink_px / total_box_px
-    # Reject empty white margins (ink_ratio < 0.005) and solid dark line-art blocks (ink_ratio > 0.42)
-    if ink_ratio < 0.005 or ink_ratio > 0.42:
-        return None
-
-    erase_c = ImageChops.darker(
-        candidate_text_ink.filter(ImageFilter.MaxFilter(5)),
-        box_clamp,
-    )
-    img.paste(Image.new("RGB", (ww, wh), (255, 255, 255)), (wx1, wy1), mask=erase_c)
-
-    return raw_x1, raw_y1, raw_x2, raw_y2, (15, 15, 15), (255, 255, 255)
+    # Reject completely blank white margins (no text ink inside `box_2d`) or colorful artwork
+    return None
 
 
 def _resolve_box_collisions(
@@ -1593,16 +1566,14 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
         raw_y1 = max(0, int((ymin / 1000.0) * height))
         raw_x2 = min(width, int((xmax / 1000.0) * width))
         raw_y2 = min(height, int((ymax / 1000.0) * height))
-        region_kind = _classify_bubble_region(img, base_gray, raw_x1, raw_y1, raw_x2, raw_y2)
-        if region_kind == "invalid_artwork":
-            continue
+        is_dark = _detect_bubble_polarity(base_gray, raw_x1, raw_y1, raw_x2, raw_y2)
         src_txt = str(b.get("source_text") or "")
         has_kanji_kana = bool(re.search(r"[ぁ-んァ-ヶ一-龯A-Za-z0-9]", src_txt))
         clean_tr = re.sub(r"\s+", " ", b["translated_text"]).strip()
-        pixel_boxes.append((raw_x1, raw_y1, raw_x2, raw_y2, region_kind, has_kanji_kana, clean_tr))
+        pixel_boxes.append((raw_x1, raw_y1, raw_x2, raw_y2, is_dark, has_kanji_kana, clean_tr))
 
     prepared_renders = []
-    for i, (rx1, ry1, rx2, ry2, region_kind, has_kk, trans_text) in enumerate(pixel_boxes):
+    for i, (rx1, ry1, rx2, ry2, is_dark, has_kk, trans_text) in enumerate(pixel_boxes):
         if (rx2 - rx1) < 3 or (ry2 - ry1) < 3:
             continue
         other_boxes = [
@@ -1618,7 +1589,7 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
             ry1,
             rx2,
             ry2,
-            region_kind=region_kind,
+            is_dark_bubble=is_dark,
             has_kanji_kana=has_kk,
         )
         if cleaned_lobe is None:
@@ -1788,12 +1759,14 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
                             filename=f"translated_p{page_idx}_{base_name}.png",
                         )
                     )
+                    # Yield briefly between CPU-heavy Pillow renders so Discord Gateway heartbeat never lags
                     await asyncio.sleep(0.05)
             except Exception as e:
                 print(f"Manga page {page_idx} rendering fallback to text-only: {e}", flush=True)
 
         transcript_text = "\n".join(transcript_lines)
 
+        # Discord allows up to 10 attachments per single message; split into chunks of 10 when >10 pages
         if discord_files:
             file_chunks = [discord_files[i : i + 10] for i in range(0, len(discord_files), 10)]
             if len(transcript_text) <= 1950:
