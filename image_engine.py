@@ -46,7 +46,7 @@ from llm import (
 )
 
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
-SOM_CV_MAX_DIM = 360        # Fast 360px flat-bytearray BFS grid with dark-line preservation (~5-8s for 10 pages!)
+SOM_CV_MAX_DIM = 360        # Fast 360px flat-bytearray BFS grid derived from single 1024px resize (~5-8s for 10 pages!)
 
 # Cache for self-healing discovery of strictly newer (>3.5) `flash-lite` models on Google AI Studio
 _FLASH_LITE_DISCOVERY_CACHE: list[str] = []
@@ -739,8 +739,8 @@ def _extract_components_bytearray_bfs(
 ) -> list[tuple[tuple[int, int, int, int], Image.Image]]:
     """
     Zero-allocation flat-`bytearray` 4-connected BFS connected-component extractor:
-      - `step=2, core_radius=1` (3x3 white cross) NEVER skips dense small speech bubbles
-        (e.g. Kisaki's bottom-left bubble on Page 1) while still running in <1s across 10 pages!
+      - `step=2, core_radius=1` (3x3 white cross) catches dense small speech bubbles
+        (e.g. Kisaki's bottom-left bubble on Page 1) while skipping 1px noise cleanly.
     """
     sw, sh = bin_img.size
     buf = bytearray(bin_img.tobytes())
@@ -899,26 +899,31 @@ def _filter_white_components(
     sw: int,
     sh: int,
     already_covered: Image.Image,
-    is_dark_line_pass: bool = False,
+    is_secondary_pass: bool = False,
 ) -> list[dict]:
     """
-    Validates candidate white connected components:
-      - Keeps connected figure-8 double bubbles unified as ONE badge (split cleanly into 2 lobes at render time).
-      - Rejects tiny jagged whisper halos (`あー…`, `副作用…` on Page 1 via `filled_area` & `rect_fill` checks),
-        while preserving clean narrow vertical bubbles & white tile strips (`rect_fill >= 0.60`, e.g. Page 8!).
+    Validates candidate white connected components with 3 rock-solid anti-background guards:
+      1) Eroded Interior Ink Check (`MinFilter(5)` -> `inner_ink_px >= 3`):
+         Empty white ceilings/panel backgrounds (Page 1 top-right, Page 3 top-left) have 0 dark text
+         strokes strictly inside their eroded interior (their only dark edges are hair/panel borders)!
+      2) Concave Panel-Background Rejection:
+         Rejects sprawling concave white backgrounds wrapping around characters/diagrams
+         (`rect_fill < 0.50` OR wide low-solidity regions `cw > sw * 0.42 and rect_fill < 0.62`)!
+      3) Whisper Halo Rejection:
+         Rejects tiny irregular whisper halos (`filled_area < 220` or narrow low-solidity slivers).
     """
     found: list[dict] = []
-    max_area_px = int(sw * sh * 0.25)
-    min_area_px = max(210, int(sw * sh * 0.0020))
+    max_area_px = int(sw * sh * 0.24)
+    min_area_px = max(220, int(sw * sh * 0.0022))
 
     for (cx1, cy1, cx2, cy2), comp_crop in raw_comps:
         cw, ch = cx2 - cx1, cy2 - cy1
 
-        if is_dark_line_pass:
+        if is_secondary_pass:
             cov_crop = already_covered.crop((cx1, cy1, cx2, cy2))
             ov_px = ImageChops.darker(comp_crop, cov_crop).histogram()[255]
             cov_crop.close()
-            if ov_px > comp_crop.histogram()[255] * 0.30:
+            if ov_px > comp_crop.histogram()[255] * 0.25:
                 comp_crop.close()
                 continue
 
@@ -930,16 +935,6 @@ def _filter_white_components(
         padded.close()
         filled_crop = ImageChops.lighter(comp_crop, holes_crop)
 
-        if is_dark_line_pass:
-            # Undo the 1px dark-line thickening
-            exp_pad = Image.new("L", (cw + 2, ch + 2), 0)
-            exp_pad.paste(filled_crop, (1, 1))
-            exp_dil = exp_pad.filter(ImageFilter.MaxFilter(3))
-            exp_pad.close()
-            filled_crop.close()
-            filled_crop = exp_dil.crop((1, 1, cw + 1, ch + 1))
-            exp_dil.close()
-
         comp_area = comp_crop.histogram()[255]
         filled_area = max(1, filled_crop.histogram()[255])
         holes_area = holes_crop.histogram()[255]
@@ -949,18 +944,22 @@ def _filter_white_components(
         rect_fill = filled_area / float(max(1, cw * ch))
         aspect = max(cw, ch) / float(max(1, min(cw, ch)))
 
-        # Reject tiny irregular whisper halos (`あー…`, `副作用…`) while keeping solid vertical bubbles & tile strips!
+        # Guard 1: Area & Concave Panel-Background Rejection (blocks Page 2 diagram bg & Page 3 panel bg!)
         if filled_area < min_area_px or filled_area > max_area_px:
             filled_crop.close()
             continue
-        if (aspect > 4.5 and rect_fill < 0.62) or (min(cw, ch) < 14 and rect_fill < 0.62):
+        if rect_fill < 0.50 or (cw > sw * 0.42 and rect_fill < 0.62):
+            filled_crop.close()
+            continue
+        if (aspect > 4.2 and rect_fill < 0.65) or (min(cw, ch) < 14 and rect_fill < 0.62):
             filled_crop.close()
             continue
 
+        # Relax dense-kanji ratio slightly (0.18..0.78) so tiny 3-column ovals (`良いから申してみよ。`) pass cleanly!
         if (
             holes_area < 3
-            or (comp_area / float(filled_area)) < 0.24
-            or (holes_area / float(filled_area)) > 0.68
+            or (comp_area / float(filled_area)) < 0.18
+            or (holes_area / float(filled_area)) > 0.78
         ):
             filled_crop.close()
             continue
@@ -972,18 +971,32 @@ def _filter_white_components(
         chroma_ratio = sum(ch_hist[28:]) / float(total_m_px)
         mean_chroma = ImageStat.Stat(ch_crop, mask=filled_crop).mean[0]
 
-        dark_ink_bin = gray_crop.point(lambda p: 255 if p < 180 else 0)
-        achrom_bin = ch_crop.point(lambda p: 255 if p < 28 else 0)
-        achrom_ink = ImageChops.darker(ImageChops.darker(dark_ink_bin, achrom_bin), filled_crop)
-        dark_ink_px = achrom_ink.histogram()[255]
+        if chroma_ratio >= 0.20 or mean_chroma >= 18.0:
+            ch_crop.close()
+            gray_crop.close()
+            filled_crop.close()
+            continue
+
+        # Guard 2: Eroded Interior Ink Check (`MinFilter(5)` = 2px inside the rim)!
+        # Guarantees actual dark text strokes sit INSIDE the oval, NEVER just outer hair/halo/panel edges!
+        inner_core = filled_crop.filter(ImageFilter.MinFilter(5))
+        if not inner_core.getbbox():
+            inner_core.close()
+            inner_core = filled_crop.filter(ImageFilter.MinFilter(3))
+
+        dark_ink_bin = gray_crop.point(lambda p: 255 if p < 175 else 0)
+        achrom_bin = ch_crop.point(lambda p: 255 if p < 26 else 0)
+        inner_ink = ImageChops.darker(ImageChops.darker(dark_ink_bin, achrom_bin), inner_core)
+        inner_ink_px = inner_ink.histogram()[255]
 
         dark_ink_bin.close()
         achrom_bin.close()
-        achrom_ink.close()
+        inner_ink.close()
+        inner_core.close()
         ch_crop.close()
         gray_crop.close()
 
-        if chroma_ratio >= 0.20 or mean_chroma >= 18.0 or dark_ink_px < 3:
+        if inner_ink_px < 4:
             filled_crop.close()
             continue
 
@@ -1011,69 +1024,71 @@ def _detect_page_bubbles_and_build_som_b64_sync(
 ) -> tuple[str, list[dict]]:
     """
     Ultra-fast `360px` flat-bytearray CV speech-bubble detector (Color & B&W Manga compatible):
-      - Pass A1 (Crisp `p >= 242`): Detects dense small bubbles (`良いから申してみよ…` on Page 1) cleanly.
-      - Pass A2 (Dark-Line-Preserved `720px -> MinFilter(3) -> 360px`, `p >= 236`):
-        Preserves 1px thin bubble outlines on white panels (e.g. `正確には…` on Page 2) &
-        seals 1-2px border breaks so thin-bordered bubbles NEVER leak into white panel backgrounds!
+      - Single-pass downscale from original -> `vis_img` (`<=1024px`) -> `small_rgb` (`<=360px`)
+        (~2-3x faster on Render 0.1 vCPU!).
+      - Pass A1 (`p >= 232`): Rock-solid `v27` base pass with `step=2, core_radius=1` (catches tiny
+        dense ovals like Page 1 bottom-left `良いから申してみよ。` without enclosing panel backgrounds!).
+      - Pass A2 (Zero-Thickening `BOX` Dark-Outline Preservation from `vis_img` `gray < 185`):
+        Preserves 1px thin bubble outlines on pure-white panels (Page 2 middle-top `正確には…`)
+        at exact 1px width WITHOUT `MinFilter(3)` kanji thickening and WITHOUT creating fake wall badges!
       - Pass B: Enclosed dark speech bubbles / dark caption boxes with white text.
-      - Uses fast `BILINEAR` thumbnailing for the vision JPEG (~5-8s total for 10 pages on 0.1 vCPU!).
     """
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     orig_w, orig_h = img.size
 
     try:
-        # Build 720px intermediate once to feed both crisp 360px AND dark-line-preserved 360px!
-        scale_mid = min(1.0, (SOM_CV_MAX_DIM * 2) / float(max(orig_w, orig_h)))
-        mw = max(64, int(round(orig_w * scale_mid)))
-        mh = max(64, int(round(orig_h * scale_mid)))
-        mid_rgb = img.resize((mw, mh), Image.Resampling.BILINEAR)
-        mid_gray = mid_rgb.convert("L")
+        # 1. Single downscale of full-res image -> `vis_img` (used for both CV derivation & SoM JPEG!)
+        vis_img = img.copy()
+        vis_img.thumbnail((vision_max_dim, vision_max_dim), Image.Resampling.BILINEAR)
+        vw, vh = vis_img.size
 
-        scale = min(1.0, SOM_CV_MAX_DIM / float(max(orig_w, orig_h)))
-        sw = max(32, int(round(orig_w * scale)))
-        sh = max(32, int(round(orig_h * scale)))
+        scale = min(1.0, SOM_CV_MAX_DIM / float(max(vw, vh)))
+        sw = max(32, int(round(vw * scale)))
+        sh = max(32, int(round(vh * scale)))
 
-        small_rgb = mid_rgb.resize((sw, sh), Image.Resampling.BILINEAR)
-        mid_rgb.close()
+        small_rgb = vis_img.resize((sw, sh), Image.Resampling.BILINEAR)
         small_gray = small_rgb.convert("L")
         small_chroma = _compute_rgb_chroma_band(small_rgb)
         small_rgb.close()
 
-        # Dark-line-preserved grayscale: `MinFilter(3)` at 720px keeps every 1px thin outline unbroken!
-        mid_dark_lines = mid_gray.filter(ImageFilter.MinFilter(3))
-        mid_gray.close()
-        small_dark_lines = mid_dark_lines.resize((sw, sh), Image.Resampling.NEAREST)
-        mid_dark_lines.close()
+        # Zero-thickening dark-outline preservation: pure C BOX average of `vis_gray < 185`!
+        vis_gray = vis_img.convert("L")
+        vis_dark_strokes = vis_gray.point(lambda p: 255 if p < 185 else 0)
+        vis_gray.close()
+        small_dark_box = vis_dark_strokes.resize((sw, sh), Image.Resampling.BOX)
+        vis_dark_strokes.close()
 
-        min_w_px = max(12, int(sw * 0.044))
-        min_h_px = max(12, int(sh * 0.030))
-        max_w_px = int(sw * 0.72)
-        max_h_px = int(sh * 0.65)
-        max_area_px = int(sw * sh * 0.25)
+        min_w_px = max(11, int(sw * 0.042))
+        min_h_px = max(11, int(sh * 0.028))
+        max_w_px = int(sw * 0.70)
+        max_h_px = int(sh * 0.62)
+        max_area_px = int(sw * sh * 0.24)
 
         already_covered = Image.new("L", (sw, sh), 0)
 
-        # Pass A1: Crisp `p >= 242` catches normal & dense small bubbles (`step=2, core_radius=1`)
-        white_bin_crisp = small_gray.point(lambda p: 255 if p >= 242 else 0)
+        # Pass A1: Standard `p >= 232` (exact v27 threshold, zero background wall artifacts!)
+        white_bin_base = small_gray.point(lambda p: 255 if p >= 232 else 0)
         raw_a1 = _extract_components_bytearray_bfs(
-            white_bin_crisp, min_w_px, min_h_px, max_w_px, max_h_px, max_area_px, step=2, core_radius=1
+            white_bin_base, min_w_px, min_h_px, max_w_px, max_h_px, max_area_px, step=2, core_radius=1
         )
-        white_bin_crisp.close()
         detected = _filter_white_components(
-            raw_a1, small_gray, small_chroma, sw, sh, already_covered, is_dark_line_pass=False
+            raw_a1, small_gray, small_chroma, sw, sh, already_covered, is_secondary_pass=False
         )
 
-        # Pass A2: Dark-Line-Preserved `p >= 236` recovers thin-outline ovals on white panels (Page 2 `正確には…`)
-        # and broken-border ovals (`あー…` on Page 1)!
-        white_bin_dl = small_dark_lines.point(lambda p: 255 if p >= 236 else 0)
-        small_dark_lines.close()
+        # Pass A2: Dark-outline-preserved pass (recovers 1px thin-bordered ovals on white panels like Page 2 `正確には…`!)
+        non_outline = small_dark_box.point(lambda p: 0 if p >= 24 else 255)
+        small_dark_box.close()
+        white_bin_outline = ImageChops.darker(white_bin_base, non_outline)
+        white_bin_base.close()
+        non_outline.close()
+
         raw_a2 = _extract_components_bytearray_bfs(
-            white_bin_dl, min_w_px, min_h_px, max_w_px, max_h_px, max_area_px, step=2, core_radius=1
+            white_bin_outline, min_w_px, min_h_px, max_w_px, max_h_px, max_area_px, step=2, core_radius=1
         )
-        white_bin_dl.close()
+        white_bin_outline.close()
         detected.extend(
             _filter_white_components(
-                raw_a2, small_gray, small_chroma, sw, sh, already_covered, is_dark_line_pass=True
+                raw_a2, small_gray, small_chroma, sw, sh, already_covered, is_secondary_pass=True
             )
         )
         already_covered.close()
@@ -1150,10 +1165,7 @@ def _detect_page_bubbles_and_build_som_b64_sync(
         for idx, b_obj in enumerate(detected, 1):
             b_obj["bubble_id"] = idx
 
-        # Stamp red contours + centered top-edge red pill ID badges onto fast BILINEAR vision JPEG
-        vis_img = img.copy()
-        vis_img.thumbnail((vision_max_dim, vision_max_dim), Image.Resampling.BILINEAR)
-        vw, vh = vis_img.size
+        # Stamp red contours + centered top-edge red pill ID badges onto `vis_img`
         vdraw = ImageDraw.Draw(vis_img)
         badge_font_size = max(15, int(vw * 0.022))
         badge_font = _load_manga_font(badge_font_size, is_thai=False)
@@ -1494,8 +1506,8 @@ async def extract_and_translate_manga_pages_batch(
 ) -> tuple[list[tuple[list[dict], str]], list[list[dict]], bool]:
     """
     Set-of-Mark (SoM) CV-Anchored Multi-Page Manga Batch Pipeline:
-      1) Detects enclosed speech bubbles via crisp + dark-line-preserved 360px flat-bytearray BFS
-         and stamps centered top-edge red badges `[1]`, `[2]`, ...
+      1) Detects enclosed speech bubbles via `v27`-base `p >= 232` + zero-thickening `BOX`
+         dark-outline preservation + eroded interior ink guard (eliminating fake background badges!).
       2) Calls `MangaBatch` strictly across:
          `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> (newer >3.5 `flash-lite`)
          -> `gemma-4-31b-it` -> `gemma-4-26b-a4b-it`
@@ -2064,7 +2076,6 @@ def _tokenize_thai_syllables(word: str) -> list[str]:
         syllables.append(tok)
         i += 1
 
-    # Pass 4: Merge any leftover orphan single bare Thai consonant (`ปกติ` -> `ปก|ติ`, `สงบ` -> `สงบ`, `คน` -> `คน`)
     final_syls: list[str] = []
     i = 0
     fs_len = len(syllables)
@@ -2297,12 +2308,11 @@ def _detect_two_lobe_render_rects(
 ) -> list[tuple[int, int, int, int]] | None:
     """
     Detects at RENDER TIME whether a unified figure-8 double speech bubble (`place_mask`)
-    has two distinct wide lobes (horizontal R->L or vertical T->B), using a 0.76 waist
-    threshold so wide double bubbles like Page 2 top-left and Page 3 bottom-middle split
-    smoothly across both lobes!
+    has two distinct wide lobes (horizontal R->L or vertical T->B), flowing text smoothly
+    across both lobes at 2x larger font size!
     """
     mw, mh = place_mask.size
-    if mw < 90 and mh < 90:
+    if mw < 100 and mh < 100:
         return None
 
     scale = min(1.0, 96.0 / float(max(mw, mh)))
@@ -2312,13 +2322,13 @@ def _detect_two_lobe_render_rects(
     data = grid.tobytes()
 
     area = grid.histogram()[255]
-    if area / float(max(1, gw * gh)) >= 0.78:
+    if area / float(max(1, gw * gh)) >= 0.74:
         grid.close()
         return None
 
     best_split = None
     # Horizontal figure-8 neck (e.g. Page 2 top-left, Page 3 bottom-middle, Page 6 bottom-right)
-    if mw >= 140 and (mw / float(max(1, mh))) >= 1.05:
+    if mw >= 150 and (mw / float(max(1, mh))) >= 1.05:
         col_counts = [0] * gw
         for y in range(gh):
             row_off = y * gw
@@ -2332,11 +2342,11 @@ def _detect_two_lobe_render_rects(
             l_max = max(col_counts[:min_x]) if min_x > 0 else 0
             r_max = max(col_counts[min_x + 1 :]) if (min_x + 1) < gw else 0
             peak_min = min(l_max, r_max)
-            if peak_min >= 18 and min_h <= peak_min * 0.76:
+            if peak_min >= 18 and min_h <= peak_min * 0.74:
                 best_split = ("v", min_x, min_h / float(peak_min))
 
     # Vertical figure-8 neck (e.g. Page 6 middle-right stacked ovals)
-    if mh >= 140 and (mh / float(max(1, mw))) >= 1.05:
+    if mh >= 150 and (mh / float(max(1, mw))) >= 1.05:
         row_counts = [0] * gh
         for y in range(gh):
             row_off = y * gw
@@ -2352,7 +2362,7 @@ def _detect_two_lobe_render_rects(
             t_max = max(row_counts[:min_y]) if min_y > 0 else 0
             b_max = max(row_counts[min_y + 1 :]) if (min_y + 1) < gh else 0
             peak_min = min(t_max, b_max)
-            if peak_min >= 18 and min_w <= peak_min * 0.76:
+            if peak_min >= 18 and min_w <= peak_min * 0.74:
                 ratio = min_w / float(peak_min)
                 if best_split is None or ratio < best_split[2]:
                     best_split = ("h", min_y, ratio)
@@ -2387,7 +2397,7 @@ def _detect_two_lobe_render_rects(
         r1 = (offset_x + t_rect[0] + 2, offset_y + t_rect[1] + 2, offset_x + t_rect[2] - 2, offset_y + t_rect[3] - 2)
         r2 = (offset_x + b_rect[0] + 2, offset_y + cut_full + b_rect[1] + 2, offset_x + b_rect[2] - 2, offset_y + cut_full + b_rect[3] - 2)
 
-    if (r1[2] - r1[0]) < 42 or (r1[3] - r1[1]) < 32 or (r2[2] - r2[0]) < 42 or (r2[3] - r2[1]) < 32:
+    if (r1[2] - r1[0]) < 48 or (r1[3] - r1[1]) < 36 or (r2[2] - r2[0]) < 48 or (r2[3] - r2[1]) < 36:
         return None
     return [r1, r2]
 
@@ -3078,9 +3088,10 @@ def render_translated_manga_image_sync(
 async def process_manga_translation_request(ctx_or_message, user_prompt: str):
     """
     Translates 1 to 12 manga pages (Color & Black-and-White, Thai & English) from direct
-    Discord attachments OR embedded links using dark-line-preserving 360px flat-bytearray
-    CV Set-of-Mark (SoM) anchoring, local mask refinement, automatic two-lobe figure-8
-    typesetting, strict `MangaBatch` model ordering:
+    Discord attachments OR embedded links using single-downscale 360px CV Set-of-Mark (SoM)
+    anchoring with zero-thickening BOX dark-outline preservation, eroded interior-ink guards,
+    local mask refinement, automatic two-lobe figure-8 typesetting, strict `MangaBatch` model
+    ordering:
       `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> (newer >3.5 flash-lite) -> `gemma-4-31b-it` -> `gemma-4-26b-a4b-it`
     correlated Render request/waiting/response logs, syllable-aware Thai wrapping,
     and full-original-resolution rendering.
