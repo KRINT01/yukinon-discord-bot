@@ -46,13 +46,24 @@ from llm import (
 )
 
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
-MAX_RENDER_CANVAS_DIM = 1280  # Caps working canvas dimension on 512MB / 0.1 vCPU Render container to prevent OOM & Gateway heartbeat lag
+MAX_RENDER_CANVAS_DIM_SINGLE = 1792  # High-detail working canvas for 1-4 pages
+MAX_RENDER_CANVAS_DIM_BATCH = 1600   # Crisp 1600px working canvas for 5-12 pages (safe within 512MB RAM / 0.1 vCPU)
+
+# Put NotoSansThai-Bold first because it has complete Thai + punctuation coverage (no missing-glyph [] tofu boxes)
+MANGA_THAI_FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/noto/NotoSansThai-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+    "/usr/share/fonts/truetype/tlwg/Garuda-Bold.ttf",
+    "/usr/share/fonts/truetype/tlwg/Garuda.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+)
 
 LATIN_FONT_CANDIDATES = (
     "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansThai-Bold.ttf",
     "/usr/share/fonts/truetype/tlwg/Garuda-Bold.ttf",
-    "/usr/share/fonts/truetype/tlwg/Garuda.ttf",
 )
 
 CODE_FENCE_BLOCK_REGEX = re.compile(r"```([a-zA-Z0-9_+-]*)\n([\s\S]*?)```")
@@ -457,7 +468,7 @@ async def send_generated_image_to_channel(channel, prompt_text: str, reply_to: d
 # ==============================================================================
 @functools.lru_cache(maxsize=64)
 def _load_manga_font(size: int, is_thai: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    candidates = FONT_CANDIDATES if is_thai else LATIN_FONT_CANDIDATES
+    candidates = MANGA_THAI_FONT_CANDIDATES if is_thai else LATIN_FONT_CANDIDATES
     for path in candidates:
         if os.path.exists(path):
             try:
@@ -465,6 +476,40 @@ def _load_manga_font(size: int, is_thai: bool = False) -> ImageFont.FreeTypeFont
             except Exception:
                 continue
     return ImageFont.load_default()
+
+
+def _sanitize_text_for_manga_font(text: str) -> str:
+    """
+    Normalizes Unicode punctuation and removes stray CJK/emoji symbols that lack glyphs
+    in Thai/Latin bitmap/TrueType fonts so missing-glyph `[]` tofu boxes never appear on bubbles.
+    """
+    if not text:
+        return ""
+    s = str(text)
+    s = (
+        s.replace("…", "...")
+        .replace("⋯", "...")
+        .replace("〜", "~")
+        .replace("～", "~")
+        .replace("—", "-")
+        .replace("–", "-")
+        .replace("―", "-")
+        .replace("・", " ")
+        .replace("“", "'")
+        .replace("”", "'")
+        .replace("‘", "'")
+        .replace("’", "'")
+        .replace("「", "'")
+        .replace("」", "'")
+        .replace("『", "'")
+        .replace("』", "'")
+        .replace("！", "!")
+        .replace("？", "?")
+    )
+    # Strip any leaked CJK/Hiragana/Katakana or high-plane emoji characters that would render as tofu []
+    s = re.sub(r"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\U00010000-\U0010FFFF]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
 def _detect_target_translation_lang(user_prompt: str) -> tuple[str, str]:
@@ -514,7 +559,7 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
             or item.get("text")
             or ""
         )
-        tr_txt = re.sub(r"\s+", " ", str(tr_txt)).strip()
+        tr_txt = _sanitize_text_for_manga_font(str(tr_txt))
         tr_txt = re.sub(
             r"-\s+(san|kun|chan|sama|sensei|senpai|dono|shi)\b",
             r"-\1",
@@ -649,11 +694,11 @@ async def extract_and_translate_manga_pages_batch(
         return [(b, s)]
 
     if num_pages >= 9:
-        batch_dim, batch_q = 832, 78
+        batch_dim, batch_q = 960, 82
     elif num_pages >= 5:
-        batch_dim, batch_q = 928, 82
+        batch_dim, batch_q = 1080, 85
     else:
-        batch_dim, batch_q = 1080, 88
+        batch_dim, batch_q = 1280, 90
 
     b64_pages = []
     for raw_b, fname in pages_input:
@@ -667,18 +712,21 @@ async def extract_and_translate_manga_pages_batch(
 You are a professional Manga, Manhwa, and Comic Localizer.
 You are given {num_pages} sequential manga page image(s) (labeled PAGE 1 to PAGE {num_pages}).
 Analyze all pages together in sequence so series title, character names, pronouns, tone, and ongoing story stay consistent across pages,
-and translate ALL speech bubbles, narration boxes, and SFX on every page into natural, idiomatic {target_lang_name}.
+and translate EVERY SINGLE speech bubble, narration box, and SFX on EVERY page into natural, idiomatic {target_lang_name}.
 
-CRITICAL RULES:
-1. Reading Order: Within each page, order the bubbles strictly in traditional Japanese Manga reading order (Top-to-Bottom, Right-to-Left across panels).
-2. In-Context Localization & Honorifics:
-   - Adapt idioms, pronouns, tone, and emotion so the dialogue sounds natural in {target_lang_name} while fitting inside a speech bubble. Do NOT use double quotes inside `translated_text` (use single quotes if needed).
-   - When translating to English, ALWAYS preserve Japanese honorifics attached directly with a hyphen and NO space (translate さん as `-san`, くん/君 as `-kun`, ちゃん as `-chan`, 様/さま as `-sama`, 先生 as `-sensei`, 先輩 as `-senpai`).
-3. Speech Bubble Bounding Boxes (`box_2d`) — STRICT PLACEMENT RULES:
+CRITICAL COMPLETENESS & BOUNDING-BOX RULES:
+1. Complete Coverage (ZERO Skipped Bubbles):
+   - You MUST extract and translate EVERY speech bubble on EVERY page (including small side bubbles, secondary bubbles in crowded panels, and background bubbles)! Do NOT skip any speech bubble on dense multi-panel pages!
+   - Within each page, order the bubbles strictly in traditional Japanese Manga reading order (Top-to-Bottom, Right-to-Left across panels).
+2. In-Context Localization & Punctuation:
+   - Adapt idioms, pronouns, tone, and emotion so the dialogue sounds natural in {target_lang_name} while fitting inside a speech bubble.
+   - Use standard ASCII punctuation (`...` instead of `…`, `~` instead of `〜`, `-` instead of `—`, single quotes `'` instead of double quotes).
+   - When translating to English, ALWAYS preserve Japanese honorifics attached directly with a hyphen and NO space (`-san`, `-kun`, `-chan`, `-sama`, `-sensei`, `-senpai`).
+3. Speech Bubble Bounding Boxes (`box_2d`) — STRICT ALIGNMENT RULES:
    - ONLY provide `box_2d` (`[ymin, xmin, ymax, xmax]`, normalized 0..1000) for dialogue/narration inside an actual speech bubble or caption box!
-   - `box_2d` MUST tightly enclose the Japanese text INSIDE the bubble (never point to empty white margin outside the bubble, and NEVER place `box_2d` over a character's face, body, or background artwork!).
-   - For floating SFX / sound effects (e.g. ドーン, ドドン, スラ〜〜, ほう…？) OR tiny unenclosed whispers drawn directly over a character's body/shirt outside a speech bubble, ALWAYS set `"box_2d": null` so the artwork/character is NEVER overwritten!
-   - NEVER merge two separate speech bubbles (or a speech bubble + an outside whisper) into a single `box_2d`! Keep each speech bubble strictly separate.
+   - Double-check every `box_2d`: `[ymin, xmin, ymax, xmax]` MUST tightly enclose the Japanese text INSIDE that specific bubble! NEVER shift `box_2d` outside the bubble onto empty background, panel gutters, or character heads/bodies!
+   - For floating SFX / sound effects (e.g. ドーン, ドドン, トスッ, スラ〜〜, ほう…？) OR tiny unenclosed whispers drawn directly over a character's body/shirt outside a speech bubble, ALWAYS set `"box_2d": null` so the artwork/character is NEVER overwritten!
+   - NEVER merge two separate speech bubbles into a single `box_2d`! Keep each speech bubble strictly separate with its own `box_2d`.
 4. Return ONLY valid JSON matching this exact structure for all {num_pages} page(s) (write `summary` in {target_lang_name}):
 {{
   "pages": [
@@ -713,7 +761,7 @@ CRITICAL RULES:
                 "contents": [{"parts": parts}],
                 "generationConfig": {
                     "temperature": 0.1,
-                    "maxOutputTokens": 16384,
+                    "maxOutputTokens": 24576,
                     "responseMimeType": "application/json",
                     "thinkingConfig": {"thinkingLevel": "LOW"},
                 },
@@ -875,18 +923,21 @@ async def extract_and_translate_manga_bubbles(
     manga_system_instruction = f"""
 You are a professional Manga, Manhwa, and Comic Localizer.
 Analyze the entire image visually (character expressions, action, speaker relationships, and panel layout)
-and translate ALL speech bubbles (including short exclamations like '!' or 'Huh?') into natural, idiomatic {target_lang_name}.
+and translate EVERY SINGLE speech bubble (including small bubbles and short exclamations like '!' or 'Huh?') into natural, idiomatic {target_lang_name}.
 
 CRITICAL RULES:
-1. Reading Order: Within each page, order the bubbles strictly in traditional Japanese Manga reading order (Top-to-Bottom, Right-to-Left across panels).
-2. In-Context Localization & Honorifics:
-   - Adapt idioms, pronouns, tone, and emotion so the dialogue sounds natural in {target_lang_name} while fitting inside a speech bubble. Do NOT use double quotes inside `translated_text` (use single quotes if needed).
-   - When translating to English, ALWAYS preserve Japanese honorifics attached directly with a hyphen and NO space (translate さん as `-san`, くん/君 as `-kun`, ちゃん as `-chan`, 様/さま as `-sama`, 先生 as `-sensei`, 先輩 as `-senpai` — e.g., 'Melt-san', NEVER 'Melt- san' or 'Miss Melt').
-3. Speech Bubble Bounding Boxes (`box_2d`) — STRICT PLACEMENT RULES:
+1. Complete Coverage & Reading Order:
+   - Translate EVERY speech bubble on the page without skipping any bubble!
+   - Order the bubbles strictly in traditional Japanese Manga reading order (Top-to-Bottom, Right-to-Left across panels).
+2. In-Context Localization & Punctuation:
+   - Adapt idioms, pronouns, tone, and emotion so the dialogue sounds natural in {target_lang_name} while fitting inside a speech bubble.
+   - Use standard ASCII punctuation (`...` instead of `…`, `~` instead of `〜`, `-` instead of `—`, single quotes `'` instead of double quotes).
+   - When translating to English, ALWAYS preserve Japanese honorifics attached directly with a hyphen and NO space (`-san`, `-kun`, `-chan`, `-sama`, `-sensei`, `-senpai`).
+3. Speech Bubble Bounding Boxes (`box_2d`) — STRICT ALIGNMENT RULES:
    - ONLY provide `box_2d` (`[ymin, xmin, ymax, xmax]`, normalized 0..1000) for dialogue/narration inside an actual speech bubble or caption box!
-   - `box_2d` MUST tightly enclose the Japanese text INSIDE the bubble (never point to empty white margin outside the bubble, and NEVER place `box_2d` over a character's face, body, or background artwork!).
-   - For floating SFX / sound effects (e.g. ドーン, ドドン, スラ〜〜, ほう…？) OR tiny unenclosed whispers drawn directly over a character's body/shirt outside a speech bubble, ALWAYS set `"box_2d": null` so the artwork/character is NEVER overwritten!
-   - NEVER merge two separate speech bubbles (or a speech bubble + an outside whisper) into a single `box_2d`! Keep each speech bubble strictly separate.
+   - `box_2d` MUST tightly enclose the Japanese text INSIDE that specific bubble (NEVER shift outside onto empty background or character heads/bodies!).
+   - For floating SFX / sound effects (e.g. ドーン, ドドン, トスッ, スラ〜〜, ほう…？) OR tiny unenclosed whispers drawn directly over a character's body/shirt outside a speech bubble, ALWAYS set `"box_2d": null` so the artwork/character is NEVER overwritten!
+   - NEVER merge two separate speech bubbles into a single `box_2d`! Keep each speech bubble strictly separate.
 4. Return ONLY valid JSON matching this exact structure (every bubble MUST have a non-empty `translated_text`; write `summary` in {target_lang_name}):
 {{
   "summary": "Brief 1-sentence scene context in {target_lang_name}",
@@ -1046,6 +1097,55 @@ CRITICAL RULES:
     return [], ""
 
 
+def _split_thai_word_cleanly(
+    draw: ImageDraw.ImageDraw,
+    word: str,
+    font: ImageFont.ImageFont,
+    max_width: int,
+) -> list[str]:
+    """
+    Splits an unspaced Thai phrase across lines without leaving orphaned leading vowels
+    (`เ`, `แ`, `โ`, `ใ`, `ไ`) at the end of a line or splitting combining tone/vowel marks.
+    """
+    leading_vowels = set("เแโใไ")
+    trailing_keep = set("ะาำๆฯ?!.,")
+    out_lines: list[str] = []
+    chunk = ""
+
+    for idx, ch in enumerate(word):
+        test_ch = chunk + ch
+        cbbox = draw.textbbox((0, 0), test_ch, font=font)
+        is_combining = ("\u0E31" <= ch <= "\u0E3A") or ("\u0E47" <= ch <= "\u0E4E")
+        if (cbbox[2] - cbbox[0]) > max_width and chunk and not is_combining:
+            # If the current chunk ends with an orphaned leading vowel (e.g. 'มีอะไรเ' before 'หรอ'),
+            # move that leading vowel to the next line so 'เหรอ' stays intact!
+            if len(chunk) > 2 and chunk[-1] in leading_vowels:
+                out_lines.append(chunk[:-1])
+                chunk = chunk[-1] + ch
+            elif ch in trailing_keep and len(chunk) > 2:
+                # Pull 1 base character + its combining marks onto the next line with the short particle
+                cut = len(chunk) - 1
+                while cut > 1 and (("\u0E31" <= chunk[cut] <= "\u0E3A") or ("\u0E47" <= chunk[cut] <= "\u0E4E")):
+                    cut -= 1
+                if cut > 1 and chunk[cut - 1] in leading_vowels:
+                    cut -= 1
+                if cut > 1:
+                    out_lines.append(chunk[:cut])
+                    chunk = chunk[cut:] + ch
+                else:
+                    out_lines.append(chunk)
+                    chunk = ch
+            else:
+                out_lines.append(chunk)
+                chunk = ch
+        else:
+            chunk = test_ch
+
+    if chunk:
+        out_lines.append(chunk)
+    return out_lines
+
+
 def _wrap_text_to_pixel_width(
     draw: ImageDraw.ImageDraw,
     text: str,
@@ -1074,13 +1174,16 @@ def _wrap_text_to_pixel_width(
             wbbox = draw.textbbox((0, 0), word, font=font)
             if (wbbox[2] - wbbox[0]) <= max_width or (not is_thai and not allow_midword_split):
                 current = word
+            elif is_thai:
+                thai_parts = _split_thai_word_cleanly(draw, word, font, max_width)
+                lines.extend(thai_parts[:-1])
+                current = thai_parts[-1] if thai_parts else ""
             else:
                 chunk = ""
                 for ch in word:
                     test_ch = chunk + ch
                     cbbox = draw.textbbox((0, 0), test_ch, font=font)
-                    is_combining = "\u0E31" <= ch <= "\u0E3A" or "\u0E47" <= ch <= "\u0E4E"
-                    if (cbbox[2] - cbbox[0]) > max_width and chunk and not is_combining:
+                    if (cbbox[2] - cbbox[0]) > max_width and chunk:
                         lines.append(chunk)
                         chunk = ch
                     else:
@@ -1095,7 +1198,7 @@ def _detect_bubble_polarity(
     base_gray: Image.Image, x1: int, y1: int, x2: int, y2: int
 ) -> bool:
     """
-    Fast C-level median luminance check using `ImageStat.Stat` (zero Python pixel list allocation).
+    Fast C-level median luminance check using `ImageStat.Stat`.
     Returns True if the bubble/panel region at (x1, y1, x2, y2) is Dark/Charcoal (< 125).
     """
     bw = x2 - x1
@@ -1163,10 +1266,10 @@ def _find_best_enclosed_white_bubble(
     has_kanji_kana: bool = True,
 ) -> Image.Image | None:
     """
-    Fast 0.5x-scale enclosed white speech bubble finder (exact `image_engine_v8.py` algorithm):
-      - Rejects blank white cheeks/faces/backgrounds by checking enclosed character loops (`holes_area`).
-      - Accepts thin-font speech bubbles where `holes_area >= 5` at 0.5x scale so they never miss
-        enclosed bubble cleaning.
+    Fast 0.5x-scale enclosed white/off-white speech bubble finder:
+      - Uses `p >= 220` threshold so JPEG-compressed or cream-tinted bubbles are detected cleanly.
+      - Allows dense multi-column kanji+furigana bubbles (`comp_area / filled_area >= 0.25`) while
+        rejecting blank white faces/margins (`holes_area < 5`).
     """
     ww, wh = sub_gray.size
     if ww < 16 or wh < 16:
@@ -1194,7 +1297,7 @@ def _find_best_enclosed_white_bubble(
             if 1 <= sx_ext < sw - 1:
                 seed_candidates.append((sx_ext, sy))
 
-    base_bin = small_gray.point(lambda p: 255 if p >= 232 else 0)
+    base_bin = small_gray.point(lambda p: 255 if p >= 220 else 0)
     pinched_bin = base_bin.filter(ImageFilter.MinFilter(3))
 
     best_small_filled = None
@@ -1239,7 +1342,8 @@ def _find_best_enclosed_white_bubble(
             filled_area = max(1, filled.crop(c_bbox).histogram()[255])
             holes_area = holes.crop(c_bbox).histogram()[255]
 
-            if comp_area < 55 or (comp_area / filled_area) < 0.48:
+            # Allow dense kanji + furigana blocks (comp_area / filled_area >= 0.25)
+            if comp_area < 45 or (comp_area / filled_area) < 0.25:
                 continue
 
             if has_kanji_kana and holes_area < 5:
@@ -1302,6 +1406,24 @@ def _sample_dark_bubble_bg_rgb_and_lum(img: Image.Image, base_gray: Image.Image,
     return bg_rgb, bg_lum
 
 
+def _sample_light_bubble_bg_rgb(img: Image.Image, base_gray: Image.Image, x1: int, y1: int, x2: int, y2: int) -> tuple[int, int, int]:
+    """Samples the true light paper color (pure white 255 or cream/light-gray 225..254) inside a light bubble."""
+    crop_rgb = img.crop((x1, y1, x2, y2))
+    crop_gray = base_gray.crop((x1, y1, x2, y2))
+    gray_vals = list(crop_gray.getdata())
+    rgb_vals = list(crop_rgb.getdata())
+    if not gray_vals:
+        return (255, 255, 255)
+    light_indices = [i for i, g in enumerate(gray_vals) if g >= 205]
+    if not light_indices:
+        return (255, 255, 255)
+    light_indices.sort(key=lambda idx: gray_vals[idx])
+    mid_idx = light_indices[len(light_indices) // 2]
+    if gray_vals[mid_idx] >= 244:
+        return (255, 255, 255)
+    return rgb_vals[mid_idx]
+
+
 def _erase_bubble_japanese_text_and_measure_lobe(
     img: Image.Image,
     base_gray: Image.Image,
@@ -1315,6 +1437,8 @@ def _erase_bubble_japanese_text_and_measure_lobe(
 ) -> tuple[int, int, int, int, tuple[int, int, int], tuple[int, int, int]] | None:
     width, height = img.size
     x1, y1, x2, y2 = raw_x1, raw_y1, raw_x2, raw_y2
+    box_w = max(10, x2 - x1)
+    box_h = max(10, y2 - y1)
 
     vor_x1, vor_y1, vor_x2, vor_y2 = _compute_voronoi_lobe_bounds(
         width, height, x1, y1, x2, y2, other_peer_boxes
@@ -1340,7 +1464,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
         box_hist = base_gray.crop((x1, y1, x2, y2)).histogram()
         total_box_px = max(1, sum(box_hist))
         bright_ratio = sum(box_hist[205:]) / total_box_px
-        # Reject colorful character hair/clothes/skin that have no white text strokes
         if mean_sat >= 42.0 or bright_ratio < 0.006:
             return None
 
@@ -1408,27 +1531,41 @@ def _erase_bubble_japanese_text_and_measure_lobe(
         )
 
     # =========================================================================
-    # CASE B: ENCLOSED WHITE SPEECH BUBBLE (Exact `image_engine_v8.py` Lobe Snap)
+    # CASE B: ENCLOSED WHITE / OFF-WHITE SPEECH BUBBLE (Complete Kanji+Furigana Wipe)
     # =========================================================================
     filled_bubble = _find_best_enclosed_white_bubble(
         sub_gray, rx1_rel, ry1_rel, rx2_rel, ry2_rel, has_kanji_kana=has_kanji_kana
     )
 
     if filled_bubble is not None:
-        safe_inner_core = filled_bubble.filter(ImageFilter.MinFilter(5))
-        ink_inside_bubble = sub_gray.point(lambda p: 255 if p < 248 else 0)
+        # Use MinFilter(3) so the entire interior up to 1px inside the outline is cleaned,
+        # and MaxFilter(5) on ink (< 238) so all kanji + furigana + JPEG halos are wiped completely!
+        safe_inner_core = filled_bubble.filter(ImageFilter.MinFilter(3))
+        ink_inside_bubble = sub_gray.point(lambda p: 255 if p < 238 else 0)
         erase_mask = ImageChops.darker(
-            ink_inside_bubble.filter(ImageFilter.MaxFilter(3)),
+            ink_inside_bubble.filter(ImageFilter.MaxFilter(5)),
             safe_inner_core,
         )
-        img.paste(Image.new("RGB", (ww, wh), (255, 255, 255)), (wx1, wy1), mask=erase_mask)
+        light_bg_rgb = _sample_light_bubble_bg_rgb(img, base_gray, raw_x1, raw_y1, raw_x2, raw_y2)
+        img.paste(Image.new("RGB", (ww, wh), light_bg_rgb), (wx1, wy1), mask=erase_mask)
 
         lobe_bbox = safe_inner_core.getbbox()
         if lobe_bbox:
-            lb_x1, lb_y1, lb_x2, lb_y2 = lobe_bbox
+            # Clamp lobe bounds tightly around the original `box_2d` so an enclosed bubble
+            # never expands sideways into an adjacent touching bubble!
+            max_expand_x = max(18, int(box_w * 0.35))
+            max_expand_y = max(16, int(box_h * 0.28))
+            lb_x1 = max(lobe_bbox[0], max(2, rx1_rel - max_expand_x))
+            lb_y1 = max(lobe_bbox[1], max(2, ry1_rel - max_expand_y))
+            lb_x2 = min(lobe_bbox[2], min(ww - 2, rx2_rel + max_expand_x))
+            lb_y2 = min(lobe_bbox[3], min(wh - 2, ry2_rel + max_expand_y))
+
+            if lb_x2 - lb_x1 < 18 or lb_y2 - lb_y1 < 16:
+                lb_x1, lb_y1, lb_x2, lb_y2 = lobe_bbox
+
             lobe_cx = (lb_x1 + lb_x2) // 2
-            rel_y1 = max(lb_y1 + 4, min(ry1_rel, lb_y1 + int((lb_y2 - lb_y1) * 0.12)))
-            rel_y2 = min(lb_y2 - 4, max(ry2_rel, lb_y1 + int((lb_y2 - lb_y1) * 0.88)))
+            rel_y1 = max(lb_y1 + 3, min(ry1_rel, lb_y1 + int((lb_y2 - lb_y1) * 0.12)))
+            rel_y2 = min(lb_y2 - 3, max(ry2_rel, lb_y1 + int((lb_y2 - lb_y1) * 0.88)))
             if rel_y2 - rel_y1 < 18:
                 rel_y1, rel_y2 = lb_y1 + 3, lb_y2 - 3
 
@@ -1461,7 +1598,7 @@ def _erase_bubble_japanese_text_and_measure_lobe(
                         wx1 + inner_r,
                         wy1 + rel_y2,
                         (15, 15, 15),
-                        (255, 255, 255),
+                        light_bg_rgb,
                     )
 
             return (
@@ -1470,43 +1607,50 @@ def _erase_bubble_japanese_text_and_measure_lobe(
                 wx1 + lb_x2 - 4,
                 wy1 + rel_y2,
                 (15, 15, 15),
-                (255, 255, 255),
+                light_bg_rgb,
             )
 
     # =========================================================================
-    # CASE C: OPEN-SIDED WHITE SPEECH BUBBLE (Strictly Clamped to `box_2d`)
+    # CASE C: BORDER-TOUCHING / OPEN-SIDED WHITE SPEECH BUBBLE
+    # (Verifies BOTH light paper AND actual Japanese text ink inside `box_2d`,
+    #  then erases ALL text strokes cleanly within `box_2d`!)
     # =========================================================================
-    tx_b1 = max(2, rx1_rel - 6)
-    ty_b1 = max(2, ry1_rel - 6)
-    tx_b2 = min(ww - 2, rx2_rel + 6)
-    ty_b2 = min(wh - 2, ry2_rel + 6)
+    tx_b1 = max(2, rx1_rel - 4)
+    ty_b1 = max(2, ry1_rel - 4)
+    tx_b2 = min(ww - 2, rx2_rel + 4)
+    ty_b2 = min(wh - 2, ry2_rel + 4)
+
+    sub_hsv_c = img.crop((x1, y1, x2, y2)).convert("HSV")
+    mean_sat_c = ImageStat.Stat(sub_hsv_c).mean[1]
 
     box_crop = sub_gray.crop((tx_b1, ty_b1, tx_b2, ty_b2))
     box_hist = box_crop.histogram()
     total_box_px = max(1, sum(box_hist))
-    pure_white_px = sum(box_hist[242:])
-    white_ratio = pure_white_px / total_box_px
+    light_paper_px = sum(box_hist[210:])
+    dark_ink_px = sum(box_hist[:165])
+    light_ratio = light_paper_px / total_box_px
+    ink_ratio = dark_ink_px / total_box_px
 
-    if white_ratio >= 0.45:
-        local_max = sub_gray.filter(ImageFilter.MaxFilter(7))
-        white_paper_zone = local_max.point(lambda p: 255 if p >= 242 else 0).filter(ImageFilter.MinFilter(3))
-
+    # Must be low-saturation speech-bubble paper (mean_sat < 36), contain >=26% white/light-gray paper
+    # (works even on dense multi-column kanji+furigana blocks!), AND contain actual text ink (>=1.2%)
+    # so empty background boxes shifted outside bubbles are cleanly rejected!
+    if mean_sat_c < 36.0 and light_ratio >= 0.26 and ink_ratio >= 0.012:
         box_clamp = Image.new("L", (ww, wh), 0)
         ImageDraw.Draw(box_clamp).rectangle([tx_b1, ty_b1, tx_b2, ty_b2], fill=255)
-        safe_open_zone = ImageChops.darker(white_paper_zone, box_clamp)
 
-        dark_strokes = sub_gray.point(lambda p: 255 if p < 238 else 0)
-        candidate_text_ink = ImageChops.darker(dark_strokes, safe_open_zone)
+        # Erase all non-white text ink (< 222) dilated with MaxFilter(5) strictly inside `box_clamp`
+        # so dense kanji + furigana + anti-aliased edges are 100% wiped without leaking outside `box_2d`!
+        text_ink_mask = sub_gray.point(lambda p: 255 if p < 222 else 0)
+        erase_c = ImageChops.darker(
+            text_ink_mask.filter(ImageFilter.MaxFilter(5)),
+            box_clamp,
+        )
+        if erase_c.getbbox():
+            light_bg_rgb = _sample_light_bubble_bg_rgb(img, base_gray, raw_x1, raw_y1, raw_x2, raw_y2)
+            img.paste(Image.new("RGB", (ww, wh), light_bg_rgb), (wx1, wy1), mask=erase_c)
+            return raw_x1, raw_y1, raw_x2, raw_y2, (15, 15, 15), light_bg_rgb
 
-        if candidate_text_ink.getbbox():
-            erase_c = ImageChops.darker(
-                candidate_text_ink.filter(ImageFilter.MaxFilter(5)),
-                box_clamp,
-            )
-            img.paste(Image.new("RGB", (ww, wh), (255, 255, 255)), (wx1, wy1), mask=erase_c)
-            return raw_x1, raw_y1, raw_x2, raw_y2, (15, 15, 15), (255, 255, 255)
-
-    # Reject completely blank white margins (no text ink inside `box_2d`) or colorful artwork
+    # Reject shifted boxes over empty background/artwork or colorful clothing/hair
     return None
 
 
@@ -1548,22 +1692,25 @@ def _resolve_box_collisions(
     return renders
 
 
-def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) -> bytes | None:
+def render_translated_manga_image_sync(
+    raw_bytes: bytes,
+    bubbles: list[dict],
+    max_canvas_dim: int = MAX_RENDER_CANVAS_DIM_BATCH,
+) -> bytes | None:
     if not raw_bytes:
         return None
     valid_boxes = [
         b for b in bubbles
         if isinstance(b.get("box_2d"), list)
         and len(b["box_2d"]) == 4
-        and (b.get("translated_text") or "").strip()
+        and _sanitize_text_for_manga_font(b.get("translated_text") or "")
     ]
     if not valid_boxes:
         return None
 
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-    # Cap canvas dimension to 1280px so 0.1 vCPU / 512MB Render container renders 4-6x faster without OOM or WebSocket lag
-    if max(img.size) > MAX_RENDER_CANVAS_DIM:
-        img.thumbnail((MAX_RENDER_CANVAS_DIM, MAX_RENDER_CANVAS_DIM), Image.Resampling.LANCZOS)
+    if max(img.size) > max_canvas_dim:
+        img.thumbnail((max_canvas_dim, max_canvas_dim), Image.Resampling.LANCZOS)
 
     base_gray = img.convert("L")
     width, height = img.size
@@ -1582,8 +1729,9 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
         is_dark = _detect_bubble_polarity(base_gray, raw_x1, raw_y1, raw_x2, raw_y2)
         src_txt = str(b.get("source_text") or "")
         has_kanji_kana = bool(re.search(r"[ぁ-んァ-ヶ一-龯A-Za-z0-9]", src_txt))
-        clean_tr = re.sub(r"\s+", " ", b["translated_text"]).strip()
-        pixel_boxes.append((raw_x1, raw_y1, raw_x2, raw_y2, is_dark, has_kanji_kana, clean_tr))
+        clean_tr = _sanitize_text_for_manga_font(b["translated_text"])
+        if clean_tr:
+            pixel_boxes.append((raw_x1, raw_y1, raw_x2, raw_y2, is_dark, has_kanji_kana, clean_tr))
 
     prepared_renders = []
     for i, (rx1, ry1, rx2, ry2, is_dark, has_kk, trans_text) in enumerate(pixel_boxes):
@@ -1617,6 +1765,9 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
 
     prepared_renders = _resolve_box_collisions(prepared_renders, min_gap=6)
 
+    # Scale max font cap proportionally to canvas size (30px at 1600px, 34px at 1792px)
+    max_font_px = max(24, int(max_canvas_dim * 0.019))
+
     draw = ImageDraw.Draw(img)
     for tx1, ty1, tx2, ty2, fg_text, stroke_col, trans_text in prepared_renders:
         box_w = max(20, tx2 - tx1)
@@ -1625,17 +1776,17 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
         usable_h = max(14, int(box_h * 0.94))
         is_thai_text = bool(THAI_CHAR_REGEX.search(trans_text))
 
-        start_font_size = min(24, max(11, int(min(box_w, box_h) * 0.27)))
-        chosen_font = _load_manga_font(8, is_thai=is_thai_text)
+        start_font_size = min(max_font_px, max(12, int(min(box_w, box_h) * 0.27)))
+        chosen_font = _load_manga_font(9, is_thai=is_thai_text)
         chosen_lines = [trans_text]
-        line_height = 10
+        line_height = 11
         ref_top = 0
 
         sample_probe = "Agกข้ำ" if is_thai_text else "Agjpqy!"
-        for fsize in range(start_font_size, 7, -1):
+        for fsize in range(start_font_size, 8, -1):
             font = _load_manga_font(fsize, is_thai=is_thai_text)
             wrapped = _wrap_text_to_pixel_width(
-                draw, trans_text, font, usable_w, allow_midword_split=(fsize <= 7)
+                draw, trans_text, font, usable_w, allow_midword_split=(fsize <= 9)
             )
             sample_bbox = draw.textbbox((0, 0), sample_probe, font=font)
             lh = max(fsize + 3, int((sample_bbox[3] - sample_bbox[1]) * 1.18))
@@ -1668,7 +1819,6 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
             )
             curr_y += line_height
 
-    # Save as high-quality JPEG (~300 KB vs ~5 MB PNG): encodes 15x faster and uses 15x less RAM on Render 512MB
     out_io = io.BytesIO()
     img.save(out_io, format="JPEG", quality=92)
     img.close()
@@ -1719,6 +1869,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
     _, target_lang_name = _detect_target_translation_lang(user_prompt)
     pages_input = pages_input[:MAX_MANGA_BATCH_PAGES]
     num_pages = len(pages_input)
+    canvas_cap = MAX_RENDER_CANVAS_DIM_SINGLE if num_pages <= 4 else MAX_RENDER_CANVAS_DIM_BATCH
 
     async with channel.typing():
         batch_results = await extract_and_translate_manga_pages_batch(
@@ -1765,7 +1916,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
 
             try:
                 rendered_jpg = await asyncio.to_thread(
-                    render_translated_manga_image_sync, raw_bytes, bubbles
+                    render_translated_manga_image_sync, raw_bytes, bubbles, canvas_cap
                 )
                 if rendered_jpg:
                     base_name = os.path.splitext(fname)[0]
@@ -1778,19 +1929,16 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
             except Exception as e:
                 print(f"Manga page {page_idx} rendering fallback to text-only: {e}", flush=True)
             finally:
-                # Immediately drop raw input bytes after rendering this page to keep 512MB RAM free
                 pages_input[page_idx - 1] = (b"", fname)
                 raw_bytes = None
                 rendered_jpg = None
 
-            # Generous 0.35s yield + periodic GC so Render 0.1 vCPU never starves Discord Gateway heartbeats
             if page_idx % 2 == 0:
                 gc.collect()
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(0.30)
 
         transcript_text = "\n".join(transcript_lines)
 
-        # Discord allows up to 10 attachments per single message; split into chunks of 10 when >10 pages
         if discord_files:
             file_chunks = [discord_files[i : i + 10] for i in range(0, len(discord_files), 10)]
             if len(transcript_text) <= 1950:
