@@ -36,7 +36,6 @@ from config import (
 )
 from llm import (
     call_gemini_generate_content_self_healing,
-    call_gemini_decision_orchestrator,
     call_gemma_ai_studio_chat,
     call_gemma_ai_studio_vision,
     call_cloudflare_gemma_chat,
@@ -47,16 +46,17 @@ from llm import (
 )
 
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
-MAX_FLOOD_MASK_DIM = 160    # Caps pure-Python PIL floodfill mask to <=160px (~20x faster, zero Discord Gateway lag!)
+SOM_CV_MAX_DIM = 420        # Fast 420px CV detection grid (~60ms/page, zero Discord Gateway lag!)
 
 # Cache for self-healing discovery of strictly newer (>3.5) `flash-lite` models on Google AI Studio
 _FLASH_LITE_DISCOVERY_CACHE: list[str] = []
 _FLASH_LITE_DISCOVERY_TS: float = 0.0
 _FLASH_LITE_EXCLUDED = ("2.5", "2.0", "1.5", "latest", "image", "tts", "audio", "live", "embedding")
 
-# Strict JSON responseSchema WITH explicit `propertyOrdering` so Gemini NEVER outputs `box_2d` alphabetically
-# before reading `panel_position` and `source_text`! `box_2d` is emitted IMMEDIATELY after `source_text`.
-MANGA_BATCH_RESPONSE_SCHEMA = {
+# Set-of-Mark (SoM) JSON responseSchema with explicit `propertyOrdering`:
+# - Every red-numbered CV bubble `[k]` maps 1-to-1 via `"bubble_id": k` (zero coordinate drift!).
+# - Unmarked borderless/open bubbles use `"bubble_id": null` + `"box_2d"` emitted AFTER `"source_text"`.
+MANGA_BATCH_SOM_SCHEMA = {
     "type": "OBJECT",
     "properties": {
         "pages": {
@@ -72,7 +72,8 @@ MANGA_BATCH_RESPONSE_SCHEMA = {
                             "type": "OBJECT",
                             "properties": {
                                 "id": {"type": "INTEGER"},
-                                "panel_position": {"type": "STRING"},
+                                "bubble_id": {"type": "INTEGER", "nullable": True},
+                                "is_dialogue": {"type": "BOOLEAN"},
                                 "speaker_or_note": {"type": "STRING"},
                                 "source_text": {"type": "STRING"},
                                 "box_2d": {
@@ -84,7 +85,8 @@ MANGA_BATCH_RESPONSE_SCHEMA = {
                             },
                             "propertyOrdering": [
                                 "id",
-                                "panel_position",
+                                "bubble_id",
+                                "is_dialogue",
                                 "speaker_or_note",
                                 "source_text",
                                 "box_2d",
@@ -92,10 +94,10 @@ MANGA_BATCH_RESPONSE_SCHEMA = {
                             ],
                             "required": [
                                 "id",
-                                "panel_position",
+                                "bubble_id",
+                                "is_dialogue",
                                 "speaker_or_note",
                                 "source_text",
-                                "box_2d",
                                 "translated_text",
                             ],
                         },
@@ -110,7 +112,7 @@ MANGA_BATCH_RESPONSE_SCHEMA = {
     "required": ["pages"],
 }
 
-MANGA_SINGLE_RESPONSE_SCHEMA = {
+MANGA_SINGLE_SOM_SCHEMA = {
     "type": "OBJECT",
     "properties": {
         "summary": {"type": "STRING"},
@@ -120,7 +122,8 @@ MANGA_SINGLE_RESPONSE_SCHEMA = {
                 "type": "OBJECT",
                 "properties": {
                     "id": {"type": "INTEGER"},
-                    "panel_position": {"type": "STRING"},
+                    "bubble_id": {"type": "INTEGER", "nullable": True},
+                    "is_dialogue": {"type": "BOOLEAN"},
                     "speaker_or_note": {"type": "STRING"},
                     "source_text": {"type": "STRING"},
                     "box_2d": {
@@ -132,7 +135,8 @@ MANGA_SINGLE_RESPONSE_SCHEMA = {
                 },
                 "propertyOrdering": [
                     "id",
-                    "panel_position",
+                    "bubble_id",
+                    "is_dialogue",
                     "speaker_or_note",
                     "source_text",
                     "box_2d",
@@ -140,10 +144,10 @@ MANGA_SINGLE_RESPONSE_SCHEMA = {
                 ],
                 "required": [
                     "id",
-                    "panel_position",
+                    "bubble_id",
+                    "is_dialogue",
                     "speaker_or_note",
                     "source_text",
-                    "box_2d",
                     "translated_text",
                 ],
             },
@@ -205,7 +209,7 @@ EXPLICIT_FILENAME_COMMENT_REGEX = re.compile(
     re.IGNORECASE,
 )
 
-# Zero-dependency Thai orthographic cluster regex for clean syllable-level line wrapping
+# Zero-dependency Thai syllable tokenizer constants
 _THAI_CLUSTER_REGEX = re.compile(
     r"[เแโใไ]?[ก-ฮ][\u0E31\u0E34-\u0E3A\u0E47-\u0E4E]*(?:[ะาำ]|[\u0E47-\u0E4E])*|[A-Za-z0-9]+|[^\s]"
 )
@@ -214,6 +218,7 @@ _THAI_VOWEL_SIGNALS = set("เแโใไะาำ\u0E31\u0E34\u0E35\u0E36\u0E3
 _THAI_CLUSTER_FIRST = set("กขคจตทบปผพฟสศษ")
 _THAI_CLUSTER_SECOND = set("รลว")
 _THAI_HO_NAM_FOLLOW = set("งญนมยรลว")
+_THAI_PREFIX_LEAD = set("สปกตฉผถข")
 _THAI_PUNCT_ATTACH = set("ๆฯ?!.,:;'\")]-~")
 
 
@@ -579,7 +584,7 @@ async def send_generated_image_to_channel(channel, prompt_text: str, reply_to: d
 
 
 # ==============================================================================
-# IN-CONTEXT MANGA / IMAGE TRANSLATION & SMART SPEECH-BUBBLE TYPESETTING ENGINE
+# SET-OF-MARK (SoM) CV-ANCHORED MANGA TRANSLATION & FULL-RES TYPESETTING ENGINE
 # ==============================================================================
 @functools.lru_cache(maxsize=64)
 def _load_manga_font(size: int, is_thai: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -595,9 +600,8 @@ def _load_manga_font(size: int, is_thai: bool = False) -> ImageFont.FreeTypeFont
 
 def _sanitize_text_for_manga_font(text: str) -> str:
     """
-    Normalizes Unicode punctuation (`…` -> `...`, `〜` -> `~`, `—` -> `-`, smart quotes -> `'`),
-    removes stray CJK/emoji symbols, and cleans empty `()` / `[]` leftovers so `Garuda-Bold.ttf`
-    renders every character cleanly with zero `[]` tofu boxes.
+    Normalizes Unicode punctuation, strips stray CJK/emoji symbols, and cleans empty `()` / `[]`
+    so `Garuda-Bold.ttf` renders every character cleanly with zero `[]` tofu boxes.
     """
     if not text:
         return ""
@@ -637,15 +641,6 @@ def _detect_target_translation_lang(user_prompt: str) -> tuple[str, str]:
     if THAI_CHAR_REGEX.search(user_prompt):
         return "th", "Thai"
     return "en", "English"
-
-
-def _prepare_manga_image_for_vision(raw_bytes: bytes, max_dim: int = 1280, quality: int = 90) -> str:
-    img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-    img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=quality)
-    img.close()
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 def _parse_flash_lite_version(model_id: str) -> tuple[int, int]:
@@ -710,6 +705,469 @@ async def _discover_manga_batch_models() -> list[tuple[str, bool]]:
     return chain
 
 
+# ------------------------------------------------------------------------------
+# STAGE 1: DETERMINISTIC CV SPEECH-BUBBLE DETECTOR + SET-OF-MARK (SoM) OVERLAY
+# ------------------------------------------------------------------------------
+def _split_concave_double_bubble(
+    crop_mask: Image.Image,
+    offset_x: int,
+    offset_y: int,
+    sw: int,
+    sh: int,
+    depth: int = 0,
+) -> list[tuple[tuple[int, int, int, int], Image.Image]]:
+    """
+    Detects connected figure-8 double speech bubbles (horizontal or vertical) via
+    projection-profile neck detection and splits them cleanly at the narrowest waist
+    into separate single-oval masks.
+    """
+    cw, ch = crop_mask.size
+    if depth >= 2 or (cw < 24 and ch < 24):
+        return [((offset_x, offset_y, offset_x + cw, offset_y + ch), crop_mask)]
+
+    area = crop_mask.histogram()[255]
+    rect_fill = area / float(max(1, cw * ch))
+    if rect_fill >= 0.74:
+        return [((offset_x, offset_y, offset_x + cw, offset_y + ch), crop_mask)]
+
+    raw_bytes = crop_mask.tobytes()
+
+    # Check horizontal figure-8 neck (wide double oval)
+    best_split = None
+    if cw >= max(28, int(sw * 0.14)):
+        col_counts = [0] * cw
+        for y in range(ch):
+            row_off = y * cw
+            for x in range(cw):
+                if raw_bytes[row_off + x] > 128:
+                    col_counts[x] += 1
+
+        s_lo = max(4, int(cw * 0.22))
+        s_hi = min(cw - 4, int(cw * 0.78))
+        if s_hi > s_lo:
+            min_x = min(range(s_lo, s_hi), key=lambda ix: col_counts[ix])
+            min_h = col_counts[min_x]
+            left_max = max(col_counts[:min_x]) if min_x > 0 else 0
+            right_max = max(col_counts[min_x + 1 :]) if (min_x + 1) < cw else 0
+            peak_min = min(left_max, right_max)
+            if peak_min >= 14 and min_h <= peak_min * 0.60:
+                best_split = ("v", min_x, min_h / float(peak_min))
+
+    # Check vertical figure-8 neck (stacked double oval)
+    if ch >= max(28, int(sh * 0.12)):
+        row_counts = [0] * ch
+        for y in range(ch):
+            row_off = y * cw
+            cnt = 0
+            for x in range(cw):
+                if raw_bytes[row_off + x] > 128:
+                    cnt += 1
+            row_counts[y] = cnt
+
+        s_lo = max(4, int(ch * 0.22))
+        s_hi = min(ch - 4, int(ch * 0.78))
+        if s_hi > s_lo:
+            min_y = min(range(s_lo, s_hi), key=lambda iy: row_counts[iy])
+            min_w = row_counts[min_y]
+            top_max = max(row_counts[:min_y]) if min_y > 0 else 0
+            bot_max = max(row_counts[min_y + 1 :]) if (min_y + 1) < ch else 0
+            peak_min = min(top_max, bot_max)
+            if peak_min >= 14 and min_w <= peak_min * 0.60:
+                ratio = min_w / float(peak_min)
+                if best_split is None or ratio < best_split[2]:
+                    best_split = ("h", min_y, ratio)
+
+    if best_split is None:
+        return [((offset_x, offset_y, offset_x + cw, offset_y + ch), crop_mask)]
+
+    axis, cut_pos, _ = best_split
+    sliced = crop_mask.copy()
+    sdraw = ImageDraw.Draw(sliced)
+    if axis == "v":
+        sdraw.rectangle([max(0, cut_pos - 1), 0, min(cw - 1, cut_pos + 1), ch - 1], fill=0)
+    else:
+        sdraw.rectangle([0, max(0, cut_pos - 1), cw - 1, min(ch - 1, cut_pos + 1)], fill=0)
+
+    # Extract separated child components from `sliced`
+    children: list[tuple[tuple[int, int, int, int], Image.Image]] = []
+    work = sliced
+    for sy in range(1, ch - 1, 3):
+        for sx in range(1, cw - 1, 3):
+            if work.getpixel((sx, sy)) != 255:
+                continue
+            ImageDraw.floodfill(work, (sx, sy), 128)
+            comp = work.point(lambda p: 255 if p == 128 else 0)
+            new_work = work.point(lambda p: 0 if p == 128 else p)
+            work.close()
+            work = new_work
+
+            bb = comp.getbbox()
+            if not bb:
+                comp.close()
+                continue
+            bw_c = bb[2] - bb[0]
+            bh_c = bb[3] - bb[1]
+            sub_m = comp.crop(bb)
+            comp.close()
+            sub_area = sub_m.histogram()[255]
+            if bw_c >= 10 and bh_c >= 10 and sub_area >= 110:
+                children.extend(
+                    _split_concave_double_bubble(
+                        sub_m, offset_x + bb[0], offset_y + bb[1], sw, sh, depth=depth + 1
+                    )
+                )
+            else:
+                sub_m.close()
+    work.close()
+
+    if len(children) >= 2:
+        crop_mask.close()
+        return children
+
+    for _, cm in children:
+        cm.close()
+    return [((offset_x, offset_y, offset_x + cw, offset_y + ch), crop_mask)]
+
+
+def _sort_bubbles_manga_reading_order(bubbles: list[dict], sw: int, sh: int) -> list[dict]:
+    """
+    Sorts detected CV bubbles in natural Japanese Manga reading order:
+    Top-to-Bottom panel rows (grouping bubbles whose vertical spans overlap significantly),
+    and Right-to-Left within each row!
+    """
+    if len(bubbles) <= 1:
+        return bubbles
+
+    # Sort primarily by top edge `y1` so we can form horizontal reading bands
+    ordered = sorted(bubbles, key=lambda d: (d["bbox_norm"][0], -d["bbox_norm"][3]))
+    bands: list[list[dict]] = []
+    for item in ordered:
+        y1, _, y2, _ = item["bbox_norm"]
+        placed = False
+        for band in bands:
+            b_y1 = min(x["bbox_norm"][0] for x in band)
+            b_y2 = max(x["bbox_norm"][2] for x in band)
+            ov = min(y2, b_y2) - max(y1, b_y1)
+            min_h = max(1.0, min(y2 - y1, b_y2 - b_y1))
+            if ov >= min_h * 0.42:
+                band.append(item)
+                placed = True
+                break
+        if not placed:
+            bands.append([item])
+
+    bands.sort(key=lambda b: min(x["bbox_norm"][0] for x in b))
+    result: list[dict] = []
+    for band in bands:
+        # Within each band, sort Right-to-Left by horizontal center, breaking ties Top-to-Bottom
+        band.sort(key=lambda x: (-((x["bbox_norm"][1] + x["bbox_norm"][3]) / 2.0), x["bbox_norm"][0]))
+        result.extend(band)
+    return result
+
+
+def _detect_page_bubbles_and_build_som_b64_sync(
+    raw_bytes: bytes,
+    vision_max_dim: int = 1024,
+    vision_quality: int = 84,
+) -> tuple[str, list[dict]]:
+    """
+    Detects enclosed white speech bubbles/caption boxes (and dark speech bubbles) directly
+    via fast C-level PIL connected components at 420px scale, splits figure-8 double bubbles
+    at their narrow waists, sorts them in Japanese Manga reading order, and draws crisp red
+    numbered Set-of-Mark (SoM) badges `[1]`, `[2]`, ... onto the vision JPEG sent to Gemini.
+
+    Returns `(b64_som_jpeg, detected_cv_bubbles)` where each item in `detected_cv_bubbles` has:
+      - `bubble_id`: 1-based integer matching the red badge on the image
+      - `bbox_norm`: `[ymin, xmin, ymax, xmax]` in `0..1000`
+      - `mask_small`: cropped L-mode mask (`255` = bubble interior)
+      - `is_dark`: bool
+    """
+    img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    orig_w, orig_h = img.size
+
+    try:
+        # 1. Fast 420px detection buffers
+        scale = min(1.0, SOM_CV_MAX_DIM / float(max(orig_w, orig_h)))
+        sw = max(32, int(round(orig_w * scale)))
+        sh = max(32, int(round(orig_h * scale)))
+        small_rgb = img.resize((sw, sh), Image.Resampling.BILINEAR)
+        small_gray = small_rgb.convert("L")
+        small_sat = small_rgb.convert("HSV").getchannel("S")
+        small_rgb.close()
+
+        detected: list[dict] = []
+
+        # --- Pass A: Enclosed White Speech Bubbles & White Rectangular Caption Boxes ---
+        white_bin = small_gray.point(lambda p: 255 if p >= 232 else 0)
+        work = white_bin.copy()
+        white_bin.close()
+
+        min_w_px = max(11, int(sw * 0.040))
+        min_h_px = max(11, int(sh * 0.028))
+        max_area_px = int(sw * sh * 0.24)
+
+        for sy in range(2, sh - 2, 4):
+            for sx in range(2, sw - 2, 4):
+                if work.getpixel((sx, sy)) != 255:
+                    continue
+
+                ImageDraw.floodfill(work, (sx, sy), 128)
+                comp = work.point(lambda p: 255 if p == 128 else 0)
+                new_work = work.point(lambda p: 0 if p == 128 else p)
+                work.close()
+                work = new_work
+
+                c_bbox = comp.getbbox()
+                if not c_bbox:
+                    comp.close()
+                    continue
+                cx1, cy1, cx2, cy2 = c_bbox
+                cw, ch = cx2 - cx1, cy2 - cy1
+
+                # Reject outer page margin / full-page backgrounds & tiny speckles
+                edge_touches = (
+                    (1 if cx1 <= 1 else 0)
+                    + (1 if cy1 <= 1 else 0)
+                    + (1 if cx2 >= sw - 1 else 0)
+                    + (1 if cy2 >= sh - 1 else 0)
+                )
+                if (
+                    edge_touches >= 2
+                    or cw > sw * 0.72
+                    or ch > sh * 0.65
+                    or cw < min_w_px
+                    or ch < min_h_px
+                ):
+                    comp.close()
+                    continue
+
+                # Hole-fill inside the local crop (2px padding ensures complete exterior floodfill)
+                comp_crop = comp.crop(c_bbox)
+                comp.close()
+
+                padded = Image.new("L", (cw + 4, ch + 4), 0)
+                padded.paste(comp_crop, (2, 2))
+                ImageDraw.floodfill(padded, (0, 0), 128)
+                holes_crop = padded.crop((2, 2, cw + 2, ch + 2)).point(lambda p: 255 if p == 0 else 0)
+                padded.close()
+                filled_crop = ImageChops.lighter(comp_crop, holes_crop)
+
+                comp_area = comp_crop.histogram()[255]
+                filled_area = max(1, filled_crop.histogram()[255])
+                holes_area = holes_crop.histogram()[255]
+                comp_crop.close()
+                holes_crop.close()
+
+                # Must contain interior text strokes (`holes_area >= 4`) and not be an entire panel
+                if (
+                    filled_area > max_area_px
+                    or holes_area < 4
+                    or (comp_area / float(filled_area)) < 0.25
+                    or (holes_area / float(filled_area)) > 0.68
+                ):
+                    filled_crop.close()
+                    continue
+
+                # Verify bubble interior is achromatic (white paper + dark ink, NOT colored food/skin/art)
+                sat_crop = small_sat.crop(c_bbox)
+                gray_crop = small_gray.crop(c_bbox)
+                sat_hist = sat_crop.histogram(mask=filled_crop)
+                total_m_px = max(1, sum(sat_hist))
+                chroma_ratio = sum(sat_hist[24:]) / float(total_m_px)
+                mean_sat = ImageStat.Stat(sat_crop, mask=filled_crop).mean[0]
+
+                # Verify there is actual dark text ink (`gray < 175` & `sat < 22`) inside `filled_crop`
+                dark_ink_bin = gray_crop.point(lambda p: 255 if p < 175 else 0)
+                achrom_bin = sat_crop.point(lambda p: 255 if p < 22 else 0)
+                achrom_ink = ImageChops.darker(ImageChops.darker(dark_ink_bin, achrom_bin), filled_crop)
+                dark_ink_px = achrom_ink.histogram()[255]
+
+                dark_ink_bin.close()
+                achrom_bin.close()
+                achrom_ink.close()
+                sat_crop.close()
+                gray_crop.close()
+
+                if chroma_ratio >= 0.20 or mean_sat >= 20.0 or dark_ink_px < 4:
+                    filled_crop.close()
+                    continue
+
+                # Split connected figure-8 double bubbles cleanly at their narrow waists
+                sub_lobes = _split_concave_double_bubble(filled_crop, cx1, cy1, sw, sh, depth=0)
+                for (lx1, ly1, lx2, ly2), lobe_mask in sub_lobes:
+                    lw, lh = lx2 - lx1, ly2 - ly1
+                    if lw < min_w_px or lh < min_h_px:
+                        lobe_mask.close()
+                        continue
+                    # Re-verify each split lobe actually contains dark text ink
+                    l_gray = small_gray.crop((lx1, ly1, lx2, ly2))
+                    l_sat = small_sat.crop((lx1, ly1, lx2, ly2))
+                    l_ink = ImageChops.darker(
+                        ImageChops.darker(
+                            l_gray.point(lambda p: 255 if p < 175 else 0),
+                            l_sat.point(lambda p: 255 if p < 22 else 0),
+                        ),
+                        lobe_mask,
+                    )
+                    l_ink_px = l_ink.histogram()[255]
+                    l_ink.close()
+                    l_gray.close()
+                    l_sat.close()
+                    if l_ink_px < 4:
+                        lobe_mask.close()
+                        continue
+
+                    bbox_norm = [
+                        int(round((ly1 / float(sh)) * 1000.0)),
+                        int(round((lx1 / float(sw)) * 1000.0)),
+                        int(round((ly2 / float(sh)) * 1000.0)),
+                        int(round((lx2 / float(sw)) * 1000.0)),
+                    ]
+                    detected.append({
+                        "bbox_norm": bbox_norm,
+                        "mask_small": lobe_mask,
+                        "is_dark": False,
+                    })
+
+        work.close()
+
+        # --- Pass B: Enclosed Dark Speech Bubbles / Dark Caption Boxes with Bright White Text ---
+        dark_bin = small_gray.point(lambda p: 255 if p <= 95 else 0)
+        work_d = dark_bin.copy()
+        dark_bin.close()
+
+        for sy in range(2, sh - 2, 5):
+            for sx in range(2, sw - 2, 5):
+                if work_d.getpixel((sx, sy)) != 255:
+                    continue
+                ImageDraw.floodfill(work_d, (sx, sy), 128)
+                comp = work_d.point(lambda p: 255 if p == 128 else 0)
+                new_wd = work_d.point(lambda p: 0 if p == 128 else p)
+                work_d.close()
+                work_d = new_wd
+
+                c_bbox = comp.getbbox()
+                if not c_bbox:
+                    comp.close()
+                    continue
+                cx1, cy1, cx2, cy2 = c_bbox
+                cw, ch = cx2 - cx1, cy2 - cy1
+                if cw < min_w_px or ch < min_h_px or cw > sw * 0.55 or ch > sh * 0.55:
+                    comp.close()
+                    continue
+
+                comp_crop = comp.crop(c_bbox)
+                comp.close()
+                padded = Image.new("L", (cw + 4, ch + 4), 0)
+                padded.paste(comp_crop, (2, 2))
+                ImageDraw.floodfill(padded, (0, 0), 128)
+                holes_crop = padded.crop((2, 2, cw + 2, ch + 2)).point(lambda p: 255 if p == 0 else 0)
+                padded.close()
+                filled_crop = ImageChops.lighter(comp_crop, holes_crop)
+
+                filled_area = max(1, filled_crop.histogram()[255])
+                holes_area = holes_crop.histogram()[255]
+                comp_crop.close()
+                holes_crop.close()
+
+                rect_fill = filled_area / float(max(1, cw * ch))
+                if filled_area > max_area_px or holes_area < 5 or rect_fill < 0.65:
+                    filled_crop.close()
+                    continue
+
+                g_crop = small_gray.crop(c_bbox)
+                s_crop = small_sat.crop(c_bbox)
+                mean_s = ImageStat.Stat(s_crop, mask=filled_crop).mean[0]
+                bright_txt = ImageChops.darker(g_crop.point(lambda p: 255 if p >= 210 else 0), filled_crop)
+                bright_px = bright_txt.histogram()[255]
+                bright_txt.close()
+                g_crop.close()
+                s_crop.close()
+
+                if mean_s < 22.0 and 0.02 <= (bright_px / float(filled_area)) <= 0.42:
+                    bbox_norm = [
+                        int(round((cy1 / float(sh)) * 1000.0)),
+                        int(round((cx1 / float(sw)) * 1000.0)),
+                        int(round((cy2 / float(sh)) * 1000.0)),
+                        int(round((cx2 / float(sw)) * 1000.0)),
+                    ]
+                    detected.append({
+                        "bbox_norm": bbox_norm,
+                        "mask_small": filled_crop,
+                        "is_dark": True,
+                    })
+                else:
+                    filled_crop.close()
+
+        work_d.close()
+        small_gray.close()
+        small_sat.close()
+
+        # Sort in Manga reading order & assign 1-based `bubble_id`
+        detected = _sort_bubbles_manga_reading_order(detected, sw, sh)
+        for idx, b_obj in enumerate(detected, 1):
+            b_obj["bubble_id"] = idx
+
+        # 2. Build annotated Set-of-Mark JPEG copy for Gemini Vision
+        vis_img = img.copy()
+        vis_img.thumbnail((vision_max_dim, vision_max_dim), Image.Resampling.LANCZOS)
+        vw, vh = vis_img.size
+        vdraw = ImageDraw.Draw(vis_img)
+        badge_font_size = max(15, int(vw * 0.022))
+        badge_font = _load_manga_font(badge_font_size, is_thai=False)
+
+        for b_obj in detected:
+            bid = b_obj["bubble_id"]
+            ymin, xmin, ymax, xmax = b_obj["bbox_norm"]
+            vx1 = max(0, int((xmin / 1000.0) * vw))
+            vy1 = max(0, int((ymin / 1000.0) * vh))
+            vx2 = min(vw - 1, int((xmax / 1000.0) * vw))
+            vy2 = min(vh - 1, int((ymax / 1000.0) * vh))
+
+            # Draw crisp red contour of the actual detected oval/rectangle mask
+            m_w = max(2, vx2 - vx1)
+            m_h = max(2, vy2 - vy1)
+            m_up = b_obj["mask_small"].resize((m_w, m_h), Image.Resampling.NEAREST)
+            m_erode = m_up.filter(ImageFilter.MinFilter(3))
+            contour = ImageChops.difference(m_up, m_erode)
+            m_up.close()
+            m_erode.close()
+            red_patch = Image.new("RGB", (m_w, m_h), (235, 20, 20))
+            vis_img.paste(red_patch, (vx1, vy1), mask=contour)
+            red_patch.close()
+            contour.close()
+
+            # Draw bold red pill badge with white ID number at the top-right edge of the bubble
+            label = str(bid)
+            tb = vdraw.textbbox((0, 0), label, font=badge_font)
+            tw = tb[2] - tb[0]
+            th = tb[3] - tb[1]
+            pw = tw + 10
+            ph = th + 6
+            bx2 = min(vw - 1, vx2 + 2)
+            bx1 = max(0, bx2 - pw)
+            by1 = max(0, vy1 - (ph // 3))
+            by2 = min(vh - 1, by1 + ph)
+            vdraw.rectangle([bx1, by1, bx2, by2], fill=(225, 15, 15), outline=(255, 255, 255), width=1)
+            vdraw.text(
+                (bx1 + 5 - tb[0], by1 + 3 - tb[1]),
+                label,
+                font=badge_font,
+                fill=(255, 255, 255),
+            )
+
+        buf = io.BytesIO()
+        vis_img.save(buf, format="JPEG", quality=vision_quality)
+        vis_img.close()
+        b64_som = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return b64_som, detected
+    finally:
+        img.close()
+
+
+# ------------------------------------------------------------------------------
+# STAGE 2: JSON NORMALIZATION & STRICT BATCH VISION ORCHESTRATION
+# ------------------------------------------------------------------------------
 def _extract_norm_box_2d(raw_box) -> list[float] | None:
     if raw_box is None:
         return None
@@ -760,6 +1218,11 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
     for idx, item in enumerate(raw_bubbles, 1):
         if not isinstance(item, dict):
             continue
+
+        is_dialogue = item.get("is_dialogue")
+        if is_dialogue is False:
+            continue
+
         speaker = (
             item.get("speaker_or_note")
             or item.get("speaker")
@@ -796,22 +1259,29 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
         spk_lower = str(speaker).strip().lower()
         is_sfx = any(k in spk_lower for k in ("sfx", "sound effect", "onomatopoeia", "เอฟเฟกต์"))
 
+        raw_bid = item.get("bubble_id")
+        bubble_id = None
+        if raw_bid is not None and not is_sfx:
+            try:
+                bid_int = int(raw_bid)
+                if bid_int >= 1:
+                    bubble_id = bid_int
+            except Exception:
+                bubble_id = None
+
         raw_box = (
             item.get("box_2d")
             or item.get("bbox")
             or item.get("bbox_2d")
             or item.get("bounding_box")
             or item.get("box")
-            or item.get("coordinates")
-            or item.get("rect")
         )
         norm_box = None if is_sfx else _extract_norm_box_2d(raw_box)
-        panel_pos = str(item.get("panel_position") or "").strip().lower()
 
         valid.append({
             "id": item.get("id", idx),
+            "bubble_id": bubble_id,
             "speaker_or_note": str(speaker).strip(),
-            "panel_position": panel_pos,
             "source_text": src_txt,
             "translated_text": tr_txt,
             "box_2d": norm_box,
@@ -894,266 +1364,6 @@ def _parse_manga_pages_batch_json(
     return [([], "") for _ in range(expected_pages)]
 
 
-async def _waiting_heartbeat_logger(req_id: str, label: str, model_id: str, interval_sec: float = 15.0):
-    start_t = time.monotonic()
-    try:
-        while True:
-            await asyncio.sleep(interval_sec)
-            elapsed = time.monotonic() - start_t
-            api_log(f"{label} [req={req_id}] WAITING -> model={model_id} still running ({elapsed:.1f}s elapsed...)")
-    except asyncio.CancelledError:
-        return
-
-
-async def extract_and_translate_manga_pages_batch(
-    pages_input: list[tuple[bytes, str]],
-    target_lang_name: str,
-    series_context_hint: str = "",
-    req_id: str = "",
-) -> tuple[list[tuple[list[dict], str]], bool]:
-    """
-    Processes 1 to 12 manga pages:
-      - If `num_pages == 1`: calls `extract_and_translate_manga_bubbles()`.
-      - If `num_pages > 1`: ALWAYS runs unified multi-page `MangaBatch` strictly across:
-        `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> (newer >3.5 `flash-lite`)
-        -> `gemma-4-31b-it` -> `gemma-4-26b-a4b-it`
-        NEVER falls back to per-page `MangaSingle`!
-      - Uses explicit `propertyOrdering` in `responseSchema` so `panel_position` and `source_text`
-        are ALWAYS generated BEFORE `box_2d` (preventing alphabetical off-by-one box drift!).
-    Returns `(results, is_service_unavailable)`.
-    """
-    num_pages = len(pages_input)
-    if num_pages == 0:
-        return [], False
-
-    req_id = req_id or f"mb-{uuid.uuid4().hex[:6]}"
-
-    if num_pages == 1:
-        b, s = await extract_and_translate_manga_bubbles(
-            pages_input[0][0],
-            pages_input[0][1],
-            target_lang_name,
-            series_context_hint=series_context_hint,
-            req_id=req_id,
-        )
-        return [(b, s)], False
-
-    if not GEMINI_API_KEY:
-        return [([], "") for _ in range(num_pages)], True
-
-    if num_pages >= 9:
-        batch_dim, batch_q = 1024, 84
-    elif num_pages >= 5:
-        batch_dim, batch_q = 1120, 86
-    else:
-        batch_dim, batch_q = 1280, 90
-
-    b64_pages = []
-    for raw_b, fname in pages_input:
-        b64_str = await asyncio.to_thread(_prepare_manga_image_for_vision, raw_b, batch_dim, batch_q)
-        b64_pages.append((b64_str, fname))
-
-    mime_type = "image/jpeg"
-    context_block = (
-        f"\nSeries / Post Context & Character Roster (use accurate names & terms):\n{series_context_hint[:1400]}\n"
-        if series_context_hint else ""
-    )
-
-    manga_batch_instruction = f"""
-You are a professional Manga, Manhwa, and Comic Localizer.
-You are given {num_pages} sequential manga page image(s) (labeled PAGE 1 to PAGE {num_pages}).
-{context_block}
-Analyze all {num_pages} page(s) in sequence so character names, titles/ranks, pronouns, and ongoing story stay consistent across every page,
-and translate EVERY SINGLE speech bubble, narration/monologue box, and caption box on EVERY page into natural, idiomatic {target_lang_name}.
-
-CRITICAL COMPLETENESS, 1-TO-1 BUBBLE SEPARATION & BOUNDING-BOX RULES:
-1. STRICT 1-BUBBLE = 1-OBJECT RULE (NEVER MERGE SEPARATE BUBBLES!):
-   - Every physically separate speech oval, cloud, or rectangular caption box MUST be its own separate object in `bubbles` — EVEN IF the same character speaks across 2 or 3 separate bubbles in the same panel!
-   - NEVER combine text from two separate speech bubbles into one `translated_text`!
-   - Scan every panel of every page systematically from top-right to bottom-left and extract EVERY speech bubble (including short 1-word replies, narrow vertical bubbles, rectangular time/location caption boxes, and secondary bubbles in crowded panels).
-   - Within each page, order the bubbles strictly in traditional Japanese Manga reading order (Top-to-Bottom, Right-to-Left across panels).
-2. Accurate Speaker Attribution, Names & Visual Gender:
-   - Identify the actual character speaking EACH individual bubble visually (follow the bubble tail; NEVER copy a single character's name onto every bubble!).
-   - Keep character names, titles/ranks, and faction names consistent across all pages using accurate Japanese phonetics.
-   - Match pronouns and politeness particles to each character's visual gender and personality (when translating to Thai, a female character who uses boyish/archaic Japanese pronouns must still use female/neutral Thai endings like `นะ`/`ล่ะ`/`สิ`/`ค่ะ` — NEVER male `ครับ`/`ผม` unless the speaker is visually male).
-   - Use standard ASCII punctuation (`...`, `~`, `-`, single quotes `'`).
-   - When translating to English, preserve Japanese honorifics attached directly with a hyphen and NO space (`-san`, `-kun`, `-chan`, `-sama`, `-sensei`, `-senpai`).
-3. Spatial Anchor & Exact Bounding Boxes (`panel_position` -> `source_text` -> `box_2d`):
-   - For each bubble: first identify `panel_position` (`"top-right"`, `"top-left"`, `"middle-right"`, `"middle-left"`, `"bottom-right"`, `"bottom-left"`), transcribe `source_text`, and IMMEDIATELY output the exact `box_2d` as 4 INTEGERS `[ymin, xmin, ymax, xmax]` in `0..1000` scale tightly enclosing THAT EXACT `source_text` on THAT page!
-   - DOUBLE-CHECK left-to-right alignment (`xmin`, `xmax`): NEVER shift `box_2d` onto an adjacent bubble to the left or right, and NEVER place `box_2d` on a character's face, eyes, hands, arms, hair, or empty background!
-   - ONLY set `"box_2d": null` for floating handwritten SFX / sound effects (e.g. ドーン, トスッ, ポスン, ムチッ, スラ〜〜) or tiny unenclosed whispers drawn directly over a character's body/shirt outside a speech bubble!
-   - NEVER assign the same `box_2d` to two different bubbles!
-4. Return ONLY valid JSON matching this exact field order for all {num_pages} page(s) (write `summary` in {target_lang_name}):
-{{
-  "pages": [
-    {{
-      "page_index": 1,
-      "summary": "Brief 1-sentence scene context for Page 1 in {target_lang_name}",
-      "bubbles": [
-        {{
-          "id": 1,
-          "panel_position": "top-right",
-          "speaker_or_note": "Actual speaker name / Narration",
-          "source_text": "Original Japanese text inside this bubble",
-          "box_2d": [120, 450, 280, 620],
-          "translated_text": "Natural {target_lang_name} translation"
-        }}
-      ]
-    }}
-  ]
-}}
-""".strip()
-
-    fallback_text_only_results = None
-
-    try:
-        parts = [{"text": manga_batch_instruction}]
-        for idx, (b64_img, fname) in enumerate(b64_pages, 1):
-            parts.append({"text": f"=== PAGE {idx} ({fname}) ==="})
-            parts.append({"inlineData": {"mimeType": mime_type, "data": b64_img}})
-
-        model_chain = await _discover_manga_batch_models()
-        per_call_timeout = min(55.0, 30.0 + (2.5 * num_pages))
-        max_wall_budget = 165.0
-        wall_start = time.monotonic()
-        session = get_http_session()
-        label_prefix = f"MangaBatch({num_pages}p)"
-
-        for model_id, is_gemma in model_chain:
-            remaining = max_wall_budget - (time.monotonic() - wall_start)
-            if remaining <= 8.0:
-                break
-
-            url = clean_url(
-                f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
-                f"{model_id}:generateContent?key={GEMINI_API_KEY}"
-            )
-            gen_cfg = {
-                "temperature": 0.1,
-                "maxOutputTokens": 24576 if is_gemma else 32768,
-                "responseMimeType": "application/json",
-            }
-            if not is_gemma:
-                gen_cfg["thinkingConfig"] = {"thinkingLevel": "LOW"}
-                gen_cfg["responseSchema"] = MANGA_BATCH_RESPONSE_SCHEMA
-
-            payload = {"contents": [{"parts": parts}], "generationConfig": gen_cfg}
-            max_attempts = 2
-
-            for attempt in range(max_attempts):
-                rem_now = max_wall_budget - (time.monotonic() - wall_start)
-                if rem_now <= 6.0:
-                    break
-                req_t = min(per_call_timeout, rem_now)
-                t0 = time.monotonic()
-
-                api_log(
-                    f"{label_prefix} [req={req_id}] REQUEST -> model={model_id} "
-                    f"(attempt {attempt + 1}/{max_attempts}, timeout={req_t:.0f}s, dim={batch_dim}px)"
-                )
-                hb_task = asyncio.create_task(
-                    _waiting_heartbeat_logger(req_id, label_prefix, model_id, interval_sec=15.0)
-                )
-                try:
-                    async with session.post(
-                        url, json=payload, timeout=aiohttp.ClientTimeout(total=req_t)
-                    ) as resp:
-                        status = resp.status
-                        body_text = await resp.text()
-                        elapsed = time.monotonic() - t0
-                except asyncio.CancelledError:
-                    hb_task.cancel()
-                    raise
-                except Exception as e:
-                    hb_task.cancel()
-                    elapsed = time.monotonic() - t0
-                    api_log(
-                        f"{label_prefix} [req={req_id}] RESPONSE -> model={model_id} "
-                        f"FAILED ({type(e).__name__}, {elapsed:.2f}s); trying next model"
-                    )
-                    break
-                finally:
-                    hb_task.cancel()
-                    try:
-                        await hb_task
-                    except Exception:
-                        pass
-
-                if status == 200:
-                    data = json.loads(body_text)
-                    resp_parts = (
-                        ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-                    )
-                    raw_json_str = "\n".join(
-                        p.get("text", "") for p in resp_parts
-                        if p.get("text") and not p.get("thought", False)
-                    ).strip()
-                    batch_results = _parse_manga_pages_batch_json(raw_json_str, num_pages)
-                    total_b = sum(len(b) for b, _ in batch_results)
-                    total_boxes = sum(
-                        1 for b_list, _ in batch_results for b in b_list
-                        if isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4
-                    )
-                    if total_b > 0 and total_boxes > 0:
-                        api_log(
-                            f"{label_prefix} [req={req_id}] RESPONSE -> model={model_id} HTTP 200 OK "
-                            f"({elapsed:.2f}s, {total_boxes}/{total_b} boxes)"
-                        )
-                        return batch_results, False
-
-                    if total_b > 0 and total_boxes == 0:
-                        if fallback_text_only_results is None:
-                            fallback_text_only_results = batch_results
-                        api_log(
-                            f"{label_prefix} [req={req_id}] RESPONSE -> model={model_id} HTTP 200 "
-                            f"but 0/{total_b} valid box_2d ({elapsed:.2f}s); trying next model"
-                        )
-                        break
-
-                    api_log(
-                        f"{label_prefix} [req={req_id}] RESPONSE -> model={model_id} HTTP 200 "
-                        f"empty JSON ({elapsed:.2f}s); trying next model"
-                    )
-                    break
-
-                if status == 400 and attempt == 0:
-                    changed = False
-                    if "responseSchema" in payload["generationConfig"] and ("schema" in body_text.lower() or "propertyOrdering" in body_text or "responseSchema" in body_text):
-                        payload["generationConfig"].pop("responseSchema", None)
-                        changed = True
-                    if "thinkingConfig" in payload["generationConfig"] and "thinkingConfig" in body_text:
-                        payload["generationConfig"].pop("thinkingConfig", None)
-                        changed = True
-                    if is_gemma and "responseMimeType" in payload["generationConfig"]:
-                        payload["generationConfig"].pop("responseMimeType", None)
-                        changed = True
-                    if changed:
-                        api_log(
-                            f"{label_prefix} [req={req_id}] RESPONSE -> model={model_id} HTTP 400 ({elapsed:.2f}s); retrying without schema/thinking"
-                        )
-                        continue
-
-                if status == 503 and attempt == 0 and (max_wall_budget - (time.monotonic() - wall_start)) > 20.0:
-                    api_log(
-                        f"{label_prefix} [req={req_id}] RESPONSE -> model={model_id} HTTP 503 ({elapsed:.2f}s); retrying once in 1.5s"
-                    )
-                    await asyncio.sleep(1.5)
-                    continue
-
-                api_log(
-                    f"{label_prefix} [req={req_id}] RESPONSE -> model={model_id} HTTP {status} ({elapsed:.2f}s); trying next model"
-                )
-                break
-    finally:
-        b64_pages.clear()
-
-    if fallback_text_only_results is not None:
-        return fallback_text_only_results, False
-
-    api_log(f"MangaBatch({num_pages}p) [req={req_id}] EXHAUSTED -> all models unavailable/timed out")
-    return [([], "") for _ in range(num_pages)], True
-
-
 def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
     if not raw_text:
         return [], ""
@@ -1206,15 +1416,16 @@ def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
             block,
             re.DOTALL,
         )
-        pos_m = re.search(r'"panel_position"\s*:\s*"([^"]+)"', block)
+        bid_m = re.search(r'"bubble_id"\s*:\s*(\d+)', block)
         box_m = re.search(r'"(?:box_2d|bbox|bbox_2d|bounding_box|box)"\s*:\s*\[([^\]]+)\]', block)
         norm_box = _extract_norm_box_2d(box_m.group(1)) if box_m else None
 
         raw_tr_val = tr_m.group(1).replace('\\"', '"').strip()
         extracted_bubbles.append({
             "id": idx,
+            "bubble_id": int(bid_m.group(1)) if bid_m else None,
+            "is_dialogue": True,
             "speaker_or_note": spk_m.group(1).strip() if spk_m else f"Bubble {idx}",
-            "panel_position": pos_m.group(1).strip() if pos_m else "",
             "source_text": src_m.group(1).strip() if src_m else "",
             "translated_text": raw_tr_val,
             "box_2d": norm_box,
@@ -1224,51 +1435,332 @@ def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
     return valid_extracted, summary
 
 
+async def _waiting_heartbeat_logger(req_id: str, label: str, model_id: str, interval_sec: float = 15.0):
+    start_t = time.monotonic()
+    try:
+        while True:
+            await asyncio.sleep(interval_sec)
+            elapsed = time.monotonic() - start_t
+            api_log(f"{label} [req={req_id}] WAITING -> model={model_id} still running ({elapsed:.1f}s elapsed...)")
+    except asyncio.CancelledError:
+        return
+
+
+async def extract_and_translate_manga_pages_batch(
+    pages_input: list[tuple[bytes, str]],
+    target_lang_name: str,
+    series_context_hint: str = "",
+    req_id: str = "",
+) -> tuple[list[tuple[list[dict], str]], list[list[dict]], bool]:
+    """
+    Set-of-Mark (SoM) CV-Anchored Multi-Page Manga Batch Pipeline:
+      1) Detects enclosed speech bubbles on every page via fast CV (`<=420px`) and draws
+         red numbered badges `[1]`, `[2]`, ... on the vision copies.
+      2) Calls `MangaBatch` strictly across:
+         `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> (newer >3.5 `flash-lite`)
+         -> `gemma-4-31b-it` -> `gemma-4-26b-a4b-it`
+         NEVER falling back to `MangaSingle` for multi-page batches!
+      3) Returns `(batch_results, cv_bubbles_per_page, is_service_unavailable)`.
+    """
+    num_pages = len(pages_input)
+    if num_pages == 0:
+        return [], [], False
+
+    req_id = req_id or f"mb-{uuid.uuid4().hex[:6]}"
+
+    if num_pages == 1:
+        b, s, cv_list = await extract_and_translate_manga_bubbles(
+            pages_input[0][0],
+            pages_input[0][1],
+            target_lang_name,
+            series_context_hint=series_context_hint,
+            req_id=req_id,
+        )
+        return [(b, s)], [cv_list], False
+
+    if not GEMINI_API_KEY:
+        return [([], "") for _ in range(num_pages)], [[] for _ in range(num_pages)], True
+
+    if num_pages >= 9:
+        batch_dim, batch_q = 1024, 84
+    elif num_pages >= 5:
+        batch_dim, batch_q = 1120, 86
+    else:
+        batch_dim, batch_q = 1280, 90
+
+    som_t0 = time.monotonic()
+    b64_pages: list[tuple[str, str, int]] = []
+    cv_bubbles_per_page: list[list[dict]] = []
+    for raw_b, fname in pages_input:
+        b64_str, cv_bubbles = await asyncio.to_thread(
+            _detect_page_bubbles_and_build_som_b64_sync, raw_b, batch_dim, batch_q
+        )
+        b64_pages.append((b64_str, fname, len(cv_bubbles)))
+        cv_bubbles_per_page.append(cv_bubbles)
+
+    total_cv = sum(len(c) for c in cv_bubbles_per_page)
+    api_log(
+        f"MangaBatch({num_pages}p) [req={req_id}] CV_DETECT -> found {total_cv} enclosed bubble(s) "
+        f"across {num_pages} page(s) in {time.monotonic() - som_t0:.2f}s"
+    )
+
+    mime_type = "image/jpeg"
+    context_block = (
+        f"\nSeries / Post Context & Character Roster (use accurate names & terms):\n{series_context_hint[:1400]}\n"
+        if series_context_hint else ""
+    )
+
+    manga_batch_instruction = f"""
+You are a professional Manga, Manhwa, and Comic Localizer.
+You are given {num_pages} sequential manga page image(s) (labeled PAGE 1 to PAGE {num_pages}).
+Every enclosed speech bubble and caption box has ALREADY been outlined in RED with a RED NUMBERED BADGE (`1`, `2`, `3`, ...) on each page!
+{context_block}
+Analyze all {num_pages} page(s) in sequence so character names, titles/ranks, pronouns, and ongoing story stay consistent across every page,
+and translate EVERY SINGLE speech bubble and narration/caption box on EVERY page into natural, idiomatic {target_lang_name}.
+
+CRITICAL SET-OF-MARK (RED BADGE) & TRANSLATION RULES:
+1. 1-TO-1 RED BADGE MATCHING (`bubble_id`):
+   - Inspect EVERY red numbered badge (`1`, `2`, ..., `K`) on each page!
+   - If red badge `k` contains Japanese dialogue, monologue, or a caption box: output an entry with `"bubble_id": k`, `"is_dialogue": true`, `"box_2d": null`, the exact `"source_text"` inside ONLY badge `k`, and its natural {target_lang_name} `"translated_text"`.
+   - NEVER merge text from two different red badges into one entry! Each red badge `k` MUST have its OWN separate object with `"bubble_id": k`!
+   - If a red badge `k` is NOT dialogue (for example, a sound effect / SFX like ゲプ…, a non-speech diagram/icon like 脂肪/免疫, or a blank background object): set `"bubble_id": k`, `"is_dialogue": false`, `"translated_text": ""` so the artwork is left untouched!
+2. UNMARKED / BORDERLESS DIALOGUE (`bubble_id: null`):
+   - If a page has real spoken dialogue or narration that does NOT have a red badge around it (such as borderless/open-sided text over a white panel background), add an entry with `"bubble_id": null`, `"is_dialogue": true`, transcribe `"source_text"`, and provide `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY that Japanese text — NEVER over faces, hands, or artwork!).
+   - NEVER output floating handwritten SFX (e.g. ドーン, トスッ, ポスン, ムチッ, ぐっ, カチャッ, 脱, ぎゅ) as `box_2d` — skip SFX or set `"box_2d": null`.
+3. Accurate Speaker Attribution, Names & Visual Gender:
+   - Identify the actual character speaking each bubble visually (follow the tail; never copy one character's name onto every bubble).
+   - Keep character names, titles/ranks, and faction names consistent across all pages using accurate Japanese phonetics.
+   - Match pronouns and politeness particles to each character's visual gender (in Thai, visually female characters must NEVER use male endings like `ครับ`/`ผม`).
+   - Use standard ASCII punctuation (`...`, `~`, `-`, single quotes `'`).
+   - When translating to English, preserve Japanese honorifics attached directly with a hyphen and NO space (`-san`, `-kun`, `-chan`, `-sama`, `-sensei`, `-senpai`).
+4. Return ONLY valid JSON matching this exact structure for all {num_pages} page(s) (write `summary` in {target_lang_name}):
+{{
+  "pages": [
+    {{
+      "page_index": 1,
+      "summary": "Brief 1-sentence scene context for Page 1 in {target_lang_name}",
+      "bubbles": [
+        {{
+          "id": 1,
+          "bubble_id": 1,
+          "is_dialogue": true,
+          "speaker_or_note": "Actual speaker name / Narration",
+          "source_text": "Original Japanese text inside badge 1",
+          "box_2d": null,
+          "translated_text": "Natural {target_lang_name} translation"
+        }}
+      ]
+    }}
+  ]
+}}
+""".strip()
+
+    fallback_text_only_results = None
+
+    try:
+        parts = [{"text": manga_batch_instruction}]
+        for idx, (b64_img, fname, cv_cnt) in enumerate(b64_pages, 1):
+            badge_note = f"red badges 1..{cv_cnt}" if cv_cnt > 0 else "no red badges"
+            parts.append({"text": f"=== PAGE {idx} ({fname} | {badge_note}) ==="})
+            parts.append({"inlineData": {"mimeType": mime_type, "data": b64_img}})
+
+        model_chain = await _discover_manga_batch_models()
+        # Client-side failover timeout (not an API limit): generous 80s for 10p so valid slow responses finish cleanly
+        per_call_timeout = min(85.0, 40.0 + (4.5 * num_pages))
+        max_wall_budget = 180.0
+        wall_start = time.monotonic()
+        session = get_http_session()
+        label_prefix = f"MangaBatch({num_pages}p)"
+
+        for model_id, is_gemma in model_chain:
+            remaining = max_wall_budget - (time.monotonic() - wall_start)
+            if remaining <= 10.0:
+                break
+
+            url = clean_url(
+                f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
+                f"{model_id}:generateContent?key={GEMINI_API_KEY}"
+            )
+            gen_cfg = {
+                "temperature": 0.1,
+                "maxOutputTokens": 24576 if is_gemma else 32768,
+                "responseMimeType": "application/json",
+            }
+            if not is_gemma:
+                gen_cfg["thinkingConfig"] = {"thinkingLevel": "LOW"}
+                gen_cfg["responseSchema"] = MANGA_BATCH_SOM_SCHEMA
+
+            payload = {"contents": [{"parts": parts}], "generationConfig": gen_cfg}
+            max_attempts = 2
+
+            for attempt in range(max_attempts):
+                rem_now = max_wall_budget - (time.monotonic() - wall_start)
+                if rem_now <= 8.0:
+                    break
+                req_t = min(per_call_timeout, rem_now)
+                t0 = time.monotonic()
+
+                api_log(
+                    f"{label_prefix} [req={req_id}] REQUEST -> model={model_id} "
+                    f"(attempt {attempt + 1}/{max_attempts}, timeout={req_t:.0f}s, dim={batch_dim}px)"
+                )
+                hb_task = asyncio.create_task(
+                    _waiting_heartbeat_logger(req_id, label_prefix, model_id, interval_sec=15.0)
+                )
+                try:
+                    async with session.post(
+                        url, json=payload, timeout=aiohttp.ClientTimeout(total=req_t)
+                    ) as resp:
+                        status = resp.status
+                        body_text = await resp.text()
+                        elapsed = time.monotonic() - t0
+                except asyncio.CancelledError:
+                    hb_task.cancel()
+                    raise
+                except Exception as e:
+                    hb_task.cancel()
+                    elapsed = time.monotonic() - t0
+                    api_log(
+                        f"{label_prefix} [req={req_id}] RESPONSE -> model={model_id} "
+                        f"FAILED ({type(e).__name__}, {elapsed:.2f}s); trying next model"
+                    )
+                    break
+                finally:
+                    hb_task.cancel()
+                    try:
+                        await hb_task
+                    except Exception:
+                        pass
+
+                if status == 200:
+                    data = json.loads(body_text)
+                    resp_parts = (
+                        ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                    )
+                    raw_json_str = "\n".join(
+                        p.get("text", "") for p in resp_parts
+                        if p.get("text") and not p.get("thought", False)
+                    ).strip()
+                    batch_results = _parse_manga_pages_batch_json(raw_json_str, num_pages)
+                    total_b = sum(len(b) for b, _ in batch_results)
+                    total_anchored = sum(
+                        1 for b_list, _ in batch_results for b in b_list
+                        if (b.get("bubble_id") is not None)
+                        or (isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4)
+                    )
+                    if total_b > 0 and total_anchored > 0:
+                        matched_som = sum(
+                            1 for b_list, _ in batch_results for b in b_list
+                            if b.get("bubble_id") is not None
+                        )
+                        api_log(
+                            f"{label_prefix} [req={req_id}] RESPONSE -> model={model_id} HTTP 200 OK "
+                            f"({elapsed:.2f}s, {total_b} bubbles: {matched_som} SoM-anchored, {total_anchored - matched_som} box_2d)"
+                        )
+                        return batch_results, cv_bubbles_per_page, False
+
+                    if total_b > 0 and total_anchored == 0:
+                        if fallback_text_only_results is None:
+                            fallback_text_only_results = batch_results
+                        api_log(
+                            f"{label_prefix} [req={req_id}] RESPONSE -> model={model_id} HTTP 200 "
+                            f"but 0/{total_b} anchored bubbles ({elapsed:.2f}s); trying next model"
+                        )
+                        break
+
+                    api_log(
+                        f"{label_prefix} [req={req_id}] RESPONSE -> model={model_id} HTTP 200 "
+                        f"empty JSON ({elapsed:.2f}s); trying next model"
+                    )
+                    break
+
+                if status == 400 and attempt == 0:
+                    changed = False
+                    if "responseSchema" in payload["generationConfig"] and (
+                        "schema" in body_text.lower() or "propertyOrdering" in body_text or "responseSchema" in body_text
+                    ):
+                        payload["generationConfig"].pop("responseSchema", None)
+                        changed = True
+                    if "thinkingConfig" in payload["generationConfig"] and "thinkingConfig" in body_text:
+                        payload["generationConfig"].pop("thinkingConfig", None)
+                        changed = True
+                    if is_gemma and "responseMimeType" in payload["generationConfig"]:
+                        payload["generationConfig"].pop("responseMimeType", None)
+                        changed = True
+                    if changed:
+                        api_log(
+                            f"{label_prefix} [req={req_id}] RESPONSE -> model={model_id} HTTP 400 ({elapsed:.2f}s); retrying without schema/thinking"
+                        )
+                        continue
+
+                # Only retry HTTP 503 if it failed fast (< 6s); slow 503 means pool saturation -> switch immediately!
+                if status == 503 and attempt == 0 and elapsed < 6.0 and (max_wall_budget - (time.monotonic() - wall_start)) > 25.0:
+                    api_log(
+                        f"{label_prefix} [req={req_id}] RESPONSE -> model={model_id} fast HTTP 503 ({elapsed:.2f}s); retrying once in 1.5s"
+                    )
+                    await asyncio.sleep(1.5)
+                    continue
+
+                api_log(
+                    f"{label_prefix} [req={req_id}] RESPONSE -> model={model_id} HTTP {status} ({elapsed:.2f}s); trying next model"
+                )
+                break
+    finally:
+        b64_pages.clear()
+
+    if fallback_text_only_results is not None:
+        return fallback_text_only_results, cv_bubbles_per_page, False
+
+    api_log(f"MangaBatch({num_pages}p) [req={req_id}] EXHAUSTED -> all models unavailable/timed out")
+    return [([], "") for _ in range(num_pages)], cv_bubbles_per_page, True
+
+
 async def extract_and_translate_manga_bubbles(
     raw_bytes: bytes,
     filename: str,
     target_lang_name: str,
     series_context_hint: str = "",
     req_id: str = "",
-) -> tuple[list[dict], str]:
+) -> tuple[list[dict], str, list[dict]]:
     req_id = req_id or f"ms-{uuid.uuid4().hex[:6]}"
-    b64_img = await asyncio.to_thread(_prepare_manga_image_for_vision, raw_bytes, 1280, 90)
+    b64_img, cv_bubbles = await asyncio.to_thread(
+        _detect_page_bubbles_and_build_som_b64_sync, raw_bytes, 1280, 90
+    )
     mime_type = "image/jpeg"
     context_block = (
         f"\nSeries / Post Context & Character Roster:\n{series_context_hint[:1000]}\n"
         if series_context_hint else ""
     )
+    badge_note = f"red numbered badges 1..{len(cv_bubbles)}" if cv_bubbles else "no red badges"
 
     manga_system_instruction = f"""
 You are a professional Manga, Manhwa, and Comic Localizer.
+This page has {badge_note} marking enclosed speech bubbles/caption boxes.
 {context_block}
-Analyze this single manga page visually (character expressions, action, speaker relationships, and panel layout)
-and translate EVERY SINGLE speech bubble, narration/monologue box, and caption box into natural, idiomatic {target_lang_name}.
+Translate EVERY SINGLE speech bubble and narration/caption box on this page into natural, idiomatic {target_lang_name}.
 
-CRITICAL RULES:
-1. STRICT 1-BUBBLE = 1-OBJECT RULE (NEVER MERGE SEPARATE BUBBLES!):
-   - Every physically separate speech oval, cloud, or rectangular caption box MUST be its own separate object in `bubbles` — EVEN IF the same character speaks across 2 or 3 separate bubbles!
-   - Scan every panel systematically and translate EVERY speech bubble on the page without skipping any bubble.
-   - Order the bubbles strictly in traditional Japanese Manga reading order (Top-to-Bottom, Right-to-Left across panels).
-2. Accurate Speaker Attribution, Names & Visual Gender:
-   - Identify the actual character speaking EACH bubble visually (never copy one speaker name onto every bubble!).
-   - Match pronouns and politeness particles to each character's visual gender (never use male Thai `ครับ`/`ผม` for visually female characters).
+CRITICAL SET-OF-MARK (RED BADGE) & TRANSLATION RULES:
+1. 1-TO-1 RED BADGE MATCHING (`bubble_id`):
+   - Inspect EVERY red numbered badge (`1`, `2`, ...) on the page.
+   - If red badge `k` contains Japanese dialogue/narration: output `"bubble_id": k`, `"is_dialogue": true`, `"box_2d": null`, exact `"source_text"` inside ONLY badge `k`, and its natural {target_lang_name} `"translated_text"`.
+   - NEVER merge text from two different red badges into one entry!
+   - If a red badge `k` is NOT dialogue (SFX, diagram, background object): set `"bubble_id": k`, `"is_dialogue": false`, `"translated_text": ""`.
+2. UNMARKED / BORDERLESS DIALOGUE (`bubble_id: null`):
+   - For dialogue/narration WITHOUT a red badge, output `"bubble_id": null`, `"is_dialogue": true`, `"source_text"`, and `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY the Japanese text).
+3. Accurate Speaker Attribution, Names & Visual Gender:
+   - Identify the actual speaker visually; match Thai/English tone to visual gender (never use male Thai `ครับ`/`ผม` for visually female characters).
    - Use standard ASCII punctuation (`...`, `~`, `-`, single quotes `'`).
-   - When translating to English, preserve Japanese honorifics attached directly with a hyphen and NO space (`-san`, `-kun`, `-chan`, `-sama`, `-sensei`, `-senpai`).
-3. Spatial Anchor & Exact Bounding Boxes (`panel_position` -> `source_text` -> `box_2d`):
-   - First identify `panel_position`, transcribe `source_text`, and IMMEDIATELY output the exact `box_2d` as 4 INTEGERS `[ymin, xmin, ymax, xmax]` in `0..1000` scale tightly enclosing THAT EXACT `source_text`!
-   - NEVER shift `box_2d` onto an adjacent bubble or onto character faces, hands, arms, hair, or empty background!
-   - ONLY set `"box_2d": null` for floating handwritten SFX / sound effects or tiny unenclosed whispers drawn directly over a character's body/shirt outside a speech bubble!
-4. Return ONLY valid JSON matching this exact field order (write `summary` in {target_lang_name}):
+4. Return ONLY valid JSON matching this exact structure (write `summary` in {target_lang_name}):
 {{
   "summary": "Brief 1-sentence scene context in {target_lang_name}",
   "bubbles": [
     {{
       "id": 1,
-      "panel_position": "top-right",
+      "bubble_id": 1,
+      "is_dialogue": true,
       "speaker_or_note": "Actual speaker name / Narration",
-      "source_text": "Original Japanese text inside this bubble",
-      "box_2d": [120, 450, 280, 620],
+      "source_text": "Original Japanese text inside badge 1",
+      "box_2d": null,
       "translated_text": "Natural {target_lang_name} translation"
     }}
   ]
@@ -1279,7 +1771,7 @@ CRITICAL RULES:
     fallback_summary = ""
 
     if GEMINI_API_KEY:
-        api_log(f"MangaSingle [req={req_id}] REQUEST -> Tier 1 Gemini ({filename})")
+        api_log(f"MangaSingle [req={req_id}] REQUEST -> Tier 1 Gemini ({filename}, {len(cv_bubbles)} CV bubbles)")
         gemini_payload = {
             "contents": [
                 {
@@ -1292,14 +1784,14 @@ CRITICAL RULES:
             "generationConfig": {
                 "temperature": 0.1,
                 "responseMimeType": "application/json",
-                "responseSchema": MANGA_SINGLE_RESPONSE_SCHEMA,
+                "responseSchema": MANGA_SINGLE_SOM_SCHEMA,
                 "thinkingConfig": {"thinkingLevel": "LOW"},
             },
         }
         try:
             data = await call_gemini_generate_content_self_healing(
                 gemini_payload,
-                timeout_sec=30,
+                timeout_sec=35,
                 purpose=f"MangaSingle[{req_id}]",
                 max_models=3,
                 preferred_models=["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3-flash-preview"],
@@ -1313,10 +1805,14 @@ CRITICAL RULES:
                 ).strip()
                 bubbles, summary = _parse_manga_bubbles_json(raw_json_str)
                 if bubbles:
-                    box_cnt = sum(1 for b in bubbles if isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4)
-                    if box_cnt > 0:
-                        api_log(f"MangaSingle [req={req_id}] RESPONSE -> Tier 1 Gemini OK ({box_cnt}/{len(bubbles)} boxes)")
-                        return bubbles, summary
+                    anchored = sum(
+                        1 for b in bubbles
+                        if (b.get("bubble_id") is not None)
+                        or (isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4)
+                    )
+                    if anchored > 0:
+                        api_log(f"MangaSingle [req={req_id}] RESPONSE -> Tier 1 Gemini OK ({anchored}/{len(bubbles)} anchored)")
+                        return bubbles, summary, cv_bubbles
                     fallback_bubbles_no_boxes = bubbles
                     fallback_summary = summary
         except Exception as e:
@@ -1328,21 +1824,20 @@ CRITICAL RULES:
             mime_type,
             b64_img,
             response_mime_type="application/json",
-            timeout_sec=30,
+            timeout_sec=35,
             purpose=f"MangaSingle[{req_id}]",
         )
         if gemma_content:
             bubbles, summary = _parse_manga_bubbles_json(gemma_content)
             if bubbles:
-                has_boxes_and_text = any(
-                    isinstance(b.get("box_2d"), list)
-                    and len(b["box_2d"]) == 4
-                    and bool(b.get("translated_text"))
+                has_anchor = any(
+                    (b.get("bubble_id") is not None)
+                    or (isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4)
                     for b in bubbles
                 )
-                if has_boxes_and_text:
+                if has_anchor:
                     api_log(f"MangaSingle [req={req_id}] RESPONSE -> Tier 2 AI Studio Gemma 4 OK ({len(bubbles)} bubbles)")
-                    return bubbles, summary
+                    return bubbles, summary, cv_bubbles
                 if not fallback_bubbles_no_boxes:
                     fallback_bubbles_no_boxes = bubbles
                     fallback_summary = summary
@@ -1354,15 +1849,14 @@ CRITICAL RULES:
         if cf_content:
             bubbles, summary = _parse_manga_bubbles_json(cf_content)
             if bubbles:
-                has_boxes_and_text = any(
-                    isinstance(b.get("box_2d"), list)
-                    and len(b["box_2d"]) == 4
-                    and bool(b.get("translated_text"))
+                has_anchor = any(
+                    (b.get("bubble_id") is not None)
+                    or (isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4)
                     for b in bubbles
                 )
-                if has_boxes_and_text:
+                if has_anchor:
                     api_log(f"MangaSingle [req={req_id}] RESPONSE -> Tier 3 Cloudflare Gemma 4 OK ({len(bubbles)} bubbles)")
-                    return bubbles, summary
+                    return bubbles, summary, cv_bubbles
                 if not fallback_bubbles_no_boxes:
                     fallback_bubbles_no_boxes = bubbles
                     fallback_summary = summary
@@ -1403,15 +1897,14 @@ CRITICAL RULES:
                         content = g_data["choices"][0]["message"]["content"].strip()
                         bubbles, summary = _parse_manga_bubbles_json(content)
                         if bubbles:
-                            has_boxes_and_text = any(
-                                isinstance(b.get("box_2d"), list)
-                                and len(b["box_2d"]) == 4
-                                and bool(b.get("translated_text"))
+                            has_anchor = any(
+                                (b.get("bubble_id") is not None)
+                                or (isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4)
                                 for b in bubbles
                             )
-                            if has_boxes_and_text:
+                            if has_anchor:
                                 api_log(f"MangaSingle [req={req_id}] RESPONSE -> Tier 4 Groq ({g_model}) OK ({len(bubbles)} bubbles)")
-                                return bubbles, summary
+                                return bubbles, summary, cv_bubbles
                             if not fallback_bubbles_no_boxes:
                                 fallback_bubbles_no_boxes = bubbles
                                 fallback_summary = summary
@@ -1419,22 +1912,25 @@ CRITICAL RULES:
                 api_log(f"MangaSingle [req={req_id}] Tier 4 Groq ({g_model}) warning: {e}")
 
     if fallback_bubbles_no_boxes:
-        return fallback_bubbles_no_boxes, fallback_summary
+        return fallback_bubbles_no_boxes, fallback_summary, cv_bubbles
 
-    return [], ""
+    return [], "", cv_bubbles
 
 
+# ------------------------------------------------------------------------------
+# STAGE 3: THAI SYLLABLE WRAPPING + EXACT-MASK FULL-RES RENDERER
+# ------------------------------------------------------------------------------
 def _tokenize_thai_syllables(word: str) -> list[str]:
     """
-    Zero-dependency Thai syllable tokenizer so unspaced Thai words wrap at natural syllable
-    boundaries (e.g. `ท่าน|เจ้า|สำ|นัก`, `ยา|ทำ|ให้|อ้วน?`, `หลาย|สัป|ดาห์|ต่อ|มา...`,
-    `มี|อะ|ไร|หรือ|เปล่า?`) instead of slicing off dangling single consonants (`น?`, `ง`, `ว!`).
+    Syllable-aware Thai tokenizer supporting onset clusters (`ห` นำ, `อย`, `กร/ปล/ปร/คร`),
+    compound vowels (`เ-อะ`, `เ-อ`, `เ-ีย`, `เ-ือ`, `เ-าะ` -> `เถอะ`, `เยอะ`, `เหงื่อ`, `เพราะ`),
+    `อักษรนำ` prefixes (`สภาพ`, `สมา`, `ประ`), `์` karan, trailing coda consonants, and punctuation.
     """
     raw = _THAI_CLUSTER_REGEX.findall(word)
     if len(raw) <= 1:
         return raw or [word]
 
-    # Pass 1: Merge onset clusters (`ห`+`งญนมยรลว`, `อ`+`ย`, consonant+`รลว` with vowel, and leading-vowel clusters like `เป`+`ล่า`)
+    # Pass 1: Merge onset clusters (`[เแโใไ]?ห` + `งญนมยรลว`, `อ` + `ย`, `[เแโใไ]?C` + `รลว`)
     merged_onsets: list[str] = []
     i = 0
     n = len(raw)
@@ -1442,57 +1938,88 @@ def _tokenize_thai_syllables(word: str) -> list[str]:
         tok = raw[i]
         nxt = raw[i + 1] if (i + 1) < n else ""
 
-        # `ห` นำ (e.g. ห + รือ -> หรือ, ห + ลา -> หลา) or `อ` นำ `ย` (อ + ยู่ -> อยู่)
-        if (
-            nxt
-            and len(tok) == 1
-            and ((tok == "ห" and nxt[0] in _THAI_HO_NAM_FOLLOW) or (tok == "อ" and nxt[0] == "ย"))
-        ):
-            merged_onsets.append(tok + nxt)
-            i += 2
-            continue
-
-        # True consonant clusters: `[เแโใไ]?[กขคจตทบปผพฟส]` + `[รลว]` carrying a vowel/tone (e.g. เป+ล่า -> เปล่า, จ+ริ -> จริ, เห+รอ -> เหรอ)
-        if nxt and nxt[0] in _THAI_CLUSTER_SECOND:
-            is_bare_c = (len(tok) == 1 and tok in _THAI_CLUSTER_FIRST)
-            is_lv_c = (len(tok) == 2 and tok[0] in _THAI_LEADING_VOWELS and tok[1] in (_THAI_CLUSTER_FIRST | {"ห"}))
-            nxt_has_vowel = any(c in _THAI_VOWEL_SIGNALS for c in nxt) or nxt[0] in ("ร", "ล") and tok.startswith("เ")
-            if is_lv_c or (is_bare_c and nxt_has_vowel):
+        if nxt:
+            # `ห` นำ (including `เหงื่อ`, `เหรอ`, `หรือ`, `หลาย`) or `อ` นำ `ย` (`อยู่`)
+            is_ho_nam = (
+                ((tok == "ห") or (len(tok) == 2 and tok[0] in _THAI_LEADING_VOWELS and tok[1] == "ห"))
+                and nxt[0] in _THAI_HO_NAM_FOLLOW
+            )
+            is_o_nam = (tok == "อ" and nxt[0] == "ย")
+            if is_ho_nam or is_o_nam:
                 merged_onsets.append(tok + nxt)
                 i += 2
                 continue
 
+            # True consonant clusters (`เปล` / `เปล่า`, `จริง`, `ปรับ`, `เพราะ`)
+            if nxt[0] in _THAI_CLUSTER_SECOND:
+                is_bare_c = (len(tok) == 1 and tok in _THAI_CLUSTER_FIRST)
+                is_lv_c = (len(tok) == 2 and tok[0] in _THAI_LEADING_VOWELS and tok[1] in _THAI_CLUSTER_FIRST)
+                nxt_has_vowel = any(c in _THAI_VOWEL_SIGNALS for c in nxt) or tok.startswith("เ")
+                if is_lv_c or (is_bare_c and nxt_has_vowel):
+                    merged_onsets.append(tok + nxt)
+                    i += 2
+                    continue
+
         merged_onsets.append(tok)
         i += 1
 
-    # Pass 2: Attach trailing coda consonants (bare consonant with no vowel/leading vowel, or ending with `์`)
-    # and punctuation (`?!.,ๆฯ`) back onto the preceding syllable!
+    # Pass 2: Merge Thai compound vowels (`เ-อะ`, `เ-อ`, `เ-ีย`, `เ-ือ`, `เ-าะ` -> `เถอะ`, `เยอะ`, `เหงื่อ`, `เพราะ`, `เหรอ`)
+    merged_vowels: list[str] = []
+    i = 0
+    m = len(merged_onsets)
+    while i < m:
+        tok = merged_onsets[i]
+        nxt = merged_onsets[i + 1] if (i + 1) < m else ""
+        if nxt and tok.startswith("เ"):
+            # `เ_ + อะ`, `เ_ + อ`, `เ_ + าะ`, `เ_ี + ย`, `เ_ื + อ`
+            if nxt in ("อะ", "อ", "าะ") or (("\u0E35" in tok) and nxt.startswith("ย")) or (("\u0E37" in tok) and nxt.startswith("อ")):
+                merged_vowels.append(tok + nxt)
+                i += 2
+                continue
+        merged_vowels.append(tok)
+        i += 1
+
+    # Pass 3: Merge `อักษรนำ` bare prefix (`ส+ภาพ`, `ส+มา`, `ป+ระ`) & attach coda consonants / karan / punctuation
     syllables: list[str] = []
-    for tok in merged_onsets:
+    i = 0
+    k = len(merged_vowels)
+    while i < k:
+        tok = merged_vowels[i]
+        nxt = merged_vowels[i + 1] if (i + 1) < k else ""
+
+        # Leading bare prefix before an explicit-vowel syllable (e.g. `ส` + `ภา` -> `สภา`, `ส` + `มา` -> `สมา`)
+        if (
+            nxt
+            and len(tok) == 1
+            and tok in _THAI_PREFIX_LEAD
+            and any(c in _THAI_VOWEL_SIGNALS for c in nxt)
+            and (not syllables or len(syllables[-1]) >= 3)
+        ):
+            syllables.append(tok + nxt)
+            i += 2
+            continue
+
         if not syllables:
             syllables.append(tok)
+            i += 1
             continue
 
-        # Punctuation / repeaters / quotes always attach to previous syllable
-        if all(c in _THAI_PUNCT_ATTACH for c in tok):
+        if all(c in _THAI_PUNCT_ATTACH for c in tok) or ("\u0E4C" in tok):
             syllables[-1] += tok
+            i += 1
             continue
 
-        # Karan (`์`) syllables like `ห์`, `ต์`, `ทร์` always attach to previous syllable
-        if "\u0E4C" in tok:
-            syllables[-1] += tok
-            continue
-
-        # Single bare Thai consonant (no vowel sign, no leading vowel, no tone mark) is a coda consonant
-        # if the previous syllable contains an explicit vowel or tone mark (e.g., `อ้`+`ว`+`น`, `สั`+`ป`, `นั`+`ก`, `ท่า`+`น`, `เรื่อ`+`ง`)
+        # Single bare Thai consonant is a coda consonant when previous syllable has a vowel/tone nucleus
         is_bare_single = (len(tok) == 1 and "\u0E01" <= tok <= "\u0E2E")
         prev = syllables[-1]
         prev_has_nucleus = any(c in _THAI_VOWEL_SIGNALS or ("\u0E48" <= c <= "\u0E4B") for c in prev)
         if is_bare_single and prev_has_nucleus and len(prev) <= 6:
             syllables[-1] += tok
+            i += 1
             continue
 
         syllables.append(tok)
+        i += 1
 
     return syllables
 
@@ -1503,10 +2030,6 @@ def _split_thai_word_cleanly(
     font: ImageFont.ImageFont,
     max_width: int,
 ) -> list[str]:
-    """
-    Wraps an unspaced Thai phrase strictly at syllable boundaries (`_tokenize_thai_syllables`),
-    only falling back to character-level splitting if a single syllable itself exceeds `max_width`.
-    """
     syllables = _tokenize_thai_syllables(word)
     out_lines: list[str] = []
     current = ""
@@ -1523,7 +2046,6 @@ def _split_thai_word_cleanly(
     if current:
         out_lines.append(current)
 
-    # Guard against a single ultra-long token overflowing a narrow bubble
     final_lines: list[str] = []
     for ln in out_lines:
         lb = draw.textbbox((0, 0), ln, font=font)
@@ -1627,276 +2149,25 @@ def _measure_crop_chroma_stats(img: Image.Image, x1: int, y1: int, x2: int, y2: 
     return float(mean_sat), float(chroma_ratio)
 
 
-def _detect_bubble_polarity(
-    base_gray: Image.Image, x1: int, y1: int, x2: int, y2: int
-) -> bool:
-    bw = x2 - x1
-    bh = y2 - y1
-    if bw < 10 or bh < 10:
-        return False
-    sub = base_gray.crop((x1 + 2, y1 + 2, x2 - 2, y2 - 2))
-    median_lum = ImageStat.Stat(sub).median[0]
-    sub.close()
-    return median_lum < 125
-
-
-def _has_dark_panel_gutter_between(
-    base_gray: Image.Image,
-    cx1: int,
-    cy1: int,
-    cx2: int,
-    cy2: int,
-) -> bool:
-    steps = 12
-    for s in range(1, steps):
-        px = int(cx1 + (cx2 - cx1) * (s / steps))
-        py = int(cy1 + (cy2 - cy1) * (s / steps))
-        if 0 <= px < base_gray.width and 0 <= py < base_gray.height:
-            if base_gray.getpixel((px, py)) < 65:
-                return True
-    return False
-
-
-def _compute_peer_clip_bounds(
-    base_gray: Image.Image,
-    width: int,
-    height: int,
-    x1: int,
-    y1: int,
-    x2: int,
-    y2: int,
-    other_peer_boxes: list[tuple[int, int, int, int]],
-) -> tuple[int, int, int, int]:
-    box_w = max(10, x2 - x1)
-    box_h = max(10, y2 - y1)
-    cx = (x1 + x2) // 2
-    cy = (y1 + y2) // 2
-
-    clip_x1 = 2
-    clip_y1 = 2
-    clip_x2 = width - 2
-    clip_y2 = height - 2
-
-    for ox1, oy1, ox2, oy2 in other_peer_boxes:
-        ocx = (ox1 + ox2) // 2
-        ocy = (oy1 + oy2) // 2
-        dx = abs(cx - ocx)
-        dy = abs(cy - ocy)
-        if dx > (box_w + (ox2 - ox1)) * 1.45 and dy > (box_h + (oy2 - oy1)) * 1.45:
-            continue
-
-        if _has_dark_panel_gutter_between(base_gray, cx, cy, ocx, ocy):
-            continue
-
-        h_gap = max(ox1 - x2, x1 - ox2)
-        v_gap = max(oy1 - y2, y1 - oy2)
-        if v_gap >= h_gap:
-            if cy < ocy:
-                mid_y = (min(y2, oy2) + max(y1, oy1)) // 2 if v_gap < 0 else (y2 + oy1) // 2
-                clip_y2 = min(clip_y2, max(y1 + 12, mid_y - 3))
-            else:
-                mid_y = (min(y2, oy2) + max(y1, oy1)) // 2 if v_gap < 0 else (y1 + oy2) // 2
-                clip_y1 = max(clip_y1, min(y2 - 12, mid_y + 3))
-        else:
-            if cx < ocx:
-                mid_x = (min(x2, ox2) + max(x1, ox1)) // 2 if h_gap < 0 else (x2 + ox1) // 2
-                clip_x2 = min(clip_x2, max(x1 + 12, mid_x - 3))
-            else:
-                mid_x = (min(x2, ox2) + max(x1, ox1)) // 2 if h_gap < 0 else (x1 + ox2) // 2
-                clip_x1 = max(clip_x1, min(x2 - 12, mid_x + 3))
-
-    return clip_x1, clip_y1, clip_x2, clip_y2
-
-
-def _find_best_enclosed_white_bubble(
-    sub_gray: Image.Image,
-    rx1_rel: int,
-    ry1_rel: int,
-    rx2_rel: int,
-    ry2_rel: int,
-    has_kanji_kana: bool = True,
-) -> Image.Image | None:
-    """
-    Ultra-fast fixed-resolution (`<= 160px`) enclosed pure-white speech bubble finder:
-      - Downscales `sub_gray` to `max(sw, sh) <= 160` before running pure-Python `ImageDraw.floodfill()`,
-        cutting floodfill CPU time by ~20x and eliminating Discord Gateway GIL freezes while still
-        producing a full-resolution mask!
-    """
-    ww, wh = sub_gray.size
-    if ww < 14 or wh < 14:
-        return None
-
-    scale = min(0.5, MAX_FLOOD_MASK_DIM / float(max(ww, wh)))
-    sw = max(12, int(round(ww * scale)))
-    sh = max(12, int(round(wh * scale)))
-    small_gray = sub_gray.resize((sw, sh), Image.Resampling.BILINEAR)
-
-    s_rx1 = max(1, int(rx1_rel * scale))
-    s_ry1 = max(1, int(ry1_rel * scale))
-    s_rx2 = min(sw - 2, max(s_rx1 + 3, int(rx2_rel * scale)))
-    s_ry2 = min(sh - 2, max(s_ry1 + 3, int(ry2_rel * scale)))
-    s_bw = max(3, s_rx2 - s_rx1)
-    s_bh = max(3, s_ry2 - s_ry1)
-
-    seed_candidates = []
-    for fy in (0.50, 0.25, 0.75):
-        sy = max(1, min(sh - 2, int(s_ry1 + s_bh * fy)))
-        for fx in (0.50, 0.25, 0.75):
-            sx = max(1, min(sw - 2, int(s_rx1 + s_bw * fx)))
-            seed_candidates.append((sx, sy))
-        for extra_dx in (-8, 8, -16, 16):
-            sx_ext = (s_rx1 + extra_dx) if extra_dx < 0 else (s_rx2 + extra_dx)
-            if 1 <= sx_ext < sw - 1:
-                seed_candidates.append((sx_ext, sy))
-
-    base_bin = small_gray.point(lambda p: 255 if p >= 238 else 0)
-    small_gray.close()
-    pinch_3 = base_bin.filter(ImageFilter.MinFilter(3))
-
-    best_small_filled = None
-    best_pinch_level = 0
-    best_score = -1.0
-    best_is_single_lobe = False
-
-    for pass_idx, bin_img in enumerate((base_bin, pinch_3)):
-        visited = Image.new("L", (sw, sh), 0)
-        for sx, sy in seed_candidates:
-            if bin_img.getpixel((sx, sy)) != 255 or visited.getpixel((sx, sy)) != 0:
-                continue
-
-            work = bin_img.copy()
-            ImageDraw.floodfill(work, (sx, sy), 128)
-            comp = work.point(lambda p: 255 if p == 128 else 0)
-            work.close()
-
-            new_visited = ImageChops.lighter(visited, comp)
-            visited.close()
-            visited = new_visited
-
-            c_bbox = comp.getbbox()
-            if not c_bbox:
-                comp.close()
-                continue
-            cx1, cy1, cx2, cy2 = c_bbox
-            cw, ch = cx2 - cx1, cy2 - cy1
-            if cw < 5 or ch < 5:
-                comp.close()
-                continue
-
-            edge_touches = (
-                (1 if cx1 <= 1 else 0)
-                + (1 if cy1 <= 1 else 0)
-                + (1 if cx2 >= sw - 1 else 0)
-                + (1 if cy2 >= sh - 1 else 0)
-            )
-            if edge_touches >= 3 or (cx1 <= 1 and cx2 >= sw - 1) or (cy1 <= 1 and cy2 >= sh - 1):
-                comp.close()
-                continue
-
-            # Check overlap BEFORE running the second hole-fill floodfill!
-            ov_x = max(0, min(cx2, s_rx2) - max(cx1, s_rx1))
-            ov_y = max(0, min(cy2, s_ry2) - max(cy1, s_ry1))
-            overlap_area = ov_x * ov_y
-            if overlap_area < 6:
-                comp.close()
-                continue
-
-            padded = Image.new("L", (sw + 4, sh + 4), 0)
-            padded.paste(comp, (2, 2))
-            ImageDraw.floodfill(padded, (0, 0), 128)
-            cropped_pad = padded.crop((2, 2, sw + 2, sh + 2))
-            padded.close()
-            holes = cropped_pad.point(lambda p: 255 if p == 0 else 0)
-            cropped_pad.close()
-            filled = ImageChops.lighter(comp, holes)
-
-            comp_crop = comp.crop(c_bbox)
-            comp_area = comp_crop.histogram()[255]
-            comp_crop.close()
-            comp.close()
-
-            filled_crop = filled.crop(c_bbox)
-            filled_area = max(1, filled_crop.histogram()[255])
-            filled_crop.close()
-
-            holes_crop = holes.crop(c_bbox)
-            holes_area = holes_crop.histogram()[255]
-            holes_crop.close()
-            holes.close()
-
-            if comp_area < 14 or (comp_area / filled_area) < 0.22:
-                filled.close()
-                continue
-
-            if has_kanji_kana and holes_area < 2:
-                filled.close()
-                continue
-
-            is_single = (cw <= s_bw * 2.15)
-            oversize_penalty = 1.0 if is_single else 0.65
-            score = ((overlap_area * 2.5) + (holes_area * 10.0) + (filled_area * 0.25)) * oversize_penalty
-            if pass_idx > 0:
-                score *= 0.94
-
-            if score > best_score:
-                if best_small_filled is not None:
-                    best_small_filled.close()
-                best_score = score
-                best_small_filled = filled
-                best_pinch_level = pass_idx
-                best_is_single_lobe = is_single
-            else:
-                filled.close()
-
-        visited.close()
-        if best_small_filled is not None and best_is_single_lobe:
-            break
-
-    base_bin.close()
-    pinch_3.close()
-
-    if best_small_filled is None:
-        return None
-
-    if best_pinch_level == 1:
-        expanded = best_small_filled.filter(ImageFilter.MaxFilter(3))
-        best_small_filled.close()
-        best_small_filled = expanded
-
-    resized = best_small_filled.resize((ww, wh), Image.Resampling.BILINEAR)
-    best_small_filled.close()
-    full_filled = resized.point(lambda p: 255 if p >= 128 else 0)
-    resized.close()
-    return full_filled
-
-
-def _sample_dark_bubble_bg_rgb_and_lum(img: Image.Image, base_gray: Image.Image, x1: int, y1: int, x2: int, y2: int) -> tuple[tuple[int, int, int], int, float]:
-    width, height = img.size
-    sx1 = max(0, x1 - 4)
-    sy1 = max(0, y1 - 4)
-    sx2 = min(width, x2 + 4)
-    sy2 = min(height, y2 + 4)
-    crop_rgb = img.crop((sx1, sy1, sx2, sy2))
-    crop_gray = base_gray.crop((sx1, sy1, sx2, sy2))
-
+def _sample_dark_bg_rgb_and_lum(img: Image.Image, base_gray: Image.Image, x1: int, y1: int, x2: int, y2: int) -> tuple[tuple[int, int, int], int, float]:
+    crop_rgb = img.crop((x1, y1, x2, y2))
+    crop_gray = base_gray.crop((x1, y1, x2, y2))
     bg_mask = crop_gray.point(lambda p: 255 if p < 145 else 0)
     if not bg_mask.getbbox():
         bg_mask.close()
         bg_mask = Image.new("L", crop_gray.size, 255)
-
     stat_rgb = ImageStat.Stat(crop_rgb, mask=bg_mask)
     stat_g = ImageStat.Stat(crop_gray, mask=bg_mask)
     bg_rgb = tuple(int(v) for v in stat_rgb.median[:3])
     bg_lum = int(stat_g.median[0])
     bg_std = float(stat_g.stddev[0])
-
     bg_mask.close()
     crop_rgb.close()
     crop_gray.close()
     return bg_rgb, bg_lum, bg_std
 
 
-def _sample_light_bubble_bg_rgb(img: Image.Image, base_gray: Image.Image, x1: int, y1: int, x2: int, y2: int) -> tuple[int, int, int]:
+def _sample_light_bg_rgb(img: Image.Image, base_gray: Image.Image, x1: int, y1: int, x2: int, y2: int) -> tuple[int, int, int]:
     crop_rgb = img.crop((x1, y1, x2, y2))
     crop_gray = base_gray.crop((x1, y1, x2, y2))
     light_mask = crop_gray.point(lambda p: 255 if p >= 200 else 0)
@@ -1905,14 +2176,12 @@ def _sample_light_bubble_bg_rgb(img: Image.Image, base_gray: Image.Image, x1: in
         crop_rgb.close()
         crop_gray.close()
         return (255, 255, 255)
-
     stat_g = ImageStat.Stat(crop_gray, mask=light_mask)
     if stat_g.median[0] >= 244:
         light_mask.close()
         crop_rgb.close()
         crop_gray.close()
         return (255, 255, 255)
-
     stat_rgb = ImageStat.Stat(crop_rgb, mask=light_mask)
     bg_rgb = tuple(int(v) for v in stat_rgb.median[:3])
     light_mask.close()
@@ -1921,593 +2190,232 @@ def _sample_light_bubble_bg_rgb(img: Image.Image, base_gray: Image.Image, x1: in
     return bg_rgb
 
 
-def _find_enclosed_dark_caption_box(
-    sub_gray: Image.Image,
-    rx1_rel: int,
-    ry1_rel: int,
-    rx2_rel: int,
-    ry2_rel: int,
-) -> tuple[int, int, int, int] | None:
-    """
-    Fast `<= 160px` enclosed dark rectangular caption-box detector (e.g. `一ヶ月後 玄龍門`).
-    """
-    ww, wh = sub_gray.size
-    box_w = max(8, rx2_rel - rx1_rel)
-    box_h = max(8, ry2_rel - ry1_rel)
-    if box_w < 14 or box_h < 20:
-        return None
-
-    scale = min(0.5, MAX_FLOOD_MASK_DIM / float(max(ww, wh)))
-    sw = max(12, int(round(ww * scale)))
-    sh = max(12, int(round(wh * scale)))
-    small_gray = sub_gray.resize((sw, sh), Image.Resampling.BILINEAR)
-
-    s_rx1 = max(1, int(rx1_rel * scale))
-    s_ry1 = max(1, int(ry1_rel * scale))
-    s_rx2 = min(sw - 2, max(s_rx1 + 3, int(rx2_rel * scale)))
-    s_ry2 = min(sh - 2, max(s_ry1 + 3, int(ry2_rel * scale)))
-    s_bw = max(3, s_rx2 - s_rx1)
-    s_bh = max(3, s_ry2 - s_ry1)
-
-    cap_bin = small_gray.point(lambda p: 255 if p <= 165 else 0)
-    small_gray.close()
-
-    seed_pt = None
-    for fy in (0.50, 0.25, 0.75):
-        sy = max(1, min(sh - 2, int(s_ry1 + s_bh * fy)))
-        for fx in (0.50, 0.25, 0.75):
-            sx = max(1, min(sw - 2, int(s_rx1 + s_bw * fx)))
-            if cap_bin.getpixel((sx, sy)) == 255:
-                seed_pt = (sx, sy)
-                break
-        if seed_pt:
-            break
-
-    if seed_pt is None:
-        cap_bin.close()
-        return None
-
-    ImageDraw.floodfill(cap_bin, seed_pt, 128)
-    comp = cap_bin.point(lambda p: 255 if p == 128 else 0)
-    cap_bin.close()
-
-    padded = Image.new("L", (sw + 4, sh + 4), 0)
-    padded.paste(comp, (2, 2))
-    ImageDraw.floodfill(padded, (0, 0), 128)
-    cropped_pad = padded.crop((2, 2, sw + 2, sh + 2))
-    padded.close()
-    holes = cropped_pad.point(lambda p: 255 if p == 0 else 0)
-    cropped_pad.close()
-    filled = ImageChops.lighter(comp, holes)
-    comp.close()
-    holes.close()
-
-    c_bbox = filled.getbbox()
-    if not c_bbox:
-        filled.close()
-        return None
-    bx1, by1, bx2, by2 = c_bbox
-    bw, bh = bx2 - bx1, by2 - by1
-
-    if bw > s_bw * 3.2 or bh > s_bh * 1.45 or bw > sw * 0.65 or bh > sh * 0.65:
-        filled.close()
-        return None
-
-    filled_crop = filled.crop(c_bbox)
-    area = filled_crop.histogram()[255]
-    filled_crop.close()
-    filled.close()
-
-    rect_fill_ratio = area / float(max(1, bw * bh))
-    if rect_fill_ratio >= 0.76:
-        return (
-            int(bx1 / scale) + 3,
-            int(by1 / scale) + 3,
-            int(bx2 / scale) - 3,
-            int(by2 / scale) - 3,
-        )
-    return None
-
-
-def _build_red_box_qa_crop_b64(img: Image.Image, x1: int, y1: int, x2: int, y2: int) -> str:
-    width, height = img.size
-    bw = max(16, x2 - x1)
-    bh = max(16, y2 - y1)
-    pad_x = max(45, int(bw * 0.55))
-    pad_y = max(45, int(bh * 0.55))
-    cx1 = max(0, x1 - pad_x)
-    cy1 = max(0, y1 - pad_y)
-    cx2 = min(width, x2 + pad_x)
-    cy2 = min(height, y2 + pad_y)
-
-    crop = img.crop((cx1, cy1, cx2, cy2)).copy()
-    draw = ImageDraw.Draw(crop)
-    draw.rectangle(
-        [x1 - cx1, y1 - cy1, x2 - cx1, y2 - cy1],
-        outline=(255, 25, 25),
-        width=max(2, int(max(crop.size) * 0.008)),
-    )
-    crop.thumbnail((320, 320), Image.Resampling.BILINEAR)
-    buf = io.BytesIO()
-    crop.save(buf, format="JPEG", quality=76)
-    crop.close()
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
-
-
-def _extract_ambiguous_qa_crops_sync(
-    raw_bytes: bytes,
-    bubbles: list[dict],
-) -> tuple[list[tuple[int, int, int, int, bool, bool, str, str]], list[tuple[int, str]]]:
-    """
-    Ultra-targeted pre-scan: inspects ONLY the **inner 60% core** of each `box_2d`!
-      - Real oval speech bubbles have an inner 60% core that is 100% inside the white oval
-        (`core_chroma_ratio < 0.04`), so they NEVER trigger false-positive BoxQA calls!
-      - Drifted boxes sitting on faces, hands, hair, or colored wallpaper have high color
-        saturation right inside their inner 60% core (`core_chroma_ratio >= 0.22` and
-        `core_mean_sat >= 16.0`), triggering surgical `gemini-decision-1` verification (~0-3 boxes total!).
-    """
-    valid_boxes = [
-        b for b in bubbles
-        if isinstance(b.get("box_2d"), list)
-        and len(b["box_2d"]) == 4
-        and _sanitize_text_for_manga_font(b.get("translated_text") or "")
-    ]
-    if not valid_boxes:
-        return [], []
-
-    img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-    base_gray = img.convert("L")
-    width, height = img.size
-
-    try:
-        pixel_boxes = []
-        for b in valid_boxes:
-            ymin, xmin, ymax, xmax = [float(v) for v in b["box_2d"]]
-            if ymin > ymax:
-                ymin, ymax = ymax, ymin
-            if xmin > xmax:
-                xmin, xmax = xmax, xmin
-            raw_x1 = max(0, int((xmin / 1000.0) * width))
-            raw_y1 = max(0, int((ymin / 1000.0) * height))
-            raw_x2 = min(width, int((xmax / 1000.0) * width))
-            raw_y2 = min(height, int((ymax / 1000.0) * height))
-            if (raw_x2 - raw_x1) < 18 or (raw_y2 - raw_y1) < 16:
-                continue
-            is_dark = _detect_bubble_polarity(base_gray, raw_x1, raw_y1, raw_x2, raw_y2)
-            src_txt = str(b.get("source_text") or "")
-            has_kanji_kana = bool(re.search(r"[ぁ-んァ-ヶ一-龯A-Za-z0-9]", src_txt))
-            clean_tr = _sanitize_text_for_manga_font(b["translated_text"])
-            panel_pos = str(b.get("panel_position") or "").strip().lower()
-            if clean_tr:
-                pixel_boxes.append((raw_x1, raw_y1, raw_x2, raw_y2, is_dark, has_kanji_kana, clean_tr, panel_pos))
-
-        pixel_boxes = _deduplicate_overlapping_pixel_boxes(pixel_boxes, height)
-
-        qa_crops: list[tuple[int, str]] = []
-        for idx, (rx1, ry1, rx2, ry2, _, _, _, _) in enumerate(pixel_boxes):
-            bw, bh = rx2 - rx1, ry2 - ry1
-            ix1 = rx1 + int(bw * 0.20)
-            iy1 = ry1 + int(bh * 0.20)
-            ix2 = max(ix1 + 6, rx2 - int(bw * 0.20))
-            iy2 = max(iy1 + 6, ry2 - int(bh * 0.20))
-            core_sat, core_chroma = _measure_crop_chroma_stats(img, ix1, iy1, ix2, iy2)
-            if core_chroma >= 0.22 and core_sat >= 16.0:
-                b64_crop = _build_red_box_qa_crop_b64(img, rx1, ry1, rx2, ry2)
-                qa_crops.append((idx, b64_crop))
-
-        return pixel_boxes, qa_crops
-    finally:
-        img.close()
-        base_gray.close()
-
-
-async def _audit_ambiguous_boxes_with_decision_1(
-    qa_crops: list[tuple[int, str]],
-    page_num: int,
-    req_id: str,
-) -> set[int]:
-    """
-    Audits ONLY inner-core-chromatic boxes (typically 0-3 per 10-page comic) via `gemini-decision-1`
-    so valid white speech ovals are NEVER blocked while drifted boxes over faces/hands/walls are stopped.
-    """
-    blocked: set[int] = set()
-    if not qa_crops or not GEMINI_API_KEY or time.time() < state.gemini_decision_cooldown_until:
-        return blocked
-
-    sem = asyncio.Semaphore(6)
-
-    async def _check_one(box_idx: int, b64_crop: str) -> tuple[int, bool]:
-        shared_input = [
-            {
-                "type": "text",
-                "text": (
-                    "Inspect ONLY the center area inside the red rectangle on this manga crop.\n"
-                    "Determine whether it contains a real speech bubble/caption box with Japanese dialogue, "
-                    "or if it drifted onto a character's face/hands/body or empty artwork without dialogue."
-                ),
-            },
-            {
-                "type": "image",
-                "data": b64_crop,
-                "mime_type": "image/jpeg",
-                "resolution": "low",
-            },
-        ]
-        questions = {
-            "has_japanese_text": {
-                "type": "noul",
-                "instructions": (
-                    "Answer YES if there is clearly readable Japanese dialogue or caption text inside the red rectangle. "
-                    "Answer NO if the red rectangle contains mostly character artwork, face/hand, or blank background."
-                ),
-            },
-            "damages_character_art": {
-                "type": "noul",
-                "instructions": (
-                    "Answer YES ONLY if the center of the red rectangle sits directly over a character's face, eyes, hair, "
-                    "hand, or body OUTSIDE a speech bubble. Answer NO if it encloses a speech bubble or caption box."
-                ),
-            },
-        }
-        async with sem:
-            answers = await call_gemini_decision_orchestrator(
-                shared_input,
-                questions,
-                timeout_sec=3.5,
-                purpose=f"BoxQA[{req_id}]-p{page_num}b{box_idx + 1}",
-            )
-        if not answers:
-            return box_idx, False
-        has_txt = float((answers.get("has_japanese_text") or {}).get("noul") or 1.0)
-        damages_art = float((answers.get("damages_character_art") or {}).get("noul") or 0.0)
-        should_block = bool(has_txt < 0.35 or damages_art >= 0.72)
-        return box_idx, should_block
-
-    results = await asyncio.gather(*[_check_one(idx, b64_c) for idx, b64_c in qa_crops[:6]])
-    for box_idx, should_block in results:
-        if should_block:
-            blocked.add(box_idx)
-    return blocked
-
-
-def _erase_bubble_japanese_text_and_measure_lobe(
+def _clean_exact_cv_bubble_and_measure_box(
     img: Image.Image,
     base_gray: Image.Image,
-    other_peer_boxes: list[tuple[int, int, int, int]],
+    cv_obj: dict,
+) -> tuple[int, int, int, int, tuple[int, int, int], tuple[int, int, int], tuple[int, int, int, int]] | None:
+    """
+    Cleans Japanese text inside a CV-anchored speech bubble using its exact pixel mask:
+      - Erodes mask 2px inside the black outline so speech-bubble borders stay razor-sharp.
+      - Protects colored chibi-art pixels (`sat >= 26`) inside the bubble while wiping 100%
+        of achromatic Japanese text strokes (`p < 246`).
+      - Measures the true inscribed text rectangle inside the oval via C-level `getbbox()` rows.
+    """
+    width, height = img.size
+    ymin, xmin, ymax, xmax = cv_obj["bbox_norm"]
+    x1 = max(0, int((xmin / 1000.0) * width))
+    y1 = max(0, int((ymin / 1000.0) * height))
+    x2 = min(width, int((xmax / 1000.0) * width))
+    y2 = min(height, int((ymax / 1000.0) * height))
+    bw, bh = x2 - x1, y2 - y1
+    if bw < 16 or bh < 14:
+        return None
+
+    is_dark = bool(cv_obj.get("is_dark"))
+    mask_full = cv_obj["mask_small"].resize((bw, bh), Image.Resampling.BILINEAR).point(
+        lambda p: 255 if p >= 128 else 0
+    )
+    # Erode 2px inward so the outer black speech-bubble stroke is 100% preserved
+    safe_core = mask_full.filter(ImageFilter.MinFilter(5))
+    mask_full.close()
+    if not safe_core.getbbox():
+        safe_core.close()
+        safe_core = cv_obj["mask_small"].resize((bw, bh), Image.Resampling.BILINEAR).point(
+            lambda p: 255 if p >= 128 else 0
+        )
+
+    sub_gray = base_gray.crop((x1, y1, x2, y2))
+    sub_rgb = img.crop((x1, y1, x2, y2))
+    sub_sat = sub_rgb.convert("HSV").getchannel("S")
+    sub_rgb.close()
+
+    try:
+        # Preserve colored chibi faces/icons drawn inside speech bubbles (`sat >= 26`)
+        chroma_px = sub_sat.point(lambda p: 255 if p >= 26 else 0)
+        chroma_shield = _fast_dilate_mask_half_res(chroma_px, kernel_half=3)
+        chroma_px.close()
+        non_chroma = ImageChops.invert(chroma_shield)
+        chroma_shield.close()
+
+        if is_dark:
+            dark_rgb, bg_lum, _ = _sample_dark_bg_rgb_and_lum(img, base_gray, x1, y1, x2, y2)
+            diff_ink = sub_gray.point(lambda p: 255 if abs(int(p) - bg_lum) > 18 else 0)
+            ink_dil = _fast_dilate_mask_half_res(diff_ink, kernel_half=3)
+            diff_ink.close()
+            erase_mask = ImageChops.darker(ImageChops.darker(ink_dil, safe_core), non_chroma)
+            ink_dil.close()
+
+            fill_patch = Image.new("RGB", (bw, bh), dark_rgb)
+            img.paste(fill_patch, (x1, y1), mask=erase_mask)
+            fill_patch.close()
+            erase_mask.close()
+            fg_rgb = (250, 250, 250)
+            stroke_rgb = (max(0, bg_lum - 20), max(0, bg_lum - 20), max(0, bg_lum - 20))
+        else:
+            ink_mask = sub_gray.point(lambda p: 255 if p < 246 else 0)
+            ink_dil = _fast_dilate_mask_half_res(ink_mask, kernel_half=3)
+            ink_mask.close()
+            erase_mask = ImageChops.darker(ImageChops.darker(ink_dil, safe_core), non_chroma)
+            ink_dil.close()
+
+            white_patch = Image.new("RGB", (bw, bh), (255, 255, 255))
+            img.paste(white_patch, (x1, y1), mask=erase_mask)
+            white_patch.close()
+            erase_mask.close()
+            fg_rgb = (15, 15, 15)
+            stroke_rgb = (255, 255, 255)
+
+        non_chroma.close()
+
+        # Measure inscribed text bounds strictly inside `safe_core`
+        core_bb = safe_core.getbbox()
+        if not core_bb:
+            return x1 + 4, y1 + 4, x2 - 4, y2 - 4, fg_rgb, stroke_rgb, (x1 + 3, y1 + 3, x2 - 3, y2 - 3)
+
+        lb_x1, lb_y1, lb_x2, lb_y2 = core_bb
+        rel_y1 = lb_y1 + max(4, int((lb_y2 - lb_y1) * 0.08))
+        rel_y2 = lb_y2 - max(4, int((lb_y2 - lb_y1) * 0.08))
+        if rel_y2 - rel_y1 < 18:
+            rel_y1, rel_y2 = lb_y1 + 2, lb_y2 - 2
+
+        mid_y_start = rel_y1 + int((rel_y2 - rel_y1) * 0.16)
+        mid_y_end = rel_y1 + int((rel_y2 - rel_y1) * 0.84)
+        step_y = max(2, (mid_y_end - mid_y_start) // 7 or 1)
+        row_lefts = []
+        row_rights = []
+        for sy in range(mid_y_start, max(mid_y_start + 1, mid_y_end), step_y):
+            if not (0 <= sy < bh):
+                continue
+            row_strip = safe_core.crop((lb_x1, sy, lb_x2, sy + 1))
+            rb = row_strip.getbbox()
+            row_strip.close()
+            if rb and (rb[2] - rb[0]) >= 14:
+                row_lefts.append(lb_x1 + rb[0])
+                row_rights.append(lb_x1 + rb[2])
+
+        hard_b = (x1 + lb_x1 + 3, y1 + lb_y1 + 3, x1 + lb_x2 - 3, y1 + lb_y2 - 3)
+        if row_lefts and row_rights:
+            row_lefts.sort()
+            row_rights.sort()
+            inner_l = row_lefts[int(len(row_lefts) * 0.65)] + 4
+            inner_r = row_rights[int(len(row_rights) * 0.35)] - 4
+            if inner_r - inner_l >= 18:
+                return x1 + inner_l, y1 + rel_y1, x1 + inner_r, y1 + rel_y2, fg_rgb, stroke_rgb, hard_b
+
+        return x1 + lb_x1 + 4, y1 + rel_y1, x1 + lb_x2 - 4, y1 + rel_y2, fg_rgb, stroke_rgb, hard_b
+    finally:
+        safe_core.close()
+        sub_gray.close()
+        sub_sat.close()
+
+
+def _clean_unmarked_open_bubble_and_measure_box(
+    img: Image.Image,
+    base_gray: Image.Image,
     raw_x1: int,
     raw_y1: int,
     raw_x2: int,
     raw_y2: int,
-    is_dark_bubble: bool = False,
-    has_kanji_kana: bool = True,
 ) -> tuple[int, int, int, int, tuple[int, int, int], tuple[int, int, int], tuple[int, int, int, int]] | None:
+    """
+    Safely cleans borderless/open-sided dialogue (`bubble_id == None`, e.g. text on a white
+    panel background like Page 3 middle-left or Page 8 left-top) while shielding colored skin,
+    hands, hair, and panel borders from any white artifacts.
+    """
     width, height = img.size
-    x1, y1, x2, y2 = raw_x1, raw_y1, raw_x2, raw_y2
-    box_w = max(8, x2 - x1)
-    box_h = max(8, y2 - y1)
-
-    if box_w < 18 or box_h < 16:
+    bw, bh = raw_x2 - raw_x1, raw_y2 - raw_y1
+    if bw < 18 or bh < 16:
         return None
 
-    pad_x = min(int(width * 0.24), max(120, int(box_w * 1.40)))
-    pad_y = min(int(height * 0.22), max(120, int(box_h * 1.40)))
-    wx1 = max(0, x1 - pad_x)
-    wy1 = max(0, y1 - pad_y)
-    wx2 = min(width, x2 + pad_x)
-    wy2 = min(height, y2 + pad_y)
+    sub_g = base_gray.crop((raw_x1, raw_y1, raw_x2, raw_y2))
+    median_lum = ImageStat.Stat(sub_g).median[0]
+    box_hist = sub_g.histogram()
+    sub_g.close()
+    total_px = max(1, sum(box_hist))
+    mean_sat, chroma_ratio = _measure_crop_chroma_stats(img, raw_x1, raw_y1, raw_x2, raw_y2)
 
-    ww = max(8, wx2 - wx1)
-    wh = max(8, wy2 - wy1)
-    sub_gray = base_gray.crop((wx1, wy1, wx2, wy2))
-
-    rx1_rel = max(2, x1 - wx1)
-    ry1_rel = max(2, y1 - wy1)
-    rx2_rel = min(ww - 2, x2 - wx1)
-    ry2_rel = min(wh - 2, y2 - wy1)
-
-    peer_clip_x1, peer_clip_y1, peer_clip_x2, peer_clip_y2 = _compute_peer_clip_bounds(
-        base_gray, width, height, x1, y1, x2, y2, other_peer_boxes
-    )
-
-    try:
-        # =====================================================================
-        # CASE A: DARK OR CHARCOAL SPEECH BUBBLE / NARRATION CAPTION BOX
-        # (Strict check: MUST be either an enclosed dark caption box OR a uniform
-        #  low-variance dark bubble with crisp white text `p >= 220` — NEVER
-        #  fires on dark character hair, striped coats, or shaded walls!)
-        # =====================================================================
-        if is_dark_bubble:
-            mean_sat, chroma_ratio = _measure_crop_chroma_stats(img, x1, y1, x2, y2)
-            sub_g_a = base_gray.crop((x1, y1, x2, y2))
-            box_hist = sub_g_a.histogram()
-            sub_g_a.close()
-            total_box_px = max(1, sum(box_hist))
-            bright_text_ratio = sum(box_hist[220:]) / total_box_px
-
-            dark_fill_rgb, bg_lum, bg_std = _sample_dark_bubble_bg_rgb_and_lum(
-                img, base_gray, raw_x1, raw_y1, raw_x2, raw_y2
-            )
-
-            cap_rect = _find_enclosed_dark_caption_box(
-                sub_gray, rx1_rel, ry1_rel, rx2_rel, ry2_rel
-            )
-            is_valid_dark_caption = (cap_rect is not None and bright_text_ratio >= 0.008 and mean_sat < 38.0)
-            is_valid_dark_bubble = (
-                bg_std <= 28.0
-                and mean_sat < 22.0
-                and chroma_ratio < 0.12
-                and 0.020 <= bright_text_ratio <= 0.38
-            )
-            if not (is_valid_dark_caption or is_valid_dark_bubble):
-                return None
-
-            fg_text_rgb = (250, 250, 250)
-            stroke_rgb = (max(0, bg_lum - 20), max(0, bg_lum - 20), max(0, bg_lum - 20))
-
-            if cap_rect is not None:
-                tx_clean_x1 = max(2, cap_rect[0])
-                tx_clean_y1 = max(2, cap_rect[1])
-                tx_clean_x2 = min(ww - 2, cap_rect[2])
-                tx_clean_y2 = min(wh - 2, cap_rect[3])
-            else:
-                tx_clean_x1 = max(2, rx1_rel - 6)
-                tx_clean_y1 = max(2, ry1_rel - 6)
-                tx_clean_x2 = min(ww - 2, rx2_rel + 6)
-                tx_clean_y2 = min(wh - 2, ry2_rel + 6)
-
-            text_box_bounds = Image.new("L", (ww, wh), 0)
-            ImageDraw.Draw(text_box_bounds).rectangle(
-                [tx_clean_x1, tx_clean_y1, tx_clean_x2, tx_clean_y2], fill=255
-            )
-
-            diff_from_bg = sub_gray.point(lambda p: 255 if abs(int(p) - bg_lum) > 18 else 0)
-            diff_dilated = _fast_dilate_mask_half_res(diff_from_bg, kernel_half=3)
-            diff_from_bg.close()
-            erase_mask_dark = ImageChops.darker(diff_dilated, text_box_bounds)
-            diff_dilated.close()
-            text_box_bounds.close()
-
-            fill_patch = Image.new("RGB", (ww, wh), dark_fill_rgb)
-            img.paste(fill_patch, (wx1, wy1), mask=erase_mask_dark)
-            fill_patch.close()
-            erase_mask_dark.close()
-
-            if cap_rect is not None:
-                hard_b = (
-                    max(peer_clip_x1, wx1 + cap_rect[0]),
-                    max(peer_clip_y1, wy1 + cap_rect[1]),
-                    min(peer_clip_x2, wx1 + cap_rect[2]),
-                    min(peer_clip_y2, wy1 + cap_rect[3]),
-                )
-                return hard_b[0], hard_b[1], hard_b[2], hard_b[3], fg_text_rgb, stroke_rgb, hard_b
-
-            hard_b = (
-                max(peer_clip_x1, raw_x1),
-                max(peer_clip_y1, raw_y1),
-                min(peer_clip_x2, raw_x2),
-                min(peer_clip_y2, raw_y2),
-            )
-            return hard_b[0], hard_b[1], hard_b[2], hard_b[3], fg_text_rgb, stroke_rgb, hard_b
-
-        # =====================================================================
-        # CASE B: ENCLOSED PURE-WHITE SPEECH BUBBLE
-        # =====================================================================
-        filled_bubble = _find_best_enclosed_white_bubble(
-            sub_gray, rx1_rel, ry1_rel, rx2_rel, ry2_rel, has_kanji_kana=has_kanji_kana
-        )
-
-        if filled_bubble is not None:
-            safe_inner_core = filled_bubble.filter(ImageFilter.MinFilter(3))
-            filled_bubble.close()
-            lobe_bbox = safe_inner_core.getbbox()
-            if lobe_bbox:
-                peer_mask = Image.new("L", (ww, wh), 0)
-                pm_x1 = max(0, peer_clip_x1 - wx1)
-                pm_y1 = max(0, peer_clip_y1 - wy1)
-                pm_x2 = min(ww, peer_clip_x2 - wx1)
-                pm_y2 = min(wh, peer_clip_y2 - wy1)
-                if pm_x2 > pm_x1 and pm_y2 > pm_y1:
-                    ImageDraw.Draw(peer_mask).rectangle([pm_x1, pm_y1, pm_x2, pm_y2], fill=255)
-                else:
-                    ImageDraw.Draw(peer_mask).rectangle([0, 0, ww, wh], fill=255)
-
-                clipped_core = ImageChops.darker(safe_inner_core, peer_mask)
-                safe_inner_core.close()
-                peer_mask.close()
-
-                ink_inside_bubble = sub_gray.point(lambda p: 255 if p < 246 else 0)
-                ink_dilated = _fast_dilate_mask_half_res(ink_inside_bubble, kernel_half=3)
-                ink_inside_bubble.close()
-                erase_mask = ImageChops.darker(ink_dilated, clipped_core)
-                ink_dilated.close()
-
-                white_patch = Image.new("RGB", (ww, wh), (255, 255, 255))
-                img.paste(white_patch, (wx1, wy1), mask=erase_mask)
-                white_patch.close()
-                erase_mask.close()
-
-                clipped_bbox = clipped_core.getbbox() or lobe_bbox
-                lb_x1, lb_y1, lb_x2, lb_y2 = clipped_bbox
-
-                rel_y1 = lb_y1 + max(4, int((lb_y2 - lb_y1) * 0.08))
-                rel_y2 = lb_y2 - max(4, int((lb_y2 - lb_y1) * 0.08))
-                if rel_y2 - rel_y1 < 18:
-                    rel_y1, rel_y2 = lb_y1 + 3, lb_y2 - 3
-
-                mid_y_start = rel_y1 + int((rel_y2 - rel_y1) * 0.16)
-                mid_y_end = rel_y1 + int((rel_y2 - rel_y1) * 0.84)
-                step_y = max(2, (mid_y_end - mid_y_start) // 7 or 1)
-                row_lefts = []
-                row_rights = []
-                for sy in range(mid_y_start, max(mid_y_start + 1, mid_y_end), step_y):
-                    if not (0 <= sy < wh):
-                        continue
-                    row_strip = clipped_core.crop((lb_x1, sy, lb_x2, sy + 1))
-                    rb = row_strip.getbbox()
-                    row_strip.close()
-                    if rb and (rb[2] - rb[0]) >= 14:
-                        row_lefts.append(lb_x1 + rb[0])
-                        row_rights.append(lb_x1 + rb[2])
-                clipped_core.close()
-
-                if row_lefts and row_rights:
-                    row_lefts.sort()
-                    row_rights.sort()
-                    inner_l = row_lefts[int(len(row_lefts) * 0.65)] + 4
-                    inner_r = row_rights[int(len(row_rights) * 0.35)] - 4
-                    if inner_r - inner_l >= 18:
-                        tx1, ty1, tx2, ty2 = wx1 + inner_l, wy1 + rel_y1, wx1 + inner_r, wy1 + rel_y2
-                        hard_b = (wx1 + lb_x1 + 3, wy1 + lb_y1 + 3, wx1 + lb_x2 - 3, wy1 + lb_y2 - 3)
-                        return tx1, ty1, tx2, ty2, (15, 15, 15), (255, 255, 255), hard_b
-
-                tx1, ty1, tx2, ty2 = wx1 + lb_x1 + 4, wy1 + rel_y1, wx1 + lb_x2 - 4, wy1 + rel_y2
-                hard_b = (wx1 + lb_x1 + 3, wy1 + lb_y1 + 3, wx1 + lb_x2 - 3, wy1 + lb_y2 - 3)
-                return tx1, ty1, tx2, ty2, (15, 15, 15), (255, 255, 255), hard_b
-            else:
-                safe_inner_core.close()
-
-        # =====================================================================
-        # CASE C: BORDER-TOUCHING WHITE OR SEMI-TRANSPARENT MIST BUBBLE
-        # =====================================================================
-        tx_b1 = max(2, rx1_rel - 4)
-        ty_b1 = max(2, ry1_rel - 4)
-        tx_b2 = min(ww - 2, rx2_rel + 4)
-        ty_b2 = min(wh - 2, ry2_rel + 4)
-
-        mean_sat_c, chroma_ratio_c = _measure_crop_chroma_stats(img, x1, y1, x2, y2)
-
-        box_crop = sub_gray.crop((tx_b1, ty_b1, tx_b2, ty_b2))
-        box_hist = box_crop.histogram()
-        box_crop.close()
-        total_box_px = max(1, sum(box_hist))
-        white_paper_px = sum(box_hist[230:])
-        midtone_px = sum(box_hist[135:230])
-        dark_ink_px = sum(box_hist[:135])
-
-        white_paper_ratio = white_paper_px / total_box_px
-        midtone_ratio = midtone_px / total_box_px
-        ink_ratio = dark_ink_px / total_box_px
-
-        is_valid_pure_white = (
-            mean_sat_c < 10.0
-            and chroma_ratio_c < 0.12
-            and white_paper_ratio >= 0.45
-            and midtone_ratio <= 0.24
-            and ink_ratio >= 0.015
-        )
-        light_mist_px = sum(box_hist[205:])
-        is_valid_mist_bubble = (
-            mean_sat_c < 7.0
-            and chroma_ratio_c < 0.08
-            and (light_mist_px / total_box_px) >= 0.62
-            and ink_ratio >= 0.015
-        )
-
-        if is_valid_pure_white or is_valid_mist_bubble:
-            exp_x1 = max(2, max(peer_clip_x1 - wx1, rx1_rel - 8))
-            exp_y1 = max(2, max(peer_clip_y1 - wy1, ry1_rel - 14))
-            exp_x2 = min(ww - 2, min(peer_clip_x2 - wx1, rx2_rel + 8))
-            exp_y2 = min(wh - 2, min(peer_clip_y2 - wy1, ry2_rel + 14))
-
-            box_clamp = Image.new("L", (ww, wh), 0)
-            ImageDraw.Draw(box_clamp).rectangle([exp_x1, exp_y1, exp_x2, exp_y2], fill=255)
-
-            bg_rgb = (255, 255, 255) if is_valid_pure_white else _sample_light_bubble_bg_rgb(
-                img, base_gray, raw_x1, raw_y1, raw_x2, raw_y2
-            )
-            ink_cutoff = 232 if is_valid_pure_white else 188
-            text_ink_mask = sub_gray.point(lambda p: 255 if p < ink_cutoff else 0)
-            text_ink_dil = _fast_dilate_mask_half_res(text_ink_mask, kernel_half=3)
-            text_ink_mask.close()
-
-            sub_rgb_shield = img.crop((wx1, wy1, wx2, wy2))
-            sub_sat_band = sub_rgb_shield.convert("HSV").getchannel("S")
-            sub_rgb_shield.close()
-            chroma_px = sub_sat_band.point(lambda p: 255 if p >= 20 else 0)
-            sub_sat_band.close()
-            chroma_shield = _fast_dilate_mask_half_res(chroma_px, kernel_half=5)
-            chroma_px.close()
-            non_chroma_mask = ImageChops.invert(chroma_shield)
-            chroma_shield.close()
-
-            safe_clamp = ImageChops.darker(box_clamp, non_chroma_mask)
-            box_clamp.close()
-            non_chroma_mask.close()
-
-            if is_valid_pure_white:
-                white_seed = sub_gray.point(lambda p: 255 if p >= 235 else 0)
-                white_zone = _fast_dilate_mask_half_res(white_seed, kernel_half=5)
-                white_seed.close()
-                safe_zone = ImageChops.darker(white_zone, safe_clamp)
-                white_zone.close()
-                safe_clamp.close()
-                erase_c = ImageChops.darker(text_ink_dil, safe_zone)
-                safe_zone.close()
-            else:
-                erase_c = ImageChops.darker(text_ink_dil, safe_clamp)
-                safe_clamp.close()
-
-            text_ink_dil.close()
-
-            if erase_c.getbbox():
-                bg_patch = Image.new("RGB", (ww, wh), bg_rgb)
-                img.paste(bg_patch, (wx1, wy1), mask=erase_c)
-                bg_patch.close()
-                erase_c.close()
-                hard_b = (raw_x1, raw_y1, raw_x2, raw_y2)
-                return raw_x1, raw_y1, raw_x2, raw_y2, (15, 15, 15), bg_rgb, hard_b
-            erase_c.close()
-
+    # Reject chromatic/colored artwork (faces, hands, wallpaper)
+    if mean_sat >= 12.0 or chroma_ratio >= 0.14:
         return None
-    finally:
-        sub_gray.close()
+
+    # Dark unmarked bubble/caption
+    if median_lum < 125:
+        dark_rgb, bg_lum, bg_std = _sample_dark_bg_rgb_and_lum(img, base_gray, raw_x1, raw_y1, raw_x2, raw_y2)
+        bright_ratio = sum(box_hist[220:]) / float(total_px)
+        if bg_std > 26.0 or not (0.02 <= bright_ratio <= 0.38):
+            return None
+
+        pad = 6
+        wx1, wy1 = max(0, raw_x1 - pad), max(0, raw_y1 - pad)
+        wx2, wy2 = min(width, raw_x2 + pad), min(height, raw_y2 + pad)
+        ww, wh = wx2 - wx1, wy2 - wy1
+        sg = base_gray.crop((wx1, wy1, wx2, wy2))
+        diff = sg.point(lambda p: 255 if abs(int(p) - bg_lum) > 18 else 0)
+        sg.close()
+        erase_d = _fast_dilate_mask_half_res(diff, kernel_half=3)
+        diff.close()
+        patch = Image.new("RGB", (ww, wh), dark_rgb)
+        img.paste(patch, (wx1, wy1), mask=erase_d)
+        patch.close()
+        erase_d.close()
+        stroke_c = (max(0, bg_lum - 20), max(0, bg_lum - 20), max(0, bg_lum - 20))
+        return raw_x1, raw_y1, raw_x2, raw_y2, (250, 250, 250), stroke_c, (raw_x1, raw_y1, raw_x2, raw_y2)
+
+    # Light open-sided bubble / white panel background
+    white_ratio = sum(box_hist[228:]) / float(total_px)
+    ink_ratio = sum(box_hist[:145]) / float(total_px)
+    if white_ratio < 0.42 or ink_ratio < 0.012:
+        return None
+
+    pad_x, pad_y = 8, 12
+    wx1, wy1 = max(0, raw_x1 - pad_x), max(0, raw_y1 - pad_y)
+    wx2, wy2 = min(width, raw_x2 + pad_x), min(height, raw_y2 + pad_y)
+    ww, wh = wx2 - wx1, wy2 - wy1
+
+    sg = base_gray.crop((wx1, wy1, wx2, wy2))
+    srgb = img.crop((wx1, wy1, wx2, wy2))
+    ssat = srgb.convert("HSV").getchannel("S")
+    srgb.close()
+
+    # Chromatic-art shield protects hands/fingers/hair within ~5px of colored pixels
+    c_px = ssat.point(lambda p: 255 if p >= 20 else 0)
+    ssat.close()
+    c_shield = _fast_dilate_mask_half_res(c_px, kernel_half=5)
+    c_px.close()
+    non_chroma = ImageChops.invert(c_shield)
+    c_shield.close()
+
+    # Only erase dark ink surrounded by white paper (protects solid black panel frames!)
+    w_seed = sg.point(lambda p: 255 if p >= 235 else 0)
+    w_zone = _fast_dilate_mask_half_res(w_seed, kernel_half=5)
+    w_seed.close()
+
+    ink_m = sg.point(lambda p: 255 if p < 230 else 0)
+    sg.close()
+    ink_dil = _fast_dilate_mask_half_res(ink_m, kernel_half=3)
+    ink_m.close()
+
+    safe_zone = ImageChops.darker(w_zone, non_chroma)
+    w_zone.close()
+    non_chroma.close()
+    erase_c = ImageChops.darker(ink_dil, safe_zone)
+    ink_dil.close()
+    safe_zone.close()
+
+    if not erase_c.getbbox():
+        erase_c.close()
+        return None
+
+    bg_rgb = _sample_light_bg_rgb(img, base_gray, raw_x1, raw_y1, raw_x2, raw_y2)
+    patch = Image.new("RGB", (ww, wh), bg_rgb)
+    img.paste(patch, (wx1, wy1), mask=erase_c)
+    patch.close()
+    erase_c.close()
+    return raw_x1, raw_y1, raw_x2, raw_y2, (15, 15, 15), bg_rgb, (raw_x1, raw_y1, raw_x2, raw_y2)
 
 
-def _deduplicate_overlapping_pixel_boxes(
-    pixel_boxes: list[tuple[int, int, int, int, bool, bool, str, str]],
-    height: int,
-) -> list[tuple[int, int, int, int, bool, bool, str, str]]:
-    def _pos_matches_y(pos: str, y1: int, y2: int) -> bool:
-        if not pos:
-            return True
-        y_norm = ((y1 + y2) / 2.0) / max(1.0, float(height)) * 1000.0
-        if pos.startswith("top"):
-            return y_norm <= 480
-        if pos.startswith("middle"):
-            return 240 <= y_norm <= 740
-        if pos.startswith("bottom"):
-            return y_norm >= 520
-        return True
-
-    kept: list[tuple[int, int, int, int, bool, bool, str, str]] = []
-    for item in pixel_boxes:
-        rx1, ry1, rx2, ry2, _, _, _, r_pos = item
-        area_a = max(1, (rx2 - rx1) * (ry2 - ry1))
-        match_a = _pos_matches_y(r_pos, ry1, ry2)
-
-        replaced_or_dropped = False
-        for idx_k, k_item in enumerate(kept):
-            kx1, ky1, kx2, ky2, _, _, _, k_pos = k_item
-            area_b = max(1, (kx2 - kx1) * (ky2 - ky1))
-            ov_x = max(0, min(rx2, kx2) - max(rx1, kx1))
-            ov_y = max(0, min(ry2, ky2) - max(ry1, ky1))
-            ov_area = ov_x * ov_y
-            if ov_area / float(min(area_a, area_b)) >= 0.55:
-                match_b = _pos_matches_y(k_pos, ky1, ky2)
-                if (match_a and not match_b) or (match_a == match_b and area_a > area_b * 1.15):
-                    kept[idx_k] = item
-                replaced_or_dropped = True
-                break
-
-        if not replaced_or_dropped:
-            kept.append(item)
-    return kept
-
-
-def _resolve_box_collisions(
-    renders: list[list],
-    min_gap: int = 6,
-) -> list[list]:
+def _resolve_box_collisions(renders: list[list], min_gap: int = 6) -> list[list]:
     n = len(renders)
     for _ in range(3):
         for i in range(n):
@@ -2592,81 +2500,115 @@ def _fit_text_binary_search(
 def render_translated_manga_image_sync(
     raw_bytes: bytes,
     bubbles: list[dict],
-    approved_pixel_boxes: list[tuple[int, int, int, int, bool, bool, str, str]] | None = None,
+    cv_bubbles: list[dict] | None = None,
 ) -> bytes | None:
     """
-    Renders translated dialogue cleanly inside speech bubbles at FULL ORIGINAL RESOLUTION
-    using fixed-160px floodfill masks, 0.5x mask dilation, syllable-aware Thai wrapping,
-    and binary-search font fitting (~1s/page on 0.1 vCPU, zero Discord Gateway lag).
+    Renders translated dialogue at FULL ORIGINAL RESOLUTION:
+      1) Matched Set-of-Mark CV bubbles (`bubble_id`) are cleaned and typeset using their
+         exact pre-detected pixel masks (zero drift, zero overlap, zero leftover Japanese!).
+      2) Unmarked open/borderless bubbles (`bubble_id == None` + `box_2d`) are cleaned safely
+         with chromatic-art shielding after verifying they don't overlap an already-rendered CV bubble.
     """
-    if not raw_bytes:
+    if not raw_bytes or not bubbles:
         return None
+
+    cv_map: dict[int, dict] = {
+        int(c["bubble_id"]): c for c in (cv_bubbles or []) if c.get("bubble_id") is not None
+    }
 
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     base_gray = img.convert("L")
     width, height = img.size
 
     try:
-        if approved_pixel_boxes is not None:
-            pixel_boxes = approved_pixel_boxes
-        else:
-            valid_boxes = [
-                b for b in bubbles
-                if isinstance(b.get("box_2d"), list)
-                and len(b["box_2d"]) == 4
-                and _sanitize_text_for_manga_font(b.get("translated_text") or "")
-            ]
-            if not valid_boxes:
-                return None
+        prepared_renders: list[list] = []
+        used_cv_ids: set[int] = set()
+        rendered_rects: list[tuple[int, int, int, int]] = []
 
-            pixel_boxes = []
-            for b in valid_boxes:
-                ymin, xmin, ymax, xmax = [float(v) for v in b["box_2d"]]
-                if ymin > ymax:
-                    ymin, ymax = ymax, ymin
-                if xmin > xmax:
-                    xmin, xmax = xmax, xmin
-                raw_x1 = max(0, int((xmin / 1000.0) * width))
-                raw_y1 = max(0, int((ymin / 1000.0) * height))
-                raw_x2 = min(width, int((xmax / 1000.0) * width))
-                raw_y2 = min(height, int((ymax / 1000.0) * height))
-                is_dark = _detect_bubble_polarity(base_gray, raw_x1, raw_y1, raw_x2, raw_y2)
-                src_txt = str(b.get("source_text") or "")
-                has_kanji_kana = bool(re.search(r"[ぁ-んァ-ヶ一-龯A-Za-z0-9]", src_txt))
-                clean_tr = _sanitize_text_for_manga_font(b["translated_text"])
-                panel_pos = str(b.get("panel_position") or "").strip().lower()
-                if clean_tr:
-                    pixel_boxes.append((raw_x1, raw_y1, raw_x2, raw_y2, is_dark, has_kanji_kana, clean_tr, panel_pos))
-
-            pixel_boxes = _deduplicate_overlapping_pixel_boxes(pixel_boxes, height)
-
-        if not pixel_boxes:
-            return None
-
-        prepared_renders = []
-        for i, (rx1, ry1, rx2, ry2, is_dark, has_kk, trans_text, _) in enumerate(pixel_boxes):
-            if (rx2 - rx1) < 3 or (ry2 - ry1) < 3:
+        # Pass 1: Render all CV-anchored Set-of-Mark bubbles (`bubble_id` match)
+        for b in bubbles:
+            bid = b.get("bubble_id")
+            tr_txt = _sanitize_text_for_manga_font(b.get("translated_text") or "")
+            if not tr_txt or bid is None or bid in used_cv_ids or bid not in cv_map:
                 continue
-            other_boxes = [
-                (ox1, oy1, ox2, oy2)
-                for j, (ox1, oy1, ox2, oy2, _, _, _, _) in enumerate(pixel_boxes)
-                if j != i
-            ]
-            cleaned_lobe = _erase_bubble_japanese_text_and_measure_lobe(
-                img,
-                base_gray,
-                other_boxes,
-                rx1,
-                ry1,
-                rx2,
-                ry2,
-                is_dark_bubble=is_dark,
-                has_kanji_kana=has_kk,
-            )
-            if cleaned_lobe is None:
+
+            cv_obj = cv_map[bid]
+            cleaned = _clean_exact_cv_bubble_and_measure_box(img, base_gray, cv_obj)
+            if cleaned is None:
                 continue
-            lx1, ly1, lx2, ly2, fg_text, stroke_col, hard_bounds = cleaned_lobe
-            prepared_renders.append([lx1, ly1, lx2, ly2, fg_text, stroke_col, trans_text, hard_bounds])
+            used_cv_ids.add(bid)
+            lx1, ly1, lx2, ly2, fg_text, stroke_col, hard_bounds = cleaned
+            prepared_renders.append([lx1, ly1, lx2, ly2, fg_text, stroke_col, tr_txt, hard_bounds])
+            rendered_rects.append(hard_bounds)
+
+        # Pass 2: Render unmarked open/borderless bubbles (`bubble_id == None` + `box_2d`)
+        for b in bubbles:
+            tr_txt = _sanitize_text_for_manga_font(b.get("translated_text") or "")
+            if not tr_txt:
+                continue
+            bid = b.get("bubble_id")
+            if bid is not None and bid in used_cv_ids:
+                continue
+
+            box = b.get("box_2d")
+            if not (isinstance(box, list) and len(box) == 4):
+                continue
+
+            ymin, xmin, ymax, xmax = [float(v) for v in box]
+            if ymin > ymax:
+                ymin, ymax = ymax, ymin
+            if xmin > xmax:
+                xmin, xmax = xmax, xmin
+            rx1 = max(0, int((xmin / 1000.0) * width))
+            ry1 = max(0, int((ymin / 1000.0) * height))
+            rx2 = min(width, int((xmax / 1000.0) * width))
+            ry2 = min(height, int((ymax / 1000.0) * height))
+            area_new = max(1, (rx2 - rx1) * (ry2 - ry1))
+
+            # Snap to an unused CV bubble if this `box_2d` overlaps it by >= 40%!
+            snapped_cv_id = None
+            best_ov = 0.0
+            for cid, c_obj in cv_map.items():
+                if cid in used_cv_ids:
+                    continue
+                cy1_n, cx1_n, cy2_n, cx2_n = c_obj["bbox_norm"]
+                cx1_p = int((cx1_n / 1000.0) * width)
+                cy1_p = int((cy1_n / 1000.0) * height)
+                cx2_p = int((cx2_n / 1000.0) * width)
+                cy2_p = int((cy2_n / 1000.0) * height)
+                ov_x = max(0, min(rx2, cx2_p) - max(rx1, cx1_p))
+                ov_y = max(0, min(ry2, cy2_p) - max(ry1, cy1_p))
+                ov_ratio = (ov_x * ov_y) / float(min(area_new, max(1, (cx2_p - cx1_p) * (cy2_p - cy1_p))))
+                if ov_ratio >= 0.40 and ov_ratio > best_ov:
+                    best_ov = ov_ratio
+                    snapped_cv_id = cid
+
+            if snapped_cv_id is not None:
+                cleaned = _clean_exact_cv_bubble_and_measure_box(img, base_gray, cv_map[snapped_cv_id])
+                if cleaned is not None:
+                    used_cv_ids.add(snapped_cv_id)
+                    lx1, ly1, lx2, ly2, fg_text, stroke_col, hard_bounds = cleaned
+                    prepared_renders.append([lx1, ly1, lx2, ly2, fg_text, stroke_col, tr_txt, hard_bounds])
+                    rendered_rects.append(hard_bounds)
+                    continue
+
+            # Reject duplicate overlap with an already-rendered bubble
+            is_dup = False
+            for ex1, ey1, ex2, ey2 in rendered_rects:
+                ov_x = max(0, min(rx2, ex2) - max(rx1, ex1))
+                ov_y = max(0, min(ry2, ey2) - max(ry1, ey1))
+                if (ov_x * ov_y) / float(min(area_new, max(1, (ex2 - ex1) * (ey2 - ey1)))) >= 0.45:
+                    is_dup = True
+                    break
+            if is_dup:
+                continue
+
+            cleaned_open = _clean_unmarked_open_bubble_and_measure_box(img, base_gray, rx1, ry1, rx2, ry2)
+            if cleaned_open is None:
+                continue
+            lx1, ly1, lx2, ly2, fg_text, stroke_col, hard_bounds = cleaned_open
+            prepared_renders.append([lx1, ly1, lx2, ly2, fg_text, stroke_col, tr_txt, hard_bounds])
+            rendered_rects.append(hard_bounds)
 
         if not prepared_renders:
             return None
@@ -2717,10 +2659,10 @@ def render_translated_manga_image_sync(
 async def process_manga_translation_request(ctx_or_message, user_prompt: str):
     """
     Translates 1 to 12 manga pages from direct Discord attachments OR embedded links
-    in 1 unified batch call using:
+    using CV Set-of-Mark (SoM) bubble anchoring, strict `MangaBatch` model ordering:
       `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> (newer >3.5 flash-lite) -> `gemma-4-31b-it` -> `gemma-4-26b-a4b-it`
-    with explicit `propertyOrdering`, inner-core `gemini-decision-1` BoxQA, correlated
-    Render request/waiting/response logs, and fast full-resolution rendering.
+    correlated Render request/waiting/response logs, syllable-aware Thai wrapping,
+    and fast full-original-resolution rendering.
     """
     from media_context import resolve_referenced_message, collect_embedded_images_and_metadata
 
@@ -2777,125 +2719,131 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
     num_pages = len(pages_input)
     req_id = f"mb-{uuid.uuid4().hex[:6]}" if num_pages > 1 else f"ms-{uuid.uuid4().hex[:6]}"
 
+    cv_bubbles_per_page: list[list[dict]] = []
+
     async with channel.typing():
-        batch_results, is_unavailable = await extract_and_translate_manga_pages_batch(
-            pages_input, target_lang_name, series_context_hint=series_context_hint, req_id=req_id
-        )
-
-        if is_unavailable:
-            pages_input.clear()
-            release_unused_memory()
-            await _send_or_reply(
-                channel,
-                msg,
-                content=(
-                    "ขณะนี้ระบบแปลมังงะแบบหลายหน้าไม่พร้อมใช้งานชั่วคราว "
-                    "(API ต้นทางขัดข้องหรือหมดเวลาเชื่อมต่อ) กรุณาลองใหม่อีกครั้งในอีกสักครู่นะคะ"
-                ),
+        try:
+            batch_results, cv_bubbles_per_page, is_unavailable = await extract_and_translate_manga_pages_batch(
+                pages_input, target_lang_name, series_context_hint=series_context_hint, req_id=req_id
             )
-            return
 
-        if not any(bubbles or summary for bubbles, summary in batch_results):
-            pages_input.clear()
-            release_unused_memory()
-            await _send_or_reply(
-                channel,
-                msg,
-                content="ไม่สามารถตรวจจับข้อความในภาพที่แนบมาหรือจากลิงก์ได้ค่ะ กรุณาตรวจสอบว่าภาพมีความคมชัดนะคะ",
+            if is_unavailable:
+                await _send_or_reply(
+                    channel,
+                    msg,
+                    content=(
+                        "ขณะนี้ระบบแปลมังงะแบบหลายหน้าไม่พร้อมใช้งานชั่วคราว "
+                        "(API ต้นทางขัดข้องหรือหมดเวลาเชื่อมต่อ) กรุณาลองใหม่อีกครั้งในอีกสักครู่นะคะ"
+                    ),
+                )
+                return
+
+            if not any(bubbles or summary for bubbles, summary in batch_results):
+                await _send_or_reply(
+                    channel,
+                    msg,
+                    content="ไม่สามารถตรวจจับข้อความในภาพที่แนบมาหรือจากลิงก์ได้ค่ะ กรุณาตรวจสอบว่าภาพมีความคมชัดนะคะ",
+                )
+                return
+
+            header_title = (
+                f"**📖 คำแปลมังงะ {num_pages} หน้า ตามลำดับช่องอ่าน ขวาไปซ้าย ({target_lang_name}):**"
+                if num_pages > 1
+                else f"**📖 คำแปลมังงะตามลำดับช่องอ่าน ขวาไปซ้าย ({target_lang_name}):**"
             )
-            return
+            transcript_lines = [header_title]
+            discord_files = []
+            render_t0 = time.monotonic()
+            api_log(f"MangaRender [req={req_id}] START -> rendering {num_pages} page(s)...")
 
-        header_title = (
-            f"**📖 คำแปลมังงะ {num_pages} หน้า ตามลำดับช่องอ่าน ขวาไปซ้าย ({target_lang_name}):**"
-            if num_pages > 1
-            else f"**📖 คำแปลมังงะตามลำดับช่องอ่าน ขวาไปซ้าย ({target_lang_name}):**"
-        )
-        transcript_lines = [header_title]
-        discord_files = []
-        render_t0 = time.monotonic()
-        total_qa_audited = 0
-        total_qa_blocked = 0
-        api_log(f"MangaRender [req={req_id}] START -> rendering {num_pages} page(s)...")
+            for page_idx in range(1, num_pages + 1):
+                raw_bytes, fname = pages_input[page_idx - 1]
+                bubbles, scene_summary = batch_results[page_idx - 1]
+                page_cv = cv_bubbles_per_page[page_idx - 1] if (page_idx - 1) < len(cv_bubbles_per_page) else []
 
-        for page_idx in range(1, num_pages + 1):
-            raw_bytes, fname = pages_input[page_idx - 1]
-            bubbles, scene_summary = batch_results[page_idx - 1]
+                if num_pages > 1:
+                    transcript_lines.append(f"\n__**📄 หน้าที่ {page_idx}/{num_pages} (`{fname}`)**__")
+                if scene_summary:
+                    clean_sum = re.sub(r"\s+", " ", scene_summary).strip()
+                    transcript_lines.append(f"-# *บริบทของฉาก: {clean_sum}*")
 
-            if num_pages > 1:
-                transcript_lines.append(f"\n__**📄 หน้าที่ {page_idx}/{num_pages} (`{fname}`)**__")
-            if scene_summary:
-                clean_sum = re.sub(r"\s+", " ", scene_summary).strip()
-                transcript_lines.append(f"-# *บริบทของฉาก: {clean_sum}*")
+                if not bubbles:
+                    transcript_lines.append("*(ไม่พบช่องคำพูดในหน้านี้)*")
+                    pages_input[page_idx - 1] = (b"", fname)
+                    continue
 
-            if not bubbles:
-                transcript_lines.append("*(ไม่พบช่องคำพูดในหน้านี้)*")
-                pages_input[page_idx - 1] = (b"", fname)
-                continue
+                for idx, b in enumerate(bubbles, 1):
+                    speaker = re.sub(r"\s+", " ", (b.get("speaker_or_note") or f"ช่องคำพูด {idx}")).strip()
+                    src_txt = re.sub(r"\s+", " ", (b.get("source_text") or "")).strip()
+                    tr_txt = re.sub(r"\s+", " ", (b.get("translated_text") or "")).strip()
+                    if tr_txt:
+                        transcript_lines.append(f"**[#{idx} | {speaker}]** `{src_txt}`\n  ↳ **{tr_txt}**")
 
-            for idx, b in enumerate(bubbles, 1):
-                speaker = re.sub(r"\s+", " ", (b.get("speaker_or_note") or f"ช่องคำพูด {idx}")).strip()
-                src_txt = re.sub(r"\s+", " ", (b.get("source_text") or "")).strip()
-                tr_txt = re.sub(r"\s+", " ", (b.get("translated_text") or "")).strip()
-                if tr_txt:
-                    transcript_lines.append(f"**[#{idx} | {speaker}]** `{src_txt}`\n  ↳ **{tr_txt}**")
-
-            try:
-                pixel_boxes, qa_crops = await asyncio.to_thread(
-                    _extract_ambiguous_qa_crops_sync, raw_bytes, bubbles
-                )
-                if qa_crops:
-                    total_qa_audited += len(qa_crops)
-                    blocked_ids = await _audit_ambiguous_boxes_with_decision_1(qa_crops, page_idx, req_id)
-                    if blocked_ids:
-                        total_qa_blocked += len(blocked_ids)
-                        pixel_boxes = [pb for idx_b, pb in enumerate(pixel_boxes) if idx_b not in blocked_ids]
-
-                rendered_jpg = await asyncio.to_thread(
-                    render_translated_manga_image_sync, raw_bytes, bubbles, pixel_boxes
-                )
-                if rendered_jpg:
-                    base_name = os.path.splitext(fname)[0]
-                    discord_files.append(
-                        discord.File(
-                            io.BytesIO(rendered_jpg),
-                            filename=f"translated_p{page_idx}_{base_name}.jpg",
-                        )
+                try:
+                    rendered_jpg = await asyncio.to_thread(
+                        render_translated_manga_image_sync, raw_bytes, bubbles, page_cv
                     )
-            except Exception as e:
-                api_log(f"MangaRender [req={req_id}] page {page_idx} fallback to text-only: {e}")
-            finally:
-                pages_input[page_idx - 1] = (b"", fname)
-                raw_bytes = None
-                rendered_jpg = None
+                    if rendered_jpg:
+                        base_name = os.path.splitext(fname)[0]
+                        discord_files.append(
+                            discord.File(
+                                io.BytesIO(rendered_jpg),
+                                filename=f"translated_p{page_idx}_{base_name}.jpg",
+                            )
+                        )
+                except Exception as e:
+                    api_log(f"MangaRender [req={req_id}] page {page_idx} fallback to text-only: {e}")
+                finally:
+                    pages_input[page_idx - 1] = (b"", fname)
+                    raw_bytes = None
+                    rendered_jpg = None
+                    for c_obj in page_cv:
+                        m = c_obj.get("mask_small")
+                        if m is not None:
+                            try:
+                                m.close()
+                            except Exception:
+                                pass
+                    page_cv.clear()
 
-            await asyncio.sleep(0.15)
+                await asyncio.sleep(0.10)
 
-        render_elapsed = time.monotonic() - render_t0
-        api_log(
-            f"MangaRender [req={req_id}] DONE -> rendered {len(discord_files)}/{num_pages} page(s) "
-            f"in {render_elapsed:.2f}s (BoxQA audited={total_qa_audited}, blocked={total_qa_blocked})"
-        )
-        transcript_text = "\n".join(transcript_lines)
+            render_elapsed = time.monotonic() - render_t0
+            api_log(
+                f"MangaRender [req={req_id}] DONE -> rendered {len(discord_files)}/{num_pages} page(s) "
+                f"in {render_elapsed:.2f}s"
+            )
+            transcript_text = "\n".join(transcript_lines)
 
-        if discord_files:
-            file_chunks = [discord_files[i : i + 10] for i in range(0, len(discord_files), 10)]
-            if len(transcript_text) <= 1950:
-                await _send_or_reply(channel, msg, content=transcript_text, files=file_chunks[0])
-                for extra_files in file_chunks[1:]:
-                    await _send_or_reply(channel, None, files=extra_files)
+            if discord_files:
+                file_chunks = [discord_files[i : i + 10] for i in range(0, len(discord_files), 10)]
+                if len(transcript_text) <= 1950:
+                    await _send_or_reply(channel, msg, content=transcript_text, files=file_chunks[0])
+                    for extra_files in file_chunks[1:]:
+                        await _send_or_reply(channel, None, files=extra_files)
+                else:
+                    for idx_fc, fc in enumerate(file_chunks):
+                        await _send_or_reply(channel, msg if idx_fc == 0 else None, files=fc)
+                    await send_chunked_response(channel, transcript_text, reply_to=None)
             else:
-                for idx_fc, fc in enumerate(file_chunks):
-                    await _send_or_reply(channel, msg if idx_fc == 0 else None, files=fc)
-                await send_chunked_response(channel, transcript_text, reply_to=None)
-        else:
-            await send_chunked_response(channel, transcript_text, reply_to=msg)
+                await send_chunked_response(channel, transcript_text, reply_to=msg)
 
-        for df in discord_files:
-            try:
-                df.close()
-            except Exception:
-                pass
-        discord_files.clear()
-        pages_input.clear()
-        batch_results.clear()
-        release_unused_memory()
+            for df in discord_files:
+                try:
+                    df.close()
+                except Exception:
+                    pass
+            discord_files.clear()
+        finally:
+            for page_cv in cv_bubbles_per_page:
+                for c_obj in page_cv:
+                    m = c_obj.get("mask_small")
+                    if m is not None:
+                        try:
+                            m.close()
+                        except Exception:
+                            pass
+                page_cv.clear()
+            cv_bubbles_per_page.clear()
+            pages_input.clear()
+            release_unused_memory()
