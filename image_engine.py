@@ -19,7 +19,6 @@ from config import (
     CF_API_TOKEN,
     CF_IMAGE_MODEL,
     GEMINI_API_KEY,
-    GEMINI_HEAVY_MODEL,
     GROQ_API_KEY,
     GROQ_CHAT_FALLBACK_MODEL,
     ACTIVE_FAST_MODEL,
@@ -35,7 +34,6 @@ from config import (
     release_unused_memory,
 )
 from llm import (
-    call_gemini_hydrogen_generate,
     call_gemini_generate_content_self_healing,
     call_gemma_ai_studio_chat,
     call_gemma_ai_studio_vision,
@@ -47,6 +45,11 @@ from llm import (
 )
 
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
+
+# Cache for self-healing discovery of newer `flash-lite` models on Google AI Studio
+_FLASH_LITE_DISCOVERY_CACHE: list[str] = []
+_FLASH_LITE_DISCOVERY_TS: float = 0.0
+_FLASH_LITE_EXCLUDED = ("2.5", "2.0", "1.5", "latest", "image", "tts", "audio", "live", "embedding")
 
 # Garuda-Bold MUST come first because NotoSansThai-Bold on Debian/Ubuntu lacks ASCII '.', '!', '?', "'", '-', '0-9'
 MANGA_THAI_FONT_CANDIDATES = (
@@ -479,9 +482,9 @@ def _load_manga_font(size: int, is_thai: bool = False) -> ImageFont.FreeTypeFont
 
 def _sanitize_text_for_manga_font(text: str) -> str:
     """
-    Normalizes Unicode punctuation (`…` -> `...`, `〜` -> `~`, `—` -> `-`, smart quotes -> `'`)
-    and removes stray CJK/emoji symbols so `Garuda-Bold.ttf` renders every character cleanly
-    with zero `[]` missing-glyph tofu boxes.
+    Normalizes Unicode punctuation (`…` -> `...`, `〜` -> `~`, `—` -> `-`, smart quotes -> `'`),
+    removes stray CJK/emoji symbols, and cleans empty `()` / `[]` leftovers so `Garuda-Bold.ttf`
+    renders every character cleanly with zero `[]` tofu boxes.
     """
     if not text:
         return ""
@@ -507,6 +510,8 @@ def _sanitize_text_for_manga_font(text: str) -> str:
         .replace("？", "?")
     )
     s = re.sub(r"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\U00010000-\U0010FFFF]", "", s)
+    # Remove empty parentheses/brackets left behind after stripping CJK furigana (e.g. 'ซานไห่จิง ()')
+    s = re.sub(r"\(\s*\)|\[\s*\]|'\s*'", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -529,6 +534,58 @@ def _prepare_manga_image_for_vision(raw_bytes: bytes, max_dim: int = 1280, quali
     img.save(buf, format="JPEG", quality=quality)
     img.close()
     return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+async def _discover_manga_batch_models() -> list[tuple[str, bool]]:
+    """
+    Returns the exact ordered model chain for multi-page `MangaBatch`:
+      1. `gemini-3.5-flash-lite`
+      2. `gemini-3.1-flash-lite`
+      3. Any newer `flash-lite` model discovered via Google AI Studio self-healing
+      4. `gemma-4-31b-it`
+      5. `gemma-4-26b-a4b-it`
+    Each entry is `(model_id, is_gemma)`.
+    """
+    global _FLASH_LITE_DISCOVERY_CACHE, _FLASH_LITE_DISCOVERY_TS
+    now = time.time()
+
+    if GEMINI_API_KEY and (not _FLASH_LITE_DISCOVERY_CACHE or (now - _FLASH_LITE_DISCOVERY_TS >= 3600.0)):
+        list_url = clean_url(
+            f"{HTTPS}generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
+        )
+        try:
+            session = get_http_session()
+            async with session.get(list_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    found = []
+                    for m in data.get("models") or []:
+                        name = (m.get("name") or "").replace("models/", "")
+                        lower_name = name.lower()
+                        methods = m.get("supportedGenerationMethods") or []
+                        if "generateContent" in methods and "flash-lite" in lower_name:
+                            if not any(bad in lower_name for bad in _FLASH_LITE_EXCLUDED):
+                                found.append(name)
+                    if found:
+                        _FLASH_LITE_DISCOVERY_CACHE = sorted(found, reverse=True)
+                        _FLASH_LITE_DISCOVERY_TS = now
+        except Exception:
+            pass
+
+    chain: list[tuple[str, bool]] = []
+    seen: set[str] = set()
+
+    for m_id in ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"] + _FLASH_LITE_DISCOVERY_CACHE:
+        if m_id and m_id not in seen:
+            seen.add(m_id)
+            chain.append((m_id, False))
+
+    for g_id in ("gemma-4-31b-it", "gemma-4-26b-a4b-it"):
+        if g_id not in seen:
+            seen.add(g_id)
+            chain.append((g_id, True))
+
+    return chain
 
 
 def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
@@ -585,7 +642,6 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
                 if len(nums) == 4:
                     norm_box = [float(v) for v in nums]
 
-        # Keep `panel_position` strictly as a Chain-of-Thought spatial anchor (never drop valid bubbles)
         panel_pos = str(item.get("panel_position") or "").strip().lower()
 
         valid.append({
@@ -682,23 +738,28 @@ async def extract_and_translate_manga_pages_batch(
     pages_input: list[tuple[bytes, str]],
     target_lang_name: str,
     series_context_hint: str = "",
-) -> list[tuple[list[dict], str]]:
+) -> tuple[list[tuple[list[dict], str]], bool]:
     """
-    Processes 1 to 12 manga pages (including multi-part X/Twitter threads) in a SINGLE unified
-    multimodal batch request (just like v9's fast 1-request architecture):
-      - Tier 1: Spatial Gemini Flash (`gemini-3-flash-preview` -> `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite`, `thinkingLevel: "LOW"`, `maxOutputTokens: 32768`)
-      - Tier 2: `gemini-4-hydrogen` (`thinkingLevel: "LOW"`, `maxOutputTokens: 65536`)
-      - Tier 3: Concurrent `Semaphore(2)` per-page fallback
+    Processes 1 to 12 manga pages:
+      - If `num_pages == 1`: calls `extract_and_translate_manga_bubbles()`.
+      - If `num_pages > 1`: ALWAYS runs unified multi-page `MangaBatch` strictly across:
+        `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> (newer discovered `flash-lite`)
+        -> `gemma-4-31b-it` -> `gemma-4-26b-a4b-it`
+        NEVER falls back to per-page `MangaSingle`!
+    Returns `(results, is_service_unavailable)`.
     """
     num_pages = len(pages_input)
     if num_pages == 0:
-        return []
+        return [], False
 
     if num_pages == 1:
         b, s = await extract_and_translate_manga_bubbles(
             pages_input[0][0], pages_input[0][1], target_lang_name, series_context_hint=series_context_hint
         )
-        return [(b, s)]
+        return [(b, s)], False
+
+    if not GEMINI_API_KEY:
+        return [([], "") for _ in range(num_pages)], True
 
     # Fast 1-pass vision resolution (960px for 9-12p, 1080px for 5-8p, 1280px for 2-4p)
     if num_pages >= 9:
@@ -763,103 +824,101 @@ CRITICAL COMPLETENESS, NAME ACCURACY & BOUNDING-BOX RULES:
 """.strip()
 
     try:
-        if GEMINI_API_KEY:
-            parts = [{"text": manga_batch_instruction}]
-            for idx, (b64_img, fname) in enumerate(b64_pages, 1):
-                parts.append({"text": f"=== PAGE {idx} ({fname}) ==="})
-                parts.append({"inlineData": {"mimeType": mime_type, "data": b64_img}})
+        parts = [{"text": manga_batch_instruction}]
+        for idx, (b64_img, fname) in enumerate(b64_pages, 1):
+            parts.append({"text": f"=== PAGE {idx} ({fname}) ==="})
+            parts.append({"inlineData": {"mimeType": mime_type, "data": b64_img}})
 
-            timeout_sec = min(135, 50 + (8 * num_pages))
+        model_chain = await _discover_manga_batch_models()
+        per_call_timeout = min(65.0, 35.0 + (3.0 * num_pages))
+        max_wall_budget = 140.0
+        wall_start = time.monotonic()
+        session = get_http_session()
 
-            # Tier 1: Spatial Gemini Flash (`gemini-3-flash-preview` -> `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite`)
-            flash_payload = {
-                "contents": [{"parts": parts}],
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "maxOutputTokens": 32768,
-                    "responseMimeType": "application/json",
-                    "thinkingConfig": {"thinkingLevel": "LOW"},
-                },
+        for model_id, is_gemma in model_chain:
+            remaining = max_wall_budget - (time.monotonic() - wall_start)
+            if remaining <= 8.0:
+                break
+
+            url = clean_url(
+                f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
+                f"{model_id}:generateContent?key={GEMINI_API_KEY}"
+            )
+            gen_cfg = {
+                "temperature": 0.1,
+                "maxOutputTokens": 24576 if is_gemma else 32768,
+                "responseMimeType": "application/json",
             }
-            try:
-                data = await call_gemini_generate_content_self_healing(
-                    flash_payload,
-                    timeout_sec=timeout_sec,
-                    purpose=f"MangaBatch({num_pages}p)",
-                    max_models=3,
-                    max_wall_sec=float(timeout_sec + 20),
-                    preferred_models=["gemini-3-flash-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
-                )
-                if data:
-                    resp_parts = (
-                        ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-                    )
-                    raw_json_str = "\n".join(
-                        p.get("text", "") for p in resp_parts
-                        if p.get("text") and not p.get("thought", False)
-                    ).strip()
-                    batch_results = _parse_manga_pages_batch_json(raw_json_str, num_pages)
-                    if any(bubbles or summary for bubbles, summary in batch_results):
-                        total_b = sum(len(b) for b, _ in batch_results)
-                        print(
-                            f"[Manga Vision Batch] Completed {num_pages} page(s) in 1 request via Tier 1 Gemini "
-                            f"({state.active_gemini_model}) - {total_b} total bubbles",
-                            flush=True,
-                        )
-                        return batch_results
-            except Exception as e:
-                print(f"Gemini Flash Manga Batch warning ({type(e).__name__}): {e}", flush=True)
+            if not is_gemma:
+                gen_cfg["thinkingConfig"] = {"thinkingLevel": "LOW"}
 
-            # Tier 2: Gemini 4 Hydrogen Heavy Specialist fallback
-            hydrogen_payload = {
-                "contents": [{"parts": parts}],
-                "generationConfig": {
-                    "maxOutputTokens": 65536,
-                    "responseMimeType": "application/json",
-                    "thinkingConfig": {"thinkingLevel": "LOW"},
-                },
-            }
-            try:
-                h_data = await call_gemini_hydrogen_generate(
-                    hydrogen_payload,
-                    timeout_sec=timeout_sec,
-                    purpose=f"MangaBatchHydrogen({num_pages}p)",
-                )
-                if h_data:
-                    resp_parts = (
-                        ((h_data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-                    )
-                    raw_json_str = "\n".join(
-                        p.get("text", "") for p in resp_parts
-                        if p.get("text") and not p.get("thought", False)
-                    ).strip()
-                    batch_results = _parse_manga_pages_batch_json(raw_json_str, num_pages)
-                    if any(bubbles or summary for bubbles, summary in batch_results):
-                        total_b = sum(len(b) for b, _ in batch_results)
-                        print(
-                            f"[Manga Vision Batch] Completed {num_pages} page(s) in 1 request via Tier 2 Hydrogen "
-                            f"({GEMINI_HEAVY_MODEL}) - {total_b} total bubbles",
-                            flush=True,
-                        )
-                        return batch_results
-            except Exception as e:
-                print(f"Gemini Hydrogen Manga Batch warning ({type(e).__name__}): {e}", flush=True)
+            payload = {"contents": [{"parts": parts}], "generationConfig": gen_cfg}
+            max_attempts = 2
+
+            for attempt in range(max_attempts):
+                rem_now = max_wall_budget - (time.monotonic() - wall_start)
+                if rem_now <= 6.0:
+                    break
+                req_t = min(per_call_timeout, rem_now)
+                t0 = time.monotonic()
+                try:
+                    async with session.post(
+                        url, json=payload, timeout=aiohttp.ClientTimeout(total=req_t)
+                    ) as resp:
+                        status = resp.status
+                        body_text = await resp.text()
+                        elapsed = time.monotonic() - t0
+
+                        if status == 200:
+                            data = json.loads(body_text)
+                            resp_parts = (
+                                ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                            )
+                            raw_json_str = "\n".join(
+                                p.get("text", "") for p in resp_parts
+                                if p.get("text") and not p.get("thought", False)
+                            ).strip()
+                            batch_results = _parse_manga_pages_batch_json(raw_json_str, num_pages)
+                            if any(bubbles or summary for bubbles, summary in batch_results):
+                                total_b = sum(len(b) for b, _ in batch_results)
+                                label = "Gemma AI Studio" if is_gemma else "Gemini"
+                                api_log(f"{label} (MangaBatch({num_pages}p)) -> {model_id} 200 OK ({elapsed:.2f}s)")
+                                print(
+                                    f"[Manga Vision Batch] Completed {num_pages} page(s) in 1 request via "
+                                    f"{model_id} - {total_b} total bubbles",
+                                    flush=True,
+                                )
+                                return batch_results, False
+                            api_log(f"MangaBatch({num_pages}p) -> {model_id} returned empty JSON; trying next model")
+                            break
+
+                        # Handle unsupported config fields cleanly before moving to next model
+                        if status == 400 and attempt == 0:
+                            if "thinkingConfig" in body_text and "thinkingConfig" in payload["generationConfig"]:
+                                payload["generationConfig"].pop("thinkingConfig", None)
+                                continue
+                            if is_gemma and "responseMimeType" in payload["generationConfig"]:
+                                payload["generationConfig"].pop("responseMimeType", None)
+                                continue
+
+                        # Brief 1.5s retry once on transient 503 overload
+                        if status == 503 and attempt == 0 and (max_wall_budget - (time.monotonic() - wall_start)) > 20.0:
+                            api_log(f"MangaBatch({num_pages}p) -> {model_id} HTTP 503 ({elapsed:.2f}s); retrying once")
+                            await asyncio.sleep(1.5)
+                            continue
+
+                        api_log(f"MangaBatch({num_pages}p) -> {model_id} HTTP {status} ({elapsed:.2f}s); trying next model")
+                        break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    api_log(f"MangaBatch({num_pages}p) -> {model_id} failed ({type(e).__name__}); trying next model")
+                    break
     finally:
         b64_pages.clear()
 
-    # Tier 3: Concurrent per-page fallback
-    sem = asyncio.Semaphore(2)
-
-    async def _bounded_single(rb: bytes, fn: str) -> tuple[list[dict], str]:
-        async with sem:
-            return await extract_and_translate_manga_bubbles(
-                rb, fn, target_lang_name, series_context_hint=series_context_hint
-            )
-
-    fallback_results = await asyncio.gather(
-        *[_bounded_single(raw_b, fname) for raw_b, fname in pages_input]
-    )
-    return list(fallback_results)
+    # All models in the MangaBatch chain failed or timed out — do NOT fall back to MangaSingle!
+    return [([], "") for _ in range(num_pages)], True
 
 
 def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
@@ -1008,8 +1067,9 @@ CRITICAL RULES:
             data = await call_gemini_generate_content_self_healing(
                 gemini_payload,
                 timeout_sec=30,
+                purpose="MangaSingle",
                 max_models=3,
-                preferred_models=["gemini-3-flash-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
+                preferred_models=["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3-flash-preview"],
             )
             if data:
                 parts = (
@@ -1027,25 +1087,6 @@ CRITICAL RULES:
                     return bubbles, summary
         except Exception as e:
             print(f"Gemini Manga Vision warning ({type(e).__name__}): {e}")
-
-    try:
-        cf_content = await call_cloudflare_vision_chat(manga_system_instruction, mime_type, b64_img)
-        if cf_content:
-            bubbles, summary = _parse_manga_bubbles_json(cf_content)
-            if bubbles:
-                has_boxes_and_text = any(
-                    isinstance(b.get("box_2d"), list)
-                    and len(b["box_2d"]) == 4
-                    and bool(b.get("translated_text"))
-                    for b in bubbles
-                )
-                if has_boxes_and_text:
-                    print(f"[Manga Vision] Completed via Tier 2 Cloudflare Gemma 4 - {len(bubbles)} bubbles")
-                    return bubbles, summary
-                fallback_bubbles_no_boxes = bubbles
-                fallback_summary = summary
-    except Exception as e:
-        print(f"Cloudflare Gemma 4 Manga Vision warning: {e}")
 
     try:
         gemma_content = await call_gemma_ai_studio_vision(
@@ -1066,13 +1107,32 @@ CRITICAL RULES:
                     for b in bubbles
                 )
                 if has_boxes_and_text:
-                    print(f"[Manga Vision] Completed via Tier 3 AI Studio Gemma 4 - {len(bubbles)} bubbles", flush=True)
+                    print(f"[Manga Vision] Completed via Tier 2 AI Studio Gemma 4 - {len(bubbles)} bubbles", flush=True)
+                    return bubbles, summary
+                fallback_bubbles_no_boxes = bubbles
+                fallback_summary = summary
+    except Exception as e:
+        print(f"AI Studio Gemma 4 Manga Vision warning: {e}", flush=True)
+
+    try:
+        cf_content = await call_cloudflare_vision_chat(manga_system_instruction, mime_type, b64_img)
+        if cf_content:
+            bubbles, summary = _parse_manga_bubbles_json(cf_content)
+            if bubbles:
+                has_boxes_and_text = any(
+                    isinstance(b.get("box_2d"), list)
+                    and len(b["box_2d"]) == 4
+                    and bool(b.get("translated_text"))
+                    for b in bubbles
+                )
+                if has_boxes_and_text:
+                    print(f"[Manga Vision] Completed via Tier 3 Cloudflare Gemma 4 - {len(bubbles)} bubbles")
                     return bubbles, summary
                 if not fallback_bubbles_no_boxes:
                     fallback_bubbles_no_boxes = bubbles
                     fallback_summary = summary
     except Exception as e:
-        print(f"AI Studio Gemma 4 Manga Vision warning: {e}", flush=True)
+        print(f"Cloudflare Gemma 4 Manga Vision warning: {e}")
 
     if GROQ_API_KEY:
         groq_vision_candidates = await discover_active_groq_vision_models()
@@ -1619,7 +1679,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
     box_w = max(8, x2 - x1)
     box_h = max(8, y2 - y1)
 
-    # Support small single-word bubbles like `はい。` (box_w >= 18, box_h >= 16)
     if box_w < 18 or box_h < 16:
         return None
 
@@ -1825,6 +1884,9 @@ def _erase_bubble_japanese_text_and_measure_lobe(
 
         # =====================================================================
         # CASE C: BORDER-TOUCHING WHITE OR SEMI-TRANSPARENT MIST BUBBLE
+        # (Strict `mean_sat < 10.0` rejects pale skin/hands/walls, while expanding
+        #  the erase margin ±14px vertically inside white-surrounded paper to
+        #  clean overhanging Japanese characters cleanly!)
         # =====================================================================
         tx_b1 = max(2, rx1_rel - 4)
         ty_b1 = max(2, ry1_rel - 4)
@@ -1841,8 +1903,8 @@ def _erase_bubble_japanese_text_and_measure_lobe(
         box_hist = box_crop.histogram()
         box_crop.close()
         total_box_px = max(1, sum(box_hist))
-        white_paper_px = sum(box_hist[225:])
-        midtone_px = sum(box_hist[135:225])
+        white_paper_px = sum(box_hist[230:])
+        midtone_px = sum(box_hist[135:230])
         dark_ink_px = sum(box_hist[:135])
 
         white_paper_ratio = white_paper_px / total_box_px
@@ -1850,21 +1912,27 @@ def _erase_bubble_japanese_text_and_measure_lobe(
         ink_ratio = dark_ink_px / total_box_px
 
         is_valid_pure_white = (
-            mean_sat_c < 18.0
-            and white_paper_ratio >= 0.42
-            and midtone_ratio <= 0.28
+            mean_sat_c < 10.0
+            and white_paper_ratio >= 0.44
+            and midtone_ratio <= 0.24
             and ink_ratio >= 0.015
         )
         light_mist_px = sum(box_hist[205:])
         is_valid_mist_bubble = (
-            mean_sat_c < 8.0
+            mean_sat_c < 7.0
             and (light_mist_px / total_box_px) >= 0.62
             and ink_ratio >= 0.015
         )
 
         if is_valid_pure_white or is_valid_mist_bubble:
+            # Expand erase clamp slightly (±14px Y, ±8px X) clipped against peer bubbles to catch overhanging strokes
+            exp_x1 = max(2, max(peer_clip_x1 - wx1, rx1_rel - 8))
+            exp_y1 = max(2, max(peer_clip_y1 - wy1, ry1_rel - 14))
+            exp_x2 = min(ww - 2, min(peer_clip_x2 - wx1, rx2_rel + 8))
+            exp_y2 = min(wh - 2, min(peer_clip_y2 - wy1, ry2_rel + 14))
+
             box_clamp = Image.new("L", (ww, wh), 0)
-            ImageDraw.Draw(box_clamp).rectangle([tx_b1, ty_b1, tx_b2, ty_b2], fill=255)
+            ImageDraw.Draw(box_clamp).rectangle([exp_x1, exp_y1, exp_x2, exp_y2], fill=255)
 
             bg_rgb = (255, 255, 255) if is_valid_pure_white else _sample_light_bubble_bg_rgb(
                 img, base_gray, raw_x1, raw_y1, raw_x2, raw_y2
@@ -1873,7 +1941,19 @@ def _erase_bubble_japanese_text_and_measure_lobe(
             text_ink_mask = sub_gray.point(lambda p: 255 if p < ink_cutoff else 0)
             text_ink_dil = text_ink_mask.filter(ImageFilter.MaxFilter(5))
             text_ink_mask.close()
-            erase_c = ImageChops.darker(text_ink_dil, box_clamp)
+
+            if is_valid_pure_white:
+                # Only erase ink surrounded by white paper (protects solid dark panel borders)
+                local_max = sub_gray.filter(ImageFilter.MaxFilter(7))
+                white_zone = local_max.point(lambda p: 255 if p >= 235 else 0)
+                local_max.close()
+                safe_zone = ImageChops.darker(white_zone, box_clamp)
+                white_zone.close()
+                erase_c = ImageChops.darker(text_ink_dil, safe_zone)
+                safe_zone.close()
+            else:
+                erase_c = ImageChops.darker(text_ink_dil, box_clamp)
+
             text_ink_dil.close()
             box_clamp.close()
 
@@ -1990,7 +2070,7 @@ def _resolve_box_collisions(
 def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) -> bytes | None:
     """
     Renders translated dialogue cleanly inside speech bubbles at FULL ORIGINAL RESOLUTION
-    (no downscaling blur!) and saves crisp 4:4:4 JPEG (`quality=94, subsampling=0`) with
+    (no downscaling blur) and saves crisp 4:4:4 JPEG (`quality=94, subsampling=0`) with
     explicit Pillow `.close()` cleanup.
     """
     if not raw_bytes:
@@ -2067,7 +2147,6 @@ def render_translated_manga_image_sync(raw_bytes: bytes, bubbles: list[dict]) ->
         for tx1, ty1, tx2, ty2, fg_text, stroke_col, trans_text, _ in prepared_renders:
             box_w = max(18, tx2 - tx1)
             box_h = max(14, ty2 - ty1)
-            # Keep comfortable inner margin so text never touches rounded bubble borders
             usable_w = max(14, int(box_w * 0.88))
             usable_h = max(12, int(box_h * 0.90))
             is_thai_text = bool(THAI_CHAR_REGEX.search(trans_text))
@@ -2127,8 +2206,9 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
     """
     Translates 1 to 12 manga pages from direct Discord attachments OR embedded links
     (including multi-part X/Twitter threads up to 12 images total, Pixiv/phixiv, Bluesky,
-    Discord embeds, or direct image URLs) in 1 fast unified vision call and renders
-    crisp full-original-resolution output images with clean end-of-batch RAM release.
+    Discord embeds, or direct image URLs) in 1 unified batch call using:
+      `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> (newer flash-lite) -> `gemma-4-31b-it` -> `gemma-4-26b-a4b-it`
+    and renders crisp full-original-resolution output images with clean end-of-batch RAM release.
     """
     from media_context import resolve_referenced_message, collect_embedded_images_and_metadata
 
@@ -2185,9 +2265,22 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
     num_pages = len(pages_input)
 
     async with channel.typing():
-        batch_results = await extract_and_translate_manga_pages_batch(
+        batch_results, is_unavailable = await extract_and_translate_manga_pages_batch(
             pages_input, target_lang_name, series_context_hint=series_context_hint
         )
+
+        if is_unavailable:
+            pages_input.clear()
+            release_unused_memory()
+            await _send_or_reply(
+                channel,
+                msg,
+                content=(
+                    "ขณะนี้ระบบแปลมังงะแบบหลายหน้าไม่พร้อมใช้งานชั่วคราว "
+                    "(API ต้นทางขัดข้องหรือหมดเวลาเชื่อมต่อ) กรุณาลองใหม่อีกครั้งในอีกสักครู่นะคะ"
+                ),
+            )
+            return
 
         if not any(bubbles or summary for bubbles, summary in batch_results):
             pages_input.clear()
@@ -2248,7 +2341,6 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
                 raw_bytes = None
                 rendered_jpg = None
 
-            # Yield to Discord Gateway heartbeat loop between full-resolution renders
             await asyncio.sleep(0.25)
 
         transcript_text = "\n".join(transcript_lines)
