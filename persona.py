@@ -19,6 +19,20 @@ from config import (
     CAT_TOPIC_REGEX,
 )
 
+# Common Katakana syllables accidentally glued onto Thai transliterated character names (e.g. 'คิสาキ' -> 'คิซากิ')
+_KATAKANA_IN_THAI_MAP = {
+    "キ": "คิ", "サ": "ซา", "ヤ": "ยะ", "カ": "คะ", "ケ": "เคะ", "コ": "โคะ",
+    "シ": "ชิ", "ス": "ซึ", "セ": "เซะ", "ソ": "โซะ", "タ": "ทะ", "チ": "จิ",
+    "ツ": "สึ", "テ": "เทะ", "ト": "โทะ", "ナ": "นะ", "ニ": "นิ", "ヌ": "นุ",
+    "ネ": "เนะ", "ノ": "โนะ", "ハ": "ฮะ", "ヒ": "ฮิ", "フ": "ฟุ", "ヘ": "เฮะ",
+    "ホ": "โฮะ", "マ": "มะ", "ミ": "มิ", "ム": "มุ", "メ": "เมะ", "モ": "โมะ",
+    "ユ": "ยุ", "ヨ": "โยะ", "ラ": "ระ", "リ": "ริ", "ル": "รุ", "レ": "เระ",
+    "ロ": "โระ", "ワ": "วะ", "ン": "อึน",
+}
+_THAI_GLUED_KATAKANA_REGEX = re.compile(
+    r"(?<=[\u0E00-\u0E7F])([\u30A1-\u30F6])|([\u30A1-\u30F6])(?=[\u0E00-\u0E7F])"
+)
+
 
 def is_owner_user(user) -> bool:
     """Checks if the Discord user is the bot owner by ID or username/display_name."""
@@ -68,9 +82,10 @@ def get_speaker_identity_context(user=None, fallback_name: str = "") -> str:
 def sanitize_yukino_output(text: str, user_prompt: str = "", speaker_user=None, speaker_name: str = "") -> str:
     """
     1) Strips any leaked [SEARCH: ...] or [REACT: ...] tags so raw tool tags never appear in Discord chat.
-    2) Removes accidental Chinese characters (e.g., 才行) leaked by Qwen3 unless the prompt is CJK.
+    2) Removes accidental Chinese characters (e.g., 才行) leaked by Qwen3 unless the prompt is CJK,
+       and repairs Katakana syllables glued onto Thai character names (e.g., 'คิสาキ' -> 'คิซากิ').
     3) Enforces female particles: replaces male 'ครับ'/'นะครับ'/'คับ', 'ครับ/ค่ะ', and casual 'จ้า'/'จ๊ะ'/'เบื่ออ่ะ' with 'ค่ะ'/'นะคะ'.
-    4) Strips out-of-character emojis and meta-persona/reaction headings.
+    4) Strips out-of-character emojis and meta-persona headings.
     5) Enforces pronoun rules: never outputs owner's name (replaces with 'นาย'), strips 'คุณ' before any user's name.
     """
     if not text:
@@ -82,22 +97,28 @@ def sanitize_yukino_output(text: str, user_prompt: str = "", speaker_user=None, 
     cleaned = re.sub(r"\[MEMO:\s*[^\]]+?\]", "", cleaned, flags=re.IGNORECASE).strip()
     cleaned = AGENTIC_REACT_TAG_REGEX.sub("", cleaned).strip()
 
-    # 2. Strip stray CJK characters unless user prompt contains CJK
+    # 2. Strip stray CJK characters unless user prompt contains CJK, and fix Katakana glued to Thai words
     if not CJK_LEAK_REGEX.search(user_prompt):
         cleaned = CJK_LEAK_REGEX.sub("", cleaned)
+
+    def _replace_glued_katakana(m: re.Match) -> str:
+        ch = m.group(1) or m.group(2) or ""
+        return _KATAKANA_IN_THAI_MAP.get(ch, "")
+
+    cleaned = _THAI_GLUED_KATAKANA_REGEX.sub(_replace_glued_katakana, cleaned)
 
     # 3. Fix out-of-character male particles ('ครับ/ค่ะ', 'นะครับ', 'ครับ', 'คับ') & casual endings ('จ้า', 'จ๊ะ', 'โอเคคะ', 'เบื่ออ่ะ')
     cleaned = re.sub(r"(?:ครับ\s*/\s*ค่ะ|ค่ะ\s*/\s*ครับ)", "ค่ะ", cleaned)
     cleaned = re.sub(r"(?:นะครับ\s*/\s*นะคะ|นะคะ\s*/\s*นะครับ)", "นะคะ", cleaned)
-    cleaned = re.sub(r"นะครับ(?=$|[\s\n\r.!?)\"']|\])", "นะคะ", cleaned)
-    cleaned = re.sub(r"ครับผม(?=$|[\s\n\r.!?)\"']|\])", "ค่ะ", cleaned)
-    cleaned = re.sub(r"(?:ครับ|คับ)(?=$|[\s\n\r.!?)\"']|\])", "ค่ะ", cleaned)
+    cleaned = re.sub(r"นะครับ(?=$|[\s\n\r.!?)\\"'|\])", "นะคะ", cleaned)
+    cleaned = re.sub(r"ครับผม(?=$|[\s\n\r.!?)\\"'|\])", "ค่ะ", cleaned)
+    cleaned = re.sub(r"(?:ครับ|คับ)(?=$|[\s\n\r.!?)\\"'|\])", "ค่ะ", cleaned)
     cleaned = re.sub(r"โอเคคะ", "เข้าใจแล้วค่ะ", cleaned)
     cleaned = re.sub(r"เบื่ออ่ะ", "รำคาญใจนะคะ", cleaned)
     cleaned = re.sub(r"นะคะ\s*(?:จ๊ะ|จ้า|จ้ะ)", "นะคะ", cleaned)
     cleaned = re.sub(r"นะ\s*(?:จ๊ะ|จ้า|จ้ะ)", "นะคะ", cleaned)
     cleaned = re.sub(r"เลย\s*(?:จ้า|จ๊ะ|จ้ะ)", "เลยค่ะ", cleaned)
-    cleaned = re.sub(r"(?:จ้า|จ๊ะ|จ้ะ)(?=$|[\s\n\r.!?)\"']|\])", "ค่ะ", cleaned)
+    cleaned = re.sub(r"(?:จ้า|จ๊ะ|จ้ะ)(?=$|[\s\n\r.!?)\\"'|\])", "ค่ะ", cleaned)
 
     # 4. Enforce pronoun & name rules (never allow 'คุณ <Name>' or owner's name, but allow standalone 'คุณ')
     if is_owner_user(speaker_user) or "krint" in (speaker_name or "").lower() or speaker_user is None:
@@ -112,14 +133,10 @@ def sanitize_yukino_output(text: str, user_prompt: str = "", speaker_user=None, 
     # Strip 'คุณ' if used before a Discord @mention
     cleaned = re.sub(r"คุณ\s*(?=<@)", "", cleaned)
 
-    # 5. Strip awkward openings, meta-persona/reaction headings, 4B repetition tics, and out-of-character ChatGPT emojis
+    # 5. Strip awkward openings, meta-persona headings, 4B repetition tics, and out-of-character ChatGPT emojis
     cleaned = re.sub(r"^สวัสดีค่ะ\s*(?:คุณ|นาย)?\s*(?=\n|\r|\d+\.)", "", cleaned).lstrip()
     cleaned = re.sub(r"สวัสดีค่ะ\s*คุณ\s*(?=\n|\r)", "สวัสดีค่ะ\n", cleaned)
-    cleaned = re.sub(
-        r"(?:^|\n)\s*(?:#{1,3}\s*|\*{1,2})?\s*(?:ความคิดเห็น(?:ส่วนตัว)?ในสไตล์ยูกิโนะ|ความรู้สึกของฉัน(?:ต่อฉากนี้|ต่อเรื่องนี้|ต่อภาพนี้)?|ความคิดเห็นของฉัน|เนื้อหาทางภาพ|เหตุการณ์และบริบทของเรื่องราว)\s*:?\s*\*{0,2}\s*\n+",
-        "\n\n",
-        cleaned,
-    )
+    cleaned = re.sub(r"(?:^|\n)\s*\*\*\s*ความคิดเห็น(?:ส่วนตัว)?ในสไตล์ยูกิโนะ\s*:?\s*\*\*\s*\n+", "\n\n", cleaned)
     cleaned = re.sub(r"นี่เอง\s*สินะ(?:คะ)?", "ค่ะ", cleaned)
     cleaned = re.sub(r"(?:นะคะ|ค่ะ|นะ)\s*สินะ(?:คะ)?", "นะคะ", cleaned)
     cleaned = re.sub(r"เร็ว\s*ๆ\s*ก่อนสินะ", "ดูนะคะ", cleaned)
@@ -234,12 +251,12 @@ FAST_SYSTEM_PROMPT = """
 1. น้ำเสียงที่เป็นธรรมชาติ ไม่ฝืน ไม่เทศนา (Natural Conversational Cadence):
    - พูดคุยด้วยภาษาพูดของเด็กสาว ม.ปลาย ที่สุภาพ คมคาย และเป็นธรรมชาติ สอดแทรกความจิกกัดเบาๆ หรือความหวังดีเข้าไปในเนื้อหาคำตอบโดยตรงอย่างลื่นไหล
    - **ข้อห้ามเด็ดขาด (Anti-Stiffness & Anti-Meta Rules)**:
-     * **ห้ามตั้งหัวข้อย่อยเมตา เช่น "ความคิดเห็นในสไตล์ยูกิโนะ", "ความรู้สึกของฉัน", "ความรู้สึกของฉันต่อฉากนี้", "เนื้อหาทางภาพ", หรือ "เหตุการณ์และบริบทของเรื่องราว" เด็ดขาด!** คุณ *คือ* ยูกิโนะอยู่แล้ว ให้เล่าเหตุการณ์และแสดงความรู้สึกออกมาในย่อหน้าสนทนาต่อเนื่องโดยตรงแบบบุคคลที่ 1 ("ฉัน...")
-     * ห้ามวิจารณ์แบบนักวิชาการหรือ AI (เช่น ห้ามพูดว่า *"เพิ่มบริบทหรือเรื่องราวเล็กๆ ที่ทำให้ตัวละครมีความลึกซึ้งมากขึ้น"* หรือ *"การแสดงออกทางศิลปะที่เน้นความอ่อนโยน"*)
+     * **ห้ามเขียนหัวข้อว่า "ความคิดเห็นในสไตล์ยูกิโนะ" หรือ "ในมุมมองของยูกิโนะ" เด็ดขาด!** คุณ *คือ* ยูกิโนะอยู่แล้ว ให้แสดงความรู้สึกหรือความเห็นออกมาในย่อหน้าสนทนาโดยตรงแบบบุคคลที่ 1 ("ฉัน...")
+     * ห้ามวิจารณ์แบบนักวิชาการหรือ AI (เช่น ห้ามพูดว่า *"เพิ่มบริบทหรือเรื่องราวเล็กๆ ที่ทำให้ตัวละครมีความลึกซึ้งมากขึ้น"* หรือ *"ผ่อนคลายความเครียดของผู้ชม"*)
      * ห้ามแบ่งคำตอบเป็นช่วงเทศนาท้ายข้อความ เช่น ห้ามขึ้นย่อหน้าใหม่ด้วยคำว่า *"แต่สิ่งที่นายควรคิดคือ..."*, *"สิ่งที่ควรระวังคือ..."*, หรือ *"คือหัวใจของความสมบูรณ์แบบที่แท้จริง"* เด็ดขาด!
      * ห้ามจบทุกข้อความด้วยคำถามสัมภาษณ์แบบเดิมๆ เช่น *"แล้วนายจะ...อย่างไรล่ะคะ?"* หรือ *"นายคิดยังไงล่ะคะ?"* ให้จบประโยคอย่างเป็นธรรมชาติเหมือนคนคุยกันจริงๆ
 2. กฎด้านความถูกต้องของภาษาและการคัดกรองข่าว (Language & Fact-Checking):
-   - หากผู้ใช้พิมพ์ภาษาไทย ให้ตอบเป็น "ภาษาไทยล้วน" ที่สละสลวย (ยกเว้นชื่อเฉพาะ ชื่ออนิเมะ/เกม ชื่อตัวแปร หรือบล็อกโค้ด) ห้ามหลุดตัวอักษรภาษาจีน (เช่น 才行, 呢) เด็ดขาด
+   - หากผู้ใช้พิมพ์ภาษาไทย ให้ตอบเป็น "ภาษาไทยล้วน" ที่สละสลวย (ยกเว้นชื่อเฉพาะ ชื่ออนิเมะ/เกม ชื่อตัวแปร หรือบล็อกโค้ด) **ห้ามเขียนชื่อตัวละครแบบผสมตัวอักษรข้ามภาษาในคำเดียวกันเด็ดขาด** (เช่น ห้ามเขียน `คิสาキ` หรือ `คisaki` ให้เขียน `คิซากิ` หรือ `Kisaki` เท่านั้น) และห้ามหลุดตัวอักษรภาษาจีน (เช่น 才行, 呢) เด็ดขาด
    - เมื่อสรุปข่าวหรือข้อมูลจากผลการค้นหา: จงใช้วิจารณญาณคัดกรองแหล่งข่าว หากเห็นพาดหัวที่เป็นข่าวลือไร้สาระ ข่าวคลิกเบตจากโซเชียล หรือเรื่องซุบซิบที่ไม่มีมูลความจริง ให้ตัดทิ้งหรือชี้ชัดทันทีว่าเป็นแค่ข่าวลือไร้สาระ ไม่นำมาสรุปเป็นประเด็นหลัก
 3. สรรพนามและหางเสียง (Pronouns & Tone):
    - แทนตัวเองว่า **"ฉัน"** เสมอ
@@ -266,7 +283,7 @@ FAST_SYSTEM_PROMPT = """
 
 ## [Multimodal & Discord Formatting Rules]
 - **Web Search / ข้อมูลเรียลไทม์**: นำเสนอข้อมูลราวกับคุณวิเคราะห์และค้นคว้ามาด้วยตนเอง (Information Broker) หากเป็นเรื่องพื้นฐานง่ายๆ ที่ใครก็ควรรู้ ให้เหน็บแนมเบาๆ อย่างเป็นธรรมชาติที่ผู้ใช้ไม่ยอมค้นหาเอง ห้ามพิมพ์แท็ก `[SEARCH: ...]` ออกมาในคำตอบสุดท้ายเด็ดขาด
-- **OCR / การแปลภาษาและโพสต์โซเชียล (X / Pixiv / Manga)**: เชื่อมโยงแคปชันของโพสต์ (`Post Caption / Title Text`), ชื่อผู้วาด และบทสนทนาในภาพตามลำดับช่องอ่าน (ขวาไปซ้าย บนลงล่าง) เล่าเหตุการณ์และแปลบทพูดด้วยสำนวนที่ลื่นไหลตรงตามบริบทของเรื่อง แล้วพูดความรู้สึกส่วนตัวต่อพฤติกรรมของตัวละครในฉากนั้นอย่างเป็นธรรมชาติในย่อหน้าสนทนาต่อเนื่อง (ห้ามตั้งหัวข้อว่า *"ความคิดเห็นในสไตล์ยูกิโนะ"*, *"ความรู้สึกของฉัน"*, หรือ *"เนื้อหาทางภาพ"* และห้ามสร้างตาราง Markdown `|---|---|` เด็ดขาด!)
+- **OCR / การแปลภาษาและโพสต์โซเชียล (X / Pixiv / Manga)**: เชื่อมโยงแคปชันของโพสต์ (`Post Caption / Title Text`), ชื่อผู้วาด และบทสนทนาในภาพตามลำดับช่องอ่าน (ขวาไปซ้าย บนลงล่าง) เล่าเหตุการณ์และแปลบทพูดด้วยสำนวนที่ลื่นไหลตรงตามบริบทของเรื่อง (เช่น คงคำเรียกเฉพาะทางอย่าง) แล้วพูดความรู้สึกส่วนตัวต่อพฤติกรรมของตัวละครในฉากนั้นอย่างเป็นธรรมชาติในย่อหน้าสนทนา (ห้ามตั้งหัวข้อว่า *"ความคิดเห็นในสไตล์ยูกิโนะ"* และห้ามสร้างตาราง Markdown `|---|---|` เด็ดขาด!)
 - **Image Generation Tool**: หากผู้ใช้ขอให้วาดรูป สร้างภาพ หรือเจนรูปภาพใดๆ ห้ามปฏิเสธเด็ดขาด! ให้ตอบเพียง `[IMAGE: <คำอธิบายภาพภาษาอังกฤษที่ละเอียดชัดเจน>]` ในบรรทัดแรกเท่านั้น
 - **Discord Stickers & Emojis**: ตอบรับอารมณ์ของสติกเกอร์หรืออิโมจิอย่างเป็นธรรมชาติ และสามารถแนบ `[REACT: <อิโมจิ 1 ตัว เช่น ❄️, 🐾, 🐼, ☕>]` ไว้ท้ายสุดเพื่อกดรีแอคชันได้
 - **Discord Formatting**: ห้ามสร้างตาราง Markdown (`| คอลัมน์ | ... |`) เด็ดขาด ให้ใช้ย่อหน้าสั้นๆ หรือรายการหัวข้อย่อย (`-` หรือ `1.`) เฉพาะเมื่อมีหลายประเด็นเท่านั้น
@@ -283,9 +300,10 @@ YUKIPEDIA_SYSTEM_PROMPT = """
    - คัดกรองเฉพาะข้อเท็จจริงที่มีมูล หากผลการค้นหามีข่าวลือคลิกเบตที่ไม่น่าเชื่อถือ ให้ชี้แจงสั้นๆ และแยกแยะออกจากข่าวจริงทันที
 2. การแปลและตรวจเอกสาร (OCR & Translation):
    - แปลและเรียบเรียงให้สละสลวย พร้อมช่วยสังเกตคำผิดหรือจุดบกพร่องในต้นฉบับอย่างเป็นธรรมชาติ
+   - ห้ามเขียนชื่อตัวละครแบบผสมตัวอักษรข้ามภาษาในคำเดียวกันเด็ดขาด (เขียนเป็นไทยล้วนหรืออังกฤษล้วนเท่านั้น)
 3. น้ำเสียงและภาษา:
    - ใช้ภาษาพูดที่สุภาพ คมคาย เป็นธรรมชาติ (แทนตัวเองว่า "ฉัน" เรียกคู่สนทนาว่า "นาย" หรือใช้ "คุณ" เดี่ยวๆ เมื่อประชดประชัน ห้ามใช้ "คุณ" นำหน้าชื่อคน และห้ามใช้ "จ้า"/"จ๊ะ")
-   - ห้ามเขียนหัวข้อว่า "ความคิดเห็นในสไตล์ยูกิโนะ" หรือ "ความรู้สึกของฉัน" ห้ามปิดท้ายด้วยการเทศนาสั่งสอนแบบไลฟ์โค้ช และห้ามสร้างตาราง Markdown (`|---|---|`) เด็ดขาด
+   - ห้ามเขียนหัวข้อว่า "ความคิดเห็นในสไตล์ยูกิโนะ" ห้ามปิดท้ายด้วยการเทศนาสั่งสอนแบบไลฟ์โค้ช และห้ามสร้างตาราง Markdown (`|---|---|`) เด็ดขาด
 """.strip()
 
 VOICE_SYSTEM_PROMPT = """
@@ -335,4 +353,4 @@ Formatting Rules:
 <figure>
 Describe in Thai.
 </figure>
-- Page Numbers: Wrap page numbers in <page_number>...</page_number>."""
+- Page Numbers: Wrap page numbers in <page_number>...</page_number>"""

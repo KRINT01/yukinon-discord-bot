@@ -237,7 +237,7 @@ class CodeReviewActionView(AutoDisappearingView):
         )
         await send_chunked_response(interaction.channel, answer)
         try:
-            await interaction.followup.send("ดำเนินการตามที่เลือกเรียบร้อยแล้วค่ะ ❄️", ephemeral=True)
+            await interaction.followup.send("เรียบร้อยแล้วค่ะ ลองตรวจสอบดูนะคะ", ephemeral=True)
         except Exception:
             pass
 
@@ -300,7 +300,7 @@ class GeneralAssistantActionView(AutoDisappearingView):
     def _make_in_bubble_manga_callback(self):
         async def _callback(interaction: discord.Interaction):
             await interaction.response.send_message(
-                "📖 กำลังแปลบทสนทนาและฝังข้อความภาษาไทยลงในช่องคำพูดของภาพให้สักครู่นะคะ...",
+                "รับทราบค่ะ เดี๋ยวฉันจัดการแปลบทสนทนาในภาพเป็นภาษาไทยให้ รอสักครู่นะคะ",
                 ephemeral=True,
             )
             target_msg = self.source_message
@@ -381,7 +381,7 @@ class GeneralAssistantActionView(AutoDisappearingView):
         )
         await send_chunked_response(interaction.channel, answer)
         try:
-            await interaction.followup.send("จัดเตรียมข้อมูลเพิ่มเติมให้เรียบร้อยแล้วค่ะ ❄️", ephemeral=True)
+            await interaction.followup.send("เรียบร้อยแล้วค่ะ ลองดูรายละเอียดด้านบนนะคะ", ephemeral=True)
         except Exception:
             pass
 
@@ -1128,8 +1128,9 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             )
             return
 
+        lang_label = "ภาษาไทย" if language.lower() == "thai" else "ภาษาอังกฤษ"
         await interaction.response.send_message(
-            f"📖 กำลังแปลหน้ามังงะเป็น **{language}** และจัดวางข้อความลงในช่องคำพูดให้สักครู่นะคะ...",
+            f"รับทราบค่ะ เดี๋ยวฉันจัดการแปลหน้านี้เป็น**{lang_label}**ให้ รอสักครู่นะคะ",
             ephemeral=True,
         )
 
@@ -1277,5 +1278,8 @@ def register_app_commands(bot: discord.ext.commands.Bot):
                 ephemeral=True,
             )
             return
-        await interaction.response.send_message("📖 กำลังแปลหน้ามังงะเป็นภาษาไทยให้สักครู่นะคะ...", ephemeral=True)
+        await interaction.response.send_message(
+            "รับทราบค่ะ เดี๋ยวฉันจัดการแปลหน้านี้เป็นภาษาไทยให้ รอสักครู่นะคะ",
+            ephemeral=True,
+        )
         await process_manga_translation_request(message, "แปลมังงะเป็นภาษาไทย")
