@@ -18,6 +18,24 @@ try:
 except ImportError:
     davey = None
 
+
+def _configure_glibc_low_ram_allocator():
+    """
+    Locks Linux glibc `M_TRIM_THRESHOLD` (-1) and `M_MMAP_THRESHOLD` (-3) to 128 KB so
+    multi-megabyte Pillow RGB image buffers use `mmap()` instead of permanently expanding
+    the `brk` heap on 512 MB Render containers.
+    """
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.mallopt(-1, 131072)  # M_TRIM_THRESHOLD = 128 KB
+        libc.mallopt(-3, 131072)  # M_MMAP_THRESHOLD = 128 KB
+        libc.malloc_trim(0)
+    except Exception:
+        pass
+
+
+_configure_glibc_low_ram_allocator()
+
 # Constructed protocol prefixes so chat/markdown renderers never auto-link URLs in code blocks
 HTTPS = "https" + "://"
 HTTP = "http" + "://"
@@ -230,8 +248,8 @@ def channel_has_recent_code_attachment(channel_id: int | None, ttl_sec: int = 18
 
 def release_unused_memory() -> tuple[float, float]:
     """
-    Forces Python's garbage collector and Linux glibc (malloc_trim) to immediately
-    return freed heap memory (such as Pillow manga buffers) back to the OS kernel.
+    Forces Python's full generation-2 garbage collector and Linux glibc (`mallopt` + `malloc_trim`)
+    to immediately return freed heap memory (such as Pillow manga buffers) back to the OS kernel.
     Returns (before_mb, after_mb).
     """
     import psutil
@@ -240,10 +258,12 @@ def release_unused_memory() -> tuple[float, float]:
     before_mb = round(proc.memory_info().rss / (1024 ** 2), 1)
 
     prune_stale_attachments()
-    gc.collect()
+    gc.collect(2)
 
     try:
         libc = ctypes.CDLL("libc.so.6")
+        libc.mallopt(-1, 131072)
+        libc.mallopt(-3, 131072)
         libc.malloc_trim(0)
     except Exception:
         pass
