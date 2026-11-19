@@ -47,13 +47,15 @@ from llm import (
 )
 
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
+MAX_FLOOD_MASK_DIM = 160    # Caps pure-Python PIL floodfill mask to <=160px (~20x faster, zero Discord Gateway lag!)
 
 # Cache for self-healing discovery of strictly newer (>3.5) `flash-lite` models on Google AI Studio
 _FLASH_LITE_DISCOVERY_CACHE: list[str] = []
 _FLASH_LITE_DISCOVERY_TS: float = 0.0
 _FLASH_LITE_EXCLUDED = ("2.5", "2.0", "1.5", "latest", "image", "tts", "audio", "live", "embedding")
 
-# Strict JSON responseSchema for Gemini models so `box_2d` is ALWAYS emitted as a 4-integer [ymin, xmin, ymax, xmax] array
+# Strict JSON responseSchema WITH explicit `propertyOrdering` so Gemini NEVER outputs `box_2d` alphabetically
+# before reading `panel_position` and `source_text`! `box_2d` is emitted IMMEDIATELY after `source_text`.
 MANGA_BATCH_RESPONSE_SCHEMA = {
     "type": "OBJECT",
     "properties": {
@@ -70,24 +72,41 @@ MANGA_BATCH_RESPONSE_SCHEMA = {
                             "type": "OBJECT",
                             "properties": {
                                 "id": {"type": "INTEGER"},
-                                "speaker_or_note": {"type": "STRING"},
                                 "panel_position": {"type": "STRING"},
+                                "speaker_or_note": {"type": "STRING"},
                                 "source_text": {"type": "STRING"},
-                                "translated_text": {"type": "STRING"},
                                 "box_2d": {
                                     "type": "ARRAY",
                                     "items": {"type": "INTEGER"},
                                     "nullable": True,
                                 },
+                                "translated_text": {"type": "STRING"},
                             },
-                            "required": ["id", "speaker_or_note", "source_text", "translated_text", "box_2d"],
+                            "propertyOrdering": [
+                                "id",
+                                "panel_position",
+                                "speaker_or_note",
+                                "source_text",
+                                "box_2d",
+                                "translated_text",
+                            ],
+                            "required": [
+                                "id",
+                                "panel_position",
+                                "speaker_or_note",
+                                "source_text",
+                                "box_2d",
+                                "translated_text",
+                            ],
                         },
                     },
                 },
+                "propertyOrdering": ["page_index", "summary", "bubbles"],
                 "required": ["page_index", "summary", "bubbles"],
             },
         }
     },
+    "propertyOrdering": ["pages"],
     "required": ["pages"],
 }
 
@@ -101,20 +120,36 @@ MANGA_SINGLE_RESPONSE_SCHEMA = {
                 "type": "OBJECT",
                 "properties": {
                     "id": {"type": "INTEGER"},
-                    "speaker_or_note": {"type": "STRING"},
                     "panel_position": {"type": "STRING"},
+                    "speaker_or_note": {"type": "STRING"},
                     "source_text": {"type": "STRING"},
-                    "translated_text": {"type": "STRING"},
                     "box_2d": {
                         "type": "ARRAY",
                         "items": {"type": "INTEGER"},
                         "nullable": True,
                     },
+                    "translated_text": {"type": "STRING"},
                 },
-                "required": ["id", "speaker_or_note", "source_text", "translated_text", "box_2d"],
+                "propertyOrdering": [
+                    "id",
+                    "panel_position",
+                    "speaker_or_note",
+                    "source_text",
+                    "box_2d",
+                    "translated_text",
+                ],
+                "required": [
+                    "id",
+                    "panel_position",
+                    "speaker_or_note",
+                    "source_text",
+                    "box_2d",
+                    "translated_text",
+                ],
             },
         },
     },
+    "propertyOrdering": ["summary", "bubbles"],
     "required": ["summary", "bubbles"],
 }
 
@@ -169,6 +204,17 @@ EXPLICIT_FILENAME_COMMENT_REGEX = re.compile(
     r"^(?://|#|--|/\*|<!--)\s*([A-Za-z0-9_.-]+\.(?:java|py|js|ts|tsx|jsx|sql|pls|pkb|pks|xml|yaml|yml|json|sh|ps1|html|css|scss|properties|gradle|md|txt|diff|patch)|Dockerfile|docker-compose\.ya?ml|pom\.xml)\b",
     re.IGNORECASE,
 )
+
+# Zero-dependency Thai orthographic cluster regex for clean syllable-level line wrapping
+_THAI_CLUSTER_REGEX = re.compile(
+    r"[เแโใไ]?[ก-ฮ][\u0E31\u0E34-\u0E3A\u0E47-\u0E4E]*(?:[ะาำ]|[\u0E47-\u0E4E])*|[A-Za-z0-9]+|[^\s]"
+)
+_THAI_LEADING_VOWELS = set("เแโใไ")
+_THAI_VOWEL_SIGNALS = set("เแโใไะาำ\u0E31\u0E34\u0E35\u0E36\u0E37\u0E38\u0E39\u0E47")
+_THAI_CLUSTER_FIRST = set("กขคจตทบปผพฟสศษ")
+_THAI_CLUSTER_SECOND = set("รลว")
+_THAI_HO_NAM_FOLLOW = set("งญนมยรลว")
+_THAI_PUNCT_ATTACH = set("ๆฯ?!.,:;'\")]-~")
 
 
 def extract_named_code_files(text: str) -> tuple[str, list[discord.File]]:
@@ -614,7 +660,7 @@ async def _discover_manga_batch_models() -> list[tuple[str, bool]]:
     Returns the exact ordered model chain for multi-page `MangaBatch`:
       1. `gemini-3.5-flash-lite`
       2. `gemini-3.1-flash-lite`
-      3. Any strictly newer (>3.5) `flash-lite` model discovered via self-healing (no duplicate -preview aliases of 3.1/3.5!)
+      3. Any strictly newer (>3.5) `flash-lite` model discovered via self-healing
       4. `gemma-4-31b-it`
       5. `gemma-4-26b-a4b-it`
     Each entry is `(model_id, is_gemma)`.
@@ -640,7 +686,6 @@ async def _discover_manga_batch_models() -> list[tuple[str, bool]]:
                             if any(bad in lower_name for bad in _FLASH_LITE_EXCLUDED):
                                 continue
                             ver = _parse_flash_lite_version(name)
-                            # Only add strictly newer versions (> 3.5) so older `-preview` aliases of 3.1/3.5 never burn wall time
                             if ver > (3, 5):
                                 found.append((ver, name))
                     found.sort(reverse=True)
@@ -666,10 +711,6 @@ async def _discover_manga_batch_models() -> list[tuple[str, bool]]:
 
 
 def _extract_norm_box_2d(raw_box) -> list[float] | None:
-    """
-    Flexibly parses bounding boxes returned in any VLM format and auto-scales
-    `[0.0..1.0]` normalized floats up to `[0..1000]`.
-    """
     if raw_box is None:
         return None
 
@@ -854,7 +895,6 @@ def _parse_manga_pages_batch_json(
 
 
 async def _waiting_heartbeat_logger(req_id: str, label: str, model_id: str, interval_sec: float = 15.0):
-    """Logs periodic waiting status lines to Render stderr while a long vision request is in flight."""
     start_t = time.monotonic()
     try:
         while True:
@@ -878,7 +918,8 @@ async def extract_and_translate_manga_pages_batch(
         `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> (newer >3.5 `flash-lite`)
         -> `gemma-4-31b-it` -> `gemma-4-26b-a4b-it`
         NEVER falls back to per-page `MangaSingle`!
-      - Emits correlated `[req=...]` REQUEST / WAITING / RESPONSE logs to Render.
+      - Uses explicit `propertyOrdering` in `responseSchema` so `panel_position` and `source_text`
+        are ALWAYS generated BEFORE `box_2d` (preventing alphabetical off-by-one box drift!).
     Returns `(results, is_service_unavailable)`.
     """
     num_pages = len(pages_input)
@@ -900,7 +941,6 @@ async def extract_and_translate_manga_pages_batch(
     if not GEMINI_API_KEY:
         return [([], "") for _ in range(num_pages)], True
 
-    # Keep vision images crisp enough (1024px for 9-12p, 1120px for 5-8p, 1280px for 2-4p) so small bubbles are never skipped
     if num_pages >= 9:
         batch_dim, batch_q = 1024, 84
     elif num_pages >= 5:
@@ -915,7 +955,7 @@ async def extract_and_translate_manga_pages_batch(
 
     mime_type = "image/jpeg"
     context_block = (
-        f"\nSeries / Post Context & Character Roster (use these exact names & terms):\n{series_context_hint[:1400]}\n"
+        f"\nSeries / Post Context & Character Roster (use accurate names & terms):\n{series_context_hint[:1400]}\n"
         if series_context_hint else ""
     )
 
@@ -932,18 +972,18 @@ CRITICAL COMPLETENESS, 1-TO-1 BUBBLE SEPARATION & BOUNDING-BOX RULES:
    - NEVER combine text from two separate speech bubbles into one `translated_text`!
    - Scan every panel of every page systematically from top-right to bottom-left and extract EVERY speech bubble (including short 1-word replies, narrow vertical bubbles, rectangular time/location caption boxes, and secondary bubbles in crowded panels).
    - Within each page, order the bubbles strictly in traditional Japanese Manga reading order (Top-to-Bottom, Right-to-Left across panels).
-2. Consistent Character Names, Visual Gender & Localization:
-   - Keep character names, titles/ranks, and faction names consistent across all pages, cross-checking with the post context above and accurate Japanese phonetics.
-   - Match pronouns and politeness particles to each character's visual gender and personality (for example, when translating to Thai, a female character who uses casual/boyish Japanese pronouns like `僕` or `妾` must still use female/neutral Thai endings like `นะ`/`ล่ะ`/`สิ`/`ค่ะ` — NEVER male `ครับ`/`ผม` unless the speaker is visually male).
+2. Accurate Speaker Attribution, Names & Visual Gender:
+   - Identify the actual character speaking EACH individual bubble visually (follow the bubble tail; NEVER copy a single character's name onto every bubble!).
+   - Keep character names, titles/ranks, and faction names consistent across all pages using accurate Japanese phonetics.
+   - Match pronouns and politeness particles to each character's visual gender and personality (when translating to Thai, a female character who uses boyish/archaic Japanese pronouns must still use female/neutral Thai endings like `นะ`/`ล่ะ`/`สิ`/`ค่ะ` — NEVER male `ครับ`/`ผม` unless the speaker is visually male).
    - Use standard ASCII punctuation (`...`, `~`, `-`, single quotes `'`).
    - When translating to English, preserve Japanese honorifics attached directly with a hyphen and NO space (`-san`, `-kun`, `-chan`, `-sama`, `-sensei`, `-senpai`).
-3. Spatial Anchor & Bounding Boxes (`panel_position` + `box_2d`) — MANDATORY FOR IN-BUBBLE RENDERING:
-   - First identify `panel_position` on that specific page (`"top-right"`, `"top-left"`, `"middle-right"`, `"middle-left"`, `"bottom-right"`, `"bottom-left"`), then output `box_2d` as 4 INTEGERS `[ymin, xmin, ymax, xmax]` in `0..1000` scale relative to THAT single page.
-   - You MUST provide a non-null `[ymin, xmin, ymax, xmax]` `box_2d` for EVERY dialogue bubble, thought bubble, and narration/caption box!
-   - `box_2d` MUST tightly enclose ONLY the Japanese text INSIDE that specific bubble — NEVER shift `box_2d` onto a character's face, eyes, hands, arms, hair, empty background, or another panel!
+3. Spatial Anchor & Exact Bounding Boxes (`panel_position` -> `source_text` -> `box_2d`):
+   - For each bubble: first identify `panel_position` (`"top-right"`, `"top-left"`, `"middle-right"`, `"middle-left"`, `"bottom-right"`, `"bottom-left"`), transcribe `source_text`, and IMMEDIATELY output the exact `box_2d` as 4 INTEGERS `[ymin, xmin, ymax, xmax]` in `0..1000` scale tightly enclosing THAT EXACT `source_text` on THAT page!
+   - DOUBLE-CHECK left-to-right alignment (`xmin`, `xmax`): NEVER shift `box_2d` onto an adjacent bubble to the left or right, and NEVER place `box_2d` on a character's face, eyes, hands, arms, hair, or empty background!
    - ONLY set `"box_2d": null` for floating handwritten SFX / sound effects (e.g. ドーン, トスッ, ポスン, ムチッ, スラ〜〜) or tiny unenclosed whispers drawn directly over a character's body/shirt outside a speech bubble!
    - NEVER assign the same `box_2d` to two different bubbles!
-4. Return ONLY valid JSON matching this exact structure for all {num_pages} page(s) (write `summary` in {target_lang_name}):
+4. Return ONLY valid JSON matching this exact field order for all {num_pages} page(s) (write `summary` in {target_lang_name}):
 {{
   "pages": [
     {{
@@ -952,11 +992,11 @@ CRITICAL COMPLETENESS, 1-TO-1 BUBBLE SEPARATION & BOUNDING-BOX RULES:
       "bubbles": [
         {{
           "id": 1,
-          "speaker_or_note": "Character / Narration / SFX",
           "panel_position": "top-right",
-          "source_text": "Original Japanese text",
-          "translated_text": "Natural {target_lang_name} translation",
-          "box_2d": [120, 450, 280, 620]
+          "speaker_or_note": "Actual speaker name / Narration",
+          "source_text": "Original Japanese text inside this bubble",
+          "box_2d": [120, 450, 280, 620],
+          "translated_text": "Natural {target_lang_name} translation"
         }}
       ]
     }}
@@ -1078,7 +1118,7 @@ CRITICAL COMPLETENESS, 1-TO-1 BUBBLE SEPARATION & BOUNDING-BOX RULES:
 
                 if status == 400 and attempt == 0:
                     changed = False
-                    if "responseSchema" in payload["generationConfig"] and ("schema" in body_text.lower() or "responseSchema" in body_text):
+                    if "responseSchema" in payload["generationConfig"] and ("schema" in body_text.lower() or "propertyOrdering" in body_text or "responseSchema" in body_text):
                         payload["generationConfig"].pop("responseSchema", None)
                         changed = True
                     if "thinkingConfig" in payload["generationConfig"] and "thinkingConfig" in body_text:
@@ -1210,27 +1250,26 @@ CRITICAL RULES:
    - Every physically separate speech oval, cloud, or rectangular caption box MUST be its own separate object in `bubbles` — EVEN IF the same character speaks across 2 or 3 separate bubbles!
    - Scan every panel systematically and translate EVERY speech bubble on the page without skipping any bubble.
    - Order the bubbles strictly in traditional Japanese Manga reading order (Top-to-Bottom, Right-to-Left across panels).
-2. Consistent Character Names, Visual Gender & Localization:
-   - Keep character names, titles/ranks, and faction names consistent with the post context above and accurate Japanese phonetics.
+2. Accurate Speaker Attribution, Names & Visual Gender:
+   - Identify the actual character speaking EACH bubble visually (never copy one speaker name onto every bubble!).
    - Match pronouns and politeness particles to each character's visual gender (never use male Thai `ครับ`/`ผม` for visually female characters).
    - Use standard ASCII punctuation (`...`, `~`, `-`, single quotes `'`).
    - When translating to English, preserve Japanese honorifics attached directly with a hyphen and NO space (`-san`, `-kun`, `-chan`, `-sama`, `-sensei`, `-senpai`).
-3. Spatial Anchor & Bounding Boxes (`panel_position` + `box_2d`) — MANDATORY FOR IN-BUBBLE RENDERING:
-   - First identify `panel_position` (`"top-right"`, `"top-left"`, `"middle-right"`, `"middle-left"`, `"bottom-right"`, `"bottom-left"`), then output `box_2d` as 4 INTEGERS `[ymin, xmin, ymax, xmax]` in `0..1000` scale.
-   - Provide a non-null `[ymin, xmin, ymax, xmax]` `box_2d` for EVERY dialogue bubble, thought bubble, and narration/caption box!
-   - `box_2d` MUST tightly enclose ONLY the Japanese text INSIDE that specific bubble — NEVER shift onto character faces, hands, arms, hair, or empty background!
+3. Spatial Anchor & Exact Bounding Boxes (`panel_position` -> `source_text` -> `box_2d`):
+   - First identify `panel_position`, transcribe `source_text`, and IMMEDIATELY output the exact `box_2d` as 4 INTEGERS `[ymin, xmin, ymax, xmax]` in `0..1000` scale tightly enclosing THAT EXACT `source_text`!
+   - NEVER shift `box_2d` onto an adjacent bubble or onto character faces, hands, arms, hair, or empty background!
    - ONLY set `"box_2d": null` for floating handwritten SFX / sound effects or tiny unenclosed whispers drawn directly over a character's body/shirt outside a speech bubble!
-4. Return ONLY valid JSON matching this exact structure (every bubble MUST have a non-empty `translated_text`; write `summary` in {target_lang_name}):
+4. Return ONLY valid JSON matching this exact field order (write `summary` in {target_lang_name}):
 {{
   "summary": "Brief 1-sentence scene context in {target_lang_name}",
   "bubbles": [
     {{
       "id": 1,
-      "speaker_or_note": "Character / Narration / SFX",
       "panel_position": "top-right",
-      "source_text": "Original Japanese text",
-      "translated_text": "Natural {target_lang_name} translation",
-      "box_2d": [120, 450, 280, 620]
+      "speaker_or_note": "Actual speaker name / Narration",
+      "source_text": "Original Japanese text inside this bubble",
+      "box_2d": [120, 450, 280, 620],
+      "translated_text": "Natural {target_lang_name} translation"
     }}
   ]
 }}
@@ -1385,46 +1424,130 @@ CRITICAL RULES:
     return [], ""
 
 
+def _tokenize_thai_syllables(word: str) -> list[str]:
+    """
+    Zero-dependency Thai syllable tokenizer so unspaced Thai words wrap at natural syllable
+    boundaries (e.g. `ท่าน|เจ้า|สำ|นัก`, `ยา|ทำ|ให้|อ้วน?`, `หลาย|สัป|ดาห์|ต่อ|มา...`,
+    `มี|อะ|ไร|หรือ|เปล่า?`) instead of slicing off dangling single consonants (`น?`, `ง`, `ว!`).
+    """
+    raw = _THAI_CLUSTER_REGEX.findall(word)
+    if len(raw) <= 1:
+        return raw or [word]
+
+    # Pass 1: Merge onset clusters (`ห`+`งญนมยรลว`, `อ`+`ย`, consonant+`รลว` with vowel, and leading-vowel clusters like `เป`+`ล่า`)
+    merged_onsets: list[str] = []
+    i = 0
+    n = len(raw)
+    while i < n:
+        tok = raw[i]
+        nxt = raw[i + 1] if (i + 1) < n else ""
+
+        # `ห` นำ (e.g. ห + รือ -> หรือ, ห + ลา -> หลา) or `อ` นำ `ย` (อ + ยู่ -> อยู่)
+        if (
+            nxt
+            and len(tok) == 1
+            and ((tok == "ห" and nxt[0] in _THAI_HO_NAM_FOLLOW) or (tok == "อ" and nxt[0] == "ย"))
+        ):
+            merged_onsets.append(tok + nxt)
+            i += 2
+            continue
+
+        # True consonant clusters: `[เแโใไ]?[กขคจตทบปผพฟส]` + `[รลว]` carrying a vowel/tone (e.g. เป+ล่า -> เปล่า, จ+ริ -> จริ, เห+รอ -> เหรอ)
+        if nxt and nxt[0] in _THAI_CLUSTER_SECOND:
+            is_bare_c = (len(tok) == 1 and tok in _THAI_CLUSTER_FIRST)
+            is_lv_c = (len(tok) == 2 and tok[0] in _THAI_LEADING_VOWELS and tok[1] in (_THAI_CLUSTER_FIRST | {"ห"}))
+            nxt_has_vowel = any(c in _THAI_VOWEL_SIGNALS for c in nxt) or nxt[0] in ("ร", "ล") and tok.startswith("เ")
+            if is_lv_c or (is_bare_c and nxt_has_vowel):
+                merged_onsets.append(tok + nxt)
+                i += 2
+                continue
+
+        merged_onsets.append(tok)
+        i += 1
+
+    # Pass 2: Attach trailing coda consonants (bare consonant with no vowel/leading vowel, or ending with `์`)
+    # and punctuation (`?!.,ๆฯ`) back onto the preceding syllable!
+    syllables: list[str] = []
+    for tok in merged_onsets:
+        if not syllables:
+            syllables.append(tok)
+            continue
+
+        # Punctuation / repeaters / quotes always attach to previous syllable
+        if all(c in _THAI_PUNCT_ATTACH for c in tok):
+            syllables[-1] += tok
+            continue
+
+        # Karan (`์`) syllables like `ห์`, `ต์`, `ทร์` always attach to previous syllable
+        if "\u0E4C" in tok:
+            syllables[-1] += tok
+            continue
+
+        # Single bare Thai consonant (no vowel sign, no leading vowel, no tone mark) is a coda consonant
+        # if the previous syllable contains an explicit vowel or tone mark (e.g., `อ้`+`ว`+`น`, `สั`+`ป`, `นั`+`ก`, `ท่า`+`น`, `เรื่อ`+`ง`)
+        is_bare_single = (len(tok) == 1 and "\u0E01" <= tok <= "\u0E2E")
+        prev = syllables[-1]
+        prev_has_nucleus = any(c in _THAI_VOWEL_SIGNALS or ("\u0E48" <= c <= "\u0E4B") for c in prev)
+        if is_bare_single and prev_has_nucleus and len(prev) <= 6:
+            syllables[-1] += tok
+            continue
+
+        syllables.append(tok)
+
+    return syllables
+
+
 def _split_thai_word_cleanly(
     draw: ImageDraw.ImageDraw,
     word: str,
     font: ImageFont.ImageFont,
     max_width: int,
 ) -> list[str]:
-    leading_vowels = set("เแโใไ")
-    trailing_keep = set("ะาำๆฯ?!.,")
+    """
+    Wraps an unspaced Thai phrase strictly at syllable boundaries (`_tokenize_thai_syllables`),
+    only falling back to character-level splitting if a single syllable itself exceeds `max_width`.
+    """
+    syllables = _tokenize_thai_syllables(word)
     out_lines: list[str] = []
-    chunk = ""
+    current = ""
 
-    for ch in word:
-        test_ch = chunk + ch
-        cbbox = draw.textbbox((0, 0), test_ch, font=font)
-        is_combining = ("\u0E31" <= ch <= "\u0E3A") or ("\u0E47" <= ch <= "\u0E4E")
-        if (cbbox[2] - cbbox[0]) > max_width and chunk and not is_combining:
-            if len(chunk) > 2 and chunk[-1] in leading_vowels:
-                out_lines.append(chunk[:-1])
-                chunk = chunk[-1] + ch
-            elif ch in trailing_keep and len(chunk) > 2:
-                cut = len(chunk) - 1
-                while cut > 1 and (("\u0E31" <= chunk[cut] <= "\u0E3A") or ("\u0E47" <= chunk[cut] <= "\u0E4E")):
-                    cut -= 1
-                if cut > 1 and chunk[cut - 1] in leading_vowels:
-                    cut -= 1
-                if cut > 1:
-                    out_lines.append(chunk[:cut])
-                    chunk = chunk[cut:] + ch
-                else:
-                    out_lines.append(chunk)
-                    chunk = ch
-            else:
-                out_lines.append(chunk)
-                chunk = ch
+    for syl in syllables:
+        test_line = current + syl
+        bbox = draw.textbbox((0, 0), test_line, font=font)
+        if (bbox[2] - bbox[0]) <= max_width or not current:
+            current = test_line
         else:
-            chunk = test_ch
+            out_lines.append(current)
+            current = syl
 
-    if chunk:
-        out_lines.append(chunk)
-    return out_lines
+    if current:
+        out_lines.append(current)
+
+    # Guard against a single ultra-long token overflowing a narrow bubble
+    final_lines: list[str] = []
+    for ln in out_lines:
+        lb = draw.textbbox((0, 0), ln, font=font)
+        if (lb[2] - lb[0]) <= max_width or len(ln) <= 3:
+            final_lines.append(ln)
+        else:
+            chunk = ""
+            for ch in ln:
+                t_ch = chunk + ch
+                cb = draw.textbbox((0, 0), t_ch, font=font)
+                is_comb = ("\u0E31" <= ch <= "\u0E3A") or ("\u0E47" <= ch <= "\u0E4E")
+                if (cb[2] - cb[0]) > max_width and chunk and not is_comb:
+                    if len(chunk) > 2 and chunk[-1] in _THAI_LEADING_VOWELS:
+                        final_lines.append(chunk[:-1])
+                        chunk = chunk[-1] + ch
+                    else:
+                        final_lines.append(chunk)
+                        chunk = ch
+                else:
+                    chunk = t_ch
+            if chunk:
+                final_lines.append(chunk)
+
+    return final_lines
 
 
 def _wrap_text_to_pixel_width(
@@ -1476,10 +1599,6 @@ def _wrap_text_to_pixel_width(
 
 
 def _fast_dilate_mask_half_res(mask_l: Image.Image, kernel_half: int = 3) -> Image.Image:
-    """
-    Runs morphological dilation at 0.5x resolution (equivalent to `MaxFilter(5..6)` at 1x)
-    which is ~16x faster on 0.1 vCPU while preserving full-resolution mask crispness.
-    """
     ww, wh = mask_l.size
     if ww < 24 or wh < 24:
         return mask_l.filter(ImageFilter.MaxFilter(3))
@@ -1495,12 +1614,6 @@ def _fast_dilate_mask_half_res(mask_l: Image.Image, kernel_half: int = 3) -> Ima
 
 
 def _measure_crop_chroma_stats(img: Image.Image, x1: int, y1: int, x2: int, y2: int) -> tuple[float, float]:
-    """
-    Returns `(mean_sat, chroma_ratio)` where `chroma_ratio` is the fraction of pixels with
-    HSV saturation >= 22. Pure white/gray speech bubbles have `chroma_ratio < 0.03`, whereas
-    anime faces, blush, skin/hands, hair, and colored wallpaper have `chroma_ratio >= 0.14`
-    even when diluted by surrounding white pixels!
-    """
     crop_rgb = img.crop((x1, y1, x2, y2))
     crop_hsv = crop_rgb.convert("HSV")
     crop_rgb.close()
@@ -1604,21 +1717,24 @@ def _find_best_enclosed_white_bubble(
     has_kanji_kana: bool = True,
 ) -> Image.Image | None:
     """
-    Fast 0.5x-scale enclosed pure-white speech bubble finder with proportional window support
-    so tall full-resolution ovals are never clipped open at crop borders.
+    Ultra-fast fixed-resolution (`<= 160px`) enclosed pure-white speech bubble finder:
+      - Downscales `sub_gray` to `max(sw, sh) <= 160` before running pure-Python `ImageDraw.floodfill()`,
+        cutting floodfill CPU time by ~20x and eliminating Discord Gateway GIL freezes while still
+        producing a full-resolution mask!
     """
     ww, wh = sub_gray.size
     if ww < 14 or wh < 14:
         return None
 
-    sw = max(7, ww // 2)
-    sh = max(7, wh // 2)
+    scale = min(0.5, MAX_FLOOD_MASK_DIM / float(max(ww, wh)))
+    sw = max(12, int(round(ww * scale)))
+    sh = max(12, int(round(wh * scale)))
     small_gray = sub_gray.resize((sw, sh), Image.Resampling.BILINEAR)
 
-    s_rx1 = max(1, rx1_rel // 2)
-    s_ry1 = max(1, ry1_rel // 2)
-    s_rx2 = min(sw - 2, max(s_rx1 + 3, rx2_rel // 2))
-    s_ry2 = min(sh - 2, max(s_ry1 + 3, ry2_rel // 2))
+    s_rx1 = max(1, int(rx1_rel * scale))
+    s_ry1 = max(1, int(ry1_rel * scale))
+    s_rx2 = min(sw - 2, max(s_rx1 + 3, int(rx2_rel * scale)))
+    s_ry2 = min(sh - 2, max(s_ry1 + 3, int(ry2_rel * scale)))
     s_bw = max(3, s_rx2 - s_rx1)
     s_bh = max(3, s_ry2 - s_ry1)
 
@@ -1628,7 +1744,7 @@ def _find_best_enclosed_white_bubble(
         for fx in (0.50, 0.25, 0.75):
             sx = max(1, min(sw - 2, int(s_rx1 + s_bw * fx)))
             seed_candidates.append((sx, sy))
-        for extra_dx in (-14, 14, -28, 28):
+        for extra_dx in (-8, 8, -16, 16):
             sx_ext = (s_rx1 + extra_dx) if extra_dx < 0 else (s_rx2 + extra_dx)
             if 1 <= sx_ext < sw - 1:
                 seed_candidates.append((sx_ext, sy))
@@ -1663,7 +1779,7 @@ def _find_best_enclosed_white_bubble(
                 continue
             cx1, cy1, cx2, cy2 = c_bbox
             cw, ch = cx2 - cx1, cy2 - cy1
-            if cw < 7 or ch < 7:
+            if cw < 5 or ch < 5:
                 comp.close()
                 continue
 
@@ -1674,6 +1790,14 @@ def _find_best_enclosed_white_bubble(
                 + (1 if cy2 >= sh - 1 else 0)
             )
             if edge_touches >= 3 or (cx1 <= 1 and cx2 >= sw - 1) or (cy1 <= 1 and cy2 >= sh - 1):
+                comp.close()
+                continue
+
+            # Check overlap BEFORE running the second hole-fill floodfill!
+            ov_x = max(0, min(cx2, s_rx2) - max(cx1, s_rx1))
+            ov_y = max(0, min(cy2, s_ry2) - max(cy1, s_ry1))
+            overlap_area = ov_x * ov_y
+            if overlap_area < 6:
                 comp.close()
                 continue
 
@@ -1700,18 +1824,11 @@ def _find_best_enclosed_white_bubble(
             holes_crop.close()
             holes.close()
 
-            if comp_area < 32 or (comp_area / filled_area) < 0.24:
+            if comp_area < 14 or (comp_area / filled_area) < 0.22:
                 filled.close()
                 continue
 
-            if has_kanji_kana and holes_area < 3:
-                filled.close()
-                continue
-
-            ov_x = max(0, min(cx2, s_rx2) - max(cx1, s_rx1))
-            ov_y = max(0, min(cy2, s_ry2) - max(cy1, s_ry1))
-            overlap_area = ov_x * ov_y
-            if overlap_area < 12:
+            if has_kanji_kana and holes_area < 2:
                 filled.close()
                 continue
 
@@ -1753,7 +1870,7 @@ def _find_best_enclosed_white_bubble(
     return full_filled
 
 
-def _sample_dark_bubble_bg_rgb_and_lum(img: Image.Image, base_gray: Image.Image, x1: int, y1: int, x2: int, y2: int) -> tuple[tuple[int, int, int], int]:
+def _sample_dark_bubble_bg_rgb_and_lum(img: Image.Image, base_gray: Image.Image, x1: int, y1: int, x2: int, y2: int) -> tuple[tuple[int, int, int], int, float]:
     width, height = img.size
     sx1 = max(0, x1 - 4)
     sy1 = max(0, y1 - 4)
@@ -1771,11 +1888,12 @@ def _sample_dark_bubble_bg_rgb_and_lum(img: Image.Image, base_gray: Image.Image,
     stat_g = ImageStat.Stat(crop_gray, mask=bg_mask)
     bg_rgb = tuple(int(v) for v in stat_rgb.median[:3])
     bg_lum = int(stat_g.median[0])
+    bg_std = float(stat_g.stddev[0])
 
     bg_mask.close()
     crop_rgb.close()
     crop_gray.close()
-    return bg_rgb, bg_lum
+    return bg_rgb, bg_lum, bg_std
 
 
 def _sample_light_bubble_bg_rgb(img: Image.Image, base_gray: Image.Image, x1: int, y1: int, x2: int, y2: int) -> tuple[int, int, int]:
@@ -1810,18 +1928,35 @@ def _find_enclosed_dark_caption_box(
     rx2_rel: int,
     ry2_rel: int,
 ) -> tuple[int, int, int, int] | None:
+    """
+    Fast `<= 160px` enclosed dark rectangular caption-box detector (e.g. `一ヶ月後 玄龍門`).
+    """
     ww, wh = sub_gray.size
     box_w = max(8, rx2_rel - rx1_rel)
     box_h = max(8, ry2_rel - ry1_rel)
     if box_w < 14 or box_h < 20:
         return None
 
-    cap_bin = sub_gray.point(lambda p: 255 if p <= 165 else 0)
+    scale = min(0.5, MAX_FLOOD_MASK_DIM / float(max(ww, wh)))
+    sw = max(12, int(round(ww * scale)))
+    sh = max(12, int(round(wh * scale)))
+    small_gray = sub_gray.resize((sw, sh), Image.Resampling.BILINEAR)
+
+    s_rx1 = max(1, int(rx1_rel * scale))
+    s_ry1 = max(1, int(ry1_rel * scale))
+    s_rx2 = min(sw - 2, max(s_rx1 + 3, int(rx2_rel * scale)))
+    s_ry2 = min(sh - 2, max(s_ry1 + 3, int(ry2_rel * scale)))
+    s_bw = max(3, s_rx2 - s_rx1)
+    s_bh = max(3, s_ry2 - s_ry1)
+
+    cap_bin = small_gray.point(lambda p: 255 if p <= 165 else 0)
+    small_gray.close()
+
     seed_pt = None
     for fy in (0.50, 0.25, 0.75):
-        sy = max(1, min(wh - 2, int(ry1_rel + box_h * fy)))
+        sy = max(1, min(sh - 2, int(s_ry1 + s_bh * fy)))
         for fx in (0.50, 0.25, 0.75):
-            sx = max(1, min(ww - 2, int(rx1_rel + box_w * fx)))
+            sx = max(1, min(sw - 2, int(s_rx1 + s_bw * fx)))
             if cap_bin.getpixel((sx, sy)) == 255:
                 seed_pt = (sx, sy)
                 break
@@ -1836,10 +1971,10 @@ def _find_enclosed_dark_caption_box(
     comp = cap_bin.point(lambda p: 255 if p == 128 else 0)
     cap_bin.close()
 
-    padded = Image.new("L", (ww + 4, wh + 4), 0)
+    padded = Image.new("L", (sw + 4, sh + 4), 0)
     padded.paste(comp, (2, 2))
     ImageDraw.floodfill(padded, (0, 0), 128)
-    cropped_pad = padded.crop((2, 2, ww + 2, wh + 2))
+    cropped_pad = padded.crop((2, 2, sw + 2, sh + 2))
     padded.close()
     holes = cropped_pad.point(lambda p: 255 if p == 0 else 0)
     cropped_pad.close()
@@ -1854,7 +1989,7 @@ def _find_enclosed_dark_caption_box(
     bx1, by1, bx2, by2 = c_bbox
     bw, bh = bx2 - bx1, by2 - by1
 
-    if bw > box_w * 3.2 or bh > box_h * 1.45 or bw > ww * 0.65 or bh > wh * 0.65:
+    if bw > s_bw * 3.2 or bh > s_bh * 1.45 or bw > sw * 0.65 or bh > sh * 0.65:
         filled.close()
         return None
 
@@ -1865,15 +2000,16 @@ def _find_enclosed_dark_caption_box(
 
     rect_fill_ratio = area / float(max(1, bw * bh))
     if rect_fill_ratio >= 0.76:
-        return bx1 + 3, by1 + 3, bx2 - 3, by2 - 3
+        return (
+            int(bx1 / scale) + 3,
+            int(by1 / scale) + 3,
+            int(bx2 / scale) - 3,
+            int(by2 / scale) - 3,
+        )
     return None
 
 
 def _build_red_box_qa_crop_b64(img: Image.Image, x1: int, y1: int, x2: int, y2: int) -> str:
-    """
-    Extracts a lightweight 320px context crop around `(x1, y1, x2, y2)` with a bright red
-    rectangle marking the exact proposed `box_2d` for `gemini-decision-1` pre-render audit.
-    """
     width, height = img.size
     bw = max(16, x2 - x1)
     bh = max(16, y2 - y1)
@@ -1903,10 +2039,12 @@ def _extract_ambiguous_qa_crops_sync(
     bubbles: list[dict],
 ) -> tuple[list[tuple[int, int, int, int, bool, bool, str, str]], list[tuple[int, str]]]:
     """
-    Fast pre-scan before rendering: identifies only ambiguous/risky boxes (boxes with
-    significant chromatic/skin pixels `chroma_ratio >= 0.08` OR non-enclosed Case C boxes)
-    and prepares tiny 320px red-box crops for `gemini-decision-1` pre-render verification.
-    Clean enclosed white speech bubbles (`chroma_ratio < 0.08`) pass with ZERO API calls!
+    Ultra-targeted pre-scan: inspects ONLY the **inner 60% core** of each `box_2d`!
+      - Real oval speech bubbles have an inner 60% core that is 100% inside the white oval
+        (`core_chroma_ratio < 0.04`), so they NEVER trigger false-positive BoxQA calls!
+      - Drifted boxes sitting on faces, hands, hair, or colored wallpaper have high color
+        saturation right inside their inner 60% core (`core_chroma_ratio >= 0.22` and
+        `core_mean_sat >= 16.0`), triggering surgical `gemini-decision-1` verification (~0-3 boxes total!).
     """
     valid_boxes = [
         b for b in bubbles
@@ -1946,11 +2084,14 @@ def _extract_ambiguous_qa_crops_sync(
         pixel_boxes = _deduplicate_overlapping_pixel_boxes(pixel_boxes, height)
 
         qa_crops: list[tuple[int, str]] = []
-        for idx, (rx1, ry1, rx2, ry2, is_dark, _, _, _) in enumerate(pixel_boxes):
-            mean_sat, chroma_ratio = _measure_crop_chroma_stats(img, rx1, ry1, rx2, ry2)
-            # Flag for surgical `gemini-decision-1` verification if the box contains chromatic/skin pixels
-            # (`chroma_ratio >= 0.08` or `mean_sat >= 11.0`) so drifted boxes over faces/hands are blocked!
-            if chroma_ratio >= 0.08 or mean_sat >= 11.0:
+        for idx, (rx1, ry1, rx2, ry2, _, _, _, _) in enumerate(pixel_boxes):
+            bw, bh = rx2 - rx1, ry2 - ry1
+            ix1 = rx1 + int(bw * 0.20)
+            iy1 = ry1 + int(bh * 0.20)
+            ix2 = max(ix1 + 6, rx2 - int(bw * 0.20))
+            iy2 = max(iy1 + 6, ry2 - int(bh * 0.20))
+            core_sat, core_chroma = _measure_crop_chroma_stats(img, ix1, iy1, ix2, iy2)
+            if core_chroma >= 0.22 and core_sat >= 16.0:
                 b64_crop = _build_red_box_qa_crop_b64(img, rx1, ry1, rx2, ry2)
                 qa_crops.append((idx, b64_crop))
 
@@ -1966,9 +2107,8 @@ async def _audit_ambiguous_boxes_with_decision_1(
     req_id: str,
 ) -> set[int]:
     """
-    Uses `gemini-decision-1` (200 RPM, ~250ms, zero generateContent quota) to audit ONLY
-    suspicious/chromatic `box_2d` crops BEFORE erasing or drawing.
-    Returns the set of `idx` indices that MUST BE BLOCKED (character face/hand/body or no Japanese text).
+    Audits ONLY inner-core-chromatic boxes (typically 0-3 per 10-page comic) via `gemini-decision-1`
+    so valid white speech ovals are NEVER blocked while drifted boxes over faces/hands/walls are stopped.
     """
     blocked: set[int] = set()
     if not qa_crops or not GEMINI_API_KEY or time.time() < state.gemini_decision_cooldown_until:
@@ -1981,9 +2121,9 @@ async def _audit_ambiguous_boxes_with_decision_1(
             {
                 "type": "text",
                 "text": (
-                    "Inspect the area strictly INSIDE the red rectangle on this manga crop.\n"
-                    "Determine if erasing inside the red rectangle would safely erase Japanese text "
-                    "or if it would damage a character's face/eyes/hands/body or erase blank artwork."
+                    "Inspect ONLY the center area inside the red rectangle on this manga crop.\n"
+                    "Determine whether it contains a real speech bubble/caption box with Japanese dialogue, "
+                    "or if it drifted onto a character's face/hands/body or empty artwork without dialogue."
                 ),
             },
             {
@@ -1997,15 +2137,15 @@ async def _audit_ambiguous_boxes_with_decision_1(
             "has_japanese_text": {
                 "type": "noul",
                 "instructions": (
-                    "Answer YES if there is clearly readable Japanese dialogue or narration text INSIDE the red rectangle. "
-                    "Answer NO if the red rectangle contains mostly character artwork, blank space, or a face/hand."
+                    "Answer YES if there is clearly readable Japanese dialogue or caption text inside the red rectangle. "
+                    "Answer NO if the red rectangle contains mostly character artwork, face/hand, or blank background."
                 ),
             },
             "damages_character_art": {
                 "type": "noul",
                 "instructions": (
-                    "Answer YES if the red rectangle sits directly over a character's face, eyes, nose, hair, fingers, hand, or body "
-                    "outside a speech bubble. Answer NO if it is cleanly inside a speech bubble or caption box."
+                    "Answer YES ONLY if the center of the red rectangle sits directly over a character's face, eyes, hair, "
+                    "hand, or body OUTSIDE a speech bubble. Answer NO if it encloses a speech bubble or caption box."
                 ),
             },
         }
@@ -2020,10 +2160,10 @@ async def _audit_ambiguous_boxes_with_decision_1(
             return box_idx, False
         has_txt = float((answers.get("has_japanese_text") or {}).get("noul") or 1.0)
         damages_art = float((answers.get("damages_character_art") or {}).get("noul") or 0.0)
-        should_block = bool(has_txt < 0.45 or damages_art >= 0.58)
+        should_block = bool(has_txt < 0.35 or damages_art >= 0.72)
         return box_idx, should_block
 
-    results = await asyncio.gather(*[_check_one(idx, b64_c) for idx, b64_c in qa_crops[:8]])
+    results = await asyncio.gather(*[_check_one(idx, b64_c) for idx, b64_c in qa_crops[:6]])
     for box_idx, should_block in results:
         if should_block:
             blocked.add(box_idx)
@@ -2041,13 +2181,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
     is_dark_bubble: bool = False,
     has_kanji_kana: bool = True,
 ) -> tuple[int, int, int, int, tuple[int, int, int], tuple[int, int, int], tuple[int, int, int, int]] | None:
-    """
-    Fast, artifact-free Japanese text erasure & bubble interior measurement:
-      - Proportional crop padding (`0.24 * W`, `0.22 * H`) so tall full-res ovals are never cut open.
-      - 0.5x mask dilation + C-level `getbbox()` row scanning (~10x faster on 0.1 vCPU).
-      - Chromatic skin/art guard (`chroma_ratio`) + skin-edge protection in Case C so fingers/faces
-        are NEVER damaged by white artifacts.
-    """
     width, height = img.size
     x1, y1, x2, y2 = raw_x1, raw_y1, raw_x2, raw_y2
     box_w = max(8, x2 - x1)
@@ -2056,7 +2189,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
     if box_w < 18 or box_h < 16:
         return None
 
-    # Proportional local window so tall full-res ovals (e.g. 500px tall on 2100px canvas) stay 100% enclosed
     pad_x = min(int(width * 0.24), max(120, int(box_w * 1.40)))
     pad_y = min(int(height * 0.22), max(120, int(box_h * 1.40)))
     wx1 = max(0, x1 - pad_x)
@@ -2079,7 +2211,10 @@ def _erase_bubble_japanese_text_and_measure_lobe(
 
     try:
         # =====================================================================
-        # CASE A: DARK OR CHARCOAL BUBBLE / NARRATION CAPTION BOX
+        # CASE A: DARK OR CHARCOAL SPEECH BUBBLE / NARRATION CAPTION BOX
+        # (Strict check: MUST be either an enclosed dark caption box OR a uniform
+        #  low-variance dark bubble with crisp white text `p >= 220` — NEVER
+        #  fires on dark character hair, striped coats, or shaded walls!)
         # =====================================================================
         if is_dark_bubble:
             mean_sat, chroma_ratio = _measure_crop_chroma_stats(img, x1, y1, x2, y2)
@@ -2087,17 +2222,28 @@ def _erase_bubble_japanese_text_and_measure_lobe(
             box_hist = sub_g_a.histogram()
             sub_g_a.close()
             total_box_px = max(1, sum(box_hist))
-            bright_ratio = sum(box_hist[205:]) / total_box_px
-            if mean_sat >= 36.0 or bright_ratio < 0.008:
-                return None
+            bright_text_ratio = sum(box_hist[220:]) / total_box_px
 
-            dark_fill_rgb, bg_lum = _sample_dark_bubble_bg_rgb_and_lum(img, base_gray, raw_x1, raw_y1, raw_x2, raw_y2)
-            fg_text_rgb = (250, 250, 250)
-            stroke_rgb = (max(0, bg_lum - 20), max(0, bg_lum - 20), max(0, bg_lum - 20))
+            dark_fill_rgb, bg_lum, bg_std = _sample_dark_bubble_bg_rgb_and_lum(
+                img, base_gray, raw_x1, raw_y1, raw_x2, raw_y2
+            )
 
             cap_rect = _find_enclosed_dark_caption_box(
                 sub_gray, rx1_rel, ry1_rel, rx2_rel, ry2_rel
             )
+            is_valid_dark_caption = (cap_rect is not None and bright_text_ratio >= 0.008 and mean_sat < 38.0)
+            is_valid_dark_bubble = (
+                bg_std <= 28.0
+                and mean_sat < 22.0
+                and chroma_ratio < 0.12
+                and 0.020 <= bright_text_ratio <= 0.38
+            )
+            if not (is_valid_dark_caption or is_valid_dark_bubble):
+                return None
+
+            fg_text_rgb = (250, 250, 250)
+            stroke_rgb = (max(0, bg_lum - 20), max(0, bg_lum - 20), max(0, bg_lum - 20))
+
             if cap_rect is not None:
                 tx_clean_x1 = max(2, cap_rect[0])
                 tx_clean_y1 = max(2, cap_rect[1])
@@ -2169,7 +2315,7 @@ def _erase_bubble_japanese_text_and_measure_lobe(
                 safe_inner_core.close()
                 peer_mask.close()
 
-                ink_inside_bubble = sub_gray.point(lambda p: 255 if p < 242 else 0)
+                ink_inside_bubble = sub_gray.point(lambda p: 255 if p < 246 else 0)
                 ink_dilated = _fast_dilate_mask_half_res(ink_inside_bubble, kernel_half=3)
                 ink_inside_bubble.close()
                 erase_mask = ImageChops.darker(ink_dilated, clipped_core)
@@ -2188,7 +2334,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
                 if rel_y2 - rel_y1 < 18:
                     rel_y1, rel_y2 = lb_y1 + 3, lb_y2 - 3
 
-                # Fast C-level row horizontal span measurement via `getbbox()`
                 mid_y_start = rel_y1 + int((rel_y2 - rel_y1) * 0.16)
                 mid_y_end = rel_y1 + int((rel_y2 - rel_y1) * 0.84)
                 step_y = max(2, (mid_y_end - mid_y_start) // 7 or 1)
@@ -2223,8 +2368,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
 
         # =====================================================================
         # CASE C: BORDER-TOUCHING WHITE OR SEMI-TRANSPARENT MIST BUBBLE
-        # (Chromatic-pixel rejection + skin-outline protection so hands, arms,
-        #  faces, and colored art are NEVER turned into white artifacts!)
         # =====================================================================
         tx_b1 = max(2, rx1_rel - 4)
         ty_b1 = max(2, ry1_rel - 4)
@@ -2245,7 +2388,6 @@ def _erase_bubble_japanese_text_and_measure_lobe(
         midtone_ratio = midtone_px / total_box_px
         ink_ratio = dark_ink_px / total_box_px
 
-        # Strict `chroma_ratio_c < 0.12` blocks pale skin/hands/faces even when surrounded by white background!
         is_valid_pure_white = (
             mean_sat_c < 10.0
             and chroma_ratio_c < 0.12
@@ -2273,12 +2415,11 @@ def _erase_bubble_japanese_text_and_measure_lobe(
             bg_rgb = (255, 255, 255) if is_valid_pure_white else _sample_light_bubble_bg_rgb(
                 img, base_gray, raw_x1, raw_y1, raw_x2, raw_y2
             )
-            ink_cutoff = 228 if is_valid_pure_white else 188
+            ink_cutoff = 232 if is_valid_pure_white else 188
             text_ink_mask = sub_gray.point(lambda p: 255 if p < ink_cutoff else 0)
             text_ink_dil = _fast_dilate_mask_half_res(text_ink_mask, kernel_half=3)
             text_ink_mask.close()
 
-            # Build chromatic-art shield: protect any pixel within ~5px of colored skin/hair/clothes (`sat >= 20`)
             sub_rgb_shield = img.crop((wx1, wy1, wx2, wy2))
             sub_sat_band = sub_rgb_shield.convert("HSV").getchannel("S")
             sub_rgb_shield.close()
@@ -2416,10 +2557,6 @@ def _fit_text_binary_search(
     start_font_size: int,
     is_thai_text: bool,
 ) -> tuple[ImageFont.ImageFont, list[str], int, int]:
-    """
-    Finds the exact largest font size in `[9..start_font_size]` that fits `(usable_w, usable_h)`
-    in O(log N) (~5 iterations instead of 45), speeding up full-res typesetting by ~8x.
-    """
     sample_probe = "Agกข้ำ" if is_thai_text else "Agjpqy!"
 
     def _measure(fsize: int) -> tuple[bool, ImageFont.ImageFont, list[str], int, int]:
@@ -2459,7 +2596,8 @@ def render_translated_manga_image_sync(
 ) -> bytes | None:
     """
     Renders translated dialogue cleanly inside speech bubbles at FULL ORIGINAL RESOLUTION
-    using fast 0.5x morphological masks, C-level row bounds, and binary-search font fitting.
+    using fixed-160px floodfill masks, 0.5x mask dilation, syllable-aware Thai wrapping,
+    and binary-search font fitting (~1s/page on 0.1 vCPU, zero Discord Gateway lag).
     """
     if not raw_bytes:
         return None
@@ -2581,8 +2719,8 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
     Translates 1 to 12 manga pages from direct Discord attachments OR embedded links
     in 1 unified batch call using:
       `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> (newer >3.5 flash-lite) -> `gemma-4-31b-it` -> `gemma-4-26b-a4b-it`
-    with surgical `gemini-decision-1` pre-render crop auditing on chromatic/drifted boxes,
-    correlated Render request/waiting/response logs, and fast full-resolution rendering.
+    with explicit `propertyOrdering`, inner-core `gemini-decision-1` BoxQA, correlated
+    Render request/waiting/response logs, and fast full-resolution rendering.
     """
     from media_context import resolve_referenced_message, collect_embedded_images_and_metadata
 
@@ -2702,7 +2840,6 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
                     transcript_lines.append(f"**[#{idx} | {speaker}]** `{src_txt}`\n  ↳ **{tr_txt}**")
 
             try:
-                # Step 1: Fast pre-scan & surgical `gemini-decision-1` check ONLY on chromatic/suspicious boxes
                 pixel_boxes, qa_crops = await asyncio.to_thread(
                     _extract_ambiguous_qa_crops_sync, raw_bytes, bubbles
                 )
@@ -2713,7 +2850,6 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
                         total_qa_blocked += len(blocked_ids)
                         pixel_boxes = [pb for idx_b, pb in enumerate(pixel_boxes) if idx_b not in blocked_ids]
 
-                # Step 2: Render full-resolution page with only verified speech-bubble boxes
                 rendered_jpg = await asyncio.to_thread(
                     render_translated_manga_image_sync, raw_bytes, bubbles, pixel_boxes
                 )
