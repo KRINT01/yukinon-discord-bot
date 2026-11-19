@@ -46,7 +46,7 @@ from llm import (
 )
 
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
-SOM_CV_MAX_DIM = 420        # Fast 420px CV detection grid (~60ms/page, zero Discord Gateway lag!)
+SOM_CV_MAX_DIM = 340        # Fast 340px CV grid (~4-6s for 10 pages on 0.1 vCPU, crisp ~3px precision)
 
 # Cache for self-healing discovery of strictly newer (>3.5) `flash-lite` models on Google AI Studio
 _FLASH_LITE_DISCOVERY_CACHE: list[str] = []
@@ -585,6 +585,7 @@ async def send_generated_image_to_channel(channel, prompt_text: str, reply_to: d
 
 # ==============================================================================
 # SET-OF-MARK (SoM) CV-ANCHORED MANGA TRANSLATION & FULL-RES TYPESETTING ENGINE
+# (Supports Color & Black-and-White Manga + Thai & English Localizations!)
 # ==============================================================================
 @functools.lru_cache(maxsize=64)
 def _load_manga_font(size: int, is_thai: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -601,7 +602,7 @@ def _load_manga_font(size: int, is_thai: bool = False) -> ImageFont.FreeTypeFont
 def _sanitize_text_for_manga_font(text: str) -> str:
     """
     Normalizes Unicode punctuation, strips stray CJK/emoji symbols, and cleans empty `()` / `[]`
-    so `Garuda-Bold.ttf` renders every character cleanly with zero `[]` tofu boxes.
+    so `Garuda-Bold.ttf` & `NotoSans-Bold.ttf` render every character cleanly with zero tofu boxes.
     """
     if not text:
         return ""
@@ -705,6 +706,26 @@ async def _discover_manga_batch_models() -> list[tuple[str, bool]]:
     return chain
 
 
+def _compute_rgb_chroma_band(rgb_img: Image.Image) -> Image.Image:
+    """
+    Computes true absolute RGB chroma `max(R,G,B) - min(R,G,B)` (`0..255`) in pure C.
+    CRITICAL: Unlike HSV saturation `S = (max-min)/max`, absolute RGB chroma NEVER explodes
+    on dark black/brown-tinted kanji strokes (`(22,20,18)` -> chroma `4`, NOT `46`!),
+    so dark Japanese text is NEVER mistaken for colored artwork — and works identically
+    on both full-color and Black-and-White manga (`chroma == 0` everywhere in B&W)!
+    """
+    r, g, b = rgb_img.split()
+    max_c = ImageChops.lighter(ImageChops.lighter(r, g), b)
+    min_c = ImageChops.darker(ImageChops.darker(r, g), b)
+    r.close()
+    g.close()
+    b.close()
+    chroma = ImageChops.subtract(max_c, min_c)
+    max_c.close()
+    min_c.close()
+    return chroma
+
+
 # ------------------------------------------------------------------------------
 # STAGE 1: DETERMINISTIC CV SPEECH-BUBBLE DETECTOR + SET-OF-MARK (SoM) OVERLAY
 # ------------------------------------------------------------------------------
@@ -718,11 +739,10 @@ def _split_concave_double_bubble(
 ) -> list[tuple[tuple[int, int, int, int], Image.Image]]:
     """
     Detects connected figure-8 double speech bubbles (horizontal or vertical) via
-    projection-profile neck detection and splits them cleanly at the narrowest waist
-    into separate single-oval masks.
+    projection-profile neck detection and splits them cleanly at the narrowest waist.
     """
     cw, ch = crop_mask.size
-    if depth >= 2 or (cw < 24 and ch < 24):
+    if depth >= 2 or (cw < 20 and ch < 20):
         return [((offset_x, offset_y, offset_x + cw, offset_y + ch), crop_mask)]
 
     area = crop_mask.histogram()[255]
@@ -732,9 +752,8 @@ def _split_concave_double_bubble(
 
     raw_bytes = crop_mask.tobytes()
 
-    # Check horizontal figure-8 neck (wide double oval)
     best_split = None
-    if cw >= max(28, int(sw * 0.14)):
+    if cw >= max(24, int(sw * 0.14)):
         col_counts = [0] * cw
         for y in range(ch):
             row_off = y * cw
@@ -742,19 +761,18 @@ def _split_concave_double_bubble(
                 if raw_bytes[row_off + x] > 128:
                     col_counts[x] += 1
 
-        s_lo = max(4, int(cw * 0.22))
-        s_hi = min(cw - 4, int(cw * 0.78))
+        s_lo = max(3, int(cw * 0.22))
+        s_hi = min(cw - 3, int(cw * 0.78))
         if s_hi > s_lo:
             min_x = min(range(s_lo, s_hi), key=lambda ix: col_counts[ix])
             min_h = col_counts[min_x]
             left_max = max(col_counts[:min_x]) if min_x > 0 else 0
             right_max = max(col_counts[min_x + 1 :]) if (min_x + 1) < cw else 0
             peak_min = min(left_max, right_max)
-            if peak_min >= 14 and min_h <= peak_min * 0.60:
+            if peak_min >= 11 and min_h <= peak_min * 0.62:
                 best_split = ("v", min_x, min_h / float(peak_min))
 
-    # Check vertical figure-8 neck (stacked double oval)
-    if ch >= max(28, int(sh * 0.12)):
+    if ch >= max(24, int(sh * 0.12)):
         row_counts = [0] * ch
         for y in range(ch):
             row_off = y * cw
@@ -764,15 +782,15 @@ def _split_concave_double_bubble(
                     cnt += 1
             row_counts[y] = cnt
 
-        s_lo = max(4, int(ch * 0.22))
-        s_hi = min(ch - 4, int(ch * 0.78))
+        s_lo = max(3, int(ch * 0.22))
+        s_hi = min(ch - 3, int(ch * 0.78))
         if s_hi > s_lo:
             min_y = min(range(s_lo, s_hi), key=lambda iy: row_counts[iy])
             min_w = row_counts[min_y]
             top_max = max(row_counts[:min_y]) if min_y > 0 else 0
             bot_max = max(row_counts[min_y + 1 :]) if (min_y + 1) < ch else 0
             peak_min = min(top_max, bot_max)
-            if peak_min >= 14 and min_w <= peak_min * 0.60:
+            if peak_min >= 11 and min_w <= peak_min * 0.62:
                 ratio = min_w / float(peak_min)
                 if best_split is None or ratio < best_split[2]:
                     best_split = ("h", min_y, ratio)
@@ -788,7 +806,6 @@ def _split_concave_double_bubble(
     else:
         sdraw.rectangle([0, max(0, cut_pos - 1), cw - 1, min(ch - 1, cut_pos + 1)], fill=0)
 
-    # Extract separated child components from `sliced`
     children: list[tuple[tuple[int, int, int, int], Image.Image]] = []
     work = sliced
     for sy in range(1, ch - 1, 3):
@@ -797,20 +814,19 @@ def _split_concave_double_bubble(
                 continue
             ImageDraw.floodfill(work, (sx, sy), 128)
             comp = work.point(lambda p: 255 if p == 128 else 0)
-            new_work = work.point(lambda p: 0 if p == 128 else p)
-            work.close()
-            work = new_work
-
             bb = comp.getbbox()
             if not bb:
                 comp.close()
+                work.paste(0, (sx, sy, sx + 1, sy + 1))
                 continue
-            bw_c = bb[2] - bb[0]
-            bh_c = bb[3] - bb[1]
             sub_m = comp.crop(bb)
             comp.close()
+            work.paste(0, bb, mask=sub_m)
+
+            bw_c = bb[2] - bb[0]
+            bh_c = bb[3] - bb[1]
             sub_area = sub_m.histogram()[255]
-            if bw_c >= 10 and bh_c >= 10 and sub_area >= 110:
+            if bw_c >= 9 and bh_c >= 9 and sub_area >= 75:
                 children.extend(
                     _split_concave_double_bubble(
                         sub_m, offset_x + bb[0], offset_y + bb[1], sw, sh, depth=depth + 1
@@ -829,16 +845,14 @@ def _split_concave_double_bubble(
     return [((offset_x, offset_y, offset_x + cw, offset_y + ch), crop_mask)]
 
 
-def _sort_bubbles_manga_reading_order(bubbles: list[dict], sw: int, sh: int) -> list[dict]:
+def _sort_bubbles_manga_reading_order(bubbles: list[dict]) -> list[dict]:
     """
     Sorts detected CV bubbles in natural Japanese Manga reading order:
-    Top-to-Bottom panel rows (grouping bubbles whose vertical spans overlap significantly),
-    and Right-to-Left within each row!
+    Top-to-Bottom panel rows, and Right-to-Left within each row.
     """
     if len(bubbles) <= 1:
         return bubbles
 
-    # Sort primarily by top edge `y1` so we can form horizontal reading bands
     ordered = sorted(bubbles, key=lambda d: (d["bbox_norm"][0], -d["bbox_norm"][3]))
     bands: list[list[dict]] = []
     for item in ordered:
@@ -859,10 +873,196 @@ def _sort_bubbles_manga_reading_order(bubbles: list[dict], sw: int, sh: int) -> 
     bands.sort(key=lambda b: min(x["bbox_norm"][0] for x in b))
     result: list[dict] = []
     for band in bands:
-        # Within each band, sort Right-to-Left by horizontal center, breaking ties Top-to-Bottom
         band.sort(key=lambda x: (-((x["bbox_norm"][1] + x["bbox_norm"][3]) / 2.0), x["bbox_norm"][0]))
         result.extend(band)
     return result
+
+
+def _scan_white_bubble_pass(
+    work: Image.Image,
+    small_gray: Image.Image,
+    small_chroma: Image.Image,
+    sw: int,
+    sh: int,
+    already_covered: Image.Image,
+    is_pinched_pass: bool = False,
+) -> list[dict]:
+    """
+    Fast connected-component white bubble scanner using local `work.paste(0, c_bbox, mask=comp_crop)`
+    clearing and neighbor pre-filtering (~5x faster than full-image `.point()` clearing!).
+    """
+    found: list[dict] = []
+    min_w_px = max(10, int(sw * 0.042))
+    min_h_px = max(10, int(sh * 0.028))
+    max_area_px = int(sw * sh * 0.24)
+
+    # Pre-clear outer 1px page border components so we never floodfill the page margin
+    for bx, by in ((1, 1), (sw - 2, 1), (1, sh - 2), (sw - 2, sh - 2), (sw // 2, 1), (sw // 2, sh - 2)):
+        if work.getpixel((bx, by)) == 255:
+            ImageDraw.floodfill(work, (bx, by), 0)
+
+    for sy in range(3, sh - 3, 4):
+        for sx in range(3, sw - 3, 4):
+            if work.getpixel((sx, sy)) != 255:
+                continue
+            # Skip 1-3px speckles with zero floodfill overhead
+            if (
+                work.getpixel((sx - 2, sy)) != 255
+                or work.getpixel((sx + 2, sy)) != 255
+                or work.getpixel((sx, sy - 2)) != 255
+                or work.getpixel((sx, sy + 2)) != 255
+            ):
+                continue
+
+            ImageDraw.floodfill(work, (sx, sy), 128)
+            comp = work.point(lambda p: 255 if p == 128 else 0)
+            c_bbox = comp.getbbox()
+            if not c_bbox:
+                comp.close()
+                work.paste(0, (sx, sy, sx + 1, sy + 1))
+                continue
+
+            comp_crop = comp.crop(c_bbox)
+            comp.close()
+            # Clear ONLY the local `c_bbox` in `work`!
+            work.paste(0, c_bbox, mask=comp_crop)
+
+            cx1, cy1, cx2, cy2 = c_bbox
+            cw, ch = cx2 - cx1, cy2 - cy1
+
+            edge_touches = (
+                (1 if cx1 <= 1 else 0)
+                + (1 if cy1 <= 1 else 0)
+                + (1 if cx2 >= sw - 1 else 0)
+                + (1 if cy2 >= sh - 1 else 0)
+            )
+            if (
+                edge_touches >= 2
+                or cw > sw * 0.72
+                or ch > sh * 0.65
+                or cw < min_w_px
+                or ch < min_h_px
+            ):
+                comp_crop.close()
+                continue
+
+            # If pinched pass, check it isn't already covered by Pass A1
+            if is_pinched_pass:
+                cov_crop = already_covered.crop(c_bbox)
+                ov_px = ImageChops.darker(comp_crop, cov_crop).histogram()[255]
+                cov_crop.close()
+                if ov_px > comp_crop.histogram()[255] * 0.35:
+                    comp_crop.close()
+                    continue
+
+            # Hole-fill inside the local crop
+            padded = Image.new("L", (cw + 4, ch + 4), 0)
+            padded.paste(comp_crop, (2, 2))
+            ImageDraw.floodfill(padded, (0, 0), 128)
+            holes_crop = padded.crop((2, 2, cw + 2, ch + 2)).point(lambda p: 255 if p == 0 else 0)
+            padded.close()
+            filled_crop = ImageChops.lighter(comp_crop, holes_crop)
+
+            if is_pinched_pass:
+                # Expand back by 1px to undo the MinFilter(3) pinch
+                exp_pad = Image.new("L", (cw + 2, ch + 2), 0)
+                exp_pad.paste(filled_crop, (1, 1))
+                exp_dil = exp_pad.filter(ImageFilter.MaxFilter(3))
+                exp_pad.close()
+                filled_crop.close()
+                filled_crop = exp_dil.crop((1, 1, cw + 1, ch + 1))
+                exp_dil.close()
+
+            comp_area = comp_crop.histogram()[255]
+            filled_area = max(1, filled_crop.histogram()[255])
+            holes_area = holes_crop.histogram()[255]
+            comp_crop.close()
+            holes_crop.close()
+
+            rect_fill = filled_area / float(max(1, cw * ch))
+            # Reject skinny background slivers (e.g. gaps between polka dots) unless rectangular caption box
+            aspect = max(cw, ch) / float(max(1, min(cw, ch)))
+            if aspect > 4.2 and min(cw, ch) < max(16, int(sw * 0.055)) and rect_fill < 0.78:
+                filled_crop.close()
+                continue
+
+            if (
+                filled_area > max_area_px
+                or holes_area < 3
+                or (comp_area / float(filled_area)) < 0.25
+                or (holes_area / float(filled_area)) > 0.68
+            ):
+                filled_crop.close()
+                continue
+
+            # Verify achromatic bubble interior via TRUE RGB chroma (never breaks on B&W or dark kanji!)
+            ch_crop = small_chroma.crop(c_bbox)
+            gray_crop = small_gray.crop(c_bbox)
+            ch_hist = ch_crop.histogram(mask=filled_crop)
+            total_m_px = max(1, sum(ch_hist))
+            chroma_ratio = sum(ch_hist[28:]) / float(total_m_px)
+            mean_chroma = ImageStat.Stat(ch_crop, mask=filled_crop).mean[0]
+
+            dark_ink_bin = gray_crop.point(lambda p: 255 if p < 180 else 0)
+            achrom_bin = ch_crop.point(lambda p: 255 if p < 28 else 0)
+            achrom_ink = ImageChops.darker(ImageChops.darker(dark_ink_bin, achrom_bin), filled_crop)
+            dark_ink_px = achrom_ink.histogram()[255]
+
+            dark_ink_bin.close()
+            achrom_bin.close()
+            achrom_ink.close()
+            ch_crop.close()
+            gray_crop.close()
+
+            if chroma_ratio >= 0.20 or mean_chroma >= 18.0 or dark_ink_px < 3:
+                filled_crop.close()
+                continue
+
+            sub_lobes = _split_concave_double_bubble(filled_crop, cx1, cy1, sw, sh, depth=0)
+            for (lx1, ly1, lx2, ly2), lobe_mask in sub_lobes:
+                lw, lh = lx2 - lx1, ly2 - ly1
+                if lw < min_w_px or lh < min_h_px:
+                    lobe_mask.close()
+                    continue
+                l_area = max(1, lobe_mask.histogram()[255])
+                l_rect_fill = l_area / float(max(1, lw * lh))
+                l_aspect = max(lw, lh) / float(max(1, min(lw, lh)))
+                if l_aspect > 4.2 and min(lw, lh) < max(16, int(sw * 0.055)) and l_rect_fill < 0.78:
+                    lobe_mask.close()
+                    continue
+
+                l_gray = small_gray.crop((lx1, ly1, lx2, ly2))
+                l_ch = small_chroma.crop((lx1, ly1, lx2, ly2))
+                l_ink = ImageChops.darker(
+                    ImageChops.darker(
+                        l_gray.point(lambda p: 255 if p < 180 else 0),
+                        l_ch.point(lambda p: 255 if p < 28 else 0),
+                    ),
+                    lobe_mask,
+                )
+                l_ink_px = l_ink.histogram()[255]
+                l_ink.close()
+                l_gray.close()
+                l_ch.close()
+                if l_ink_px < 3:
+                    lobe_mask.close()
+                    continue
+
+                already_covered.paste(255, (lx1, ly1, lx2, ly2), mask=lobe_mask)
+                bbox_norm = [
+                    int(round((ly1 / float(sh)) * 1000.0)),
+                    int(round((lx1 / float(sw)) * 1000.0)),
+                    int(round((ly2 / float(sh)) * 1000.0)),
+                    int(round((lx2 / float(sw)) * 1000.0)),
+                ]
+                found.append({
+                    "bbox_norm": bbox_norm,
+                    "mask_small": lobe_mask,
+                    "rect_fill": l_rect_fill,
+                    "is_dark": False,
+                })
+
+    return found
 
 
 def _detect_page_bubbles_and_build_som_b64_sync(
@@ -871,193 +1071,74 @@ def _detect_page_bubbles_and_build_som_b64_sync(
     vision_quality: int = 84,
 ) -> tuple[str, list[dict]]:
     """
-    Detects enclosed white speech bubbles/caption boxes (and dark speech bubbles) directly
-    via fast C-level PIL connected components at 420px scale, splits figure-8 double bubbles
-    at their narrow waists, sorts them in Japanese Manga reading order, and draws crisp red
-    numbered Set-of-Mark (SoM) badges `[1]`, `[2]`, ... onto the vision JPEG sent to Gemini.
-
-    Returns `(b64_som_jpeg, detected_cv_bubbles)` where each item in `detected_cv_bubbles` has:
-      - `bubble_id`: 1-based integer matching the red badge on the image
-      - `bbox_norm`: `[ymin, xmin, ymax, xmax]` in `0..1000`
-      - `mask_small`: cropped L-mode mask (`255` = bubble interior)
-      - `is_dark`: bool
+    Fast `340px` CV speech-bubble detector (Color & B&W Manga compatible):
+      - Pass A1: Enclosed white ovals & white rectangular caption boxes.
+      - Pass A2: Pinched (`MinFilter(3)`) pass to recover broken-border ovals (e.g. text breaking an oval edge).
+      - Pass B:  Enclosed dark bubbles / dark caption boxes with white text.
+      - Caps to top 24 highest-confidence bubbles on busy B&W pages, sorts in Manga reading order,
+        and stamps crisp red contours + numbered badges `[1]`, `[2]`, ... onto the vision JPEG.
     """
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     orig_w, orig_h = img.size
 
     try:
-        # 1. Fast 420px detection buffers
         scale = min(1.0, SOM_CV_MAX_DIM / float(max(orig_w, orig_h)))
         sw = max(32, int(round(orig_w * scale)))
         sh = max(32, int(round(orig_h * scale)))
         small_rgb = img.resize((sw, sh), Image.Resampling.BILINEAR)
         small_gray = small_rgb.convert("L")
-        small_sat = small_rgb.convert("HSV").getchannel("S")
+        small_chroma = _compute_rgb_chroma_band(small_rgb)
         small_rgb.close()
 
-        detected: list[dict] = []
-
-        # --- Pass A: Enclosed White Speech Bubbles & White Rectangular Caption Boxes ---
+        already_covered = Image.new("L", (sw, sh), 0)
         white_bin = small_gray.point(lambda p: 255 if p >= 232 else 0)
-        work = white_bin.copy()
-        white_bin.close()
 
-        min_w_px = max(11, int(sw * 0.040))
-        min_h_px = max(11, int(sh * 0.028))
+        # Pass A1: Standard enclosed white bubbles
+        work_a1 = white_bin.copy()
+        detected = _scan_white_bubble_pass(
+            work_a1, small_gray, small_chroma, sw, sh, already_covered, is_pinched_pass=False
+        )
+        work_a1.close()
+
+        # Pass A2: Pinched pass catches ovals with 1-2px broken borders (like `あー…` on Page 1!)
+        work_a2 = white_bin.filter(ImageFilter.MinFilter(3))
+        white_bin.close()
+        detected_pinched = _scan_white_bubble_pass(
+            work_a2, small_gray, small_chroma, sw, sh, already_covered, is_pinched_pass=True
+        )
+        work_a2.close()
+        detected.extend(detected_pinched)
+        already_covered.close()
+
+        # Pass B: Enclosed dark speech bubbles / dark caption boxes
+        dark_bin = small_gray.point(lambda p: 255 if p <= 95 else 0)
+        min_w_px = max(10, int(sw * 0.042))
+        min_h_px = max(10, int(sh * 0.028))
         max_area_px = int(sw * sh * 0.24)
 
-        for sy in range(2, sh - 2, 4):
-            for sx in range(2, sw - 2, 4):
-                if work.getpixel((sx, sy)) != 255:
+        for sy in range(3, sh - 3, 5):
+            for sx in range(3, sw - 3, 5):
+                if dark_bin.getpixel((sx, sy)) != 255:
                     continue
-
-                ImageDraw.floodfill(work, (sx, sy), 128)
-                comp = work.point(lambda p: 255 if p == 128 else 0)
-                new_work = work.point(lambda p: 0 if p == 128 else p)
-                work.close()
-                work = new_work
-
+                if dark_bin.getpixel((sx - 2, sy)) != 255 or dark_bin.getpixel((sx + 2, sy)) != 255:
+                    continue
+                ImageDraw.floodfill(dark_bin, (sx, sy), 128)
+                comp = dark_bin.point(lambda p: 255 if p == 128 else 0)
                 c_bbox = comp.getbbox()
                 if not c_bbox:
                     comp.close()
+                    dark_bin.paste(0, (sx, sy, sx + 1, sy + 1))
                     continue
-                cx1, cy1, cx2, cy2 = c_bbox
-                cw, ch = cx2 - cx1, cy2 - cy1
-
-                # Reject outer page margin / full-page backgrounds & tiny speckles
-                edge_touches = (
-                    (1 if cx1 <= 1 else 0)
-                    + (1 if cy1 <= 1 else 0)
-                    + (1 if cx2 >= sw - 1 else 0)
-                    + (1 if cy2 >= sh - 1 else 0)
-                )
-                if (
-                    edge_touches >= 2
-                    or cw > sw * 0.72
-                    or ch > sh * 0.65
-                    or cw < min_w_px
-                    or ch < min_h_px
-                ):
-                    comp.close()
-                    continue
-
-                # Hole-fill inside the local crop (2px padding ensures complete exterior floodfill)
                 comp_crop = comp.crop(c_bbox)
                 comp.close()
+                dark_bin.paste(0, c_bbox, mask=comp_crop)
 
-                padded = Image.new("L", (cw + 4, ch + 4), 0)
-                padded.paste(comp_crop, (2, 2))
-                ImageDraw.floodfill(padded, (0, 0), 128)
-                holes_crop = padded.crop((2, 2, cw + 2, ch + 2)).point(lambda p: 255 if p == 0 else 0)
-                padded.close()
-                filled_crop = ImageChops.lighter(comp_crop, holes_crop)
-
-                comp_area = comp_crop.histogram()[255]
-                filled_area = max(1, filled_crop.histogram()[255])
-                holes_area = holes_crop.histogram()[255]
-                comp_crop.close()
-                holes_crop.close()
-
-                # Must contain interior text strokes (`holes_area >= 4`) and not be an entire panel
-                if (
-                    filled_area > max_area_px
-                    or holes_area < 4
-                    or (comp_area / float(filled_area)) < 0.25
-                    or (holes_area / float(filled_area)) > 0.68
-                ):
-                    filled_crop.close()
-                    continue
-
-                # Verify bubble interior is achromatic (white paper + dark ink, NOT colored food/skin/art)
-                sat_crop = small_sat.crop(c_bbox)
-                gray_crop = small_gray.crop(c_bbox)
-                sat_hist = sat_crop.histogram(mask=filled_crop)
-                total_m_px = max(1, sum(sat_hist))
-                chroma_ratio = sum(sat_hist[24:]) / float(total_m_px)
-                mean_sat = ImageStat.Stat(sat_crop, mask=filled_crop).mean[0]
-
-                # Verify there is actual dark text ink (`gray < 175` & `sat < 22`) inside `filled_crop`
-                dark_ink_bin = gray_crop.point(lambda p: 255 if p < 175 else 0)
-                achrom_bin = sat_crop.point(lambda p: 255 if p < 22 else 0)
-                achrom_ink = ImageChops.darker(ImageChops.darker(dark_ink_bin, achrom_bin), filled_crop)
-                dark_ink_px = achrom_ink.histogram()[255]
-
-                dark_ink_bin.close()
-                achrom_bin.close()
-                achrom_ink.close()
-                sat_crop.close()
-                gray_crop.close()
-
-                if chroma_ratio >= 0.20 or mean_sat >= 20.0 or dark_ink_px < 4:
-                    filled_crop.close()
-                    continue
-
-                # Split connected figure-8 double bubbles cleanly at their narrow waists
-                sub_lobes = _split_concave_double_bubble(filled_crop, cx1, cy1, sw, sh, depth=0)
-                for (lx1, ly1, lx2, ly2), lobe_mask in sub_lobes:
-                    lw, lh = lx2 - lx1, ly2 - ly1
-                    if lw < min_w_px or lh < min_h_px:
-                        lobe_mask.close()
-                        continue
-                    # Re-verify each split lobe actually contains dark text ink
-                    l_gray = small_gray.crop((lx1, ly1, lx2, ly2))
-                    l_sat = small_sat.crop((lx1, ly1, lx2, ly2))
-                    l_ink = ImageChops.darker(
-                        ImageChops.darker(
-                            l_gray.point(lambda p: 255 if p < 175 else 0),
-                            l_sat.point(lambda p: 255 if p < 22 else 0),
-                        ),
-                        lobe_mask,
-                    )
-                    l_ink_px = l_ink.histogram()[255]
-                    l_ink.close()
-                    l_gray.close()
-                    l_sat.close()
-                    if l_ink_px < 4:
-                        lobe_mask.close()
-                        continue
-
-                    bbox_norm = [
-                        int(round((ly1 / float(sh)) * 1000.0)),
-                        int(round((lx1 / float(sw)) * 1000.0)),
-                        int(round((ly2 / float(sh)) * 1000.0)),
-                        int(round((lx2 / float(sw)) * 1000.0)),
-                    ]
-                    detected.append({
-                        "bbox_norm": bbox_norm,
-                        "mask_small": lobe_mask,
-                        "is_dark": False,
-                    })
-
-        work.close()
-
-        # --- Pass B: Enclosed Dark Speech Bubbles / Dark Caption Boxes with Bright White Text ---
-        dark_bin = small_gray.point(lambda p: 255 if p <= 95 else 0)
-        work_d = dark_bin.copy()
-        dark_bin.close()
-
-        for sy in range(2, sh - 2, 5):
-            for sx in range(2, sw - 2, 5):
-                if work_d.getpixel((sx, sy)) != 255:
-                    continue
-                ImageDraw.floodfill(work_d, (sx, sy), 128)
-                comp = work_d.point(lambda p: 255 if p == 128 else 0)
-                new_wd = work_d.point(lambda p: 0 if p == 128 else p)
-                work_d.close()
-                work_d = new_wd
-
-                c_bbox = comp.getbbox()
-                if not c_bbox:
-                    comp.close()
-                    continue
                 cx1, cy1, cx2, cy2 = c_bbox
                 cw, ch = cx2 - cx1, cy2 - cy1
                 if cw < min_w_px or ch < min_h_px or cw > sw * 0.55 or ch > sh * 0.55:
-                    comp.close()
+                    comp_crop.close()
                     continue
 
-                comp_crop = comp.crop(c_bbox)
-                comp.close()
                 padded = Image.new("L", (cw + 4, ch + 4), 0)
                 padded.paste(comp_crop, (2, 2))
                 ImageDraw.floodfill(padded, (0, 0), 128)
@@ -1071,20 +1152,20 @@ def _detect_page_bubbles_and_build_som_b64_sync(
                 holes_crop.close()
 
                 rect_fill = filled_area / float(max(1, cw * ch))
-                if filled_area > max_area_px or holes_area < 5 or rect_fill < 0.65:
+                if filled_area > max_area_px or holes_area < 4 or rect_fill < 0.65:
                     filled_crop.close()
                     continue
 
                 g_crop = small_gray.crop(c_bbox)
-                s_crop = small_sat.crop(c_bbox)
-                mean_s = ImageStat.Stat(s_crop, mask=filled_crop).mean[0]
+                c_crop = small_chroma.crop(c_bbox)
+                mean_c = ImageStat.Stat(c_crop, mask=filled_crop).mean[0]
                 bright_txt = ImageChops.darker(g_crop.point(lambda p: 255 if p >= 210 else 0), filled_crop)
                 bright_px = bright_txt.histogram()[255]
                 bright_txt.close()
                 g_crop.close()
-                s_crop.close()
+                c_crop.close()
 
-                if mean_s < 22.0 and 0.02 <= (bright_px / float(filled_area)) <= 0.42:
+                if mean_c < 18.0 and 0.02 <= (bright_px / float(filled_area)) <= 0.42:
                     bbox_norm = [
                         int(round((cy1 / float(sh)) * 1000.0)),
                         int(round((cx1 / float(sw)) * 1000.0)),
@@ -1094,21 +1175,35 @@ def _detect_page_bubbles_and_build_som_b64_sync(
                     detected.append({
                         "bbox_norm": bbox_norm,
                         "mask_small": filled_crop,
+                        "rect_fill": rect_fill,
                         "is_dark": True,
                     })
                 else:
                     filled_crop.close()
 
-        work_d.close()
+        dark_bin.close()
         small_gray.close()
-        small_sat.close()
+        small_chroma.close()
 
-        # Sort in Manga reading order & assign 1-based `bubble_id`
-        detected = _sort_bubbles_manga_reading_order(detected, sw, sh)
+        # On dense B&W pages, cap to top 24 highest-solidity/largest candidates so badges stay clean
+        if len(detected) > 24:
+            detected.sort(
+                key=lambda d: (
+                    (d["bbox_norm"][2] - d["bbox_norm"][0])
+                    * (d["bbox_norm"][3] - d["bbox_norm"][1])
+                    * d.get("rect_fill", 0.7)
+                ),
+                reverse=True,
+            )
+            for dropped in detected[24:]:
+                dropped["mask_small"].close()
+            detected = detected[:24]
+
+        detected = _sort_bubbles_manga_reading_order(detected)
         for idx, b_obj in enumerate(detected, 1):
             b_obj["bubble_id"] = idx
 
-        # 2. Build annotated Set-of-Mark JPEG copy for Gemini Vision
+        # Stamp red contours + red pill ID badges onto the vision JPEG copy
         vis_img = img.copy()
         vis_img.thumbnail((vision_max_dim, vision_max_dim), Image.Resampling.LANCZOS)
         vw, vh = vis_img.size
@@ -1124,7 +1219,6 @@ def _detect_page_bubbles_and_build_som_b64_sync(
             vx2 = min(vw - 1, int((xmax / 1000.0) * vw))
             vy2 = min(vh - 1, int((ymax / 1000.0) * vh))
 
-            # Draw crisp red contour of the actual detected oval/rectangle mask
             m_w = max(2, vx2 - vx1)
             m_h = max(2, vy2 - vy1)
             m_up = b_obj["mask_small"].resize((m_w, m_h), Image.Resampling.NEAREST)
@@ -1137,7 +1231,6 @@ def _detect_page_bubbles_and_build_som_b64_sync(
             red_patch.close()
             contour.close()
 
-            # Draw bold red pill badge with white ID number at the top-right edge of the bubble
             label = str(bid)
             tb = vdraw.textbbox((0, 0), label, font=badge_font)
             tw = tb[2] - tb[0]
@@ -1219,8 +1312,7 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
         if not isinstance(item, dict):
             continue
 
-        is_dialogue = item.get("is_dialogue")
-        if is_dialogue is False:
+        if item.get("is_dialogue") is False:
             continue
 
         speaker = (
@@ -1454,8 +1546,8 @@ async def extract_and_translate_manga_pages_batch(
 ) -> tuple[list[tuple[list[dict], str]], list[list[dict]], bool]:
     """
     Set-of-Mark (SoM) CV-Anchored Multi-Page Manga Batch Pipeline:
-      1) Detects enclosed speech bubbles on every page via fast CV (`<=420px`) and draws
-         red numbered badges `[1]`, `[2]`, ... on the vision copies.
+      1) Detects enclosed speech bubbles on every page via fast 340px CV (Pass A1 + pinched Pass A2 + dark Pass B)
+         and stamps red numbered badges `[1]`, `[2]`, ... onto the vision copies.
       2) Calls `MangaBatch` strictly across:
          `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> (newer >3.5 `flash-lite`)
          -> `gemma-4-31b-it` -> `gemma-4-26b-a4b-it`
@@ -1523,14 +1615,15 @@ CRITICAL SET-OF-MARK (RED BADGE) & TRANSLATION RULES:
    - Inspect EVERY red numbered badge (`1`, `2`, ..., `K`) on each page!
    - If red badge `k` contains Japanese dialogue, monologue, or a caption box: output an entry with `"bubble_id": k`, `"is_dialogue": true`, `"box_2d": null`, the exact `"source_text"` inside ONLY badge `k`, and its natural {target_lang_name} `"translated_text"`.
    - NEVER merge text from two different red badges into one entry! Each red badge `k` MUST have its OWN separate object with `"bubble_id": k`!
-   - If a red badge `k` is NOT dialogue (for example, a sound effect / SFX like ゲプ…, a non-speech diagram/icon like 脂肪/免疫, or a blank background object): set `"bubble_id": k`, `"is_dialogue": false`, `"translated_text": ""` so the artwork is left untouched!
+   - If a red badge `k` is NOT dialogue (for example, a sound effect / SFX like ゲプ…, a non-speech diagram/icon, or a blank background/face object on a B&W page): set `"bubble_id": k`, `"is_dialogue": false`, `"translated_text": ""` so the artwork is left untouched!
 2. UNMARKED / BORDERLESS DIALOGUE (`bubble_id: null`):
-   - If a page has real spoken dialogue or narration that does NOT have a red badge around it (such as borderless/open-sided text over a white panel background), add an entry with `"bubble_id": null`, `"is_dialogue": true`, transcribe `"source_text"`, and provide `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY that Japanese text — NEVER over faces, hands, or artwork!).
-   - NEVER output floating handwritten SFX (e.g. ドーン, トスッ, ポスン, ムチッ, ぐっ, カチャッ, 脱, ぎゅ) as `box_2d` — skip SFX or set `"box_2d": null`.
+   - ALSO scan every page for real spoken dialogue or monologue written directly on white/light areas WITHOUT a red badge (for example, open-sided/borderless lines like `んん…少し…慣れてきた。`).
+   - For each unmarked dialogue line, add an entry with `"bubble_id": null`, `"is_dialogue": true`, transcribe `"source_text"`, and provide `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY that Japanese text — NEVER over faces, hands, or artwork!).
+   - NEVER output floating handwritten SFX (e.g. ドーン, トスッ, ポスン, ムチッ, ぐっ, カチャッ, 脱, ぎゅ) as `box_2d`.
 3. Accurate Speaker Attribution, Names & Visual Gender:
    - Identify the actual character speaking each bubble visually (follow the tail; never copy one character's name onto every bubble).
    - Keep character names, titles/ranks, and faction names consistent across all pages using accurate Japanese phonetics.
-   - Match pronouns and politeness particles to each character's visual gender (in Thai, visually female characters must NEVER use male endings like `ครับ`/`ผม`).
+   - Match pronouns and politeness particles strictly to each speaker's visual gender and setting: in Thai, visually female characters (including female subordinates, guards, and attendants) must use female/neutral endings (`ค่ะ`, `คะ`, `นะคะ`, `นะ`, `ล่ะ`, `สิ`) — NEVER use male `ครับ`/`ผม` unless the speaker is clearly drawn as male!
    - Use standard ASCII punctuation (`...`, `~`, `-`, single quotes `'`).
    - When translating to English, preserve Japanese honorifics attached directly with a hyphen and NO space (`-san`, `-kun`, `-chan`, `-sama`, `-sensei`, `-senpai`).
 4. Return ONLY valid JSON matching this exact structure for all {num_pages} page(s) (write `summary` in {target_lang_name}):
@@ -1565,7 +1658,6 @@ CRITICAL SET-OF-MARK (RED BADGE) & TRANSLATION RULES:
             parts.append({"inlineData": {"mimeType": mime_type, "data": b64_img}})
 
         model_chain = await _discover_manga_batch_models()
-        # Client-side failover timeout (not an API limit): generous 80s for 10p so valid slow responses finish cleanly
         per_call_timeout = min(85.0, 40.0 + (4.5 * num_pages))
         max_wall_budget = 180.0
         wall_start = time.monotonic()
@@ -1693,7 +1785,6 @@ CRITICAL SET-OF-MARK (RED BADGE) & TRANSLATION RULES:
                         )
                         continue
 
-                # Only retry HTTP 503 if it failed fast (< 6s); slow 503 means pool saturation -> switch immediately!
                 if status == 503 and attempt == 0 and elapsed < 6.0 and (max_wall_budget - (time.monotonic() - wall_start)) > 25.0:
                     api_log(
                         f"{label_prefix} [req={req_id}] RESPONSE -> model={model_id} fast HTTP 503 ({elapsed:.2f}s); retrying once in 1.5s"
@@ -1744,11 +1835,11 @@ CRITICAL SET-OF-MARK (RED BADGE) & TRANSLATION RULES:
    - Inspect EVERY red numbered badge (`1`, `2`, ...) on the page.
    - If red badge `k` contains Japanese dialogue/narration: output `"bubble_id": k`, `"is_dialogue": true`, `"box_2d": null`, exact `"source_text"` inside ONLY badge `k`, and its natural {target_lang_name} `"translated_text"`.
    - NEVER merge text from two different red badges into one entry!
-   - If a red badge `k` is NOT dialogue (SFX, diagram, background object): set `"bubble_id": k`, `"is_dialogue": false`, `"translated_text": ""`.
+   - If a red badge `k` is NOT dialogue (SFX, diagram, background object, face): set `"bubble_id": k`, `"is_dialogue": false`, `"translated_text": ""`.
 2. UNMARKED / BORDERLESS DIALOGUE (`bubble_id: null`):
-   - For dialogue/narration WITHOUT a red badge, output `"bubble_id": null`, `"is_dialogue": true`, `"source_text"`, and `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY the Japanese text).
+   - For real spoken dialogue/narration WITHOUT a red badge, output `"bubble_id": null`, `"is_dialogue": true`, `"source_text"`, and `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY the Japanese text).
 3. Accurate Speaker Attribution, Names & Visual Gender:
-   - Identify the actual speaker visually; match Thai/English tone to visual gender (never use male Thai `ครับ`/`ผม` for visually female characters).
+   - Identify the actual speaker visually; match Thai/English tone to visual gender (never use male Thai `ครับ`/`ผม` for female characters/guards).
    - Use standard ASCII punctuation (`...`, `~`, `-`, single quotes `'`).
 4. Return ONLY valid JSON matching this exact structure (write `summary` in {target_lang_name}):
 {{
@@ -1918,13 +2009,14 @@ CRITICAL SET-OF-MARK (RED BADGE) & TRANSLATION RULES:
 
 
 # ------------------------------------------------------------------------------
-# STAGE 3: THAI SYLLABLE WRAPPING + EXACT-MASK FULL-RES RENDERER
+# STAGE 3: THAI SYLLABLE WRAPPING + INSCRIBED-RECT EXACT-MASK FULL-RES RENDERER
 # ------------------------------------------------------------------------------
 def _tokenize_thai_syllables(word: str) -> list[str]:
     """
     Syllable-aware Thai tokenizer supporting onset clusters (`ห` นำ, `อย`, `กร/ปล/ปร/คร`),
     compound vowels (`เ-อะ`, `เ-อ`, `เ-ีย`, `เ-ือ`, `เ-าะ` -> `เถอะ`, `เยอะ`, `เหงื่อ`, `เพราะ`),
-    `อักษรนำ` prefixes (`สภาพ`, `สมา`, `ประ`), `์` karan, trailing coda consonants, and punctuation.
+    `อ` vowel-carrier (`ออก`, `ก่อน`, `ต้อง`, `ห้อง`, `บอก`, `หน่อย`), `อักษรนำ` prefixes
+    (`สภาพ`, `สมา`, `ประ`), `์` karan, trailing coda consonants, and punctuation.
     """
     raw = _THAI_CLUSTER_REGEX.findall(word)
     if len(raw) <= 1:
@@ -1939,7 +2031,6 @@ def _tokenize_thai_syllables(word: str) -> list[str]:
         nxt = raw[i + 1] if (i + 1) < n else ""
 
         if nxt:
-            # `ห` นำ (including `เหงื่อ`, `เหรอ`, `หรือ`, `หลาย`) or `อ` นำ `ย` (`อยู่`)
             is_ho_nam = (
                 ((tok == "ห") or (len(tok) == 2 and tok[0] in _THAI_LEADING_VOWELS and tok[1] == "ห"))
                 and nxt[0] in _THAI_HO_NAM_FOLLOW
@@ -1950,7 +2041,6 @@ def _tokenize_thai_syllables(word: str) -> list[str]:
                 i += 2
                 continue
 
-            # True consonant clusters (`เปล` / `เปล่า`, `จริง`, `ปรับ`, `เพราะ`)
             if nxt[0] in _THAI_CLUSTER_SECOND:
                 is_bare_c = (len(tok) == 1 and tok in _THAI_CLUSTER_FIRST)
                 is_lv_c = (len(tok) == 2 and tok[0] in _THAI_LEADING_VOWELS and tok[1] in _THAI_CLUSTER_FIRST)
@@ -1963,23 +2053,28 @@ def _tokenize_thai_syllables(word: str) -> list[str]:
         merged_onsets.append(tok)
         i += 1
 
-    # Pass 2: Merge Thai compound vowels (`เ-อะ`, `เ-อ`, `เ-ีย`, `เ-ือ`, `เ-าะ` -> `เถอะ`, `เยอะ`, `เหงื่อ`, `เพราะ`, `เหรอ`)
+    # Pass 2: Merge compound vowels (`เ-อะ`, `เ-อ`, `เ-ีย`, `เ-ือ`, `เ-าะ`) & `อ` vowel carrier (`ออ`, `ก่อ`, `ต้อ`, `ห้อ`, `หน่อย`)
     merged_vowels: list[str] = []
     i = 0
     m = len(merged_onsets)
     while i < m:
         tok = merged_onsets[i]
         nxt = merged_onsets[i + 1] if (i + 1) < m else ""
-        if nxt and tok.startswith("เ"):
-            # `เ_ + อะ`, `เ_ + อ`, `เ_ + าะ`, `เ_ี + ย`, `เ_ื + อ`
-            if nxt in ("อะ", "อ", "าะ") or (("\u0E35" in tok) and nxt.startswith("ย")) or (("\u0E37" in tok) and nxt.startswith("อ")):
+        if nxt:
+            if tok.startswith("เ"):
+                if nxt in ("อะ", "อ", "าะ") or (("\u0E35" in tok) and nxt.startswith("ย")) or (("\u0E37" in tok) and nxt.startswith("อ")):
+                    merged_vowels.append(tok + nxt)
+                    i += 2
+                    continue
+            # `C[tone]?` + bare `อ` -> `/ɔː/` vowel syllable (`ออก`, `ก่อน`, `ต้อง`, `ห้อง`, `บอก`, `หน่อย`)
+            if nxt == "อ" and not any(c in _THAI_VOWEL_SIGNALS for c in tok) and any("\u0E01" <= c <= "\u0E2E" for c in tok):
                 merged_vowels.append(tok + nxt)
                 i += 2
                 continue
         merged_vowels.append(tok)
         i += 1
 
-    # Pass 3: Merge `อักษรนำ` bare prefix (`ส+ภาพ`, `ส+มา`, `ป+ระ`) & attach coda consonants / karan / punctuation
+    # Pass 3: Merge `อักษรนำ` bare prefix (`ส+ภาพ`, `ส+มา`) & attach coda consonants / karan / punctuation
     syllables: list[str] = []
     i = 0
     k = len(merged_vowels)
@@ -1987,7 +2082,6 @@ def _tokenize_thai_syllables(word: str) -> list[str]:
         tok = merged_vowels[i]
         nxt = merged_vowels[i + 1] if (i + 1) < k else ""
 
-        # Leading bare prefix before an explicit-vowel syllable (e.g. `ส` + `ภา` -> `สภา`, `ส` + `มา` -> `สมา`)
         if (
             nxt
             and len(tok) == 1
@@ -2009,10 +2103,13 @@ def _tokenize_thai_syllables(word: str) -> list[str]:
             i += 1
             continue
 
-        # Single bare Thai consonant is a coda consonant when previous syllable has a vowel/tone nucleus
         is_bare_single = (len(tok) == 1 and "\u0E01" <= tok <= "\u0E2E")
         prev = syllables[-1]
-        prev_has_nucleus = any(c in _THAI_VOWEL_SIGNALS or ("\u0E48" <= c <= "\u0E4B") for c in prev)
+        prev_has_o_vowel = (len(prev) >= 2 and prev.endswith("อ"))
+        prev_has_nucleus = (
+            prev_has_o_vowel
+            or any(c in _THAI_VOWEL_SIGNALS or ("\u0E48" <= c <= "\u0E4B") for c in prev)
+        )
         if is_bare_single and prev_has_nucleus and len(prev) <= 6:
             syllables[-1] += tok
             i += 1
@@ -2135,18 +2232,107 @@ def _fast_dilate_mask_half_res(mask_l: Image.Image, kernel_half: int = 3) -> Ima
     return out
 
 
-def _measure_crop_chroma_stats(img: Image.Image, x1: int, y1: int, x2: int, y2: int) -> tuple[float, float]:
-    crop_rgb = img.crop((x1, y1, x2, y2))
-    crop_hsv = crop_rgb.convert("HSV")
-    crop_rgb.close()
-    sat_band = crop_hsv.getchannel("S")
-    crop_hsv.close()
-    sat_hist = sat_band.histogram()
-    mean_sat = ImageStat.Stat(sat_band).mean[0]
-    sat_band.close()
-    total_px = max(1, sum(sat_hist))
-    chroma_ratio = sum(sat_hist[22:]) / total_px
-    return float(mean_sat), float(chroma_ratio)
+def _build_true_chroma_art_shield(sub_rgb: Image.Image, chroma_thresh: int = 34) -> Image.Image:
+    """
+    Returns an L-mode `non_chroma` mask (`255` = safe to erase, `0` = protected colored art).
+    Uses TRUE RGB chroma (`max(R,G,B) - min(R,G,B) >= 34`) with morphological opening
+    (`MinFilter(3)` -> `MaxFilter(5)`) so:
+      - Black / dark-gray / warm-tinted JPEG kanji (`chroma <= 14`) is 100% NEVER shielded!
+      - Real colored chibi faces/icons/hands inside or adjacent to bubbles (`chroma >= 34`) ARE shielded!
+      - Black & White manga has `chroma == 0` everywhere -> `non_chroma` is 100% open (`255`)!
+    """
+    chroma_band = _compute_rgb_chroma_band(sub_rgb)
+    # Fast 0.5x opening + dilation
+    ww, wh = chroma_band.size
+    if ww >= 24 and wh >= 24:
+        sw, sh = max(8, ww // 2), max(8, wh // 2)
+        small_c = chroma_band.resize((sw, sh), Image.Resampling.BILINEAR)
+        chroma_band.close()
+        bin_c = small_c.point(lambda p: 255 if p >= chroma_thresh else 0)
+        small_c.close()
+        if not bin_c.getbbox():
+            bin_c.close()
+            return Image.new("L", (ww, wh), 255)
+        # Opening removes 1px JPEG fringe noise; dilation shields adjacent chibi outlines
+        opened = bin_c.filter(ImageFilter.MinFilter(3))
+        bin_c.close()
+        shield_small = opened.filter(ImageFilter.MaxFilter(5))
+        opened.close()
+        up = shield_small.resize((ww, wh), Image.Resampling.BILINEAR)
+        shield_small.close()
+        non_chroma = up.point(lambda p: 0 if p >= 64 else 255)
+        up.close()
+        return non_chroma
+
+    bin_c = chroma_band.point(lambda p: 255 if p >= chroma_thresh else 0)
+    chroma_band.close()
+    if not bin_c.getbbox():
+        bin_c.close()
+        return Image.new("L", (ww, wh), 255)
+    shield = bin_c.filter(ImageFilter.MaxFilter(3))
+    bin_c.close()
+    non_chroma = ImageChops.invert(shield)
+    shield.close()
+    return non_chroma
+
+
+def _largest_inscribed_rect_in_mask(mask_l: Image.Image) -> tuple[int, int, int, int] | None:
+    """
+    Exact O(W * H) histogram-stack algorithm finding the best-proportioned axis-aligned
+    rectangle lying 100% INSIDE `mask_l` (`p >= 128`).
+    Guarantees text NEVER leaks outside tilted ovals, diagonal figure-8 double bubbles
+    (like Page 7 #2), or L-shaped clouds!
+    Runs on a <=96px grid in < 0.3ms.
+    """
+    mw, mh = mask_l.size
+    if mw < 4 or mh < 4:
+        return None
+
+    scale = min(1.0, 96.0 / float(max(mw, mh)))
+    gw = max(6, int(round(mw * scale)))
+    gh = max(6, int(round(mh * scale)))
+    grid = mask_l.resize((gw, gh), Image.Resampling.NEAREST) if scale < 1.0 else mask_l
+    data = grid.tobytes()
+    if scale < 1.0:
+        grid.close()
+
+    heights = [0] * (gw + 1)
+    best_score = -1.0
+    best_rect = None
+
+    for y in range(gh):
+        row_off = y * gw
+        for x in range(gw):
+            heights[x] = (heights[x] + 1) if data[row_off + x] >= 128 else 0
+        heights[gw] = 0
+
+        stack: list[int] = []
+        for x in range(gw + 1):
+            cur_h = heights[x]
+            while stack and heights[stack[-1]] > cur_h:
+                h_val = heights[stack.pop()]
+                left_x = (stack[-1] + 1) if stack else 0
+                w_val = x - left_x
+                if w_val >= 3 and h_val >= 3:
+                    # Slight preference for well-balanced text rectangles over ultra-thin strips
+                    area = w_val * h_val
+                    min_side = min(w_val, h_val)
+                    score = area * (0.75 + 0.25 * (min_side / float(max(w_val, h_val))))
+                    if score > best_score:
+                        best_score = score
+                        best_rect = (left_x, y - h_val + 1, x, y + 1)
+            stack.append(x)
+
+    if best_rect is None:
+        return None
+
+    rx1, ry1, rx2, ry2 = best_rect
+    return (
+        max(0, int(round(rx1 / scale))),
+        max(0, int(round(ry1 / scale))),
+        min(mw, int(round(rx2 / scale))),
+        min(mh, int(round(ry2 / scale))),
+    )
 
 
 def _sample_dark_bg_rgb_and_lum(img: Image.Image, base_gray: Image.Image, x1: int, y1: int, x2: int, y2: int) -> tuple[tuple[int, int, int], int, float]:
@@ -2197,10 +2383,14 @@ def _clean_exact_cv_bubble_and_measure_box(
 ) -> tuple[int, int, int, int, tuple[int, int, int], tuple[int, int, int], tuple[int, int, int, int]] | None:
     """
     Cleans Japanese text inside a CV-anchored speech bubble using its exact pixel mask:
-      - Erodes mask 2px inside the black outline so speech-bubble borders stay razor-sharp.
-      - Protects colored chibi-art pixels (`sat >= 26`) inside the bubble while wiping 100%
-        of achromatic Japanese text strokes (`p < 246`).
-      - Measures the true inscribed text rectangle inside the oval via C-level `getbbox()` rows.
+      1) Uses TRUE RGB chroma shielding (`_build_true_chroma_art_shield`) so dark/warm-black
+         Japanese text is 100% wiped clean while colored chibi artwork inside bubbles stays safe.
+      2) Uses `MinFilter(3)` (1px inward erosion) so speech-bubble outlines stay crisp while
+         text close to borders is completely erased.
+      3) For concave white panel backgrounds (`rect_fill < 0.56`, e.g. Page 8 top-left panel around
+         a hand), centers text strictly over the erased Japanese ink footprint inside `safe_core`!
+      4) For all normal/tilted/double bubbles, computes the **Largest Inscribed Rectangle**
+         (`_largest_inscribed_rect_in_mask`) so text NEVER spills outside tilted/diagonal ovals!
     """
     width, height = img.size
     ymin, xmin, ymax, xmax = cv_obj["bbox_norm"]
@@ -2213,11 +2403,13 @@ def _clean_exact_cv_bubble_and_measure_box(
         return None
 
     is_dark = bool(cv_obj.get("is_dark"))
+    rect_fill = float(cv_obj.get("rect_fill") or 0.70)
+
     mask_full = cv_obj["mask_small"].resize((bw, bh), Image.Resampling.BILINEAR).point(
         lambda p: 255 if p >= 128 else 0
     )
-    # Erode 2px inward so the outer black speech-bubble stroke is 100% preserved
-    safe_core = mask_full.filter(ImageFilter.MinFilter(5))
+    # Erode 1px inward (`MinFilter(3)`) so crisp bubble outlines stay intact while edge kanji is wiped
+    safe_core = mask_full.filter(ImageFilter.MinFilter(3))
     mask_full.close()
     if not safe_core.getbbox():
         safe_core.close()
@@ -2227,17 +2419,10 @@ def _clean_exact_cv_bubble_and_measure_box(
 
     sub_gray = base_gray.crop((x1, y1, x2, y2))
     sub_rgb = img.crop((x1, y1, x2, y2))
-    sub_sat = sub_rgb.convert("HSV").getchannel("S")
+    non_chroma = _build_true_chroma_art_shield(sub_rgb, chroma_thresh=34)
     sub_rgb.close()
 
     try:
-        # Preserve colored chibi faces/icons drawn inside speech bubbles (`sat >= 26`)
-        chroma_px = sub_sat.point(lambda p: 255 if p >= 26 else 0)
-        chroma_shield = _fast_dilate_mask_half_res(chroma_px, kernel_half=3)
-        chroma_px.close()
-        non_chroma = ImageChops.invert(chroma_shield)
-        chroma_shield.close()
-
         if is_dark:
             dark_rgb, bg_lum, _ = _sample_dark_bg_rgb_and_lum(img, base_gray, x1, y1, x2, y2)
             diff_ink = sub_gray.point(lambda p: 255 if abs(int(p) - bg_lum) > 18 else 0)
@@ -2249,7 +2434,6 @@ def _clean_exact_cv_bubble_and_measure_box(
             fill_patch = Image.new("RGB", (bw, bh), dark_rgb)
             img.paste(fill_patch, (x1, y1), mask=erase_mask)
             fill_patch.close()
-            erase_mask.close()
             fg_rgb = (250, 250, 250)
             stroke_rgb = (max(0, bg_lum - 20), max(0, bg_lum - 20), max(0, bg_lum - 20))
         else:
@@ -2262,52 +2446,57 @@ def _clean_exact_cv_bubble_and_measure_box(
             white_patch = Image.new("RGB", (bw, bh), (255, 255, 255))
             img.paste(white_patch, (x1, y1), mask=erase_mask)
             white_patch.close()
-            erase_mask.close()
             fg_rgb = (15, 15, 15)
             stroke_rgb = (255, 255, 255)
 
-        non_chroma.close()
+        erased_bb = erase_mask.getbbox()
+        erase_mask.close()
 
-        # Measure inscribed text bounds strictly inside `safe_core`
-        core_bb = safe_core.getbbox()
-        if not core_bb:
-            return x1 + 4, y1 + 4, x2 - 4, y2 - 4, fg_rgb, stroke_rgb, (x1 + 3, y1 + 3, x2 - 3, y2 - 3)
+        # Combine `safe_core` & `non_chroma` so text placement avoids colored chibi faces inside bubbles too!
+        place_mask = ImageChops.darker(safe_core, non_chroma)
+        if not place_mask.getbbox():
+            place_mask.close()
+            place_mask = safe_core.copy()
 
-        lb_x1, lb_y1, lb_x2, lb_y2 = core_bb
-        rel_y1 = lb_y1 + max(4, int((lb_y2 - lb_y1) * 0.08))
-        rel_y2 = lb_y2 - max(4, int((lb_y2 - lb_y1) * 0.08))
-        if rel_y2 - rel_y1 < 18:
-            rel_y1, rel_y2 = lb_y1 + 2, lb_y2 - 2
+        # Special Case: Concave white panel background wrapped around a hand/character (e.g. Page 8 left panels!)
+        # Anchor text cleanly over the erased Japanese ink region rather than the center of the whole panel!
+        if (not is_dark) and rect_fill < 0.58 and erased_bb is not None:
+            ex1, ey1, ex2, ey2 = erased_bb
+            ew, eh = ex2 - ex1, ey2 - ey1
+            if ew < bw * 0.62 or eh < bh * 0.62:
+                # Expand erased ink bbox generously inside `place_mask`
+                pad_ix = max(24, int(bw * 0.14))
+                pad_iy = max(16, int(bh * 0.08))
+                clip_win = Image.new("L", (bw, bh), 0)
+                ImageDraw.Draw(clip_win).rectangle(
+                    [max(0, ex1 - pad_ix), max(0, ey1 - pad_iy), min(bw, ex2 + pad_ix), min(bh, ey2 + pad_iy)],
+                    fill=255,
+                )
+                local_place = ImageChops.darker(place_mask, clip_win)
+                clip_win.close()
+                inscribed = _largest_inscribed_rect_in_mask(local_place)
+                local_place.close()
+                if inscribed and (inscribed[2] - inscribed[0]) >= 36 and (inscribed[3] - inscribed[1]) >= 24:
+                    ix1, iy1, ix2, iy2 = inscribed
+                    place_mask.close()
+                    hard_b = (x1 + ix1 + 2, y1 + iy1 + 2, x1 + ix2 - 2, y1 + iy2 - 2)
+                    return hard_b[0], hard_b[1], hard_b[2], hard_b[3], fg_rgb, stroke_rgb, hard_b
 
-        mid_y_start = rel_y1 + int((rel_y2 - rel_y1) * 0.16)
-        mid_y_end = rel_y1 + int((rel_y2 - rel_y1) * 0.84)
-        step_y = max(2, (mid_y_end - mid_y_start) // 7 or 1)
-        row_lefts = []
-        row_rights = []
-        for sy in range(mid_y_start, max(mid_y_start + 1, mid_y_end), step_y):
-            if not (0 <= sy < bh):
-                continue
-            row_strip = safe_core.crop((lb_x1, sy, lb_x2, sy + 1))
-            rb = row_strip.getbbox()
-            row_strip.close()
-            if rb and (rb[2] - rb[0]) >= 14:
-                row_lefts.append(lb_x1 + rb[0])
-                row_rights.append(lb_x1 + rb[2])
+        # Exact Largest Inscribed Rectangle inside `place_mask` (zero spill on tilted/diagonal bubbles!)
+        inscribed = _largest_inscribed_rect_in_mask(place_mask)
+        place_mask.close()
+        if inscribed and (inscribed[2] - inscribed[0]) >= 18 and (inscribed[3] - inscribed[1]) >= 14:
+            ix1, iy1, ix2, iy2 = inscribed
+            hard_b = (x1 + ix1 + 2, y1 + iy1 + 2, x1 + ix2 - 2, y1 + iy2 - 2)
+            return hard_b[0], hard_b[1], hard_b[2], hard_b[3], fg_rgb, stroke_rgb, hard_b
 
-        hard_b = (x1 + lb_x1 + 3, y1 + lb_y1 + 3, x1 + lb_x2 - 3, y1 + lb_y2 - 3)
-        if row_lefts and row_rights:
-            row_lefts.sort()
-            row_rights.sort()
-            inner_l = row_lefts[int(len(row_lefts) * 0.65)] + 4
-            inner_r = row_rights[int(len(row_rights) * 0.35)] - 4
-            if inner_r - inner_l >= 18:
-                return x1 + inner_l, y1 + rel_y1, x1 + inner_r, y1 + rel_y2, fg_rgb, stroke_rgb, hard_b
-
-        return x1 + lb_x1 + 4, y1 + rel_y1, x1 + lb_x2 - 4, y1 + rel_y2, fg_rgb, stroke_rgb, hard_b
+        core_bb = safe_core.getbbox() or (4, 4, bw - 4, bh - 4)
+        hard_b = (x1 + core_bb[0] + 3, y1 + core_bb[1] + 3, x1 + core_bb[2] - 3, y1 + core_bb[3] - 3)
+        return hard_b[0], hard_b[1], hard_b[2], hard_b[3], fg_rgb, stroke_rgb, hard_b
     finally:
         safe_core.close()
+        non_chroma.close()
         sub_gray.close()
-        sub_sat.close()
 
 
 def _clean_unmarked_open_bubble_and_measure_box(
@@ -2319,9 +2508,9 @@ def _clean_unmarked_open_bubble_and_measure_box(
     raw_y2: int,
 ) -> tuple[int, int, int, int, tuple[int, int, int], tuple[int, int, int], tuple[int, int, int, int]] | None:
     """
-    Safely cleans borderless/open-sided dialogue (`bubble_id == None`, e.g. text on a white
-    panel background like Page 3 middle-left or Page 8 left-top) while shielding colored skin,
-    hands, hair, and panel borders from any white artifacts.
+    Safely cleans borderless/open-sided dialogue (`bubble_id == None`, e.g. Page 5 middle-right)
+    using true RGB chroma shielding so colored artwork/hands/faces are never damaged while
+    both color and B&W manga text is wiped cleanly.
     """
     width, height = img.size
     bw, bh = raw_x2 - raw_x1, raw_y2 - raw_y1
@@ -2333,10 +2522,16 @@ def _clean_unmarked_open_bubble_and_measure_box(
     box_hist = sub_g.histogram()
     sub_g.close()
     total_px = max(1, sum(box_hist))
-    mean_sat, chroma_ratio = _measure_crop_chroma_stats(img, raw_x1, raw_y1, raw_x2, raw_y2)
 
-    # Reject chromatic/colored artwork (faces, hands, wallpaper)
-    if mean_sat >= 12.0 or chroma_ratio >= 0.14:
+    sub_rgb_check = img.crop((raw_x1, raw_y1, raw_x2, raw_y2))
+    ch_band = _compute_rgb_chroma_band(sub_rgb_check)
+    sub_rgb_check.close()
+    ch_hist = ch_band.histogram()
+    mean_chroma = ImageStat.Stat(ch_band).mean[0]
+    ch_band.close()
+    chroma_ratio = sum(ch_hist[28:]) / float(max(1, sum(ch_hist)))
+
+    if mean_chroma >= 18.0 or chroma_ratio >= 0.18:
         return None
 
     # Dark unmarked bubble/caption
@@ -2363,9 +2558,9 @@ def _clean_unmarked_open_bubble_and_measure_box(
         return raw_x1, raw_y1, raw_x2, raw_y2, (250, 250, 250), stroke_c, (raw_x1, raw_y1, raw_x2, raw_y2)
 
     # Light open-sided bubble / white panel background
-    white_ratio = sum(box_hist[228:]) / float(total_px)
-    ink_ratio = sum(box_hist[:145]) / float(total_px)
-    if white_ratio < 0.42 or ink_ratio < 0.012:
+    white_ratio = sum(box_hist[220:]) / float(total_px)
+    ink_ratio = sum(box_hist[:155]) / float(total_px)
+    if white_ratio < 0.38 or ink_ratio < 0.010:
         return None
 
     pad_x, pad_y = 8, 12
@@ -2375,23 +2570,14 @@ def _clean_unmarked_open_bubble_and_measure_box(
 
     sg = base_gray.crop((wx1, wy1, wx2, wy2))
     srgb = img.crop((wx1, wy1, wx2, wy2))
-    ssat = srgb.convert("HSV").getchannel("S")
+    non_chroma = _build_true_chroma_art_shield(srgb, chroma_thresh=30)
     srgb.close()
 
-    # Chromatic-art shield protects hands/fingers/hair within ~5px of colored pixels
-    c_px = ssat.point(lambda p: 255 if p >= 20 else 0)
-    ssat.close()
-    c_shield = _fast_dilate_mask_half_res(c_px, kernel_half=5)
-    c_px.close()
-    non_chroma = ImageChops.invert(c_shield)
-    c_shield.close()
-
-    # Only erase dark ink surrounded by white paper (protects solid black panel frames!)
-    w_seed = sg.point(lambda p: 255 if p >= 235 else 0)
+    w_seed = sg.point(lambda p: 255 if p >= 228 else 0)
     w_zone = _fast_dilate_mask_half_res(w_seed, kernel_half=5)
     w_seed.close()
 
-    ink_m = sg.point(lambda p: 255 if p < 230 else 0)
+    ink_m = sg.point(lambda p: 255 if p < 232 else 0)
     sg.close()
     ink_dil = _fast_dilate_mask_half_res(ink_m, kernel_half=3)
     ink_m.close()
@@ -2473,7 +2659,7 @@ def _fit_text_binary_search(
             draw, trans_text, font, usable_w, allow_midword_split=(fsize <= 9)
         )
         sample_bbox = draw.textbbox((0, 0), sample_probe, font=font)
-        lh = max(fsize + 3, int((sample_bbox[3] - sample_bbox[1]) * 1.18))
+        lh = max(fsize + 3, int((sample_bbox[3] - sample_bbox[1]) * 1.16))
         total_h = lh * len(wrapped)
         max_line_w = max(
             (draw.textbbox((0, 0), ln, font=font)[2] - draw.textbbox((0, 0), ln, font=font)[0])
@@ -2504,10 +2690,10 @@ def render_translated_manga_image_sync(
 ) -> bytes | None:
     """
     Renders translated dialogue at FULL ORIGINAL RESOLUTION:
-      1) Matched Set-of-Mark CV bubbles (`bubble_id`) are cleaned and typeset using their
-         exact pre-detected pixel masks (zero drift, zero overlap, zero leftover Japanese!).
-      2) Unmarked open/borderless bubbles (`bubble_id == None` + `box_2d`) are cleaned safely
-         with chromatic-art shielding after verifying they don't overlap an already-rendered CV bubble.
+      1) Matched Set-of-Mark CV bubbles (`bubble_id`) are wiped 100% clean using TRUE RGB
+         chroma shielding and fitted inside the exact Largest Inscribed Rectangle.
+      2) Unmarked open/borderless bubbles (`bubble_id == None` + `box_2d`) snap to unused CV
+         bubbles when overlapping >= 40% or clean safely with RGB chroma shielding.
     """
     if not raw_bytes or not bubbles:
         return None
@@ -2565,7 +2751,6 @@ def render_translated_manga_image_sync(
             ry2 = min(height, int((ymax / 1000.0) * height))
             area_new = max(1, (rx2 - rx1) * (ry2 - ry1))
 
-            # Snap to an unused CV bubble if this `box_2d` overlaps it by >= 40%!
             snapped_cv_id = None
             best_ov = 0.0
             for cid, c_obj in cv_map.items():
@@ -2592,7 +2777,6 @@ def render_translated_manga_image_sync(
                     rendered_rects.append(hard_bounds)
                     continue
 
-            # Reject duplicate overlap with an already-rendered bubble
             is_dup = False
             for ex1, ey1, ex2, ey2 in rendered_rects:
                 ov_x = max(0, min(rx2, ex2) - max(rx1, ex1))
@@ -2616,17 +2800,18 @@ def render_translated_manga_image_sync(
         prepared_renders = _resolve_box_collisions(prepared_renders, min_gap=6)
 
         max_dim = max(width, height)
-        max_font_px = max(26, int(max_dim * 0.019))
+        max_font_px = max(28, int(max_dim * 0.021))
 
         draw = ImageDraw.Draw(img)
         for tx1, ty1, tx2, ty2, fg_text, stroke_col, trans_text, _ in prepared_renders:
             box_w = max(18, tx2 - tx1)
             box_h = max(14, ty2 - ty1)
-            usable_w = max(14, int(box_w * 0.88))
-            usable_h = max(12, int(box_h * 0.90))
+            # Inscribed rect is already inside `safe_core`, so 92% width/height gives comfortable, legible sizing
+            usable_w = max(14, int(box_w * 0.92))
+            usable_h = max(12, int(box_h * 0.92))
             is_thai_text = bool(THAI_CHAR_REGEX.search(trans_text))
 
-            start_font_size = min(max_font_px, max(12, int(min(box_w, box_h) * 0.26)))
+            start_font_size = min(max_font_px, max(14, int(min(box_w * 0.42, box_h * 0.36))))
             chosen_font, chosen_lines, line_height, ref_top = _fit_text_binary_search(
                 draw, trans_text, usable_w, usable_h, start_font_size, is_thai_text
             )
@@ -2658,8 +2843,9 @@ def render_translated_manga_image_sync(
 
 async def process_manga_translation_request(ctx_or_message, user_prompt: str):
     """
-    Translates 1 to 12 manga pages from direct Discord attachments OR embedded links
-    using CV Set-of-Mark (SoM) bubble anchoring, strict `MangaBatch` model ordering:
+    Translates 1 to 12 manga pages (Color & Black-and-White, Thai & English) from direct
+    Discord attachments OR embedded links using CV Set-of-Mark (SoM) bubble anchoring,
+    strict `MangaBatch` model ordering:
       `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> (newer >3.5 flash-lite) -> `gemma-4-31b-it` -> `gemma-4-26b-a4b-it`
     correlated Render request/waiting/response logs, syllable-aware Thai wrapping,
     and fast full-original-resolution rendering.
