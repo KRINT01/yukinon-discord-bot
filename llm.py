@@ -851,16 +851,28 @@ async def call_gemini_generate_content_self_healing(
     purpose: str = "Generate",
     max_models: int = 3,
     max_wall_sec: float | None = None,
+    preferred_models: list[str] | None = None,
 ) -> dict | None:
     """
     Deterministic, bounded Gemini Flash caller:
-      `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> `gemini-3-flash-preview`
+      Default: `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> `gemini-3-flash-preview`
+      (or caller-specified `preferred_models` for spatial 2D bounding-box grounding)
     with `thinkingLevel` normalization, short cooldowns on transient 503/timeout, and strict wall-time caps.
     """
     if not GEMINI_API_KEY:
         return None
 
-    candidate_models = await _discover_active_gemini_flash_model(force_remote=False)
+    base_candidates = await _discover_active_gemini_flash_model(force_remote=False)
+    if preferred_models:
+        seen_p = set()
+        candidate_models = []
+        for m in list(preferred_models) + base_candidates:
+            if m and m not in seen_p:
+                seen_p.add(m)
+                candidate_models.append(m)
+    else:
+        candidate_models = base_candidates
+
     tried = set()
     wall_start = time.monotonic()
     wall_budget = max_wall_sec if max_wall_sec is not None else float(timeout_sec * max_models + 4)
@@ -901,7 +913,7 @@ async def call_gemini_generate_content_self_healing(
                     elapsed = time.monotonic() - t0
 
                     if status == 200:
-                        if state.active_gemini_model != model_id:
+                        if not preferred_models and state.active_gemini_model != model_id:
                             state.active_gemini_model = model_id
                         api_log(f"Gemini ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
                         return json.loads(body_text)
