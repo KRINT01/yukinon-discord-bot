@@ -492,7 +492,7 @@ def _search_google_ai_studio_grounded_sync(query: str) -> str:
             "thinkingConfig": {"thinkingLevel": "MINIMAL"},
         },
     }
-    for model_id in ("gemini-3.1-flash-lite", "gemini-3.5-flash-lite"):
+    for model_id in ("gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3-flash-preview"):
         url = clean_url(
             f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
             f"{model_id}:generateContent?key={GEMINI_API_KEY}"

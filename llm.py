@@ -13,6 +13,7 @@ from config import (
     GEMINI_HEAVY_MODEL,
     GEMINI_SEARCH_MODEL,
     GEMINI_FALLBACK_MODEL,
+    GEMINI_PREVIEW_MODEL,
     GEMMA_CHAT_MODEL,
     GEMMA_VISION_MODEL,
     CF_ACCOUNT_ID,
@@ -62,10 +63,10 @@ from search_engine import (
 )
 
 GEMINI_MODEL_HINT_REGEX = re.compile(r"models/([a-zA-Z0-9._-]+)")
-# Exclude legacy 1.5/2.0/2.5/omni/latest aliases and non-text endpoints so routing stays deterministic on 3.1/3.5/3.6
+# Allow `gemini-3-flash-preview` while excluding legacy 1.5/2.0/2.5/omni/latest aliases and non-text endpoints
 GEMINI_EXCLUDED_SUBSTRINGS = (
     "image", "tts", "audio", "live", "embedding", "aqa", "bison", "gecko",
-    "decision", "hydrogen", "preview", "omni", "2.5", "2.0", "1.5", "latest", "3.7", "3.8"
+    "decision", "hydrogen", "omni", "2.5", "2.0", "1.5", "latest", "3.7", "3.8"
 )
 
 GROQ_EXCLUDED_SUBSTRINGS = (
@@ -131,7 +132,7 @@ def _adapt_gemini_thinking_config_for_model(payload: dict, model_id: str) -> dic
          - Strips `temperature`, `topP`, `topK` (Hydrogen ignores/rejects custom sampling params).
          - Raises `maxOutputTokens` to `65536` (shared 1M unified input+thinking+output window).
          - Uses `thinkingLevel` (`LOW`, `MEDIUM`, `HIGH`, `XHIGH`; rejects `MINIMAL`).
-      2) `gemini-3.1-flash-lite`, `gemini-3.5-flash-lite`, `gemini-3.6-flash`:
+      2) `gemini-3.1-flash-lite`, `gemini-3.5-flash-lite`, `gemini-3-flash-preview`, `gemini-3.6-flash`:
          - Uses `thinkingLevel` (`MINIMAL`, `LOW`, `MEDIUM`, `HIGH`) and removes legacy `thinkingBudget`.
       3) `gemini-3.8-flash` / `gemini-3.7-flash`:
          - Uses `thinkingLevel` (`LOW`, `MEDIUM`, `HIGH`; never `MINIMAL`).
@@ -144,7 +145,7 @@ def _adapt_gemini_thinking_config_for_model(payload: dict, model_id: str) -> dic
     lower_m = (model_id or "").lower()
     is_gemini_4 = lower_m.startswith("gemini-4")
     no_minimal_models = is_gemini_4 or lower_m.startswith(("gemini-3.8", "gemini-3.7"))
-    minimal_capable_models = lower_m.startswith(("gemini-3.6", "gemini-3.5", "gemini-3.1"))
+    minimal_capable_models = lower_m.startswith(("gemini-3.6", "gemini-3.5", "gemini-3.1", "gemini-3-flash"))
 
     if is_gemini_4:
         gen_cfg.pop("temperature", None)
@@ -603,10 +604,10 @@ async def discover_active_gemma_models(vision_required: bool = False) -> list[st
 
 async def _discover_active_gemini_flash_model(force_remote: bool = False) -> list[str]:
     """
-    Deterministic priority order for Gemini Flash models (15 RPM, 250K TPM, 500 RPD):
-      1. `gemini-3.1-flash-lite` (Primary — highest reliability and success rate)
+    Deterministic priority order for Gemini Flash models:
+      1. `gemini-3.1-flash-lite` (Primary — highest throughput & reliability)
       2. `gemini-3.5-flash-lite` (Secondary Flash-Lite fallback)
-      3. `gemini-3.6-flash` (Tertiary Flash fallback)
+      3. `gemini-3-flash-preview` (Tertiary Flash Preview fallback)
     """
     global _GEMINI_DISCOVERED_MODELS_CACHE, _GEMINI_MODELS_LAST_FETCH_TS
     now = time.time()
@@ -614,9 +615,10 @@ async def _discover_active_gemini_flash_model(force_remote: bool = False) -> lis
     preferred_seed = [
         "gemini-3.1-flash-lite",
         "gemini-3.5-flash-lite",
-        "gemini-3.6-flash",
+        "gemini-3-flash-preview",
         GEMINI_SEARCH_MODEL,
         GEMINI_FALLBACK_MODEL,
+        GEMINI_PREVIEW_MODEL,
     ]
 
     seen = set()
@@ -843,13 +845,14 @@ async def call_gemma_ai_studio_vision(
 
 async def call_gemini_generate_content_self_healing(
     payload: dict,
-    timeout_sec: int = 20,
+    timeout_sec: int = 22,
     purpose: str = "Generate",
-    max_models: int = 2,
+    max_models: int = 3,
     max_wall_sec: float | None = None,
 ) -> dict | None:
     """
-    Deterministic, bounded Gemini Flash-Lite caller (`gemini-3.1-flash-lite` -> `gemini-3.5-flash-lite`)
+    Deterministic, bounded Gemini Flash caller:
+      `gemini-3.1-flash-lite` -> `gemini-3.5-flash-lite` -> `gemini-3-flash-preview`
     with `thinkingLevel` normalization, short cooldowns on transient 503/timeout, and strict wall-time caps.
     """
     if not GEMINI_API_KEY:
@@ -858,7 +861,7 @@ async def call_gemini_generate_content_self_healing(
     candidate_models = await _discover_active_gemini_flash_model(force_remote=False)
     tried = set()
     wall_start = time.monotonic()
-    wall_budget = max_wall_sec if max_wall_sec is not None else float(timeout_sec * 2 + 4)
+    wall_budget = max_wall_sec if max_wall_sec is not None else float(timeout_sec * max_models + 4)
 
     session = get_http_session()
     idx = 0
@@ -979,8 +982,8 @@ async def call_gemini_chat_messages(
         payload,
         timeout_sec=18,
         purpose=purpose,
-        max_models=2,
-        max_wall_sec=26.0,
+        max_models=3,
+        max_wall_sec=36.0,
     )
     if data:
         parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
@@ -1597,7 +1600,7 @@ async def query_local_ollama_chat(
             target_temp = 0.2 if (did_search or is_user_correction) else temperature
 
             if is_japanese_or_social_media:
-                # Primary: `gemini-3.1-flash-lite` -> `gemini-3.5-flash-lite` -> Gemma 4 -> CF Gemma
+                # Tier 1: `gemini-3.1-flash-lite` -> `gemini-3.5-flash-lite` -> `gemini-3-flash-preview`
                 if GEMINI_API_KEY:
                     ans = await call_gemini_chat_messages(
                         messages,

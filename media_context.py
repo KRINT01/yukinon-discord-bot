@@ -48,7 +48,6 @@ from search_engine import (
 )
 from llm import (
     discover_active_groq_vision_models,
-    discover_active_gemma_models,
     call_gemma_ai_studio_vision,
     call_cloudflare_vision_chat,
     call_gemini_generate_content_self_healing,
@@ -1313,8 +1312,8 @@ def _compress_image_for_vision_ocr_sync(raw_bytes: bytes, max_dim: int = 1280, q
 async def _call_gemini_multi_image_batch(
     encoded_images: list[tuple[str, str, str]],
     batch_prompt: str,
-    timeout_sec: int = 45,
-    max_output_tokens: int = 3584,
+    timeout_sec: int = 36,
+    max_output_tokens: int = 3072,
 ) -> str:
     if not GEMINI_API_KEY:
         return ""
@@ -1336,8 +1335,8 @@ async def _call_gemini_multi_image_batch(
             payload,
             timeout_sec=timeout_sec,
             purpose=f"MultiImageOCR({len(encoded_images)}p)",
-            max_models=2,
-            max_wall_sec=float(timeout_sec + 16),
+            max_models=3,
+            max_wall_sec=65.0,
         )
         if data:
             resp_parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
@@ -1352,68 +1351,11 @@ async def _call_gemini_multi_image_batch(
     return ""
 
 
-async def _call_ai_studio_gemma_multi_image_batch(
-    encoded_images: list[tuple[str, str, str]],
-    batch_prompt: str,
-    timeout_sec: int = 30,
-    max_output_tokens: int = 3584,
-) -> str:
-    """Tier 2 Google AI Studio Gemma 4 multi-image batch backup (uses fast 26B MoE)."""
-    if not GEMINI_API_KEY:
-        return ""
-    gemma_models = await discover_active_gemma_models(vision_required=True)
-    candidates = [m for m in gemma_models if "26b" in m] or gemma_models[:1]
-    if not candidates:
-        return ""
-
-    parts = [{"text": batch_prompt}]
-    for idx, (b64_img, mime_type, fname) in enumerate(encoded_images, 1):
-        parts.append({"text": f"=== Image {idx}/{len(encoded_images)} (`{fname}`) ==="})
-        parts.append({"inlineData": {"mimeType": mime_type, "data": b64_img}})
-
-    session = get_http_session()
-    for model_id in candidates[:1]:
-        url = clean_url(
-            f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
-            f"{model_id}:generateContent?key={GEMINI_API_KEY}"
-        )
-        payload = {
-            "contents": [{"parts": parts}],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": max_output_tokens,
-            },
-        }
-        t0 = time.monotonic()
-        try:
-            async with session.post(
-                url, json=payload, timeout=aiohttp.ClientTimeout(total=timeout_sec)
-            ) as resp:
-                elapsed = time.monotonic() - t0
-                if resp.status == 200:
-                    data = await resp.json()
-                    resp_parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-                    out_txt = "\n".join(
-                        p.get("text", "") for p in resp_parts
-                        if p.get("text") and not p.get("thought", False)
-                    ).strip()
-                    out_txt = re.sub(r"<think>[\s\S]*?</think>", "", out_txt).strip()
-                    if out_txt:
-                        api_log(f"MultiImageOCR (Tier 2 AI Studio Gemma) -> {model_id} 200 OK ({elapsed:.2f}s)")
-                        return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{out_txt}"
-                api_log(f"MultiImageOCR (Tier 2 AI Studio Gemma) -> {model_id} HTTP {resp.status} ({elapsed:.2f}s)")
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            api_log(f"MultiImageOCR (Tier 2 AI Studio Gemma) -> {model_id} error ({type(e).__name__})")
-    return ""
-
-
 async def _call_cf_multi_image_batch(
     encoded_images: list[tuple[str, str, str]],
     batch_prompt: str,
-    timeout_sec: int = 30,
-    max_tokens: int = 3584,
+    timeout_sec: int = 50,
+    max_tokens: int = 3072,
 ) -> str:
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
         return ""
@@ -1455,13 +1397,13 @@ async def _call_cf_multi_image_batch(
                     content = (choices[0].get("message") or {}).get("content") or ""
                     content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
                     if content:
-                        api_log(f"MultiImageOCR (Tier 3 CF) -> {CF_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
+                        api_log(f"MultiImageOCR (Tier 2 CF) -> {CF_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
                         return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{content}"
-            api_log(f"MultiImageOCR (Tier 3 CF) -> HTTP {resp.status} ({elapsed:.2f}s)")
+            api_log(f"MultiImageOCR (Tier 2 CF) -> HTTP {resp.status} ({elapsed:.2f}s)")
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        api_log(f"MultiImageOCR (Tier 3 CF) -> error ({type(e).__name__})")
+        api_log(f"MultiImageOCR (Tier 2 CF) -> error ({type(e).__name__})")
     return ""
 
 
@@ -1471,8 +1413,9 @@ async def extract_multi_images_batch_ocr(
 ) -> str:
     """
     Inspects 2 to 12 sequential comic/illustration pages together in a SINGLE unified
-    multimodal batch call using `gemini-3.1-flash-lite` (`thinkingLevel: "MINIMAL"`)
-    with a 22s hedged backup.
+    multimodal batch call (`gemini-3.1-flash-lite` -> `gemini-3.5-flash-lite` -> `gemini-3-flash-preview`),
+    hedged cleanly against Cloudflare Workers AI (`@cf/google/gemma-4-26b-a4b-it`) so Google AI Studio
+    never suffers same-key concurrency contention.
     """
     target_list = images_list[:MAX_BATCH_IMAGES]
     if len(target_list) < 2:
@@ -1497,7 +1440,7 @@ async def extract_multi_images_batch_ocr(
 
     n_imgs = len(target_list)
     if n_imgs >= 9:
-        target_dim, target_q, out_tokens = 720, 74, 3584
+        target_dim, target_q, out_tokens = 672, 72, 3072
     elif n_imgs >= 5:
         target_dim, target_q, out_tokens = 768, 76, 3072
     elif n_imgs >= 3:
@@ -1520,32 +1463,27 @@ async def extract_multi_images_batch_ocr(
 
     has_gemini = bool(GEMINI_API_KEY)
     has_cf = bool(CF_ACCOUNT_ID and CF_API_TOKEN)
-    gemini_timeout = min(50, 24 + (2 * len(encoded_images)))
-    backup_timeout = min(38, 20 + (2 * len(encoded_images)))
-
-    async def _run_batch_backup_chain() -> str:
-        if has_gemini:
-            gemma_res = await _call_ai_studio_gemma_multi_image_batch(
-                encoded_images, batch_prompt, timeout_sec=backup_timeout, max_output_tokens=out_tokens
-            )
-            if gemma_res:
-                return gemma_res
-        if has_cf:
-            return await _call_cf_multi_image_batch(
-                encoded_images, batch_prompt, timeout_sec=backup_timeout, max_tokens=out_tokens
-            )
-        return ""
+    gemini_timeout = min(38, 18 + (2 * len(encoded_images)))
+    cf_timeout = min(55, 25 + (3 * len(encoded_images)))
 
     try:
-        if not has_gemini:
-            return await _run_batch_backup_chain()
+        if not has_gemini and has_cf:
+            return await _call_cf_multi_image_batch(
+                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=out_tokens
+            )
+        if has_gemini and not has_cf:
+            return await _call_gemini_multi_image_batch(
+                encoded_images, batch_prompt, timeout_sec=gemini_timeout, max_output_tokens=out_tokens
+            )
+        if not has_gemini and not has_cf:
+            return ""
 
         gemini_task = asyncio.create_task(
             _call_gemini_multi_image_batch(
                 encoded_images, batch_prompt, timeout_sec=gemini_timeout, max_output_tokens=out_tokens
             )
         )
-        done, _ = await asyncio.wait({gemini_task}, timeout=22.0)
+        done, _ = await asyncio.wait({gemini_task}, timeout=20.0)
         if gemini_task in done:
             try:
                 res = gemini_task.result()
@@ -1553,11 +1491,17 @@ async def extract_multi_images_batch_ocr(
                     return res
             except Exception:
                 pass
-            return await _run_batch_backup_chain()
+            return await _call_cf_multi_image_batch(
+                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=out_tokens
+            )
 
-        api_log(f"Hedge (MultiImageOCR {len(encoded_images)}p) -> Gemini >22s; racing backup batch in parallel")
-        backup_task = asyncio.create_task(_run_batch_backup_chain())
-        tasks = {gemini_task, backup_task}
+        api_log(f"Hedge (MultiImageOCR {len(encoded_images)}p) -> Gemini >20s; racing Cloudflare batch in parallel")
+        cf_task = asyncio.create_task(
+            _call_cf_multi_image_batch(
+                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=out_tokens
+            )
+        )
+        tasks = {gemini_task, cf_task}
         try:
             while tasks:
                 done_set, pending_set = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -1586,7 +1530,7 @@ async def extract_multi_images_batch_ocr(
 
 
 async def _call_gemini_single_image_vision(
-    ocr_prompt: str, mime_type: str, b64_img: str, purpose: str = "Image OCR Tier 1 Gemini"
+    ocr_prompt: str, mime_type: str, b64_img: str, purpose: str = "Image OCR Gemini"
 ) -> str:
     if not GEMINI_API_KEY:
         return ""
@@ -1607,10 +1551,10 @@ async def _call_gemini_single_image_vision(
     }
     data = await call_gemini_generate_content_self_healing(
         payload,
-        timeout_sec=12,
+        timeout_sec=14,
         purpose=purpose,
-        max_models=2,
-        max_wall_sec=16.0,
+        max_models=3,
+        max_wall_sec=24.0,
     )
     if not data:
         return ""
@@ -1670,25 +1614,12 @@ async def extract_image_via_transient_ocr(
 
     vision_result = ""
 
-    # Tier 1: Gemini 3.1 Flash-Lite -> Gemini 3.5 Flash-Lite
-    if GEMINI_API_KEY:
-        vision_result = await _call_gemini_single_image_vision(ocr_prompt, mime_type, b64_img)
+    # Tier 1: Cloudflare Workers AI Vision (`@cf/google/gemma-4-26b-a4b-it`)
+    cf_ocr = await call_cloudflare_vision_chat(ocr_prompt, mime_type, b64_img, purpose="Image OCR Tier 1 CF")
+    if cf_ocr:
+        vision_result = cf_ocr
 
-    # Tier 2: Cloudflare Workers AI Vision (`@cf/google/gemma-4-26b-a4b-it`)
-    if not vision_result:
-        cf_ocr = await call_cloudflare_vision_chat(ocr_prompt, mime_type, b64_img, purpose="Image OCR Tier 2 CF")
-        if cf_ocr:
-            vision_result = cf_ocr
-
-    # Tier 3: Google AI Studio Gemma 4 Vision (`gemma-4-26b-a4b-it`)
-    if not vision_result:
-        gemma_ocr = await call_gemma_ai_studio_vision(
-            ocr_prompt, mime_type, b64_img, timeout_sec=12, purpose="Image OCR Tier 3 AI Studio"
-        )
-        if gemma_ocr:
-            vision_result = gemma_ocr
-
-    # Tier 4: Groq LPU Vision (`qwen/qwen3.8-27b`)
+    # Tier 2: Groq LPU Vision (`qwen/qwen3.8-27b`)
     if not vision_result and GROQ_API_KEY:
         groq_candidates = await discover_active_groq_vision_models()
         groq_host = "api." + "groq.com"
@@ -1725,12 +1656,26 @@ async def extract_image_via_transient_ocr(
                         content = g_data["choices"][0]["message"]["content"].strip()
                         content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
                         if content:
-                            api_log(f"Image OCR (Tier 4 Groq) -> {g_mod} 200 OK ({elapsed:.2f}s)")
+                            api_log(f"Image OCR (Tier 2 Groq) -> {g_mod} 200 OK ({elapsed:.2f}s)")
                             vision_result = content
                             break
-                    api_log(f"Image OCR (Tier 4 Groq) -> {g_mod} HTTP {resp.status}; fallback to Tier 5")
+                    api_log(f"Image OCR (Tier 2 Groq) -> {g_mod} HTTP {resp.status}; fallback to Tier 3")
             except Exception as e:
-                api_log(f"Image OCR (Tier 4 Groq) -> {g_mod} failed ({type(e).__name__}); fallback to Tier 5")
+                api_log(f"Image OCR (Tier 2 Groq) -> {g_mod} failed ({type(e).__name__}); fallback to Tier 3")
+
+    # Tier 3: Gemini (`gemini-3.1-flash-lite` -> `gemini-3.5-flash-lite` -> `gemini-3-flash-preview`)
+    if not vision_result and GEMINI_API_KEY:
+        vision_result = await _call_gemini_single_image_vision(
+            ocr_prompt, mime_type, b64_img, purpose="Image OCR Tier 3 Gemini"
+        )
+
+    # Tier 4: Google AI Studio Gemma 4 Vision (`gemma-4-26b-a4b-it`)
+    if not vision_result:
+        gemma_ocr = await call_gemma_ai_studio_vision(
+            ocr_prompt, mime_type, b64_img, timeout_sec=12, purpose="Image OCR Tier 4 AI Studio"
+        )
+        if gemma_ocr:
+            vision_result = gemma_ocr
 
     # Tier 5: Modal T4 GPU
     if not vision_result:
@@ -1896,7 +1841,7 @@ async def extract_all_context(
                 blocks.append(batch_vis)
         if processed_image_count == 0:
             total_att_imgs = len(image_att_batch)
-            sem = asyncio.Semaphore(3)
+            sem = asyncio.Semaphore(2)
 
             async def _ocr_att_item(idx: int, img_b: bytes, img_fn: str) -> tuple[int, str, str]:
                 async with sem:
@@ -1944,7 +1889,7 @@ async def extract_all_context(
 
         if not batch_done:
             total_emb_imgs = len(target_embed_imgs)
-            sem = asyncio.Semaphore(3)
+            sem = asyncio.Semaphore(2)
 
             async def _ocr_embed_item(idx: int, emb_bytes: bytes, emb_fname: str, emb_url: str) -> str:
                 async with sem:
