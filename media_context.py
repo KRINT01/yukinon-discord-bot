@@ -51,6 +51,10 @@ from llm import (
     call_gemma_ai_studio_vision,
     call_cloudflare_vision_chat,
     call_gemini_generate_content_self_healing,
+    triage_image_with_decision_1,
+    triage_pdf_with_decision_1,
+    extract_scanned_pdf_with_gemini_native,
+    MAX_NATIVE_INLINE_PDF_BYTES,
 )
 
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024  # 25 MB cap (supports standard Discord PDF/doc uploads safely)
@@ -208,6 +212,61 @@ def parse_pdf_bytes(raw_bytes: bytes, max_chars: int = 32000) -> str:
             f"(likely a scanned/image-only PDF). Ask the user to send page screenshots or export text if OCR is needed.]"
         )
     return joined
+
+
+async def extract_pdf_context_async(
+    raw_bytes: bytes,
+    filename: str,
+    max_chars: int = 32000,
+) -> tuple[str, bool]:
+    """
+    Phase 2 Smart PDF Extractor:
+      1) Runs fast local `pypdf` extraction first (0 API calls for normal digital PDFs).
+      2) If `pypdf` detects a scanned/image-only PDF (`< 60` selectable chars) and the PDF fits
+         within `MAX_NATIVE_INLINE_PDF_BYTES` (20 MB), triages it via Decision-1's native
+         `document` block (`application/pdf`) and extracts full content via native Gemini PDF vision
+         (`gemini-3.5-flash-lite` or `gemini-4-hydrogen` for dense tables/diagrams).
+    Returns `(formatted_context_block, is_code_or_technical)`.
+    """
+    pypdf_text = await asyncio.to_thread(parse_pdf_bytes, raw_bytes, max_chars)
+    is_sparse_scanned = pypdf_text.startswith("[PDF Notice:")
+
+    if not is_sparse_scanned:
+        is_tech_pdf = bool(STACK_TRACE_SIGNATURE_REGEX.search(pypdf_text[:4000]))
+        return f"=== Attached PDF Document: `{filename}` ===\n{pypdf_text}", is_tech_pdf
+
+    if not GEMINI_API_KEY or len(raw_bytes) > MAX_NATIVE_INLINE_PDF_BYTES:
+        return f"=== Attached PDF Document: `{filename}` ===\n{pypdf_text}", False
+
+    triage = await triage_pdf_with_decision_1(raw_bytes, filename=filename, extracted_chars=0)
+    if triage is not None and not triage.get("is_readable_scanned_doc") and float(triage.get("readable_prob") or 0.0) < 0.25:
+        return (
+            f"=== Attached PDF Document: `{filename}` ===\n"
+            f"[PDF Notice: Native visual inspection found that `{filename}` appears blank or unreadable.]"
+        ), False
+
+    doc_category = str((triage or {}).get("doc_category") or "form_report")
+    prefer_heavy = bool((triage or {}).get("needs_heavy_model"))
+
+    native_txt = await extract_scanned_pdf_with_gemini_native(
+        raw_bytes,
+        filename=filename,
+        doc_category=doc_category,
+        prefer_heavy=prefer_heavy,
+        max_chars=max_chars,
+    )
+    if native_txt and len(native_txt.strip()) >= 20:
+        is_code_pdf = (
+            doc_category == "technical_spec"
+            or bool(STACK_TRACE_SIGNATURE_REGEX.search(native_txt[:4000]))
+        )
+        triage_tag = f"[PDFTriage: category={doc_category} | heavy={prefer_heavy}]"
+        return (
+            f"=== Attached Scanned PDF (Native Gemini Vision): `{filename}` ===\n"
+            f"{triage_tag}\n{native_txt}"
+        ), is_code_pdf
+
+    return f"=== Attached PDF Document: `{filename}` ===\n{pypdf_text}", False
 
 
 def parse_docx_bytes(raw_bytes: bytes, max_chars: int = 30000) -> str:
@@ -1180,42 +1239,42 @@ async def _search_saucenao_async(raw_bytes: bytes, filename: str) -> str:
                 return ""
             data = await resp.json(content_type=None)
 
-        results = data.get("results") or []
-        matches = []
-        for item in results:
-            hdr = item.get("header") or {}
-            sim = float(hdr.get("similarity") or 0.0)
-            if sim < 68.0:
-                continue
-            d = item.get("data") or {}
-            title = d.get("title") or d.get("source") or d.get("eng_name") or d.get("jp_name") or ""
-            part = d.get("part") or ""
-            author = d.get("member_name") or d.get("author") or d.get("creator") or ""
-            if isinstance(author, list):
-                author = ", ".join(str(x) for x in author)
-            characters = d.get("characters") or ""
-            material = d.get("material") or ""
-            pixiv_id = d.get("pixiv_id")
-            ext_urls = d.get("ext_urls") or []
-            if pixiv_id and not any("pixiv.net" in u for u in ext_urls):
-                ext_urls.insert(0, f"{HTTPS}www.pixiv.net/artworks/{pixiv_id}")
+            results = data.get("results") or []
+            matches = []
+            for item in results:
+                hdr = item.get("header") or {}
+                sim = float(hdr.get("similarity") or 0.0)
+                if sim < 68.0:
+                    continue
+                d = item.get("data") or {}
+                title = d.get("title") or d.get("source") or d.get("eng_name") or d.get("jp_name") or ""
+                part = d.get("part") or ""
+                author = d.get("member_name") or d.get("author") or d.get("creator") or ""
+                if isinstance(author, list):
+                    author = ", ".join(str(x) for x in author)
+                characters = d.get("characters") or ""
+                material = d.get("material") or ""
+                pixiv_id = d.get("pixiv_id")
+                ext_urls = d.get("ext_urls") or []
+                if pixiv_id and not any("pixiv.net" in u for u in ext_urls):
+                    ext_urls.insert(0, f"{HTTPS}www.pixiv.net/artworks/{pixiv_id}")
 
-            info_parts = [f"Similarity: {sim:.1f}%"]
-            if title:
-                info_parts.append(f"Title/Source: {title}{f' ({part})' if part else ''}")
-            if material:
-                info_parts.append(f"Series/Material: {material}")
-            if characters:
-                info_parts.append(f"Character(s): {characters}")
-            if author:
-                info_parts.append(f"Artist/Author: {author}")
-            if ext_urls:
-                info_parts.append(f"URLs: {' | '.join(ext_urls[:2])}")
-            matches.append("- " + " | ".join(info_parts))
+                info_parts = [f"Similarity: {sim:.1f}%"]
+                if title:
+                    info_parts.append(f"Title/Source: {title}{f' ({part})' if part else ''}")
+                if material:
+                    info_parts.append(f"Series/Material: {material}")
+                if characters:
+                    info_parts.append(f"Character(s): {characters}")
+                if author:
+                    info_parts.append(f"Artist/Author: {author}")
+                if ext_urls:
+                    info_parts.append(f"URLs: {' | '.join(ext_urls[:2])}")
+                matches.append("- " + " | ".join(info_parts))
 
-        if matches:
-            api_log(f"ReverseImage (SauceNAO) -> {len(matches)} match(es) ({time.monotonic() - t0:.2f}s)")
-            return "=== SauceNAO Reverse Image Matches (Pixiv / Manga / Art) ===\n" + "\n".join(matches[:3])
+            if matches:
+                api_log(f"ReverseImage (SauceNAO) -> {len(matches)} match(es) ({time.monotonic() - t0:.2f}s)")
+                return "=== SauceNAO Reverse Image Matches (Pixiv / Manga / Art) ===\n" + "\n".join(matches[:3])
     except Exception as e:
         api_log(f"ReverseImage (SauceNAO) -> skipped ({type(e).__name__})")
     return ""
@@ -1248,31 +1307,31 @@ async def _search_iqdb_keyless_async(raw_bytes: bytes, filename: str) -> str:
                 return ""
             html_text = await resp.text()
 
-        if "Best match" not in html_text:
-            return ""
-        sim_m = re.search(r"(\d+)%\s*similarity", html_text)
-        if not sim_m or int(sim_m.group(1)) < 72:
-            return ""
-        sim_pct = int(sim_m.group(1))
+            if "Best match" not in html_text:
+                return ""
+            sim_m = re.search(r"(\d+)%\s*similarity", html_text)
+            if not sim_m or int(sim_m.group(1)) < 72:
+                return ""
+            sim_pct = int(sim_m.group(1))
 
-        link_m = re.search(
-            r"Best match.*?href=[\"']((?:https?:)?//[^\"']+)[\"'][^>]*>\s*<img[^>]*alt=[\"']([^\"']*)[\"']",
-            html_text,
-            re.DOTALL | re.IGNORECASE,
-        )
-        if not link_m:
-            return ""
-        match_url = link_m.group(1)
-        if match_url.startswith("//"):
-            match_url = "https:" + match_url
-        alt_tags = link_m.group(2).strip()
+            link_m = re.search(
+                r"Best match.*?href=[\"']((?:https?:)?//[^\"']+)[\"'][^>]*>\s*<img[^>]*alt=[\"']([^\"']*)[\"']",
+                html_text,
+                re.DOTALL | re.IGNORECASE,
+            )
+            if not link_m:
+                return ""
+            match_url = link_m.group(1)
+            if match_url.startswith("//"):
+                match_url = "https:" + match_url
+            alt_tags = link_m.group(2).strip()
 
-        api_log(f"ReverseImage (IQDB Keyless) -> {sim_pct}% match ({time.monotonic() - t0:.2f}s)")
-        return (
-            f"=== IQDB Reverse Illustration Match ===\n"
-            f"- Similarity: {sim_pct}% | Source Archive URL: {match_url}\n"
-            f"- Detected Tags / Character / Series: {alt_tags}"
-        )
+            api_log(f"ReverseImage (IQDB Keyless) -> {sim_pct}% match ({time.monotonic() - t0:.2f}s)")
+            return (
+                f"=== IQDB Reverse Illustration Match ===\n"
+                f"- Similarity: {sim_pct}% | Source Archive URL: {match_url}\n"
+                f"- Detected Tags / Character / Series: {alt_tags}"
+            )
     except Exception:
         return ""
 
@@ -1292,38 +1351,38 @@ async def _search_tracemoe_async(raw_bytes: bytes, mime_type: str) -> str:
                 return ""
             data = await resp.json()
 
-        docs = data.get("result") or []
-        if not docs:
-            return ""
-        top = docs[0]
-        sim = float(top.get("similarity") or 0.0) * 100.0
-        if sim < 87.0:
-            return ""
+            docs = data.get("result") or []
+            if not docs:
+                return ""
+            top = docs[0]
+            sim = float(top.get("similarity") or 0.0) * 100.0
+            if sim < 87.0:
+                return ""
 
-        anilist = top.get("anilist") or {}
-        title_obj = anilist.get("title") if isinstance(anilist, dict) else {}
-        romaji = (title_obj or {}).get("romaji") or ""
-        english = (title_obj or {}).get("english") or ""
-        native = (title_obj or {}).get("native") or ""
-        mal_id = anilist.get("idMal") if isinstance(anilist, dict) else None
-        ani_id = anilist.get("id") if isinstance(anilist, dict) else None
+            anilist = top.get("anilist") or {}
+            title_obj = anilist.get("title") if isinstance(anilist, dict) else {}
+            romaji = (title_obj or {}).get("romaji") or ""
+            english = (title_obj or {}).get("english") or ""
+            native = (title_obj or {}).get("native") or ""
+            mal_id = anilist.get("idMal") if isinstance(anilist, dict) else None
+            ani_id = anilist.get("id") if isinstance(anilist, dict) else None
 
-        ep = top.get("episode") or "Movie/OVA"
-        from_sec = int(float(top.get("from") or 0))
-        mm, ss = divmod(from_sec, 60)
-        hh, mm = divmod(mm, 60)
-        ts_str = f"{hh:02d}:{mm:02d}:{ss:02d}" if hh > 0 else f"{mm:02d}:{ss:02d}"
+            ep = top.get("episode") or "Movie/OVA"
+            from_sec = int(float(top.get("from") or 0))
+            mm, ss = divmod(from_sec, 60)
+            hh, mm = divmod(mm, 60)
+            ts_str = f"{hh:02d}:{mm:02d}:{ss:02d}" if hh > 0 else f"{mm:02d}:{ss:02d}"
 
-        mal_link = f"{HTTPS}myanimelist.net/anime/{mal_id}" if mal_id else (
-            f"{HTTPS}anilist.co/anime/{ani_id}" if ani_id else ""
-        )
-        api_log(f"ReverseImage (trace.moe) -> '{romaji or native}' Ep.{ep} at {ts_str} ({sim:.1f}%, {time.monotonic() - t0:.2f}s)")
-        return (
-            f"=== trace.moe Anime Screenshot Match ===\n"
-            f"- Anime Title: {romaji} / {english} ({native})\n"
-            f"- Episode: {ep} | Exact Scene Timestamp: {ts_str} | Similarity: {sim:.1f}%\n"
-            + (f"- Reference Link: {mal_link}" if mal_link else "")
-        ).strip()
+            mal_link = f"{HTTPS}myanimelist.net/anime/{mal_id}" if mal_id else (
+                f"{HTTPS}anilist.co/anime/{ani_id}" if ani_id else ""
+            )
+            api_log(f"ReverseImage (trace.moe) -> '{romaji or native}' Ep.{ep} at {ts_str} ({sim:.1f}%, {time.monotonic() - t0:.2f}s)")
+            return (
+                f"=== trace.moe Anime Screenshot Match ===\n"
+                f"- Anime Title: {romaji} / {english} ({native})\n"
+                f"- Episode: {ep} | Exact Scene Timestamp: {ts_str} | Similarity: {sim:.1f}%\n"
+                + (f"- Reference Link: {mal_link}" if mal_link else "")
+            ).strip()
     except Exception as e:
         api_log(f"ReverseImage (trace.moe) -> skipped ({type(e).__name__})")
     return ""
@@ -1344,11 +1403,69 @@ def _compress_image_for_vision_ocr_sync(raw_bytes: bytes, max_dim: int = 1280, q
     return base64.b64encode(buf.getvalue()).decode("utf-8"), "image/jpeg", is_color_image
 
 
+def _build_tailored_single_image_ocr_prompt(
+    context_header: str,
+    triage_type: str | None,
+) -> str:
+    """Builds a domain-specific OCR prompt when Decision-1 triage classifies the image."""
+    if triage_type == "code_or_error":
+        return (
+            f"{context_header}"
+            "Analyze this software/code/terminal/system screenshot with strict technical precision:\n"
+            "1. [Error / Component Context]: Identify the tool/IDE/dashboard/runtime shown and summarize the exact error or state.\n"
+            "2. [Verbatim Code, Logs & Error Codes]: Transcribe ALL visible code lines, SQL queries, stack trace frames, "
+            "`ORA-`/`TNS-`/HTTP error codes, file paths, line numbers, and terminal commands verbatim with accurate spelling and indentation.\n"
+            "Do NOT guess missing lines and do NOT output any `[WEB_VERIFY_QUERY]` tag."
+        )
+
+    if triage_type == "document_table":
+        return (
+            f"{context_header}"
+            "Analyze this document, form, invoice, slide, or table screenshot accurately:\n"
+            "1. [Document Overview]: Identify the document type, title, dates, and issuing organization if visible.\n"
+            "2. [Verbatim Text & Structured Data]: Transcribe ALL visible headings, body text, form fields, key-value pairs, "
+            "and table rows/numbers verbatim (pay close attention to Thai tone marks, vowels, and exact digits).\n"
+            "Do NOT fabricate unreadable fields and do NOT output any `[WEB_VERIFY_QUERY]` tag."
+        )
+
+    if triage_type == "real_world_product":
+        return (
+            f"{context_header}"
+            "Analyze this real-world photograph thoroughly for Yukino Yukinoshita:\n"
+            "1. [Product / Object Identification]: Identify the Brand, Product Line, exact Model Name/Number, "
+            "and key physical markings, ports, specs, or visual details.\n"
+            "2. [Verbatim Visible Text]: Transcribe ALL visible text, labels, model stickers, or Thai/English/Japanese markings verbatim.\n"
+            "3. [WEB_VERIFY_QUERY]: On the very last line, if a specific brand/model/product name is visible, output:\n"
+            "   `[WEB_VERIFY_QUERY: <exact brand + model name or visible product code>]`"
+        )
+
+    # Default / manga_comic / anime_fanart / meme_casual prompt
+    return (
+        f"{context_header}"
+        "Analyze this image thoroughly so Yukino Yukinoshita can understand the exact visual story, "
+        "series/character identity, speaker attribution, and source.\n"
+        "Provide your output in 3 concise, well-structured sections:\n"
+        "1. [Identification & Panel-by-Panel Visual Context]:\n"
+        "   - If Comic / Manga / Fanart: Identify the Anime/Game/Manga Series and Character names ONLY if clearly supported by "
+        "unmistakable visual features (hair ornaments, outfits, halos/no halos) or the post caption above. NEVER mix character names "
+        "from one franchise with a different franchise title, and NEVER invent nonsensical style names or guess when ambiguous—write 'Unknown / Unconfirmed Series' instead! "
+        "Describe what is happening visually in each panel in traditional Japanese reading order (Top-to-Bottom, Right-to-Left).\n"
+        "   - If Code / Terminal / Stack Trace / UI Screenshot: Describe the exact error message, HTTP status, UI component, or terminal output shown.\n"
+        "   - If Real-World Photo/Product/Hardware: Identify the Brand, Product Line, Model Name/Number, and distinguishing physical features.\n"
+        "2. [Ordered Dialogue & Verbatim OCR Text]:\n"
+        "   - For comics/manga: List the dialogue and SFX in reading order (Right-to-Left, Top-to-Bottom) tagged with the speaker.\n"
+        "   - Transcribe ALL visible text (Thai, Japanese, English, code, error codes) verbatim, paying close attention to Thai tone marks/vowels.\n"
+        "3. [WEB_VERIFY_QUERY]: On the very last line, ONLY if the image contains actual spoken dialogue or product model text (NEVER pure comic sound effects like タッ or ドシッ!), output:\n"
+        "   `[WEB_VERIFY_QUERY: <exact verbatim dialogue quote or product model — NEVER pure SFX and NEVER a guessed title>]`"
+    )
+
+
 async def _call_gemini_multi_image_batch(
     encoded_images: list[tuple[str, str, str]],
     batch_prompt: str,
     timeout_sec: int = 36,
     max_output_tokens: int = 3072,
+    triage_header: str = "",
 ) -> str:
     if not GEMINI_API_KEY:
         return ""
@@ -1378,7 +1495,8 @@ async def _call_gemini_multi_image_batch(
             out_txt = "\n".join(p.get("text", "") for p in resp_parts if p.get("text") and not p.get("thought", False)).strip()
             out_txt = re.sub(r"<think>[\s\S]*?</think>", "", out_txt).strip()
             if out_txt:
-                return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{out_txt}"
+                prefix = f"{triage_header}\n" if triage_header else ""
+                return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{prefix}{out_txt}"
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -1391,6 +1509,7 @@ async def _call_cf_multi_image_batch(
     batch_prompt: str,
     timeout_sec: int = 50,
     max_tokens: int = 3072,
+    triage_header: str = "",
 ) -> str:
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
         return ""
@@ -1433,7 +1552,8 @@ async def _call_cf_multi_image_batch(
                     content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
                     if content:
                         api_log(f"MultiImageOCR (Tier 2 CF) -> {CF_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
-                        return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{content}"
+                        prefix = f"{triage_header}\n" if triage_header else ""
+                        return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{prefix}{content}"
             api_log(f"MultiImageOCR (Tier 2 CF) -> HTTP {resp.status} ({elapsed:.2f}s)")
     except asyncio.CancelledError:
         raise
@@ -1449,23 +1569,6 @@ async def extract_multi_images_batch_ocr(
     target_list = images_list[:MAX_BATCH_IMAGES]
     if len(target_list) < 2:
         return ""
-
-    batch_prompt = (
-        f"You are analyzing a sequential multi-image post/comic (Pages 1 to {len(target_list)}) for Yukino Yukinoshita.\n"
-        + (f"Post Metadata / Caption Context:\n{post_meta_hint[:1400]}\n\n" if post_meta_hint else "")
-        + "Examine ALL pages together in sequence so you maintain strict character & franchise consistency across every page:\n"
-        "1. [Series / Franchise & Character Identification — STRICT EVIDENCE RULE]:\n"
-        "   - Verify concrete visual traits (hair/eye color, signature hair accessories/ornaments, outfits, presence or absence of floating halos) "
-        "and cross-check with the post caption/tags before naming ANY franchise or character.\n"
-        "   - NEVER mix characters from one franchise with the title/protagonist of a different franchise! "
-        "(For example: do NOT label a post as 'Blue Archive' or call a male character 'Sensei' unless floating halos above characters' heads "
-        "or explicit Blue Archive names are actually visible; if characters are Firefly/Hotaru and Caelus, the franchise is 'Honkai: Star Rail').\n"
-        "   - If the franchise or character names are not 100% certain from the visuals or caption, write 'Unknown / Unconfirmed Series' "
-        "and describe the characters strictly by appearance rather than guessing.\n"
-        "2. [Page-by-Page Story & Panel-by-Panel Dialogue/SFX (Right-to-Left, Top-to-Bottom)]:\n"
-        "   - For each page (Page 1, Page 2, ...), summarize the visual events and list all dialogue, thoughts, "
-        "and key SFX in Japanese reading order tagged with the speaker."
-    )
 
     n_imgs = len(target_list)
     if n_imgs >= 9:
@@ -1490,6 +1593,59 @@ async def extract_multi_images_batch_ocr(
     if len(encoded_images) < 2:
         return ""
 
+    # Phase 2 Pre-OCR Batch Triage on Page 1 (~250ms, ~260 tokens):
+    # Tailors batch prompt for code/document screenshot sets and preserves Japanese dialogue flags.
+    triage = await triage_image_with_decision_1(
+        encoded_images[0][0],
+        encoded_images[0][1],
+        filename=encoded_images[0][2],
+        post_meta_hint=post_meta_hint,
+        resolution="low",
+    )
+    triage_type = (
+        triage["image_type"]
+        if (triage and float(triage.get("image_type_confidence") or 0.0) >= 0.65)
+        else ""
+    )
+    triage_header = (
+        f"[ImageTriage: type={triage_type} | conf={triage['image_type_confidence']:.2f} | "
+        f"has_japanese_dialogue={bool(triage.get('has_japanese_dialogue'))}]"
+        if triage_type
+        else ""
+    )
+
+    if triage_type == "code_or_error":
+        batch_prompt = (
+            f"You are analyzing {len(encoded_images)} sequential software/code/terminal/log screenshots.\n"
+            + (f"User/Post Context:\n{post_meta_hint[:1000]}\n\n" if post_meta_hint else "")
+            + "For each image (Image 1, Image 2, ...), transcribe ALL visible code, SQL queries, error messages, "
+            "stack traces, config values, and terminal outputs verbatim, connecting how the screenshots relate to each other."
+        )
+    elif triage_type == "document_table":
+        batch_prompt = (
+            f"You are analyzing {len(encoded_images)} sequential document/table/slide pages.\n"
+            + (f"User/Post Context:\n{post_meta_hint[:1000]}\n\n" if post_meta_hint else "")
+            + "For each page (Image 1, Image 2, ...), transcribe ALL visible headings, body text, numbers, dates, "
+            "and table rows verbatim in their original language (Thai/English/Japanese)."
+        )
+    else:
+        batch_prompt = (
+            f"You are analyzing a sequential multi-image post/comic (Pages 1 to {len(encoded_images)}) for Yukino Yukinoshita.\n"
+            + (f"Post Metadata / Caption Context:\n{post_meta_hint[:1400]}\n\n" if post_meta_hint else "")
+            + "Examine ALL pages together in sequence so you maintain strict character & franchise consistency across every page:\n"
+            "1. [Series / Franchise & Character Identification — STRICT EVIDENCE RULE]:\n"
+            "   - Verify concrete visual traits (hair/eye color, signature hair accessories/ornaments, outfits, presence or absence of floating halos) "
+            "and cross-check with the post caption/tags before naming ANY franchise or character.\n"
+            "   - NEVER mix characters from one franchise with the title/protagonist of a different franchise! "
+            "(For example: do NOT label a post as 'Blue Archive' or call a male character 'Sensei' unless floating halos above characters' heads "
+            "or explicit Blue Archive names are actually visible; if characters are Firefly/Hotaru and Caelus, the franchise is 'Honkai: Star Rail').\n"
+            "   - If the franchise or character names are not 100% certain from the visuals or caption, write 'Unknown / Unconfirmed Series' "
+            "and describe the characters strictly by appearance rather than guessing.\n"
+            "2. [Page-by-Page Story & Panel-by-Panel Dialogue/SFX (Right-to-Left, Top-to-Bottom)]:\n"
+            "   - For each page (Page 1, Page 2, ...), summarize the visual events and list all dialogue, thoughts, "
+            "and key SFX in Japanese reading order tagged with the speaker."
+        )
+
     has_gemini = bool(GEMINI_API_KEY)
     has_cf = bool(CF_ACCOUNT_ID and CF_API_TOKEN)
     gemini_timeout = min(38, 18 + (2 * len(encoded_images)))
@@ -1498,18 +1654,18 @@ async def extract_multi_images_batch_ocr(
     try:
         if not has_gemini and has_cf:
             return await _call_cf_multi_image_batch(
-                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=out_tokens
+                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=out_tokens, triage_header=triage_header
             )
         if has_gemini and not has_cf:
             return await _call_gemini_multi_image_batch(
-                encoded_images, batch_prompt, timeout_sec=gemini_timeout, max_output_tokens=out_tokens
+                encoded_images, batch_prompt, timeout_sec=gemini_timeout, max_output_tokens=out_tokens, triage_header=triage_header
             )
         if not has_gemini and not has_cf:
             return ""
 
         gemini_task = asyncio.create_task(
             _call_gemini_multi_image_batch(
-                encoded_images, batch_prompt, timeout_sec=gemini_timeout, max_output_tokens=out_tokens
+                encoded_images, batch_prompt, timeout_sec=gemini_timeout, max_output_tokens=out_tokens, triage_header=triage_header
             )
         )
         done, _ = await asyncio.wait({gemini_task}, timeout=16.0)
@@ -1521,13 +1677,13 @@ async def extract_multi_images_batch_ocr(
             except Exception:
                 pass
             return await _call_cf_multi_image_batch(
-                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=out_tokens
+                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=out_tokens, triage_header=triage_header
             )
 
         api_log(f"Hedge (MultiImageOCR {len(encoded_images)}p) -> Gemini >16s; racing Cloudflare batch in parallel")
         cf_task = asyncio.create_task(
             _call_cf_multi_image_batch(
-                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=out_tokens
+                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=out_tokens, triage_header=triage_header
             )
         )
         tasks = {gemini_task, cf_task}
@@ -1608,38 +1764,66 @@ async def extract_image_via_transient_ocr(
         mime_type = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
         is_color_img = True
 
+    # Phase 2 Pre-OCR Multimodal Triage (~250-350ms, 0 output tokens):
+    # Skips wasted 2-6s anime reverse-image lookups on code/doc/product photos and selects a tailored OCR prompt.
+    triage = await triage_image_with_decision_1(
+        b64_img,
+        mime_type,
+        filename=filename,
+        post_meta_hint=post_meta_hint,
+        resolution="low",
+    )
+    triage_conf = float((triage or {}).get("image_type_confidence") or 0.0)
+    triage_type = str((triage or {}).get("image_type") or "") if triage_conf >= 0.65 else ""
+    has_jp_dialogue = bool((triage or {}).get("has_japanese_dialogue"))
+    triage_needs_lookup = bool((triage or {}).get("needs_source_lookup"))
+    triage_is_anime_ss = bool((triage or {}).get("is_anime_screenshot"))
+    triage_anime_ss_prob = float((triage or {}).get("anime_screenshot_prob") or 0.0)
+
+    if triage_type in ("code_or_error", "document_table"):
+        do_saucenao = False
+        do_iqdb = False
+        do_tracemoe = False
+        do_web_verify = False
+    elif triage_type == "real_world_product":
+        do_saucenao = False
+        do_iqdb = False
+        do_tracemoe = False
+        do_web_verify = bool(run_source_lookup)
+    elif triage_type == "manga_comic":
+        do_saucenao = bool(run_source_lookup and triage_needs_lookup)
+        do_iqdb = do_saucenao
+        do_tracemoe = bool(run_source_lookup and is_color_img and triage_is_anime_ss)
+        do_web_verify = bool(run_source_lookup)
+    elif triage_type == "anime_fanart":
+        do_saucenao = bool(run_source_lookup)
+        do_iqdb = bool(run_source_lookup)
+        do_tracemoe = bool(run_source_lookup and is_color_img and (triage_is_anime_ss or triage_anime_ss_prob >= 0.35))
+        do_web_verify = bool(run_source_lookup)
+    elif triage_type == "meme_casual":
+        do_saucenao = bool(run_source_lookup and triage_needs_lookup)
+        do_iqdb = do_saucenao
+        do_tracemoe = False
+        do_web_verify = bool(run_source_lookup)
+    else:
+        # Fallback to existing behavior if Decision-1 triage is unavailable or low-confidence
+        do_saucenao = bool(run_source_lookup)
+        do_iqdb = bool(run_source_lookup)
+        do_tracemoe = bool(run_source_lookup and is_color_img)
+        do_web_verify = bool(run_source_lookup)
+
     context_header = ""
     if page_label or post_meta_hint:
         context_header = (
             f"Context Note ({page_label or 'Single Image'}):\n"
             + (f"{post_meta_hint[:600]}\n" if post_meta_hint else "")
-            + "Keep character identities consistent with the post caption/context above.\n\n"
+            + "Keep character identities and details consistent with the context above.\n\n"
         )
 
-    ocr_prompt = (
-        f"{context_header}"
-        "Analyze this image thoroughly so Yukino Yukinoshita can understand the exact visual story, "
-        "series/character identity, speaker attribution, and source.\n"
-        "Provide your output in 3 concise, well-structured sections:\n"
-        "1. [Identification & Panel-by-Panel Visual Context]:\n"
-        "   - If Comic / Manga / Fanart: Identify the Anime/Game/Manga Series and Character names ONLY if clearly supported by "
-        "unmistakable visual features (hair ornaments, outfits, halos/no halos) or the post caption above. NEVER mix character names "
-        "from one franchise with a different franchise title, and NEVER invent nonsensical style names or guess when ambiguous—write 'Unknown / Unconfirmed Series' instead! "
-        "Describe what is happening visually in each panel in traditional Japanese reading order (Top-to-Bottom, Right-to-Left).\n"
-        "   - If Code / Terminal / Stack Trace / UI Screenshot: Describe the exact error message, HTTP status, UI component, or terminal output shown.\n"
-        "   - If Real-World Photo/Product/Hardware: Identify the Brand, Product Line, Model Name/Number, and distinguishing physical features.\n"
-        "2. [Ordered Dialogue & Verbatim OCR Text]:\n"
-        "   - For comics/manga: List the dialogue and SFX in reading order (Right-to-Left, Top-to-Bottom) tagged with the speaker.\n"
-        "   - Transcribe ALL visible text (Thai, Japanese, English, code, error codes) verbatim, paying close attention to Thai tone marks/vowels.\n"
-        "3. [WEB_VERIFY_QUERY]: On the very last line, ONLY if the image contains actual spoken dialogue or product model text (NEVER pure comic sound effects like タッ or ドシッ!), output:\n"
-        "   `[WEB_VERIFY_QUERY: <exact verbatim dialogue quote or product model — NEVER pure SFX and NEVER a guessed title>]`"
-    )
+    ocr_prompt = _build_tailored_single_image_ocr_prompt(context_header, triage_type or None)
 
-    reverse_tasks = []
-    if run_source_lookup:
-        reverse_tasks.append(asyncio.create_task(_search_saucenao_async(raw_bytes, filename)))
-        if is_color_img:
-            reverse_tasks.append(asyncio.create_task(_search_tracemoe_async(raw_bytes, mime_type)))
+    saucenao_task = asyncio.create_task(_search_saucenao_async(raw_bytes, filename)) if do_saucenao else None
+    tracemoe_task = asyncio.create_task(_search_tracemoe_async(raw_bytes, mime_type)) if do_tracemoe else None
 
     vision_result = ""
 
@@ -1738,27 +1922,37 @@ async def extract_image_via_transient_ocr(
             api_log(f"Image OCR (Tier 5 Modal) -> {ACTIVE_VISION_MODEL} failed ({type(e).__name__})")
 
     out_parts = []
-    if reverse_tasks:
-        rev_results = await asyncio.gather(*reverse_tasks, return_exceptions=True)
-        saucenao_txt = rev_results[0] if (len(rev_results) > 0 and isinstance(rev_results[0], str)) else ""
-        tracemoe_txt = rev_results[1] if (len(rev_results) > 1 and isinstance(rev_results[1], str)) else ""
+    if triage_type:
+        out_parts.append(
+            f"[ImageTriage: type={triage_type} | conf={triage_conf:.2f} | has_japanese_dialogue={has_jp_dialogue}]"
+        )
 
-        if saucenao_txt:
-            out_parts.append(saucenao_txt)
-        else:
-            iqdb_txt = await _search_iqdb_keyless_async(raw_bytes, filename)
-            if iqdb_txt:
-                out_parts.append(iqdb_txt)
+    saucenao_txt = ""
+    tracemoe_txt = ""
+    pending_rev = [t for t in (saucenao_task, tracemoe_task) if t is not None]
+    if pending_rev:
+        await asyncio.gather(*pending_rev, return_exceptions=True)
+        if saucenao_task is not None and not saucenao_task.cancelled() and saucenao_task.exception() is None:
+            saucenao_txt = saucenao_task.result() or ""
+        if tracemoe_task is not None and not tracemoe_task.cancelled() and tracemoe_task.exception() is None:
+            tracemoe_txt = tracemoe_task.result() or ""
 
-        if tracemoe_txt:
-            out_parts.append(tracemoe_txt)
+    if saucenao_txt:
+        out_parts.append(saucenao_txt)
+    elif do_iqdb:
+        iqdb_txt = await _search_iqdb_keyless_async(raw_bytes, filename)
+        if iqdb_txt:
+            out_parts.append(iqdb_txt)
+
+    if tracemoe_txt:
+        out_parts.append(tracemoe_txt)
 
     if vision_result:
         clean_vis = re.sub(r"\[WEB_VERIFY_QUERY:\s*[^\]]+?\]", "", vision_result, flags=re.IGNORECASE).strip()
         out_parts.append(f"=== Vision Analysis & OCR ===\n{clean_vis}")
 
         q_match = re.search(r"\[WEB_VERIFY_QUERY:\s*([^\]]+?)\s*\]", vision_result, re.IGNORECASE)
-        if run_source_lookup and q_match:
+        if do_web_verify and q_match:
             verify_q = q_match.group(1).strip()[:120]
             if (
                 verify_q
@@ -1844,10 +2038,10 @@ async def extract_all_context(
                 )
             elif fname.endswith(".pdf"):
                 parsed_heavy_doc = True
-                blocks.append(
-                    f"=== Attached PDF Document: `{att.filename}` ===\n"
-                    + await asyncio.to_thread(parse_pdf_bytes, raw_bytes)
-                )
+                pdf_block, is_code_pdf = await extract_pdf_context_async(raw_bytes, att.filename)
+                if is_code_pdf:
+                    has_code_file = True
+                blocks.append(pdf_block)
             elif fname.endswith(".docx"):
                 parsed_heavy_doc = True
                 blocks.append(
@@ -1868,7 +2062,7 @@ async def extract_all_context(
             batch_vis = await extract_multi_images_batch_ocr(image_att_batch, post_meta_hint=message.content or "")
             if batch_vis:
                 processed_image_count += len(image_att_batch)
-                if STACK_TRACE_SIGNATURE_REGEX.search(batch_vis):
+                if "[ImageTriage: type=code_or_error" in batch_vis or STACK_TRACE_SIGNATURE_REGEX.search(batch_vis):
                     has_code_file = True
                 blocks.append(batch_vis)
         if processed_image_count == 0:
@@ -1892,7 +2086,7 @@ async def extract_all_context(
             ]
             for idx, img_fn, ocr_out in await asyncio.gather(*att_tasks):
                 processed_image_count += 1
-                if STACK_TRACE_SIGNATURE_REGEX.search(ocr_out):
+                if "[ImageTriage: type=code_or_error" in ocr_out or STACK_TRACE_SIGNATURE_REGEX.search(ocr_out):
                     has_code_file = True
                 blocks.append(f"=== Image #{idx} Inspection & Source Lookup (`{img_fn}`) ===\n{ocr_out}")
         image_att_batch.clear()
@@ -1920,7 +2114,7 @@ async def extract_all_context(
             batch_vis = await extract_multi_images_batch_ocr(target_embed_imgs, post_meta_hint=meta_hint)
             if batch_vis:
                 processed_image_count += len(target_embed_imgs)
-                if STACK_TRACE_SIGNATURE_REGEX.search(batch_vis):
+                if "[ImageTriage: type=code_or_error" in batch_vis or STACK_TRACE_SIGNATURE_REGEX.search(batch_vis):
                     has_code_file = True
                 blocks.append(batch_vis)
                 batch_done = True
@@ -1950,7 +2144,7 @@ async def extract_all_context(
             ]
             for res_block in await asyncio.gather(*emb_tasks):
                 processed_image_count += 1
-                if STACK_TRACE_SIGNATURE_REGEX.search(res_block):
+                if "[ImageTriage: type=code_or_error" in res_block or STACK_TRACE_SIGNATURE_REGEX.search(res_block):
                     has_code_file = True
                 blocks.append(res_block)
 

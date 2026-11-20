@@ -1,6 +1,7 @@
 import re
 import json
 import time
+import base64
 import asyncio
 import aiohttp
 
@@ -96,6 +97,9 @@ _CF_RESPONSES_UNSUPPORTED_UNTIL: float = 0.0
 # Cooldown & in-flight guard for passive background user-fact extraction (Phase 1 Decision-1)
 _PASSIVE_FACT_COOLDOWN_UNTIL: dict[str, float] = {}
 _PASSIVE_FACT_IN_PROGRESS: set[str] = set()
+
+# Safe Render 512 MB RAM cap for inline base64 PDFs sent to Decision-1 / Gemini native PDF vision
+MAX_NATIVE_INLINE_PDF_BYTES = 20 * 1024 * 1024
 
 _ACTION_ROUTES_FOR_MULTI_INTENT = frozenset({
     "weather", "web_search", "ot_log", "image_gen", "code", "manga_translate"
@@ -446,9 +450,11 @@ async def call_gemini_hydrogen_chat(
 
 # ==============================================================================
 # GOOGLE GEMINI DECISIONS API ORCHESTRATOR (`gemini-decision-1` — 200 RPM, 50K TPM, 10K RPD)
-# Phase 1 Upgrade: Context-aware 10-question single-pass scoring (route + probabilities,
-# per-question confidences, complexity 0..3 rubric, tool gating, semantic guardrails,
-# tone cues, and passive durable-fact memory trigger).
+# Phase 1: Context-aware 10-question single-pass scoring (route + probabilities,
+#          per-question confidences, complexity 0..3 rubric, tool gating, semantic
+#          guardrails, tone cues, and passive durable-fact memory trigger).
+# Phase 2: Multimodal pre-OCR triage for images (`image` block) & scanned PDFs
+#          (`document` block) + native Gemini PDF extraction fallback.
 # ==============================================================================
 def _build_recent_channel_history_preview(channel_id: int | None) -> str:
     """Compact 2-turn conversation + active topic snapshot so Decision-1 resolves short follow-ups."""
@@ -761,6 +767,303 @@ async def orchestrate_message_with_decision_1(
         "button_domain": btn_domain,
         "domain_confidence": domain_conf,
     }
+
+
+async def triage_image_with_decision_1(
+    b64_img: str,
+    mime_type: str = "image/jpeg",
+    filename: str = "",
+    post_meta_hint: str = "",
+    resolution: str = "low",
+) -> dict | None:
+    """
+    Phase 2 Multimodal Pre-OCR Triage (~250-350ms, ~260 tokens at low resolution):
+    Classifies an image BEFORE launching OCR / SauceNAO / IQDB / trace.moe so code
+    screenshots, documents, and real-world product photos skip anime reverse-search
+    completely and receive tailored OCR prompts.
+    """
+    if not b64_img or not GEMINI_API_KEY or not GEMINI_DECISION_MODEL:
+        return None
+    if time.time() < state.gemini_decision_cooldown_until:
+        return None
+
+    safe_mime = (mime_type or "image/jpeg").strip().lower()
+    if not safe_mime.startswith("image/"):
+        safe_mime = "image/jpeg"
+
+    meta_line = f"Post / Caption Hint: {post_meta_hint[:350]}\n" if post_meta_hint else ""
+    text_block = f"Filename: {filename or 'image.jpg'}\n{meta_line}Classify this image for OCR and routing.\n"
+    shared_input = [
+        {"type": "text", "text": text_block},
+        {
+            "type": "image",
+            "data": b64_img,
+            "mime_type": safe_mime,
+            "resolution": resolution if resolution in ("low", "medium", "high") else "low",
+        },
+    ]
+
+    questions = {
+        "image_type": {
+            "type": "choice",
+            "instructions": "Select the single best visual category for this image.",
+            "criteria": {
+                "anime_fanart": "Single anime/game illustration, character fanart, key visual, or anime episode screenshot without multi-panel comic speech bubbles.",
+                "code_or_error": "IDE editor screenshot, source code, terminal/CLI output, stack trace, database/SQL tool, server log, Kubernetes/Grafana/network dashboard, or software error dialog.",
+                "document_table": "Scanned document, receipt, invoice, form, slide deck, chart, spreadsheet table, or dense text/article screenshot.",
+                "manga_comic": "Manga, manhwa, webtoon, 4-koma, or comic page/strip containing speech bubbles or comic panel dialogue.",
+                "meme_casual": "Casual meme, sticker, reaction image, chat screenshot, or miscellaneous social post.",
+                "real_world_product": "Real-world photograph of physical hardware, electronics, coffee equipment, model kits, food, scenery, or consumer products.",
+            },
+        },
+        "has_japanese_dialogue": {
+            "type": "noul",
+            "instructions": (
+                "Answer YES if this image visibly contains Japanese speech-bubble dialogue, comic narration, "
+                "or Japanese character speech lines that a reader would want translated. "
+                "Answer NO for pure sound effects, logos, UI buttons, English/Thai-only images, or textless art."
+            ),
+        },
+        "needs_source_lookup": {
+            "type": "noul",
+            "instructions": (
+                "Answer YES if anime/illustration reverse-image databases (SauceNAO, IQDB, trace.moe) "
+                "would be useful to identify the artist, anime, or manga source. "
+                "Answer NO for code/error screenshots, documents, invoices, charts, or real-world hardware photos."
+            ),
+        },
+        "is_anime_screenshot": {
+            "type": "noul",
+            "instructions": (
+                "Answer YES only if this is a colored frame or screenshot taken from an animated TV anime, "
+                "anime movie, or anime PV (suitable for trace.moe episode timestamp matching). "
+                "Answer NO for manga pages, static fanart illustrations, real photos, or software screenshots."
+            ),
+        },
+    }
+
+    answers = await call_gemini_decision_orchestrator(
+        shared_input, questions, timeout_sec=4.0, purpose="ImageTriage"
+    )
+    if not answers:
+        return None
+
+    type_ans = answers.get("image_type") or {}
+    jp_ans = answers.get("has_japanese_dialogue") or {}
+    lookup_ans = answers.get("needs_source_lookup") or {}
+    anime_ss_ans = answers.get("is_anime_screenshot") or {}
+
+    img_type = str(type_ans.get("choice") or "meme_casual")
+    img_type_conf = float(type_ans.get("confidence") or 0.0)
+    jp_prob = float(jp_ans.get("noul") or 0.0)
+    lookup_prob = float(lookup_ans.get("noul") or 0.0)
+    anime_ss_prob = float(anime_ss_ans.get("noul") or 0.0)
+
+    api_log(
+        f"ImageTriage ({(filename or 'img')[:32]}) -> type={img_type} ({img_type_conf:.2f}), "
+        f"jp_dlg={jp_prob >= 0.55} ({jp_prob:.2f}), lookup={lookup_prob >= 0.50} ({lookup_prob:.2f}), "
+        f"anime_ss={anime_ss_prob >= 0.55} ({anime_ss_prob:.2f})"
+    )
+    return {
+        "image_type": img_type,
+        "image_type_confidence": img_type_conf,
+        "has_japanese_dialogue": jp_prob >= 0.55,
+        "jp_dialogue_prob": jp_prob,
+        "needs_source_lookup": lookup_prob >= 0.50,
+        "source_lookup_prob": lookup_prob,
+        "is_anime_screenshot": anime_ss_prob >= 0.55,
+        "anime_screenshot_prob": anime_ss_prob,
+    }
+
+
+async def triage_pdf_with_decision_1(
+    pdf_bytes: bytes,
+    filename: str = "",
+    extracted_chars: int = 0,
+) -> dict | None:
+    """
+    Phase 2 Multimodal PDF Triage using Decision-1's native `document` block (`application/pdf`):
+    Inspects scanned/image-only PDFs directly without rendering pages locally on 0.1 vCPU,
+    determining readability, category, and whether `gemini-4-hydrogen` is needed.
+    """
+    if not pdf_bytes or not GEMINI_API_KEY or not GEMINI_DECISION_MODEL:
+        return None
+    if len(pdf_bytes) > MAX_NATIVE_INLINE_PDF_BYTES:
+        return None
+    if time.time() < state.gemini_decision_cooldown_until:
+        return None
+
+    b64_pdf = ""
+    try:
+        b64_pdf = await asyncio.to_thread(lambda b: base64.b64encode(b).decode("ascii"), pdf_bytes)
+        text_block = (
+            f"Filename: {filename or 'document.pdf'}\n"
+            f"Selectable Text Extracted by pypdf: {extracted_chars} chars (sparse/scanned PDF).\n"
+            "Inspect the attached PDF visually and classify it for native multimodal extraction.\n"
+        )
+        # Official Decisions API schema: document block takes `data` + `mime_type` (no `resolution` field)
+        shared_input = [
+            {"type": "text", "text": text_block},
+            {
+                "type": "document",
+                "data": b64_pdf,
+                "mime_type": "application/pdf",
+            },
+        ]
+        questions = {
+            "is_readable_scanned_doc": {
+                "type": "noul",
+                "instructions": (
+                    "Answer YES if this PDF visibly contains readable scanned text, forms, tables, "
+                    "diagrams, invoices, or comic dialogue that native PDF vision can extract. "
+                    "Answer NO only if the PDF is completely blank, corrupted, or unreadable."
+                ),
+            },
+            "doc_category": {
+                "type": "choice",
+                "instructions": "Select the primary category of this PDF document.",
+                "criteria": {
+                    "financial_invoice": "Invoice, receipt, e-Tax document, quotation, bill, purchase order, or bank/financial statement.",
+                    "form_report": "Official form, contract, manual, academic paper, meeting report, letter, or general scanned document.",
+                    "manga_visual": "Manga, comic, artbook, brochure, or primarily visual/illustrated booklet.",
+                    "technical_spec": "Software architecture spec, API doc, code/SQL listing, system diagram, network topology, or server/incident report.",
+                },
+            },
+            "needs_heavy_model": {
+                "type": "noul",
+                "instructions": (
+                    "Answer YES if this PDF has dense multi-page financial/technical tables, intricate diagrams, "
+                    "or very small fine print that requires a high-precision heavy reasoning model. "
+                    "Answer NO if standard fast extraction is sufficient."
+                ),
+            },
+        }
+        answers = await call_gemini_decision_orchestrator(
+            shared_input, questions, timeout_sec=8.0, purpose="PDFTriage"
+        )
+        if not answers:
+            return None
+
+        read_ans = answers.get("is_readable_scanned_doc") or {}
+        cat_ans = answers.get("doc_category") or {}
+        heavy_ans = answers.get("needs_heavy_model") or {}
+
+        read_prob = float(read_ans.get("noul") or 0.0)
+        doc_cat = str(cat_ans.get("choice") or "form_report")
+        cat_conf = float(cat_ans.get("confidence") or 0.0)
+        heavy_prob = float(heavy_ans.get("noul") or 0.0)
+
+        api_log(
+            f"PDFTriage ({(filename or 'doc.pdf')[:32]}) -> readable={read_prob >= 0.45} ({read_prob:.2f}), "
+            f"category={doc_cat} ({cat_conf:.2f}), heavy={heavy_prob >= 0.65} ({heavy_prob:.2f})"
+        )
+        return {
+            "is_readable_scanned_doc": read_prob >= 0.45,
+            "readable_prob": read_prob,
+            "doc_category": doc_cat,
+            "category_confidence": cat_conf,
+            "needs_heavy_model": heavy_prob >= 0.65,
+            "heavy_prob": heavy_prob,
+        }
+    except Exception as e:
+        api_log(f"PDFTriage -> skipped ({type(e).__name__})")
+        return None
+    finally:
+        b64_pdf = ""
+
+
+async def extract_scanned_pdf_with_gemini_native(
+    pdf_bytes: bytes,
+    filename: str = "",
+    doc_category: str = "form_report",
+    prefer_heavy: bool = False,
+    max_chars: int = 32000,
+) -> str:
+    """
+    Phase 2 Native Scanned PDF Extractor:
+    Sends raw PDF bytes directly via Gemini `inlineData` (`application/pdf`, up to 20 MB on Render),
+    eliminating local PDF rasterization on 0.1 vCPU and unlocking scanned Thai/EN/JP documents.
+    """
+    if not GEMINI_API_KEY or not pdf_bytes or len(pdf_bytes) > MAX_NATIVE_INLINE_PDF_BYTES:
+        return ""
+
+    category_directives = {
+        "financial_invoice": (
+            "Preserve EVERY line item, date, invoice/tax ID, vendor/customer name, quantity, "
+            "unit price, VAT/tax breakdown, subtotal, and grand total verbatim. Format tabular rows cleanly."
+        ),
+        "technical_spec": (
+            "Preserve ALL code snippets, SQL statements, error codes, config keys, IP/hostnames, "
+            "architecture diagram labels, and technical parameters verbatim."
+        ),
+        "manga_visual": (
+            "For each page, briefly describe the scene and transcribe dialogue/captions in reading order "
+            "tagged with the speaker."
+        ),
+        "form_report": (
+            "Transcribe ALL visible headings, paragraphs, form fields/checkbox values, dates, numbers, "
+            "and tables accurately in their original language (Thai/English/Japanese)."
+        ),
+    }
+    directive = category_directives.get(doc_category, category_directives["form_report"])
+    extract_prompt = (
+        f"You are extracting content from a scanned/image-based PDF file named `{filename or 'document.pdf'}`.\n"
+        f"{directive}\n"
+        "Rules:\n"
+        "1. Organize output clearly by page (`--- Page 1 ---`, `--- Page 2 ---`, ...).\n"
+        "2. Do NOT fabricate or guess unreadable text; mark genuinely illegible parts as `[illegible]`.\n"
+        "3. Pay special attention to Thai tone marks, vowels, and exact digits.\n"
+        "4. Output ONLY the clean extracted content."
+    )
+
+    b64_pdf = ""
+    payload = None
+    try:
+        b64_pdf = await asyncio.to_thread(lambda b: base64.b64encode(b).decode("ascii"), pdf_bytes)
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": extract_prompt},
+                        {"inlineData": {"mimeType": "application/pdf", "data": b64_pdf}},
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 8192,
+                "thinkingConfig": {"thinkingLevel": "LOW"},
+            },
+        }
+
+        data = None
+        if prefer_heavy:
+            data = await call_gemini_hydrogen_generate(
+                payload, timeout_sec=70, purpose="ScannedPDFHeavy"
+            )
+        if not data:
+            data = await call_gemini_generate_content_self_healing(
+                payload,
+                timeout_sec=45,
+                purpose="ScannedPDF",
+                max_models=3,
+                max_wall_sec=75.0,
+            )
+        if not data and not prefer_heavy:
+            data = await call_gemini_hydrogen_generate(
+                payload, timeout_sec=70, purpose="ScannedPDFHeavyFallback"
+            )
+
+        if not data:
+            return ""
+        extracted_txt, _, _ = _extract_gemini_text_and_calls(data)
+        return extracted_txt[:max_chars] if extracted_txt else ""
+    except Exception as e:
+        api_log(f"ScannedPDF Native Extract -> failed ({type(e).__name__}: {str(e)[:80]})")
+        return ""
+    finally:
+        b64_pdf = ""
+        payload = None
 
 
 async def _extract_and_save_durable_fact_bg(speaker_user, raw_user_query: str):
