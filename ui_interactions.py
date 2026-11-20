@@ -67,6 +67,35 @@ _SUBSTANTIVE_REQUEST_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+_IMAGE_TRIAGE_TAG_REGEX = re.compile(
+    r"\[ImageTriage:\s*type=([a-z_]+)\s*\|\s*conf=([0-9.]+)\s*\|\s*has_japanese_dialogue=(True|False)\]",
+    re.IGNORECASE,
+)
+
+
+def _parse_image_triage_metadata(extracted_ctx: str) -> tuple[str, float, bool | None]:
+    """Extracts `(image_type, confidence, has_japanese_dialogue)` from `[ImageTriage: ...]` if present."""
+    if not extracted_ctx:
+        return "", 0.0, None
+    m = _IMAGE_TRIAGE_TAG_REGEX.search(extracted_ctx)
+    if not m:
+        return "", 0.0, None
+    return m.group(1).strip().lower(), float(m.group(2) or 0.0), (m.group(3).lower() == "true")
+
+
+def _has_japanese_in_ocr_body_only(extracted_ctx: str) -> bool:
+    """Checks for Japanese dialogue strictly inside Vision/OCR blocks (never tweet captions)."""
+    if not extracted_ctx:
+        return False
+    ocr_sections = re.findall(
+        r"===\s*(?:Vision Analysis & OCR|Unified Multi-Image Visual & OCR Analysis)[^\n]*===\n([\s\S]*?)(?=\n===|\Z)",
+        extracted_ctx,
+        re.IGNORECASE,
+    )
+    if not ocr_sections:
+        return False
+    return bool(re.search(r"[ぁ-んァ-ヶ一-龯]", "\n".join(ocr_sections)))
+
 
 def _strip_internal_prompt_hints(text: str) -> str:
     if not text:
@@ -129,8 +158,8 @@ def should_attach_interactive_view(
     if valid_ctx or did_search:
         return True
 
-    # Gate on attach_buttons' OWN confidence (`buttons_confidence`) rather than `route_confidence`
-    if decision_plan:
+    # Gate on attach_buttons' OWN confidence (`buttons_confidence`) only when `attach_buttons` is actually present
+    if decision_plan and "attach_buttons" in decision_plan:
         btn_conf = float(
             decision_plan.get("buttons_confidence")
             if decision_plan.get("buttons_confidence") is not None
@@ -178,6 +207,33 @@ class AutoDisappearingView(discord.ui.View):
                 await msg.edit(view=None)
         except Exception:
             pass
+
+
+async def _deliver_button_followup_cleanly(interaction: discord.Interaction, answer: str) -> None:
+    """
+    Delivers a button follow-up answer cleanly WITHOUT any extra filler confirmation message:
+      - Short answers (<=1900 chars): resolve the deferred interaction directly via `interaction.followup.send(answer)`.
+      - Long/chunked answers (>1900 chars): delete the deferred thinking placeholder silently and post via `send_chunked_response`.
+    """
+    if not answer or not answer.strip():
+        try:
+            await interaction.delete_original_response()
+        except Exception:
+            pass
+        return
+
+    if len(answer) <= 1900:
+        try:
+            await interaction.followup.send(answer)
+            return
+        except Exception:
+            pass
+
+    try:
+        await interaction.delete_original_response()
+    except Exception:
+        pass
+    await send_chunked_response(interaction.channel, answer)
 
 
 async def _send_interaction_with_auto_view(
@@ -250,11 +306,7 @@ class CodeReviewActionView(AutoDisappearingView):
                 "complexity_confidence": 0.90,
             },
         )
-        await send_chunked_response(interaction.channel, answer)
-        try:
-            await interaction.followup.send("เรียบร้อยแล้วค่ะ ลองตรวจสอบดูนะคะ", ephemeral=True)
-        except Exception:
-            pass
+        await _deliver_button_followup_cleanly(interaction, answer)
 
     @discord.ui.button(label="Code Map", style=discord.ButtonStyle.primary, emoji="🗺️")
     async def btn_code_map(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -378,8 +430,10 @@ class GeneralAssistantActionView(AutoDisappearingView):
             f"[บริบทหัวข้อก่อนหน้า]: {self.user_query}\n"
             f"[สรุปคำตอบก่อนหน้า (ห้ามเขียนซ้ำ)]: {self.bot_reply[:1500]}"
         )
-        if cached_ctx and not use_search:
-            composed += f"\n\n[เนื้อหาอ้างอิงจากไฟล์/ลิงก์ในห้องแชท]:\n{cached_ctx[:18000]}"
+        if cached_ctx:
+            # Always include compact visual/document context so product/model-kit follow-ups know the exact identified entity
+            ctx_limit = 18000 if not use_search else 5000
+            composed += f"\n\n[เนื้อหาอ้างอิงจากไฟล์/ลิงก์ในห้องแชท]:\n{cached_ctx[:ctx_limit]}"
 
         answer, _ = await query_local_ollama_chat(
             composed,
@@ -388,15 +442,11 @@ class GeneralAssistantActionView(AutoDisappearingView):
             channel_id=self.channel_id,
             temperature=0.45,
             allow_agentic_search=use_search,
-            has_fresh_attachment=bool(cached_ctx and not use_search),
+            has_fresh_attachment=bool(cached_ctx),
             speaker_user=interaction.user,
             decision_plan=dec_plan,
         )
-        await send_chunked_response(interaction.channel, answer)
-        try:
-            await interaction.followup.send("เรียบร้อยแล้วค่ะ ลองดูรายละเอียดด้านบนนะคะ", ephemeral=True)
-        except Exception:
-            pass
+        await _deliver_button_followup_cleanly(interaction, answer)
 
 
 def build_contextual_suggestion_view(
@@ -409,6 +459,7 @@ def build_contextual_suggestion_view(
 ) -> GeneralAssistantActionView:
     ctx_lower = (extracted_ctx or "").lower()
     combined = f"{user_query} {bot_reply}".lower()
+    triage_type, triage_conf, triage_has_jp = _parse_image_triage_metadata(extracted_ctx)
 
     # Gate on button_domain's OWN confidence (`domain_confidence`) rather than `route_confidence`
     dec_domain = ""
@@ -421,12 +472,16 @@ def build_contextual_suggestion_view(
         if dom_conf >= 0.65:
             dec_domain = str(decision_plan.get("button_domain") or "").strip().lower()
 
-    if dec_domain in ("document", "social_art", "game", "news"):
+    # Physical product / scale model kit / collectible photo -> dedicated product buttons (never manga buttons!)
+    if triage_type == "real_world_product" and triage_conf >= 0.65:
+        domain = "product"
+    elif dec_domain in ("document", "social_art", "game", "news"):
         domain = dec_domain
     elif any(
         tag in ctx_lower
         for tag in (
             "=== attached pdf",
+            "=== attached scanned pdf",
             "=== attached word",
             "=== attached excel",
             "=== youtube video information",
@@ -445,6 +500,34 @@ def build_contextual_suggestion_view(
         domain = "news"
     else:
         domain = "general"
+
+    if domain == "product":
+        specs = [
+            (
+                "เช็ครุ่น & ราคาในไทย",
+                "🏷️",
+                discord.ButtonStyle.primary,
+                "จากสินค้า โมเดล หรือฟิกเกอร์ที่ระบุไว้ในคำตอบก่อนหน้า ช่วยค้นหาข้อมูลรุ่นที่วางจำหน่ายจริง "
+                "ไลน์สินค้า/สเกลที่เป็นไปได้ และราคาตลาดโดยประมาณในไทย (เช่น Shopee / ร้านโมเดล / ราคาเปิดตัว) ให้หน่อยค่ะ",
+                True,
+            ),
+            (
+                "เทียบสเกล / รุ่นใกล้เคียง",
+                "⚖️",
+                discord.ButtonStyle.secondary,
+                "ช่วยเปรียบเทียบความแตกต่างระหว่างสเกล รุ่นย่อย หรือไลน์สินค้าที่ใกล้เคียงกันของสิ่งนี้ "
+                "(เช่น รายละเอียดงาน ข้อต่อ ขนาด และความคุ้มค่า) แบบตรงไปตรงมาสไตล์ยูกิโนะค่ะ",
+                True,
+            ),
+            (
+                "สรุปจุดเด่น & รายละเอียด",
+                "📌",
+                discord.ButtonStyle.secondary,
+                "ช่วยสรุปจุดเด่นทางกายภาพ สเปค หรือดีเทลที่น่าสนใจของสิ่งนี้จากภาพออกมาเป็น 3 ข้อสั้นๆ กระชับๆ ค่ะ",
+                False,
+            ),
+        ]
+        return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs, source_message=source_message)
 
     if domain == "document":
         specs = [
@@ -473,7 +556,12 @@ def build_contextual_suggestion_view(
         return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs, source_message=source_message)
 
     if domain == "social_art":
-        has_foreign_dialogue = bool(re.search(r"[ぁ-んァ-ヶ一-龯]", extracted_ctx or ""))
+        # Trust ImageTriage's visual dialogue flag first; only fall back to OCR body (never tweet captions!)
+        if triage_has_jp is not None:
+            has_foreign_dialogue = triage_has_jp
+        else:
+            has_foreign_dialogue = _has_japanese_in_ocr_body_only(extracted_ctx)
+
         specs = []
         if has_foreign_dialogue:
             specs.append(

@@ -21,6 +21,12 @@ from search_engine import (
 MAX_TOOL_OUTPUT_CHARS = 7500
 MAX_TOOLS_PER_TURN = 6
 
+# Reject blind web searches that only contain a raw URL, bare @handle, or numeric tweet/post ID
+_BLIND_HANDLE_OR_URL_ONLY_REGEX = re.compile(
+    r"^(?:https?://\S+|@?[A-Za-z0-9_]{2,30}|\d{8,24}|@?[A-Za-z0-9_]{2,30}\s+\d{8,24})$",
+    re.IGNORECASE,
+)
+
 
 # ==============================================================================
 # CANONICAL NATIVE FUNCTION-CALLING TOOL SPECIFICATIONS
@@ -32,12 +38,19 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "modes": ("general", "code", "voice"),
         "description": (
             "Search the live web (Google Grounding, News RSS, Wikipedia, Jikan MAL, Steam TH, Tavily, DuckDuckGo) "
-            "for up-to-date facts, news, prices, game/anime details, software docs, or fact-checking."
+            "for up-to-date facts, news, prices, game/anime details, software docs, or fact-checking. "
+            "For embedded posts/images that already have OCR/Visual Context, ONLY call web_search when extra facts "
+            "(price, release date, specs, verification) are genuinely needed or requested—and search by the visually "
+            "identified subject/franchise/product name, NEVER blindly by a raw @handle, URL, or status ID unless the user asks about the creator."
         ),
         "parameters": {
             "query": {
                 "type": "string",
-                "description": "Concise, specific search query (prefer English keywords for technical/game/anime entities, Thai for local Thai news).",
+                "description": (
+                    "Concise, specific search query using the identified subject/entity/product name "
+                    "(prefer English keywords for technical/game/anime/model-kit entities, Thai for local Thai news). "
+                    "NEVER pass a raw URL or bare tweet/post ID."
+                ),
                 "required": True,
             },
             "max_results": {
@@ -351,6 +364,13 @@ async def execute_tool_call(
             query = str(args.get("query") or "").strip()[:180]
             if not query:
                 return "[Tool Error: 'query' is required.]"
+            if _BLIND_HANDLE_OR_URL_ONLY_REGEX.match(query):
+                api_log(f"ToolExec -> web_search BLOCKED blind handle/URL/ID query '{query[:45]}'")
+                return (
+                    "[Tool Notice: Do not search bare URLs, raw status IDs, or single handles. "
+                    "Answer directly from the Vision/OCR context already provided, or search using "
+                    "the specific identified subject/product/series name instead.]"
+                )
             max_res = max(1, min(6, int(args.get("max_results") or 5)))
             res = await run_safe_web_search_async(query, max_results=max_res)
             if res:

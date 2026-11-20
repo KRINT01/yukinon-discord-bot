@@ -657,7 +657,7 @@ async def orchestrate_message_with_decision_1(
                 "code": "Source code, stack trace, SQL query, or DevOps/Docker/K8s config.",
                 "document": "Attached PDF, Word, Excel document, web article, or YouTube video.",
                 "game": "Video games, character builds, classes, or Steam store.",
-                "general": "Hardware/product comparison, coffee/tech specs, or general advice.",
+                "general": "Physical hardware, scale model kits, collectible figures, product comparisons, coffee/tech specs, or general advice.",
                 "news": "Breaking news, stock market, gold/crypto prices, or current events.",
                 "social_art": "Embedded X/Twitter, Pixiv, Bluesky post, illustration, fanart, or anime/manga page.",
             },
@@ -1121,7 +1121,7 @@ async def triage_image_with_decision_1(
                 "document_table": "Scanned document, receipt, invoice, form, slide deck, chart, spreadsheet table, or dense text/article screenshot.",
                 "manga_comic": "Manga, manhwa, webtoon, 4-koma, or comic page/strip containing speech bubbles or comic panel dialogue.",
                 "meme_casual": "Casual meme, sticker, reaction image, chat screenshot, or miscellaneous social post.",
-                "real_world_product": "Real-world photograph of physical hardware, electronics, coffee equipment, model kits, food, scenery, or consumer products.",
+                "real_world_product": "Real-world photograph of physical hardware, electronics, coffee equipment, model kits, collectible figures, food, scenery, or consumer products.",
             },
         },
         "has_japanese_dialogue": {
@@ -1137,7 +1137,7 @@ async def triage_image_with_decision_1(
             "instructions": (
                 "Answer YES if anime/illustration reverse-image databases (SauceNAO, IQDB, trace.moe) "
                 "would be useful to identify the artist, anime, or manga source. "
-                "Answer NO for code/error screenshots, documents, invoices, charts, or real-world hardware photos."
+                "Answer NO for code/error screenshots, documents, invoices, charts, or real-world hardware/model-kit photos."
             ),
         },
         "is_anime_screenshot": {
@@ -2507,7 +2507,8 @@ async def query_local_ollama_chat(
         or RECENCY_INTENT_REGEX.search(raw_user_query)
     )
     is_japanese_or_social_media = bool(
-        re.search(r"=== (?:Embedded (?:X|Pixiv|Bluesky)|Image (?:#\d+ )?Inspection|Unified Multi-Image)", prompt)
+        re.search(r"=== (?:Embedded (?:X|Pixiv|Bluesky)|Image (?:#\d+ )?Inspection|Unified Multi-Image|Vision Analysis & OCR)", prompt)
+        or "[ImageTriage:" in prompt
         or re.search(r"[ぁ-んァ-ヶ一-龯]", prompt)
     )
 
@@ -2518,7 +2519,7 @@ async def query_local_ollama_chat(
     # IMPLICIT PREFIX CACHING: Keep `systemInstruction` 100% static across turns!
     static_system_prompt = f"{system_prompt}\n\n{speaker_context_block}".strip()
 
-    # Move volatile clock, active topic, and dynamic tone cue to the tail of the latest user turn
+    # Move volatile clock, active topic, and dynamic tone/visual cues to the tail of the latest user turn
     volatile_ctx_lines = [f"- เวลาปัจจุบันของระบบ (Real-Time System Clock): **{live_clock_str}**"]
     if active_topic:
         volatile_ctx_lines.append(
@@ -2527,6 +2528,12 @@ async def query_local_ollama_chat(
         )
     if tone_cue in _TONE_CUE_INSTRUCTIONS and tone_conf >= 0.70:
         volatile_ctx_lines.append(f"- {_TONE_CUE_INSTRUCTIONS[tone_cue]}")
+    if "[ImageTriage: type=real_world_product" in prompt:
+        volatile_ctx_lines.append(
+            "- ภาพนี้เป็นภาพถ่ายวัตถุ/โมเดล/ฟิกเกอร์/สินค้าจริง: ให้ระบุชื่อเรื่อง ชื่อรุ่น ไลน์สินค้า/สเกลที่เป็นไปได้ "
+            "และจุดสังเกตสำคัญจาก Vision Analysis ให้ชัดเจน (หากยังไม่ยืนยันสเกล/รุ่นย่อยจากมุมเดียวได้ ให้บอกตรงๆ ว่ายังระบุสเกลแน่ชัดไม่ได้) "
+            "และห้ามใส่คำว่า 'คุณ' นำหน้าชื่อเจ้าของโพสต์หรือผู้สร้างผลงานเด็ดขาด"
+        )
 
     working_prompt = (
         f"{working_prompt}\n\n"
@@ -2556,16 +2563,18 @@ async def query_local_ollama_chat(
     elif is_coding:
         tool_ctx.mode = "code"
 
+    # Already-scraped embed URLs (`has_fresh_attachment=True`) must NOT override Decision-1 `needs_tool_use=False`!
+    has_unscraped_url = bool(URL_REGEX.search(raw_user_query)) and not has_fresh_attachment
     has_tool_cue = bool(
         is_compound
         or _NATIVE_TOOL_CUE_REGEX.search(raw_user_query)
         or WEATHER_INTENT_PATTERN.search(raw_user_query)
         or IMAGE_GEN_INTENT_PATTERN.search(raw_user_query)
-        or URL_REGEX.search(raw_user_query)
+        or has_unscraped_url
     )
 
     # Dynamic tool subsetting via Decision-1 (`needs_tool_use` + `complexity_score`):
-    # Avoids shipping tool schemas on trivial pure chat to save tokens & prevent spurious tool calls.
+    # Avoids shipping tool schemas on trivial pure chat & already-OCR'd bare embeds to cut latency & prevent blind searches.
     if (
         dec_needs_tools is False
         and dec_tool_conf >= 0.72

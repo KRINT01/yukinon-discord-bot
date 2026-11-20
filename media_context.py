@@ -103,6 +103,11 @@ _X_PAGE_RANGE_EXTRACT_REGEX = re.compile(
 
 _FULLWIDTH_DIGIT_TRANS = str.maketrans("０１２３４５６７８９", "0123456789")
 
+_BLIND_VERIFY_QUERY_REGEX = re.compile(
+    r"^(?:https?://\S+|@?[A-Za-z0-9_]{2,30}|\d{6,24}|@?[A-Za-z0-9_]{2,30}\s+\d{6,24})$",
+    re.IGNORECASE,
+)
+
 
 def _extract_x_page_range_bounds(text: str) -> tuple[int, int] | None:
     if not text:
@@ -151,6 +156,20 @@ def _is_pure_sfx_query(q: str) -> bool:
         return True
     non_sfx = [t for t in tokens if not _SFX_TOKEN_REGEX.match(t)]
     return len(non_sfx) == 0
+
+
+def _is_blind_handle_or_id_query(q: str) -> bool:
+    """Blocks blind web_verify queries containing only a social handle, raw URL, or tweet/post ID."""
+    if not q:
+        return True
+    s = re.sub(r"\s+", " ", q).strip()
+    if not s:
+        return True
+    if _BLIND_VERIFY_QUERY_REGEX.match(s):
+        return True
+    if "status/" in s.lower() or "x.com/" in s.lower() or "twitter.com/" in s.lower() or "pixiv.net/" in s.lower():
+        return True
+    return False
 
 
 def parse_xlsx_bytes_to_markdown(raw_bytes: bytes, max_chars: int = 25000) -> str:
@@ -956,7 +975,7 @@ def _extract_native_discord_embeds_data(embeds: list[discord.Embed]) -> tuple[li
                 if clean_img and dkey not in seen_dedup_keys:
                     seen_dedup_keys.add(dkey)
                     image_urls.append(clean_img)
-                break
+                    break
 
         if parts:
             meta_blocks.append(f"[Discord Embed #{idx}]\n" + "\n".join(parts))
@@ -1011,8 +1030,8 @@ async def collect_embedded_images_and_metadata(
             if tw_meta:
                 resolved_social_api_post = True
                 metadata_sections.append(f"=== Embedded X (Twitter) Post Metadata & Caption ===\n{tw_meta}")
-            for p_url in tw_photos:
-                _queue_img(p_url)
+                for p_url in tw_photos:
+                    _queue_img(p_url)
             continue
 
         px_m = PIXIV_ILLUST_URL_REGEX.search(url)
@@ -1023,8 +1042,8 @@ async def collect_embedded_images_and_metadata(
             if px_meta:
                 resolved_social_api_post = True
                 metadata_sections.append(f"=== Embedded Pixiv Artwork Metadata & Caption ===\n{px_meta}")
-            for p_url in px_photos:
-                _queue_img(p_url, referer=f"{HTTPS}www.pixiv.net/artworks/{illust_id}")
+                for p_url in px_photos:
+                    _queue_img(p_url, referer=f"{HTTPS}www.pixiv.net/artworks/{illust_id}")
             continue
 
         bsky_m = BSKY_POST_URL_REGEX.search(url)
@@ -1034,8 +1053,8 @@ async def collect_embedded_images_and_metadata(
             if b_meta:
                 resolved_social_api_post = True
                 metadata_sections.append(f"=== Embedded Bluesky Post Metadata & Caption ===\n{b_meta}")
-            for p_url in b_photos:
-                _queue_img(p_url)
+                for p_url in b_photos:
+                    _queue_img(p_url)
             continue
 
         if DIRECT_IMAGE_URL_REGEX.match(url):
@@ -1239,42 +1258,42 @@ async def _search_saucenao_async(raw_bytes: bytes, filename: str) -> str:
                 return ""
             data = await resp.json(content_type=None)
 
-            results = data.get("results") or []
-            matches = []
-            for item in results:
-                hdr = item.get("header") or {}
-                sim = float(hdr.get("similarity") or 0.0)
-                if sim < 68.0:
-                    continue
-                d = item.get("data") or {}
-                title = d.get("title") or d.get("source") or d.get("eng_name") or d.get("jp_name") or ""
-                part = d.get("part") or ""
-                author = d.get("member_name") or d.get("author") or d.get("creator") or ""
-                if isinstance(author, list):
-                    author = ", ".join(str(x) for x in author)
-                characters = d.get("characters") or ""
-                material = d.get("material") or ""
-                pixiv_id = d.get("pixiv_id")
-                ext_urls = d.get("ext_urls") or []
-                if pixiv_id and not any("pixiv.net" in u for u in ext_urls):
-                    ext_urls.insert(0, f"{HTTPS}www.pixiv.net/artworks/{pixiv_id}")
+        results = data.get("results") or []
+        matches = []
+        for item in results:
+            hdr = item.get("header") or {}
+            sim = float(hdr.get("similarity") or 0.0)
+            if sim < 68.0:
+                continue
+            d = item.get("data") or {}
+            title = d.get("title") or d.get("source") or d.get("eng_name") or d.get("jp_name") or ""
+            part = d.get("part") or ""
+            author = d.get("member_name") or d.get("author") or d.get("creator") or ""
+            if isinstance(author, list):
+                author = ", ".join(str(x) for x in author)
+            characters = d.get("characters") or ""
+            material = d.get("material") or ""
+            pixiv_id = d.get("pixiv_id")
+            ext_urls = d.get("ext_urls") or []
+            if pixiv_id and not any("pixiv.net" in u for u in ext_urls):
+                ext_urls.insert(0, f"{HTTPS}www.pixiv.net/artworks/{pixiv_id}")
 
-                info_parts = [f"Similarity: {sim:.1f}%"]
-                if title:
-                    info_parts.append(f"Title/Source: {title}{f' ({part})' if part else ''}")
-                if material:
-                    info_parts.append(f"Series/Material: {material}")
-                if characters:
-                    info_parts.append(f"Character(s): {characters}")
-                if author:
-                    info_parts.append(f"Artist/Author: {author}")
-                if ext_urls:
-                    info_parts.append(f"URLs: {' | '.join(ext_urls[:2])}")
-                matches.append("- " + " | ".join(info_parts))
+            info_parts = [f"Similarity: {sim:.1f}%"]
+            if title:
+                info_parts.append(f"Title/Source: {title}{f' ({part})' if part else ''}")
+            if material:
+                info_parts.append(f"Series/Material: {material}")
+            if characters:
+                info_parts.append(f"Character(s): {characters}")
+            if author:
+                info_parts.append(f"Artist/Author: {author}")
+            if ext_urls:
+                info_parts.append(f"URLs: {' | '.join(ext_urls[:2])}")
+            matches.append("- " + " | ".join(info_parts))
 
-            if matches:
-                api_log(f"ReverseImage (SauceNAO) -> {len(matches)} match(es) ({time.monotonic() - t0:.2f}s)")
-                return "=== SauceNAO Reverse Image Matches (Pixiv / Manga / Art) ===\n" + "\n".join(matches[:3])
+        if matches:
+            api_log(f"ReverseImage (SauceNAO) -> {len(matches)} match(es) ({time.monotonic() - t0:.2f}s)")
+            return "=== SauceNAO Reverse Image Matches (Pixiv / Manga / Art) ===\n" + "\n".join(matches[:3])
     except Exception as e:
         api_log(f"ReverseImage (SauceNAO) -> skipped ({type(e).__name__})")
     return ""
@@ -1307,31 +1326,31 @@ async def _search_iqdb_keyless_async(raw_bytes: bytes, filename: str) -> str:
                 return ""
             html_text = await resp.text()
 
-            if "Best match" not in html_text:
-                return ""
-            sim_m = re.search(r"(\d+)%\s*similarity", html_text)
-            if not sim_m or int(sim_m.group(1)) < 72:
-                return ""
-            sim_pct = int(sim_m.group(1))
+        if "Best match" not in html_text:
+            return ""
+        sim_m = re.search(r"(\d+)%\s*similarity", html_text)
+        if not sim_m or int(sim_m.group(1)) < 72:
+            return ""
+        sim_pct = int(sim_m.group(1))
 
-            link_m = re.search(
-                r"Best match.*?href=[\"']((?:https?:)?//[^\"']+)[\"'][^>]*>\s*<img[^>]*alt=[\"']([^\"']*)[\"']",
-                html_text,
-                re.DOTALL | re.IGNORECASE,
-            )
-            if not link_m:
-                return ""
-            match_url = link_m.group(1)
-            if match_url.startswith("//"):
-                match_url = "https:" + match_url
-            alt_tags = link_m.group(2).strip()
+        link_m = re.search(
+            r"Best match.*?href=[\"']((?:https?:)?//[^\"']+)[\"'][^>]*>\s*<img[^>]*alt=[\"']([^\"']*)[\"']",
+            html_text,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if not link_m:
+            return ""
+        match_url = link_m.group(1)
+        if match_url.startswith("//"):
+            match_url = "https:" + match_url
+        alt_tags = link_m.group(2).strip()
 
-            api_log(f"ReverseImage (IQDB Keyless) -> {sim_pct}% match ({time.monotonic() - t0:.2f}s)")
-            return (
-                f"=== IQDB Reverse Illustration Match ===\n"
-                f"- Similarity: {sim_pct}% | Source Archive URL: {match_url}\n"
-                f"- Detected Tags / Character / Series: {alt_tags}"
-            )
+        api_log(f"ReverseImage (IQDB Keyless) -> {sim_pct}% match ({time.monotonic() - t0:.2f}s)")
+        return (
+            f"=== IQDB Reverse Illustration Match ===\n"
+            f"- Similarity: {sim_pct}% | Source Archive URL: {match_url}\n"
+            f"- Detected Tags / Character / Series: {alt_tags}"
+        )
     except Exception:
         return ""
 
@@ -1351,38 +1370,38 @@ async def _search_tracemoe_async(raw_bytes: bytes, mime_type: str) -> str:
                 return ""
             data = await resp.json()
 
-            docs = data.get("result") or []
-            if not docs:
-                return ""
-            top = docs[0]
-            sim = float(top.get("similarity") or 0.0) * 100.0
-            if sim < 87.0:
-                return ""
+        docs = data.get("result") or []
+        if not docs:
+            return ""
+        top = docs[0]
+        sim = float(top.get("similarity") or 0.0) * 100.0
+        if sim < 87.0:
+            return ""
 
-            anilist = top.get("anilist") or {}
-            title_obj = anilist.get("title") if isinstance(anilist, dict) else {}
-            romaji = (title_obj or {}).get("romaji") or ""
-            english = (title_obj or {}).get("english") or ""
-            native = (title_obj or {}).get("native") or ""
-            mal_id = anilist.get("idMal") if isinstance(anilist, dict) else None
-            ani_id = anilist.get("id") if isinstance(anilist, dict) else None
+        anilist = top.get("anilist") or {}
+        title_obj = anilist.get("title") if isinstance(anilist, dict) else {}
+        romaji = (title_obj or {}).get("romaji") or ""
+        english = (title_obj or {}).get("english") or ""
+        native = (title_obj or {}).get("native") or ""
+        mal_id = anilist.get("idMal") if isinstance(anilist, dict) else None
+        ani_id = anilist.get("id") if isinstance(anilist, dict) else None
 
-            ep = top.get("episode") or "Movie/OVA"
-            from_sec = int(float(top.get("from") or 0))
-            mm, ss = divmod(from_sec, 60)
-            hh, mm = divmod(mm, 60)
-            ts_str = f"{hh:02d}:{mm:02d}:{ss:02d}" if hh > 0 else f"{mm:02d}:{ss:02d}"
+        ep = top.get("episode") or "Movie/OVA"
+        from_sec = int(float(top.get("from") or 0))
+        mm, ss = divmod(from_sec, 60)
+        hh, mm = divmod(mm, 60)
+        ts_str = f"{hh:02d}:{mm:02d}:{ss:02d}" if hh > 0 else f"{mm:02d}:{ss:02d}"
 
-            mal_link = f"{HTTPS}myanimelist.net/anime/{mal_id}" if mal_id else (
-                f"{HTTPS}anilist.co/anime/{ani_id}" if ani_id else ""
-            )
-            api_log(f"ReverseImage (trace.moe) -> '{romaji or native}' Ep.{ep} at {ts_str} ({sim:.1f}%, {time.monotonic() - t0:.2f}s)")
-            return (
-                f"=== trace.moe Anime Screenshot Match ===\n"
-                f"- Anime Title: {romaji} / {english} ({native})\n"
-                f"- Episode: {ep} | Exact Scene Timestamp: {ts_str} | Similarity: {sim:.1f}%\n"
-                + (f"- Reference Link: {mal_link}" if mal_link else "")
-            ).strip()
+        mal_link = f"{HTTPS}myanimelist.net/anime/{mal_id}" if mal_id else (
+            f"{HTTPS}anilist.co/anime/{ani_id}" if ani_id else ""
+        )
+        api_log(f"ReverseImage (trace.moe) -> '{romaji or native}' Ep.{ep} at {ts_str} ({sim:.1f}%, {time.monotonic() - t0:.2f}s)")
+        return (
+            f"=== trace.moe Anime Screenshot Match ===\n"
+            f"- Anime Title: {romaji} / {english} ({native})\n"
+            f"- Episode: {ep} | Exact Scene Timestamp: {ts_str} | Similarity: {sim:.1f}%\n"
+            + (f"- Reference Link: {mal_link}" if mal_link else "")
+        ).strip()
     except Exception as e:
         api_log(f"ReverseImage (trace.moe) -> skipped ({type(e).__name__})")
     return ""
@@ -1407,7 +1426,10 @@ def _build_tailored_single_image_ocr_prompt(
     context_header: str,
     triage_type: str | None,
 ) -> str:
-    """Builds a domain-specific OCR prompt when Decision-1 triage classifies the image."""
+    """
+    Builds a Google Lens–style domain-specific Vision & OCR prompt based on Decision-1 ImageTriage.
+    Prioritizes accurate entity/franchise/product/scale identification directly from visual cues.
+    """
     if triage_type == "code_or_error":
         return (
             f"{context_header}"
@@ -1431,32 +1453,39 @@ def _build_tailored_single_image_ocr_prompt(
     if triage_type == "real_world_product":
         return (
             f"{context_header}"
-            "Analyze this real-world photograph thoroughly for Yukino Yukinoshita:\n"
-            "1. [Product / Object Identification]: Identify the Brand, Product Line, exact Model Name/Number, "
-            "and key physical markings, ports, specs, or visual details.\n"
-            "2. [Verbatim Visible Text]: Transcribe ALL visible text, labels, model stickers, or Thai/English/Japanese markings verbatim.\n"
-            "3. [WEB_VERIFY_QUERY]: On the very last line, if a specific brand/model/product name is visible, output:\n"
-            "   `[WEB_VERIFY_QUERY: <exact brand + model name or visible product code>]`"
+            "Act like Google Lens and identify this real-world object, scale model kit, collectible figure, or product with high precision:\n"
+            "1. [Subject / Franchise / Product Identification]:\n"
+            "   - If it is a scale model kit, plastic model, mecha, starship, statue, or anime/game figure: identify the EXACT subject name "
+            "and originating franchise/series/installment (e.g., Space Battleship Yamato from Yamato 2199/2202/3199, Gundam MS designation, character name) "
+            "whenever recognizable from unmistakable design cues, plus likely manufacturer (e.g., Bandai Spirits, Tamashii Nations, Good Smile, Kotobukiya).\n"
+            "   - If it is consumer hardware, coffee gear, audio gear, or everyday product: identify the exact Brand, Product Line, and Model Name/Number.\n"
+            "2. [Visual Cues & Possible Product Lines / Scales]:\n"
+            "   - List the concrete distinguishing visual features (colors, hull/armor silhouette, weapons/markings, crest/emblem, display stand, paint/finish, ports).\n"
+            "   - If multiple releases or scales share this design (e.g., 1/1000 plastic model kit vs. Mecha Collection vs. pre-painted Kikan-Taizen / Soul of Chogokin figure), "
+            "name the top likely candidates AND note clearly if the exact scale or release cannot be confirmed from this angle alone.\n"
+            "3. [Verbatim Visible Text]: Transcribe ALL visible text, decals, labels, or model stickers verbatim (if none, write 'None').\n"
+            "4. [WEB_VERIFY_QUERY]: On the very last line, ONLY if you identified a concrete subject/product/model name (NEVER a Twitter @handle, account name, URL, or numeric ID!), output:\n"
+            "   `[WEB_VERIFY_QUERY: <exact identified subject/franchise or brand + model name>]`"
         )
 
     # Default / manga_comic / anime_fanart / meme_casual prompt
     return (
         f"{context_header}"
-        "Analyze this image thoroughly so Yukino Yukinoshita can understand the exact visual story, "
-        "series/character identity, speaker attribution, and source.\n"
+        "Act like Google Lens and analyze this image thoroughly so Yukino Yukinoshita understands the exact subject, "
+        "franchise/character identity, visual story, speaker attribution, and source.\n"
         "Provide your output in 3 concise, well-structured sections:\n"
-        "1. [Identification & Panel-by-Panel Visual Context]:\n"
-        "   - If Comic / Manga / Fanart: Identify the Anime/Game/Manga Series and Character names ONLY if clearly supported by "
-        "unmistakable visual features (hair ornaments, outfits, halos/no halos) or the post caption above. NEVER mix character names "
-        "from one franchise with a different franchise title, and NEVER invent nonsensical style names or guess when ambiguous—write 'Unknown / Unconfirmed Series' instead! "
-        "Describe what is happening visually in each panel in traditional Japanese reading order (Top-to-Bottom, Right-to-Left).\n"
-        "   - If Code / Terminal / Stack Trace / UI Screenshot: Describe the exact error message, HTTP status, UI component, or terminal output shown.\n"
-        "   - If Real-World Photo/Product/Hardware: Identify the Brand, Product Line, Model Name/Number, and distinguishing physical features.\n"
+        "1. [Identification & Visual Context]:\n"
+        "   - Identify the Anime/Game/Manga Series, Character name(s), or iconic mecha/ship/item ONLY if clearly supported by "
+        "unmistakable visual features (hair ornaments, outfits, weapons, insignia, halos/no halos) or the post caption above. "
+        "NEVER mix character names from one franchise with a different franchise title, and write 'Unknown / Unconfirmed Series' if genuinely ambiguous.\n"
+        "   - For comics/manga: describe what happens visually in each panel in traditional Japanese reading order (Top-to-Bottom, Right-to-Left).\n"
+        "   - For illustrations/fanart: describe the pose, expression, outfit, props, and mood concisely.\n"
         "2. [Ordered Dialogue & Verbatim OCR Text]:\n"
-        "   - For comics/manga: List the dialogue and SFX in reading order (Right-to-Left, Top-to-Bottom) tagged with the speaker.\n"
-        "   - Transcribe ALL visible text (Thai, Japanese, English, code, error codes) verbatim, paying close attention to Thai tone marks/vowels.\n"
-        "3. [WEB_VERIFY_QUERY]: On the very last line, ONLY if the image contains actual spoken dialogue or product model text (NEVER pure comic sound effects like タッ or ドシッ!), output:\n"
-        "   `[WEB_VERIFY_QUERY: <exact verbatim dialogue quote or product model — NEVER pure SFX and NEVER a guessed title>]`"
+        "   - For comics/manga: list the dialogue and key SFX in reading order (Right-to-Left, Top-to-Bottom) tagged with the speaker.\n"
+        "   - Transcribe ALL visible text (Thai, Japanese, English, code, labels) verbatim, paying close attention to Thai tone marks/vowels.\n"
+        "3. [WEB_VERIFY_QUERY]: On the very last line, ONLY if the image contains actual spoken dialogue or a clearly identified subject/product name "
+        "(NEVER pure comic SFX like タッ/ドシッ, NEVER a raw Twitter @handle, URL, or numeric status ID!), output:\n"
+        "   `[WEB_VERIFY_QUERY: <exact verbatim dialogue quote or identified subject/series name>]`"
     )
 
 
@@ -1594,7 +1623,7 @@ async def extract_multi_images_batch_ocr(
         return ""
 
     # Phase 2 Pre-OCR Batch Triage on Page 1 (~250ms, ~260 tokens):
-    # Tailors batch prompt for code/document screenshot sets and preserves Japanese dialogue flags.
+    # Tailors batch prompt for code/document/product photo sets and preserves Japanese dialogue flags.
     triage = await triage_image_with_decision_1(
         encoded_images[0][0],
         encoded_images[0][1],
@@ -1627,6 +1656,16 @@ async def extract_multi_images_batch_ocr(
             + (f"User/Post Context:\n{post_meta_hint[:1000]}\n\n" if post_meta_hint else "")
             + "For each page (Image 1, Image 2, ...), transcribe ALL visible headings, body text, numbers, dates, "
             "and table rows verbatim in their original language (Thai/English/Japanese)."
+        )
+    elif triage_type == "real_world_product":
+        batch_prompt = (
+            f"Act like Google Lens and analyze these {len(encoded_images)} sequential real-world photos of a product, "
+            "scale model kit, collectible figure, or hardware item.\n"
+            + (f"User/Post Context:\n{post_meta_hint[:1000]}\n\n" if post_meta_hint else "")
+            + "1. [Subject / Franchise / Product Identification]: Identify the exact subject, franchise/series, brand/manufacturer, "
+            "and likely product line(s) or scale(s) across all angles (note clearly if exact scale/release cannot be confirmed).\n"
+            "2. [Angle-by-Angle Details & Visible Text]: Summarize distinguishing visual details, craftsmanship/modifications, "
+            "and any visible text/decals/labels across Images 1..N."
         )
     else:
         batch_prompt = (
@@ -1715,7 +1754,7 @@ async def extract_multi_images_batch_ocr(
 
 
 async def _call_gemini_single_image_vision(
-    ocr_prompt: str, mime_type: str, b64_img: str, purpose: str = "Image OCR Gemini"
+    ocr_prompt: str, mime_type: str, b64_img: str, purpose: str = "Image OCR Tier 1 Gemini"
 ) -> str:
     if not GEMINI_API_KEY:
         return ""
@@ -1754,6 +1793,7 @@ async def extract_image_via_transient_ocr(
     run_source_lookup: bool = True,
     post_meta_hint: str = "",
     page_label: str = "",
+    skip_triage: bool = False,
 ) -> str:
     try:
         b64_img, mime_type, is_color_img = await asyncio.to_thread(
@@ -1765,14 +1805,16 @@ async def extract_image_via_transient_ocr(
         is_color_img = True
 
     # Phase 2 Pre-OCR Multimodal Triage (~250-350ms, 0 output tokens):
-    # Skips wasted 2-6s anime reverse-image lookups on code/doc/product photos and selects a tailored OCR prompt.
-    triage = await triage_image_with_decision_1(
-        b64_img,
-        mime_type,
-        filename=filename,
-        post_meta_hint=post_meta_hint,
-        resolution="low",
-    )
+    # Skips wasted 2-6s anime reverse-image lookups on code/doc/product photos and selects a tailored Lens prompt.
+    triage = None
+    if not skip_triage:
+        triage = await triage_image_with_decision_1(
+            b64_img,
+            mime_type,
+            filename=filename,
+            post_meta_hint=post_meta_hint,
+            resolution="low",
+        )
     triage_conf = float((triage or {}).get("image_type_confidence") or 0.0)
     triage_type = str((triage or {}).get("image_type") or "") if triage_conf >= 0.65 else ""
     has_jp_dialogue = bool((triage or {}).get("has_japanese_dialogue"))
@@ -1806,7 +1848,6 @@ async def extract_image_via_transient_ocr(
         do_tracemoe = False
         do_web_verify = bool(run_source_lookup)
     else:
-        # Fallback to existing behavior if Decision-1 triage is unavailable or low-confidence
         do_saucenao = bool(run_source_lookup)
         do_iqdb = bool(run_source_lookup)
         do_tracemoe = bool(run_source_lookup and is_color_img)
@@ -1817,7 +1858,7 @@ async def extract_image_via_transient_ocr(
         context_header = (
             f"Context Note ({page_label or 'Single Image'}):\n"
             + (f"{post_meta_hint[:600]}\n" if post_meta_hint else "")
-            + "Keep character identities and details consistent with the context above.\n\n"
+            + "Keep character/subject identities and details consistent with the context above.\n\n"
         )
 
     ocr_prompt = _build_tailored_single_image_ocr_prompt(context_header, triage_type or None)
@@ -1827,12 +1868,28 @@ async def extract_image_via_transient_ocr(
 
     vision_result = ""
 
-    # Tier 1: Cloudflare Workers AI Vision (`@cf/google/gemma-4-26b-a4b-it`)
-    cf_ocr = await call_cloudflare_vision_chat(ocr_prompt, mime_type, b64_img, purpose="Image OCR Tier 1 CF")
-    if cf_ocr:
-        vision_result = cf_ocr
+    # Tier 1: Google AI Studio Gemini Flash-Lite (`gemini-3.5-flash-lite` -> `3.1-flash-lite` -> `3-flash-preview`)
+    # Fastest (~1.0-1.5s) and strongest Google Lens–grade real-world/model-kit/anime entity recognition!
+    if GEMINI_API_KEY:
+        vision_result = await _call_gemini_single_image_vision(
+            ocr_prompt, mime_type, b64_img, purpose="Image OCR Tier 1 Gemini"
+        )
 
-    # Tier 2: Groq LPU Vision (`qwen/qwen3.8-27b`)
+    # Tier 2: Google AI Studio Gemma 4 Vision (`gemma-4-26b-a4b-it`)
+    if not vision_result and GEMINI_API_KEY:
+        gemma_ocr = await call_gemma_ai_studio_vision(
+            ocr_prompt, mime_type, b64_img, timeout_sec=12, purpose="Image OCR Tier 2 AI Studio"
+        )
+        if gemma_ocr:
+            vision_result = gemma_ocr
+
+    # Tier 3: Cloudflare Workers AI Vision (`@cf/google/gemma-4-26b-a4b-it`)
+    if not vision_result:
+        cf_ocr = await call_cloudflare_vision_chat(ocr_prompt, mime_type, b64_img, purpose="Image OCR Tier 3 CF")
+        if cf_ocr:
+            vision_result = cf_ocr
+
+    # Tier 4: Groq LPU Vision (`qwen/qwen3.8-27b`)
     if not vision_result and GROQ_API_KEY:
         groq_candidates = await discover_active_groq_vision_models()
         groq_host = "api." + "groq.com"
@@ -1869,26 +1926,12 @@ async def extract_image_via_transient_ocr(
                         content = g_data["choices"][0]["message"]["content"].strip()
                         content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
                         if content:
-                            api_log(f"Image OCR (Tier 2 Groq) -> {g_mod} 200 OK ({elapsed:.2f}s)")
+                            api_log(f"Image OCR (Tier 4 Groq) -> {g_mod} 200 OK ({elapsed:.2f}s)")
                             vision_result = content
                             break
-                    api_log(f"Image OCR (Tier 2 Groq) -> {g_mod} HTTP {resp.status}; fallback to Tier 3")
+                    api_log(f"Image OCR (Tier 4 Groq) -> {g_mod} HTTP {resp.status}; fallback to Tier 5")
             except Exception as e:
-                api_log(f"Image OCR (Tier 2 Groq) -> {g_mod} failed ({type(e).__name__}); fallback to Tier 3")
-
-    # Tier 3: Gemini (`gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> `gemini-3-flash-preview`)
-    if not vision_result and GEMINI_API_KEY:
-        vision_result = await _call_gemini_single_image_vision(
-            ocr_prompt, mime_type, b64_img, purpose="Image OCR Tier 3 Gemini"
-        )
-
-    # Tier 4: Google AI Studio Gemma 4 Vision (`gemma-4-26b-a4b-it`)
-    if not vision_result:
-        gemma_ocr = await call_gemma_ai_studio_vision(
-            ocr_prompt, mime_type, b64_img, timeout_sec=12, purpose="Image OCR Tier 4 AI Studio"
-        )
-        if gemma_ocr:
-            vision_result = gemma_ocr
+                api_log(f"Image OCR (Tier 4 Groq) -> {g_mod} failed ({type(e).__name__}); fallback to Tier 5")
 
     # Tier 5: Modal T4 GPU
     if not vision_result:
@@ -1958,6 +2001,7 @@ async def extract_image_via_transient_ocr(
                 verify_q
                 and verify_q.lower() not in ("none", "n/a")
                 and not _is_pure_sfx_query(verify_q)
+                and not _is_blind_handle_or_id_query(verify_q)
             ):
                 try:
                     web_verify = await run_safe_web_search_async(verify_q, max_results=3)
@@ -2126,6 +2170,7 @@ async def extract_all_context(
             async def _ocr_embed_item(idx: int, emb_bytes: bytes, emb_fname: str, emb_url: str) -> str:
                 async with sem:
                     try:
+                        # Vision-first on scraped social embeds (no blind handle/ID web_search unless explicitly asked)
                         do_lookup = (not has_authoritative_social_meta) and (idx <= 2)
                         ocr_out = await extract_image_via_transient_ocr(
                             emb_bytes,
@@ -2170,7 +2215,10 @@ async def extract_all_context(
                         stk_bytes = await s_resp.read()
                         if len(stk_bytes) <= 8 * 1024 * 1024:
                             stk_vis = await extract_image_via_transient_ocr(
-                                stk_bytes, f"{stk_name}.png", run_source_lookup=False
+                                stk_bytes,
+                                f"{stk_name}.png",
+                                run_source_lookup=False,
+                                skip_triage=True,
                             )
                             if stk_vis and "[OCR could not" not in stk_vis:
                                 stk_desc += f"\nVisual/Sticker Details:\n{stk_vis}"
