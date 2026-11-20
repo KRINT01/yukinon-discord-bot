@@ -115,12 +115,19 @@ SAUCENAO_API_KEY = os.getenv("SAUCENAO_API_KEY", "").strip()
 # Render Free Web Service dynamically injects PORT (defaults to 10000)
 PORT = int(os.getenv("PORT", "10000"))
 
-# Yukino Yukinoshita (Saori Hayami Composed Kuudere Tone: calm neutral pitch, articulate measured rate)
+# Yukino Yukinoshita Voice Profile (Cool, calm, slightly brisk, smooth pause trimming)
 TTS_VOICE_TH = os.getenv("TTS_VOICE_TH", "th-TH-PremwadeeNeural")
 TTS_VOICE_EN = os.getenv("TTS_VOICE_EN", "en-US-AriaNeural")
 TTS_PITCH = os.getenv("TTS_PITCH", "-2Hz")
 TTS_RATE = os.getenv("TTS_RATE", "-12%")
+TTS_GOOGLE_PITCH = float(os.getenv("TTS_GOOGLE_PITCH", "0.97"))
+TTS_GOOGLE_SPEED = float(os.getenv("TTS_GOOGLE_SPEED", "1.24"))
+TTS_SILENCE_TRIM = os.getenv("TTS_SILENCE_TRIM", "1").strip().lower() not in ("0", "false", "no", "off")
 STT_PRIMARY_LANG = os.getenv("STT_PRIMARY_LANG", "th-TH")
+
+# Passive Multi-Speaker Voice Scribe Guardrails (Option 1: In-RAM only, auto-cleared on finish/leave)
+VOICE_SCRIBE_MAX_ENTRIES = int(os.getenv("VOICE_SCRIBE_MAX_ENTRIES", "2000"))
+VOICE_SCRIBE_MAX_DURATION_SEC = int(os.getenv("VOICE_SCRIBE_MAX_DURATION_SEC", "10800"))
 
 # Multi-server allowlist & AI channel IDs
 raw_guilds = os.getenv("ALLOWED_GUILD_IDS", "").strip()
@@ -142,8 +149,10 @@ intents.voice_states = True
 # Concurrency locks & boot timestamp
 ollama_lock = asyncio.Lock()
 tts_lock = asyncio.Lock()
-# Global OOM guard: serializes heavy multi-page Pillow CV/Render jobs on 512 MB Render containers
+# Global OOM guard: serializes heavy multi-page Pillow/OpenCV jobs on 512 MB Render containers
 manga_semaphore = asyncio.Semaphore(1)
+# Caps concurrent multi-speaker FFmpeg/STT tasks so 0.1 vCPU stays responsive to Discord voice heartbeats
+voice_stt_semaphore = asyncio.Semaphore(2)
 BOOT_TIME = time.time()
 
 
@@ -209,6 +218,8 @@ channel_last_attachment: dict[int, deque] = defaultdict(lambda: deque(maxlen=4))
 channel_last_weather = {}
 # False = reply to all speech in voice channel; True = require wake word ("ยูกิโนะ", etc.)
 voice_wake_word_enabled = defaultdict(lambda: False)
+# Active in-RAM passive Voice Scribe sessions keyed by guild_id (cleared on stop/leave/disconnect)
+voice_scribe_sessions: dict[int, dict] = {}
 
 # ==============================================================================
 # ZERO-RAM /tmp IMAGE CACHE (5-min TTL, 30 MB cap — speeds up In-Bubble follow-ups)

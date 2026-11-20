@@ -11,6 +11,8 @@ import tempfile
 import threading
 import asyncio
 import subprocess
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from collections import defaultdict, deque
 from urllib.parse import quote_plus
 
@@ -27,6 +29,11 @@ from config import (
     TTS_VOICE_EN,
     TTS_PITCH,
     TTS_RATE,
+    TTS_GOOGLE_PITCH,
+    TTS_GOOGLE_SPEED,
+    TTS_SILENCE_TRIM,
+    VOICE_SCRIBE_MAX_ENTRIES,
+    VOICE_SCRIBE_MAX_DURATION_SEC,
     STT_PRIMARY_LANG,
     DDGS_PROXY,
     GEMINI_API_KEY,
@@ -40,14 +47,22 @@ from config import (
     CAT_TOPIC_REGEX,
     STUTTER_REGEX,
     tts_lock,
+    voice_stt_semaphore,
     voice_wake_word_enabled,
+    voice_scribe_sessions,
     state,
     davey,
     clean_url,
     api_log,
     get_http_session,
+    release_unused_memory,
 )
-from persona import is_owner_user, sanitize_yukino_output, VOICE_SYSTEM_PROMPT
+from persona import (
+    is_owner_user,
+    sanitize_yukino_output,
+    FAST_SYSTEM_PROMPT,
+    VOICE_SYSTEM_PROMPT,
+)
 from llm import query_local_ollama_chat, orchestrate_message_with_decision_1
 
 # Silence noisy RTCP SenderReport logs (type=200) and opus flush warnings from discord-ext-voice-recv
@@ -70,12 +85,35 @@ GTRANS_HOST = "translate." + "googleapis.com"
 GROQ_API_HOST = "api." + "groq.com"
 GEMINI_WS_HOST = "generativelanguage." + "googleapis.com"
 
+# Active voice sink registry (keyed by guild_id) so Scribe Stop can flush mid-sentence buffers cleanly
+_ACTIVE_VOICE_SINKS: dict[int, "SilenceGatedVoiceSink"] = {}
+
 # Spoken test phrases (including common STT phonetic variations like ชัด/แชท, ตัดสอบ/ทดสอบ, หยิน/ยิน)
 VOICE_TEST_PHRASE_REGEX = re.compile(
     r"(ได้ยินไหม|ได้ยินมั้ย|ได้ยินหรือเปล่า|ได้ยินฉันไหม|ไม่หยินไหม|ได้มิดิน|"
     r"ถ้าได้ยิน|ถ้าได้อีกแล้ว|พิมพ์ตอบในแชท|พิมพ์ตอบในชัด|ตอบในแชท|ตอบในชัด|"
     r"เทสเสียง|ทดสอบเสียง|ทดสอบไมค์|ตัดสอบ|ฮัลโหลเทส|"
     r"can\s+you\s+hear\s+me|if\s+you\s+hear\s+me|reply\s+in\s+chat|mic\s+test|testing\s+1\s*2\s*3)",
+    re.IGNORECASE,
+)
+
+# Passive Voice Scribe Start & Stop triggers (avoids colliding with "จด OT" or casual speech)
+VOICE_SCRIBE_START_REGEX = re.compile(
+    r"(เริ่มจดบันทึก|เริ่มจดการประชุม|เริ่มจดประชุม|เริ่มจดสรุป|เริ่มบันทึกการประชุม|เริ่มบันทึกเสียง|"
+    r"(?:ช่วย)?จดการประชุม|(?:ช่วย)?จดประชุม|(?:ช่วย)?จดสรุปการประชุม|(?:ช่วย)?จดบันทึกการประชุม|"
+    r"(?:ช่วย)?ฟังแล้ว(?:จด|สรุป)|โหมดจดประชุม|โหมดจดบันทึก|"
+    r"\b(?:start\s+scribe|start\s+recording|take\s+meeting\s+notes|record\s+meeting)\b)",
+    re.IGNORECASE,
+)
+VOICE_SCRIBE_STOP_UNAMBIGUOUS_REGEX = re.compile(
+    r"(หยุดจด|หยุดบันทึก|หยุดอัด|เลิกจด|จบการประชุม|จบประชุม|"
+    r"สรุปการประชุม|สรุปประชุม|สรุปที่คุยกัน|สรุปบทสนทนา|สรุปทั้งหมดให้หน่อย|หยุดฟังแล้วสรุป|"
+    r"\b(?:stop\s+scribe|stop\s+recording|end\s+meeting|summarize\s+meeting)\b)",
+    re.IGNORECASE,
+)
+VOICE_SCRIBE_STOP_WAKE_SHORT_REGEX = re.compile(
+    r"(?:สรุป(?:เลย|ให้หน่อย|ได้แล้ว|หน่อย)?|หยุด(?:เลย|ได้แล้ว)?|พอแล้ว|จบแล้ว|"
+    r"\b(?:stop|summarize|summary|finish|done)\b)",
     re.IGNORECASE,
 )
 
@@ -89,6 +127,12 @@ GEMINI_LIVE_CUSTOM_VOCAB = [
     "สรุป OT",
     "ลบ OT",
     "แก้ OT",
+    "เริ่มจดบันทึก",
+    "จดประชุม",
+    "หยุดจด",
+    "หยุดบันทึก",
+    "สรุปการประชุม",
+    "สรุปประชุม",
     "ดูความจำ",
     "จำไว้ว่า",
     "ยูกิพีเดีย",
@@ -111,7 +155,7 @@ GEMINI_LIVE_CUSTOM_VOCAB = [
 WHISPER_THAI_PROMPT_HINT = (
     "ยูกิโนะ ยูกิน่อน Yukino Yukinon สวัสดีค่ะ แนะนำตัวหน่อย ได้ยินไหม ถ้าได้ยินแล้วพิมพ์ตอบในแชท "
     "ทดสอบไมค์ เทสเสียง ทดสอบ วันนี้วันอะไร ตอนนี้เวลากี่โมง อากาศวันนี้เป็นยังไง "
-    "จด OT 6 โมงถึงทุ่มนึง สรุป OT ลบ OT ดูความจำ ยูกิพีเดีย Yukipedia PSO2 NGS แปลมังงะ"
+    "เริ่มจดบันทึก จดประชุม หยุดจด สรุปการประชุม จด OT 6 โมงถึงทุ่มนึง สรุป OT ลบ OT ดูความจำ ยูกิพีเดีย Yukipedia"
 )
 
 STT_PHONETIC_FIXES = (
@@ -398,6 +442,14 @@ except ImportError:
 state.has_voice_recv = HAS_VOICE_RECV
 
 
+def register_voice_sink(guild_id: int, sink: "SilenceGatedVoiceSink") -> None:
+    _ACTIVE_VOICE_SINKS[int(guild_id)] = sink
+
+
+def unregister_voice_sink(guild_id: int) -> None:
+    _ACTIVE_VOICE_SINKS.pop(int(guild_id), None)
+
+
 THAI_DAY_NUMBER_WORDS = {
     1: "หนึ่ง", 2: "สอง", 3: "สาม", 4: "สี่", 5: "ห้า",
     6: "หก", 7: "เจ็ด", 8: "แปด", 9: "เก้า", 10: "สิบ",
@@ -446,17 +498,17 @@ def _normalize_thai_dates_and_times_for_tts(text: str) -> str:
         hh = int(m.group(1))
         mm = int(m.group(2))
         if 0 <= hh <= 23 and 0 <= mm <= 59:
-            return f" {_format_colloquial_thai_time(hh, mm)} "
+            return _format_colloquial_thai_time(hh, mm)
         return m.group(0)
 
-    # Convert both HH:MM and HH.MM (e.g., 18.00 - 19.00 น.) into colloquial Thai speech
+    # Convert both HH:MM and HH.MM (e.g., 18.00 - 19.00 น.) into colloquial Thai speech without extra pause spaces
     s = re.sub(r"\b(\d{1,2})[:.](\d{2})\s*(?:น\.)?", _time_repl, s)
 
     def _day_num_repl(m):
         prefix = m.group(1)
         day_int = int(m.group(2))
         day_word = THAI_DAY_NUMBER_WORDS.get(day_int, str(day_int))
-        return f"{prefix}{day_word} "
+        return f"{prefix}{day_word}"
 
     s = re.sub(r"(ที่)\s*(\d{1,2})\b", _day_num_repl, s)
     s = re.sub(r"(?:พ\.ศ\.|พุทธศักราช)\s*(\d{4})", r"\1", s)
@@ -470,7 +522,9 @@ def clean_text_for_speech(text: str) -> str:
     cleaned = re.sub(r"```[\s\S]*?```", " รายละเอียดของโค้ดฉันส่งไว้ให้ในแชทแล้วค่ะ ", cleaned)
     cleaned = URL_REGEX.sub(" ลิงก์อ้างอิงอยู่ในแชทแล้วค่ะ ", cleaned)
     cleaned = _normalize_thai_dates_and_times_for_tts(cleaned)
-    cleaned = re.sub(r"[\(\)\*\_\~\`\#\>|\"'\[\]]", " ", cleaned)
+    # Remove Markdown formatting symbols without injecting stutter-causing commas between Thai words
+    cleaned = re.sub(r"[\(\)\*\_\~\`\#\>\|\"'\[\]]", "", cleaned)
+    cleaned = re.sub(r"(?<=[\u0E00-\u0E7F])\s*[,،]\s*(?=[\u0E00-\u0E7F])", " ", cleaned)
     cleaned = re.sub(r"[\U00010000-\U0010ffff]", "", cleaned)
     return re.sub(r"\s+", " ", cleaned).strip()[:450]
 
@@ -479,30 +533,65 @@ def select_tts_voice(text: str) -> str:
     return TTS_VOICE_TH if THAI_CHAR_REGEX.search(text) else TTS_VOICE_EN
 
 
-def _split_tts_chunks(text: str, max_len: int = 190) -> list[str]:
-    words = text.split(" ")
-    chunks, cur = [], ""
-    for w in words:
-        if len(cur) + len(w) + 1 <= max_len:
-            cur = f"{cur} {w}".strip()
+def _split_tts_chunks(text: str, max_len: int = 195) -> list[str]:
+    """Splits text along natural sentence/clause endings first so Google TTS never stalls mid-phrase."""
+    if len(text) <= max_len:
+        return [text]
+
+    raw_clauses = re.split(r"(?<=[.!?])\s+|(?<=ค่ะ)\s+|(?<=นะคะ)\s+|\n+", text)
+    chunks: list[str] = []
+    cur = ""
+    for clause in raw_clauses:
+        clause = clause.strip()
+        if not clause:
+            continue
+        if len(cur) + len(clause) + (1 if cur else 0) <= max_len:
+            cur = f"{cur} {clause}".strip() if cur else clause
+            continue
+        if cur:
+            chunks.append(cur)
+            cur = ""
+        if len(clause) <= max_len:
+            cur = clause
         else:
-            if cur:
-                chunks.append(cur)
-            cur = w[:max_len]
+            for w in clause.split(" "):
+                if len(cur) + len(w) + (1 if cur else 0) <= max_len:
+                    cur = f"{cur} {w}".strip() if cur else w
+                else:
+                    if cur:
+                        chunks.append(cur)
+                    cur = w[:max_len]
     if cur:
         chunks.append(cur)
     return chunks
 
 
-def _master_tts_audio_sync(mp3_bytes: bytes, extra_af: str = "") -> bytes:
-    # 220ms lead-in delay prevents clipped opening syllables on Discord Opus playback start
-    base_af = (
-        "adelay=220:all=1,"
-        "equalizer=f=3200:t=q:w=1.2:g=-2.5,"
-        "acompressor=threshold=-18dB:ratio=2:attack=15:release=150,"
-        "volume=1.35"
-    )
-    full_af = f"{extra_af},{base_af}" if extra_af else base_af
+def _master_tts_audio_sync(
+    mp3_bytes: bytes,
+    extra_af: str = "",
+    trim_internal_pauses: bool = True,
+) -> bytes:
+    """
+    Audio mastering chain tuned for Yukino's calm, cool kuudere voice:
+      - `silenceremove`: tightens dead gaps >160ms (including chunk seams) down to a natural 70ms breath
+      - `adelay=220:all=1`: prevents Discord Opus from clipping opening syllables
+      - Subtle warmth (+1.5dB @ 240Hz) + de-harshing (-3.0dB @ 3.2kHz) + gentle compression
+    """
+    stages = []
+    if extra_af:
+        stages.append(extra_af)
+    if trim_internal_pauses and TTS_SILENCE_TRIM:
+        stages.append(
+            "silenceremove=stop_periods=-1:stop_duration=0.16:stop_threshold=-40dB:stop_silence=0.07"
+        )
+    stages.extend([
+        "adelay=220:all=1",
+        "equalizer=f=240:t=q:w=1.1:g=1.5",
+        "equalizer=f=3200:t=q:w=1.2:g=-3.0",
+        "acompressor=threshold=-18dB:ratio=2:attack=15:release=150",
+        "volume=1.35",
+    ])
+    full_af = ",".join(stages)
     proc = subprocess.run(
         [
             "ffmpeg", "-threads", "1", "-i", "pipe:0",
@@ -524,7 +613,7 @@ async def _google_tts_with_yukino_filter(spoken_text: str, lang_code: str) -> by
     raw_mp3_parts = bytearray()
     headers = {"User-Agent": "Mozilla/5.0"}
     session = get_http_session()
-    for chunk in _split_tts_chunks(spoken_text, max_len=190):
+    for chunk in _split_tts_chunks(spoken_text, max_len=195):
         tts_url = (
             f"{HTTPS}{GTRANS_HOST}/translate_tts"
             f"?ie=UTF-8&client=tw-ob&tl={lang_code}&q={quote_plus(chunk)}"
@@ -541,9 +630,18 @@ async def _google_tts_with_yukino_filter(spoken_text: str, lang_code: str) -> by
     if not raw_mp3_parts:
         return b""
 
-    steady_af = "asetrate=24000*1.04,aresample=48000,atempo=1.15"
+    # Cooler Yukino pitch (default 0.97 vs old 1.04) & slightly brisker smooth speed (default 1.24x)
+    pitch = max(0.85, min(1.15, float(TTS_GOOGLE_PITCH)))
+    speed = max(0.85, min(1.60, float(TTS_GOOGLE_SPEED)))
+    atempo = max(0.50, min(2.00, speed / pitch))
+    steady_af = f"asetrate=24000*{pitch:.4f},aresample=48000,atempo={atempo:.4f}"
     try:
-        return await asyncio.to_thread(_master_tts_audio_sync, bytes(raw_mp3_parts), steady_af)
+        return await asyncio.to_thread(
+            _master_tts_audio_sync,
+            bytes(raw_mp3_parts),
+            steady_af,
+            True,
+        )
     except Exception:
         return bytes(raw_mp3_parts)
 
@@ -567,7 +665,7 @@ async def _edge_tts_with_mastering(spoken_text: str, is_thai: bool) -> bytes:
             with open(mp3_path, "rb") as f:
                 raw_edge_mp3 = f.read()
             try:
-                return await asyncio.to_thread(_master_tts_audio_sync, raw_edge_mp3)
+                return await asyncio.to_thread(_master_tts_audio_sync, raw_edge_mp3, "", True)
             except Exception:
                 return raw_edge_mp3
     except Exception as e:
@@ -584,9 +682,9 @@ async def _edge_tts_with_mastering(spoken_text: str, is_thai: bool) -> bytes:
 async def synthesize_tts_mp3_bytes(text: str) -> bytes:
     """
     Consistent voice synthesis:
-    - Default (`TTS_PRIMARY_ENGINE=google`): Google TTS + Yukino filter for every turn
-      (including join greeting), falling back to Edge-TTS only if Google TTS fails.
-    - Optional (`TTS_PRIMARY_ENGINE=edge`): Edge-TTS primary with Google TTS fallback.
+      - Default (`TTS_PRIMARY_ENGINE=google`): Google TTS + tuned cool Yukino filter for every turn
+        (including join greeting), falling back to Edge-TTS only if Google TTS fails.
+      - Optional (`TTS_PRIMARY_ENGINE=edge`): Edge-TTS primary with Google TTS fallback.
     """
     spoken_text = clean_text_for_speech(text)
     if not spoken_text:
@@ -657,6 +755,336 @@ async def speak_in_voice_channel(guild: discord.Guild, text: str, fallback_chann
                 pass
 
 
+# ==============================================================================
+# PASSIVE MULTI-SPEAKER VOICE SCRIBE & CONVERSATION SUMMARIZER (IN-RAM ONLY)
+# ==============================================================================
+def is_voice_scribe_active(guild_id: int | None) -> bool:
+    if not guild_id:
+        return False
+    sess = voice_scribe_sessions.get(int(guild_id))
+    return bool(sess and sess.get("active"))
+
+
+def clear_voice_scribe_session(guild_id: int | None) -> None:
+    """Explicitly purges any in-RAM Voice Scribe transcript & references for `guild_id`."""
+    if not guild_id:
+        return
+    sess = voice_scribe_sessions.pop(int(guild_id), None)
+    if isinstance(sess, dict):
+        entries = sess.get("entries")
+        if isinstance(entries, list):
+            entries.clear()
+        sess["text_channel"] = None
+        sess.clear()
+
+
+def _has_wake_word_prefix_or_near_start(text: str) -> bool:
+    low = (text or "").strip().lower()
+    return any(low.startswith(w) or w in low[:22] for w in VOICE_WAKE_WORDS)
+
+
+def _is_voice_scribe_start_command(text: str) -> bool:
+    if not text:
+        return False
+    # Never steal "จด OT" commands into Scribe Mode
+    if re.search(r"(\bot\b|โอ\s*ที)", text, re.IGNORECASE):
+        return False
+    return bool(VOICE_SCRIBE_START_REGEX.search(text))
+
+
+def _is_voice_scribe_stop_command(text: str) -> bool:
+    if not text:
+        return False
+    if re.search(r"(\bot\b|โอ\s*ที)", text, re.IGNORECASE):
+        return False
+    if VOICE_SCRIBE_STOP_UNAMBIGUOUS_REGEX.search(text):
+        return True
+    if _has_wake_word_prefix_or_near_start(text):
+        body = _strip_wake_word_prefix(text)
+        if VOICE_SCRIBE_STOP_WAKE_SHORT_REGEX.search(body):
+            return True
+    return False
+
+
+def _format_scribe_duration(seconds: float) -> str:
+    total = max(1, int(round(seconds)))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h} ชม. {m} นาที"
+    if m > 0:
+        return f"{m} นาที {s} วินาที"
+    return f"{s} วินาที"
+
+
+async def start_voice_scribe_session(
+    guild: discord.Guild,
+    text_channel,
+    started_by: str = "",
+    topic: str = "",
+    speak_ack: bool = True,
+) -> bool:
+    """Starts an in-RAM passive multi-speaker Voice Scribe session for `guild`."""
+    if not guild:
+        return False
+    gid = int(guild.id)
+    existing = voice_scribe_sessions.get(gid)
+    if existing and existing.get("active") and not existing.get("stopping"):
+        cnt = len(existing.get("entries") or [])
+        if text_channel:
+            await text_channel.send(
+                f"📝 ตอนนี้ฉันกำลังจดบันทึกการสนทนาอยู่แล้วค่ะ (บันทึกไปแล้ว `{cnt}` ประโยค) "
+                "หากต้องการให้สรุป พิมพ์ `!stopscribe` หรือพูดว่า `ยูกิโนะ หยุดจด` ได้เลยนะคะ"
+            )
+        return False
+
+    vc = guild.voice_client
+    vc_name = vc.channel.name if (vc and getattr(vc, "channel", None)) else "Voice Channel"
+    now_th = datetime.now(ZoneInfo("Asia/Bangkok"))
+    clean_topic = re.sub(r"\s+", " ", (topic or "")).strip()[:160]
+
+    voice_scribe_sessions[gid] = {
+        "active": True,
+        "stopping": False,
+        "guild_id": gid,
+        "channel_id": text_channel.id if text_channel else 0,
+        "text_channel": text_channel,
+        "voice_channel_name": vc_name,
+        "topic": clean_topic,
+        "started_by": started_by or "Member",
+        "started_at_ts": time.time(),
+        "started_at_str": now_th.strftime("%H:%M"),
+        "started_date_str": now_th.strftime("%Y%m%d_%H%M"),
+        "entries": [],
+    }
+
+    topic_line = f"\n- **หัวข้อ:** `{clean_topic}`" if clean_topic else ""
+    api_log(f"Voice Scribe STARTED -> guild={gid}, channel='{vc_name}', topic='{clean_topic}'")
+    if text_channel:
+        await text_channel.send(
+            f"📝 **[เริ่มโหมดจดบันทึกและสรุปการสนทนา (Voice Scribe)]**\n"
+            f"- **ห้องเสียง:** `{vc_name}` | **เริ่มเวลา:** `{now_th.strftime('%H:%M')} น.`{topic_line}\n"
+            f"- ระหว่างนี้ฉันจะตั้งใจฟังและจดบันทึกทุกคนแบบเงียบๆ โดยไม่พิมพ์รบกวนในแชทและไม่พูดแทรกค่ะ\n"
+            f"- เมื่อคุยเสร็จแล้ว พิมพ์ `!stopscribe` / `!หยุดจด` / `!leave` หรือพูดว่า **\"ยูกิโนะ หยุดจด\"** / **\"สรุปการประชุม\"** ได้เลยนะคะ"
+        )
+    if speak_ack and vc and vc.is_connected():
+        await speak_in_voice_channel(
+            guild,
+            "รับทราบค่ะ ฉันจะตั้งใจฟังและจดบันทึกให้เงียบๆ โดยไม่พูดแทรกนะคะ เมื่อคุยเสร็จแล้วสั่งหยุดหรือให้สรุปได้เลยค่ะ",
+            fallback_channel=None,
+        )
+    return True
+
+
+def _append_scribe_entry(
+    guild_id: int,
+    speaker_user,
+    speaker_name: str,
+    text: str,
+    utterance_ts: float | None = None,
+) -> tuple[bool, bool]:
+    """
+    Appends one transcribed utterance into the in-RAM session.
+    Returns `(recorded, hit_limit_auto_stop)`.
+    """
+    sess = voice_scribe_sessions.get(int(guild_id))
+    if not sess or not sess.get("active"):
+        return False, False
+
+    entries: list[dict] = sess["entries"]
+    ts_val = float(utterance_ts or time.time())
+    dt_th = datetime.fromtimestamp(ts_val, ZoneInfo("Asia/Bangkok"))
+    uid = int(getattr(speaker_user, "id", 0) or 0)
+    disp = (
+        getattr(speaker_user, "display_name", None)
+        or speaker_name
+        or f"Speaker_{uid % 10000}"
+    )
+
+    # Deduplicate identical back-to-back line from same speaker within 2.5s
+    if entries:
+        last = entries[-1]
+        if last["speaker_id"] == uid and last["text"] == text and abs(ts_val - last["ts"]) < 2.5:
+            return False, False
+
+    entries.append({
+        "ts": ts_val,
+        "time_str": dt_th.strftime("%H:%M:%S"),
+        "speaker_id": uid,
+        "speaker": str(disp).strip()[:36],
+        "text": text.strip(),
+    })
+    print(f"[Voice Scribe] [{dt_th.strftime('%H:%M:%S')}] {disp}: {text}", flush=True)
+
+    duration = time.time() - float(sess.get("started_at_ts") or ts_val)
+    hit_limit = (len(entries) >= VOICE_SCRIBE_MAX_ENTRIES) or (duration >= VOICE_SCRIBE_MAX_DURATION_SEC)
+    return True, hit_limit
+
+
+async def stop_voice_scribe_session(
+    guild: discord.Guild,
+    fallback_text_channel=None,
+    triggered_by: str = "",
+    speak_ack: bool = True,
+    reason: str = "",
+) -> bool:
+    """
+    Flushes any in-progress speaker buffers, summarizes the full multi-speaker transcript,
+    posts the summary + full transcript to Discord, and guarantees the in-RAM session is cleared.
+    """
+    if not guild:
+        return False
+    gid = int(guild.id)
+    sess = voice_scribe_sessions.get(gid)
+    if not sess or not sess.get("active"):
+        return False
+    if sess.get("stopping"):
+        return False
+
+    sess["stopping"] = True
+    target_channel = fallback_text_channel or sess.get("text_channel")
+
+    try:
+        # 1. Flush any speakers who just finished talking right before !stop / !leave
+        sink = _ACTIVE_VOICE_SINKS.get(gid)
+        if sink is not None:
+            try:
+                await sink.flush_pending_utterances(timeout_sec=6.0)
+            except Exception as e:
+                api_log(f"Voice Scribe flush note: {type(e).__name__}: {e}")
+
+        # 2. Detach & clear in-RAM session immediately so memory is released even if LLM fails
+        entries = sorted(list(sess.get("entries") or []), key=lambda x: x["ts"])
+        vc_name = sess.get("voice_channel_name") or "Voice Channel"
+        topic_hint = sess.get("topic") or ""
+        started_ts = float(sess.get("started_at_ts") or time.time())
+        started_str = sess.get("started_at_str") or ""
+        started_date_str = sess.get("started_date_str") or datetime.now(ZoneInfo("Asia/Bangkok")).strftime("%Y%m%d_%H%M")
+        clear_voice_scribe_session(gid)
+
+        ended_th = datetime.now(ZoneInfo("Asia/Bangkok"))
+        duration_str = _format_scribe_duration(time.time() - started_ts)
+
+        if not entries:
+            if target_channel:
+                reason_note = f" ({reason})" if reason else ""
+                await target_channel.send(
+                    f"📝 หยุดโหมดจดบันทึกในห้อง `{vc_name}` แล้วค่ะ{reason_note} — "
+                    f"ตลอดช่วง `{duration_str}` ที่ผ่านมาไม่พบเสียงสนทนาที่ชัดเจน จึงไม่มีข้อมูลให้สรุปค่ะ"
+                )
+            if speak_ack and guild.voice_client and guild.voice_client.is_connected():
+                await speak_in_voice_channel(guild, "หยุดจดบันทึกแล้วค่ะ แต่ไม่พบเสียงสนทนาให้สรุปนะคะ")
+            return True
+
+        speakers_ordered: list[str] = []
+        for e in entries:
+            if e["speaker"] not in speakers_ordered:
+                speakers_ordered.append(e["speaker"])
+
+        transcript_lines = [
+            f"[{e['time_str']}] {e['speaker']}: {e['text']}" for e in entries
+        ]
+        full_transcript_text = "\n".join(transcript_lines)
+        entries.clear()
+
+        api_log(
+            f"Voice Scribe STOPPED -> guild={gid}, utterances={len(transcript_lines)}, "
+            f"speakers={len(speakers_ordered)}, chars={len(full_transcript_text)}"
+        )
+
+        if target_channel:
+            await target_channel.send(
+                f"📝 หยุดจดบันทึกห้อง `{vc_name}` แล้วค่ะ (`{len(transcript_lines)}` ประโยค | `{len(speakers_ordered)}` ผู้พูด | `{duration_str}`) "
+                "กำลังเรียบเรียงสรุปประเด็นทั้งหมดให้ รอสักครู่นะคะ..."
+            )
+
+        topic_ctx = f"หัวข้อที่ระบุไว้ตอนเริ่ม: {topic_hint}\n" if topic_hint else ""
+        summary_prompt = (
+            f"ด้านล่างนี้คือบันทึกคำพูดจากการสนทนาในห้องเสียง `{vc_name}` "
+            f"(เวลา {started_str} - {ended_th.strftime('%H:%M')} น. | ระยะเวลา {duration_str} | "
+            f"ผู้เข้าร่วมพูด: {', '.join(speakers_ordered)})\n"
+            f"{topic_ctx}"
+            "โปรดวิเคราะห์และสรุปบทสนทนาทั้งหมดให้ชัดเจน กระชับ อ่านง่าย ในน้ำเสียงสุขุมเป็นธรรมชาติของยูกิโนะ "
+            "(ห้ามสร้างตาราง Markdown และห้ามแต่งข้อมูลที่ไม่ได้พูดในบันทึก):\n"
+            "1. **ภาพรวมหัวข้อที่สนทนา (Overall Summary)**: สรุปสั้นๆ 2-4 ประโยคว่าคุยเรื่องอะไรบ้าง\n"
+            "2. **ประเด็นสำคัญแยกตามหัวข้อ (Key Discussion Points)**: จัดกลุ่มหัวข้อที่พูดถึงพร้อมระบุใจความสำคัญและผู้เสนอประเด็น\n"
+            "3. **ข้อสรุปและสิ่งที่ต้องทำต่อ (Decisions & Action Items)**: ระบุสิ่งที่ตกลงกันแล้วหรือสิ่งที่ต้องทำต่อพร้อมชื่อผู้รับผิดชอบ (ถ้าไม่มีให้ระบุสั้นๆ ว่าเป็นการพูดคุยทั่วไป ไม่มี Action Items)\n\n"
+            f"=== บันทึกบทสนทนา (Voice Transcript) ===\n{full_transcript_text[:95000]}"
+        )
+
+        summary_answer, _ = await query_local_ollama_chat(
+            summary_prompt,
+            model=ACTIVE_FAST_MODEL,
+            system_prompt=FAST_SYSTEM_PROMPT,
+            channel_id=target_channel.id if target_channel else None,
+            temperature=0.25,
+            allow_agentic_search=False,
+            has_fresh_attachment=True,
+            speaker_user=None,
+            speaker_name="",
+            decision_plan={"route": "chat", "route_confidence": 0.99, "needs_web_search": False},
+        )
+
+        from image_engine import send_chunked_response
+
+        header_meta = (
+            f"📋 **[สรุปการสนทนาในห้องเสียง `{vc_name}`]**\n"
+            f"- **ช่วงเวลา:** `{started_str} - {ended_th.strftime('%H:%M')} น.` (`{duration_str}`) | "
+            f"**ผู้พูด ({len(speakers_ordered)}):** `{', '.join(speakers_ordered)}` | "
+            f"**จำนวน:** `{len(transcript_lines)} ประโยค`"
+        )
+        if topic_hint:
+            header_meta += f"\n- **หัวข้อ:** `{topic_hint}`"
+        if reason:
+            header_meta += f"\n- **สถานะ:** `{reason}`"
+
+        if target_channel:
+            await send_chunked_response(
+                target_channel,
+                f"{header_meta}\n\n{summary_answer}",
+                filename_fallback=f"voice_summary_{started_date_str}.md",
+            )
+
+            # Deliver full timestamped transcript inline (short) or as downloadable .txt (long)
+            if len(full_transcript_text) <= 1450:
+                await target_channel.send(
+                    f"**🎙️ บันทึกคำพูดทั้งหมด (Full Transcript):**\n```text\n{full_transcript_text}\n```"
+                )
+            else:
+                file_header = (
+                    f"Voice Channel: {vc_name}\n"
+                    f"Time (TH): {started_str} - {ended_th.strftime('%H:%M')} ({duration_str})\n"
+                    f"Speakers: {', '.join(speakers_ordered)}\n"
+                    + (f"Topic: {topic_hint}\n" if topic_hint else "")
+                    + ("=" * 60)
+                    + "\n\n"
+                )
+                transcript_bytes = (file_header + full_transcript_text).encode("utf-8")
+                await target_channel.send(
+                    content="📎 **บันทึกคำพูดฉบับเต็ม (Full Voice Transcript):**",
+                    file=discord.File(
+                        io.BytesIO(transcript_bytes),
+                        filename=f"voice_transcript_{started_date_str}.txt",
+                    ),
+                )
+
+        if speak_ack and guild.voice_client and guild.voice_client.is_connected():
+            await speak_in_voice_channel(
+                guild,
+                "สรุปการสนทนาและส่งบันทึกทั้งหมดลงในแชทให้เรียบร้อยแล้วค่ะ",
+                fallback_channel=None,
+            )
+
+        transcript_lines.clear()
+        return True
+    finally:
+        clear_voice_scribe_session(gid)
+        release_unused_memory()
+
+
+# ==============================================================================
+# 3-TIER HYBRID SPEECH-TO-TEXT PIPELINE
+# ==============================================================================
 def _apply_phonetic_fixes(text: str) -> str:
     cleaned = text.strip()
     for pattern, replacement in STT_PHONETIC_FIXES:
@@ -695,7 +1123,6 @@ def _extract_pcm16k_from_wav_bytes(wav_bytes: bytes) -> tuple[bytes, int]:
     with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
         rate = wf.getframerate() or 16000
         pcm = wf.readframes(wf.getnframes())
-    # Ensure even byte length for 16-bit PCM alignment
     if len(pcm) % 2 == 1:
         pcm = pcm[:-1]
     return pcm, rate
@@ -722,7 +1149,7 @@ async def transcribe_wav_bytes_gemini_live(wav_bytes: bytes) -> str:
     """
     Tier 1 Primary STT: Streams 16kHz mono PCM audio to `gemini-3.5-transcribe-live`
     over Google AI Studio's Multimodal Live WebSocket (`BidiGenerateContent`):
-      - Parses BOTH `BINARY` and `TEXT` JSON frames (fixes `setupComplete` TimeoutError!).
+      - Parses BOTH `BINARY` and `TEXT` JSON frames.
       - Uses official `inputAudioTranscription` (`languageCodes`, `customVocabulary`, `mode="SMART"`)
         with manual VAD (`activityStart` / `activityEnd`) for instant utterance finalization.
       - Reads `serverContent.inputTranscription` (and `interimInputTranscription` fallback).
@@ -818,7 +1245,6 @@ async def transcribe_wav_bytes_gemini_live(wav_bytes: bytes) -> str:
                 if use_manual_vad:
                     await ws.send_json({"realtimeInput": {"activityStart": {}}})
 
-                # 100ms chunks (3200 bytes @ 16kHz 16-bit mono) + 300ms trailing silence padding
                 padded_pcm = pcm_bytes + (b"\x00" * (sample_rate * 2 * 3 // 10))
                 chunk_size = 3200
                 for offset in range(0, len(padded_pcm), chunk_size):
@@ -848,7 +1274,6 @@ async def transcribe_wav_bytes_gemini_live(wav_bytes: bytes) -> str:
 
                 while time.monotonic() < read_deadline:
                     rem = max(0.15, read_deadline - time.monotonic())
-                    # Once we have finalized inputTranscription, wait at most 0.75s for trailing chunks
                     recv_timeout = min(rem, 0.75) if final_parts else rem
                     try:
                         msg = await ws.receive(timeout=recv_timeout)
@@ -872,7 +1297,6 @@ async def transcribe_wav_bytes_gemini_live(wav_bytes: bytes) -> str:
                     if isinstance(input_tr, dict):
                         tr_txt = (input_tr.get("text") or "").strip()
                         if tr_txt:
-                            # SMART mode emits full cumulative text; VERBATIM emits incremental pieces
                             if use_manual_vad:
                                 final_parts = [tr_txt]
                             else:
@@ -917,7 +1341,6 @@ async def transcribe_wav_bytes_gemini_live(wav_bytes: bytes) -> str:
                 return ""
         except Exception as e:
             last_err = f"{type(e).__name__}: {str(e)[:120]}"
-            # If manual_smart setup was rejected by server schema, try hybrid_auto immediately
             if mode_label == "manual_smart" and ("429" not in last_err and "quota" not in last_err.lower()):
                 api_log(f"Gemini Transcribe Live (manual_smart) note ({last_err}); retrying hybrid_auto")
                 continue
@@ -1035,7 +1458,12 @@ def _strip_wake_word_prefix(text: str) -> str:
 
 
 async def handle_spoken_voice_command(
-    guild: discord.Guild, text_channel, speaker_user, speaker_name: str, spoken_text: str
+    guild: discord.Guild,
+    text_channel,
+    speaker_user,
+    speaker_name: str,
+    spoken_text: str,
+    utterance_ts: float | None = None,
 ):
     from user_memory import (
         is_ot_command_text,
@@ -1051,6 +1479,33 @@ async def handle_spoken_voice_command(
         or NOISE_HALLUCINATION_REGEX.search(cleaned)
     ):
         return
+
+    # 0. Passive Multi-Speaker Voice Scribe Mode: silently record everyone until Stop command!
+    if guild and is_voice_scribe_active(guild.id):
+        sess = voice_scribe_sessions.get(int(guild.id))
+        if sess and not sess.get("stopping") and _is_voice_scribe_stop_command(cleaned):
+            print(f"[Voice Scribe] Stop command detected from {speaker_name}: '{cleaned}'", flush=True)
+            await stop_voice_scribe_session(
+                guild,
+                fallback_text_channel=text_channel,
+                triggered_by=speaker_name,
+                speak_ack=True,
+            )
+            return
+
+        _, hit_limit = _append_scribe_entry(
+            guild.id, speaker_user, speaker_name, cleaned, utterance_ts=utterance_ts
+        )
+        if hit_limit and sess and not sess.get("stopping"):
+            await stop_voice_scribe_session(
+                guild,
+                fallback_text_channel=text_channel,
+                triggered_by="Auto-Limit",
+                speak_ack=True,
+                reason="ถึงขีดจำกัดระยะเวลาหรือจำนวนข้อความสูงสุดอัตโนมัติ",
+            )
+        return
+
     print(f"[Voice STT] {speaker_name} spoke: '{cleaned}' (wake_word_required={voice_wake_word_enabled[guild.id]})", flush=True)
 
     # 1. Instant Voice-Test Trigger (Always replies in chat even if wakeword is on)
@@ -1076,6 +1531,18 @@ async def handle_spoken_voice_command(
 
     command_body = _strip_wake_word_prefix(cleaned)
     chan_id = text_channel.id if text_channel else 0
+
+    # 1B. Spoken Start Voice Scribe Trigger ('ยูกิโนะ เริ่มจดบันทึก' / 'จดประชุม')
+    if guild and _is_voice_scribe_start_command(command_body):
+        topic_hint = VOICE_SCRIBE_START_REGEX.sub("", command_body).strip(" :-")
+        await start_voice_scribe_session(
+            guild,
+            text_channel,
+            started_by=speaker_name,
+            topic=topic_hint,
+            speak_ack=True,
+        )
+        return
 
     class _VoiceProxyMsg:
         def __init__(self):
@@ -1141,11 +1608,11 @@ async def handle_spoken_voice_command(
 
 class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
     """
-    Adaptive Noise-Floor VAD Sink tuned for rooms with steady fan noise (PC/UPS/switch/desk fans):
+    Adaptive Noise-Floor Multi-Speaker VAD Sink tuned for rooms with steady fan noise:
       - Tracks a slow per-speaker ambient noise floor EMA so steady fan hum (rms 30-65) never triggers STT.
-      - Requires dynamic SNR margin (`frame_rms >= max(110, floor * 2.25)`) to start capturing,
-        hysteresis (`max(85, floor * 1.75)`) to preserve soft word endings,
-        and minimum peak RMS + active frames before sending to STT.
+      - Preserves per-speaker utterance start timestamps so overlapping multi-speaker conversations
+        sort in exact chronological order during Voice Scribe Mode.
+      - Caps concurrent FFmpeg/STT tasks via `voice_stt_semaphore` (`Semaphore(2)`).
     """
 
     BASE_SPEECH_RMS_MIN = 110.0
@@ -1164,7 +1631,9 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
         self.speech_frame_counts = defaultdict(int)
         self.peak_rms = defaultdict(float)
         self.noise_floors = defaultdict(lambda: 45.0)
+        self.utterance_started_at: dict = {}
         self.last_spoken = {}
+        self._inflight_tasks: set[asyncio.Task] = set()
         self._last_rms_log = 0.0
         self.running = True
         try:
@@ -1225,6 +1694,7 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
 
             if frame_rms >= effective_thresh:
                 if not is_capturing:
+                    self.utterance_started_at[speaker] = time.time()
                     for pre_frame in self.pre_roll_buffers[speaker]:
                         buf.extend(pre_frame)
                     self.pre_roll_buffers[speaker].clear()
@@ -1238,22 +1708,52 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
                 if len(buf) < MAX_UTTERANCE_BYTES:
                     buf.extend(data.pcm)
             else:
-                # Update ambient noise floor EMA gently while idle (clamped to [15, 95] so loud noise can't deafen VAD)
                 if frame_rms > 5.0:
                     updated_floor = (floor * 0.94) + (min(frame_rms, 110.0) * 0.06)
                     self.noise_floors[speaker] = max(15.0, min(95.0, updated_floor))
                 self.pre_roll_buffers[speaker].append(data.pcm)
 
-            if frame_rms > 25.0 and (now - self._last_rms_log > 5.0):
-                self._last_rms_log = now
-                print(
-                    f"[Voice Mic Level] speaker={speaker.display_name}, "
-                    f"rms={int(frame_rms)}, floor={int(self.noise_floors[speaker])}, thresh={int(start_thresh)}",
-                    flush=True,
-                )
+        if frame_rms > 25.0 and (now - self._last_rms_log > 5.0):
+            self._last_rms_log = now
+            print(
+                f"[Voice Mic Level] speaker={speaker.display_name}, "
+                f"rms={int(frame_rms)}, floor={int(self.noise_floors[speaker])}, thresh={int(start_thresh)}",
+                flush=True,
+            )
+
+    def _spawn_pcm_task(self, user, pcm_bytes: bytes, utterance_ts: float) -> asyncio.Task:
+        task = self._loop.create_task(self._process_user_pcm(user, pcm_bytes, utterance_ts))
+        self._inflight_tasks.add(task)
+        task.add_done_callback(self._inflight_tasks.discard)
+        return task
+
+    async def flush_pending_utterances(self, timeout_sec: float = 6.0) -> None:
+        """Flushes any buffered speaker utterances immediately and awaits in-flight STT tasks."""
+        ready_payloads = []
+        with self._lock:
+            for user in list(self.last_spoken.keys()):
+                pcm_bytes = bytes(self.user_buffers.pop(user, b""))
+                active_frames = self.speech_frame_counts.pop(user, 0)
+                peak = self.peak_rms.pop(user, 0.0)
+                floor = self.noise_floors.get(user, 45.0)
+                utt_ts = self.utterance_started_at.pop(user, time.time())
+                self.last_spoken.pop(user, None)
+                min_peak = max(self.MIN_PEAK_RMS, floor * 2.6)
+                if active_frames >= self.MIN_ACTIVE_SPEECH_FRAMES and peak >= min_peak and len(pcm_bytes) >= 38400:
+                    ready_payloads.append((user, pcm_bytes, utt_ts))
+
+        for user, pcm_bytes, utt_ts in ready_payloads:
+            self._spawn_pcm_task(user, pcm_bytes, utt_ts)
+
+        cur_task = asyncio.current_task()
+        pending = [t for t in list(self._inflight_tasks) if not t.done() and t is not cur_task]
+        if pending:
+            await asyncio.wait(pending, timeout=timeout_sec)
 
     def cleanup(self):
         self.running = False
+        if self.guild:
+            unregister_voice_sink(self.guild.id)
         if getattr(self, "monitor_task", None) and not self.monitor_task.done():
             self.monitor_task.cancel()
         with self._lock:
@@ -1262,6 +1762,7 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
             self.speech_frame_counts.clear()
             self.peak_rms.clear()
             self.noise_floors.clear()
+            self.utterance_started_at.clear()
             self.last_spoken.clear()
 
     async def _silence_monitor_loop(self):
@@ -1272,12 +1773,13 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
             with self._lock:
                 for user, last_t in list(self.last_spoken.items()):
                     buf_len = len(self.user_buffers.get(user, b""))
-                    # Flush after 1.1s silence OR immediately if continuous mic noise hits MAX_UTTERANCE_BYTES
+                    # Flush after 1.1s silence OR immediately if continuous speech hits MAX_UTTERANCE_BYTES
                     if (now - last_t >= 1.1) or (buf_len >= MAX_UTTERANCE_BYTES):
                         pcm_bytes = bytes(self.user_buffers.pop(user, b""))
                         active_frames = self.speech_frame_counts.pop(user, 0)
                         peak = self.peak_rms.pop(user, 0.0)
                         floor = self.noise_floors.get(user, 45.0)
+                        utt_ts = self.utterance_started_at.pop(user, time.time())
                         self.last_spoken.pop(user, None)
                         min_peak = max(self.MIN_PEAK_RMS, floor * 2.6)
                         if (
@@ -1285,36 +1787,42 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
                             and peak >= min_peak
                             and len(pcm_bytes) >= 38400
                         ):
-                            ready_payloads.append((user, pcm_bytes, active_frames, peak, floor))
+                            ready_payloads.append((user, pcm_bytes, active_frames, peak, floor, utt_ts))
                         elif active_frames > 0:
                             print(
                                 f"[Voice VAD Dropped Noise] speaker={user.display_name}, "
                                 f"frames={active_frames}, peak={int(peak)} < {int(min_peak)} (floor={int(floor)})",
                                 flush=True,
                             )
-            for user, pcm_bytes, active_frames, peak, floor in ready_payloads:
+            for user, pcm_bytes, active_frames, peak, floor, utt_ts in ready_payloads:
                 print(
                     f"[Voice VAD] Captured speech from {user.display_name} "
                     f"({active_frames} active frames, peak={int(peak)}, floor={int(floor)}, {len(pcm_bytes)} bytes)",
                     flush=True,
                 )
-                self._loop.create_task(self._process_user_pcm(user, pcm_bytes))
+                self._spawn_pcm_task(user, pcm_bytes, utt_ts)
 
-    async def _process_user_pcm(self, user, pcm_bytes: bytes):
+    async def _process_user_pcm(self, user, pcm_bytes: bytes, utterance_ts: float):
         try:
-            raw_wav_io = io.BytesIO()
-            with wave.open(raw_wav_io, "wb") as wf:
-                wf.setnchannels(2)
-                wf.setsampwidth(2)
-                wf.setframerate(48000)
-                wf.writeframes(pcm_bytes)
-            compact_wav = await asyncio.to_thread(convert_audio_bytes_to_wav_sync, raw_wav_io.getvalue())
-            spoken_text = await transcribe_wav_bytes_hybrid(compact_wav)
+            async with voice_stt_semaphore:
+                raw_wav_io = io.BytesIO()
+                with wave.open(raw_wav_io, "wb") as wf:
+                    wf.setnchannels(2)
+                    wf.setsampwidth(2)
+                    wf.setframerate(48000)
+                    wf.writeframes(pcm_bytes)
+                compact_wav = await asyncio.to_thread(convert_audio_bytes_to_wav_sync, raw_wav_io.getvalue())
+                spoken_text = await transcribe_wav_bytes_hybrid(compact_wav)
             if spoken_text:
                 await handle_spoken_voice_command(
-                    self.guild, self.text_channel, user, user.display_name, spoken_text
+                    self.guild,
+                    self.text_channel,
+                    user,
+                    user.display_name,
+                    spoken_text,
+                    utterance_ts=utterance_ts,
                 )
             else:
                 print(f"[Voice STT] Audio captured from {user.display_name}, but STT returned empty text.", flush=True)
         except Exception as e:
-            print(f"Voice PCM processing error: {e}", flush=True)
+            print(f"Voice PCM processing error: {type(e).__name__}: {e}", flush=True)

@@ -36,6 +36,8 @@ from config import (
     GEMINI_DECISION_MODEL,
     GEMINI_HEAVY_MODEL,
     GEMINI_TRANSCRIBE_LIVE_MODEL,
+    TTS_GOOGLE_PITCH,
+    TTS_GOOGLE_SPEED,
     AUDIO_EXTENSIONS,
     IMAGE_EXTENSIONS,
     CUSTOM_EMOJI_REGEX,
@@ -50,6 +52,7 @@ from config import (
     channel_memory,
     channel_last_attachment,
     voice_wake_word_enabled,
+    voice_scribe_sessions,
     state,
     davey,
     get_http_session,
@@ -95,6 +98,12 @@ from voice_engine import (
     voice_recv,
     SilenceGatedVoiceSink,
     speak_in_voice_channel,
+    is_voice_scribe_active,
+    start_voice_scribe_session,
+    stop_voice_scribe_session,
+    clear_voice_scribe_session,
+    register_voice_sink,
+    unregister_voice_sink,
 )
 from ui_interactions import (
     CodeReviewActionView,
@@ -221,6 +230,7 @@ def _collect_health_metrics() -> dict:
     live_stt_cd = max(0, int(state.gemini_transcribe_live_cooldown_until - now))
     edge_cd = max(0, int(state.edge_tts_cooldown_until - now))
     cached_files_count = sum(len(q) for q in channel_last_attachment.values())
+    active_scribe_count = sum(1 for s in voice_scribe_sessions.values() if s.get("active"))
 
     return {
         "status": "ok" if rss_mb < 480 else "warning_high_memory",
@@ -233,6 +243,7 @@ def _collect_health_metrics() -> dict:
             "gateway_ping_ms": ws_ping_ms,
             "guilds_count": len(bot.guilds) if bot.is_ready() else 0,
             "active_voice_sessions": len(bot.voice_clients),
+            "active_scribe_sessions": active_scribe_count,
             "dave_e2ee_ready": bool(davey is not None and HAS_VOICE_RECV),
         },
         "memory": {
@@ -266,6 +277,8 @@ def _collect_health_metrics() -> dict:
             "gemma_active_model": getattr(state, "active_gemma_model", None) if GEMINI_API_KEY else None,
             "gemini_active_model": state.active_gemini_model if GEMINI_API_KEY else None,
             "gemini_grounding_cooldown_sec": gemini_cd,
+            "tts_google_pitch": TTS_GOOGLE_PITCH,
+            "tts_google_speed": TTS_GOOGLE_SPEED,
             "edge_tts_cooldown_sec": edge_cd,
         },
     }
@@ -284,7 +297,7 @@ async def handle_root(request: web.Request) -> web.Response:
         else "🟡 Connecting to Discord Gateway..."
     )
     gemini_cd_note = f" (Grounding Cooldown: {ai['gemini_grounding_cooldown_sec']}s)" if ai["gemini_grounding_cooldown_sec"] else ""
-    edge_cd_note = f" (Fallback Google TTS active: {ai['edge_tts_cooldown_sec']}s left)" if ai["edge_tts_cooldown_sec"] else " (Edge-TTS Primary)"
+    tts_note = f" | TTS: Google Yukino (pitch={ai['tts_google_pitch']}, speed={ai['tts_google_speed']}x)"
 
     html = f"""
     <html>
@@ -293,11 +306,11 @@ async def handle_root(request: web.Request) -> web.Response:
         <title>Yukinon Discord Bot - System Telemetry</title>
     </head>
     <body style="font-family: system-ui, sans-serif; max-width: 740px; margin: 36px auto; line-height: 1.6; color: #1f2937; padding: 0 16px;">
-        <h2>❄️ Yukino Yukinoshita Discord Bot (Native Function-Calling & Multi-Cloud Edition)</h2>
+        <h2>❄️ Yukino Yukinoshita Discord Bot (Native Function-Calling, Voice Scribe &amp; Multi-Cloud Edition)</h2>
         <p><b>System Time (TH):</b> {m['system_time_th']}</p>
         <p><b>Discord Gateway:</b> {gw_status}</p>
         <p><b>Native Tools:</b> {len(ai['registered_tools'])} active (<code>{', '.join(ai['registered_tools'])}</code>)</p>
-        <p><b>Voice & DAVE E2EE:</b> {d['active_voice_sessions']} active session(s) | DAVE Ready: {d['dave_e2ee_ready']} | Live STT: <code>{ai['gemini_transcribe_live_model']}</code>{edge_cd_note}</p>
+        <p><b>Voice &amp; Scribe:</b> {d['active_voice_sessions']} voice session(s), {d['active_scribe_sessions']} active scribe(s) | DAVE Ready: {d['dave_e2ee_ready']} | Live STT: <code>{ai['gemini_transcribe_live_model']}</code>{tts_note}</p>
         <p><b>Container RAM:</b> {mem['bot_ram_mb']} MB / {mem['render_limit_mb']} MB ({mem['ram_usage_pct']}%) |
            <b>Cached Contexts:</b> {mem['active_chat_channels']} chat(s), {mem['cached_attachments']} file(s), {mem['stored_user_profiles']} profile(s)</p>
         <hr style="border: 0; border-top: 1px solid #e5e7eb; margin: 16px 0;">
@@ -381,7 +394,6 @@ class YukinonBot(commands.Bot):
 
     async def setup_hook(self):
         register_app_commands(self)
-        # Initialize shared pooled aiohttp session with 5-min DNS cache
         get_http_session()
         app = web.Application()
         app.router.add_get("/", handle_root)
@@ -393,6 +405,8 @@ class YukinonBot(commands.Bot):
         print(f"[Render Web Service Health Server] Listening on 0.0.0.0:{PORT}", flush=True)
 
     async def close(self):
+        for gid in list(voice_scribe_sessions.keys()):
+            clear_voice_scribe_session(gid)
         if monthly_ot_auto_report_task.is_running():
             monthly_ot_auto_report_task.cancel()
         await close_http_session()
@@ -419,6 +433,67 @@ async def on_ready():
     if not monthly_ot_auto_report_task.is_running():
         monthly_ot_auto_report_task.start()
     print(f"Logged in as {bot.user} on {platform.machine()} at {get_current_thai_datetime_str()}", flush=True)
+
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    """
+    1) Registers mid-call joiners into DAVE `_KNOWN_VOICE_USER_IDS` for multi-speaker decryption.
+    2) Auto-finalizes & clears in-RAM Voice Scribe sessions if the bot is disconnected OR all humans leave.
+    """
+    guild = member.guild
+    if not guild:
+        return
+    vc = guild.voice_client
+
+    # Case A: Bot itself was disconnected/kicked from a voice channel
+    if bot.user and member.id == bot.user.id:
+        if before.channel is not None and after.channel is None:
+            if is_voice_scribe_active(guild.id):
+                await stop_voice_scribe_session(
+                    guild,
+                    triggered_by="Disconnect",
+                    speak_ack=False,
+                    reason="ตัดการเชื่อมต่อจากห้องเสียง",
+                )
+            else:
+                clear_voice_scribe_session(guild.id)
+            unregister_voice_sink(guild.id)
+        return
+
+    if not vc or not vc.is_connected() or not getattr(vc, "channel", None):
+        return
+
+    # Case B: Another human joins the bot's active voice channel -> register for DAVE multi-speaker E2EE
+    if not member.bot and after.channel is not None and after.channel.id == vc.channel.id:
+        from voice_engine import _KNOWN_VOICE_USER_IDS
+        _KNOWN_VOICE_USER_IDS.add(int(member.id))
+        return
+
+    # Case C: A human left the bot's active voice channel -> check if room is now empty
+    if not member.bot and before.channel is not None and before.channel.id == vc.channel.id:
+        if after.channel is None or after.channel.id != vc.channel.id:
+            remaining_humans = [m for m in vc.channel.members if not m.bot]
+            if not remaining_humans:
+                if is_voice_scribe_active(guild.id):
+                    await stop_voice_scribe_session(
+                        guild,
+                        triggered_by="Auto-Leave",
+                        speak_ack=False,
+                        reason="สมาชิกออกจากห้องเสียงครบทุกคนแล้ว",
+                    )
+                else:
+                    clear_voice_scribe_session(guild.id)
+                if hasattr(vc, "stop_listening"):
+                    try:
+                        vc.stop_listening()
+                    except Exception:
+                        pass
+                unregister_voice_sink(guild.id)
+                try:
+                    await vc.disconnect(force=True)
+                except Exception:
+                    pass
 
 
 async def _send_response_with_interactive_view(
@@ -897,6 +972,63 @@ async def sync_app_commands(ctx, scope: str = "guild"):
         await ctx.send(f"เกิดข้อผิดพลาดระหว่างซิงค์คำสั่งค่ะ (`{type(e).__name__}: {e}`)")
 
 
+async def _connect_bot_to_voice_channel(ctx, target_channel, greet: bool = True):
+    """Shared voice connection helper with DAVE E2EE + registered SilenceGatedVoiceSink."""
+    from voice_engine import _KNOWN_VOICE_USER_IDS
+    for m in target_channel.members:
+        _KNOWN_VOICE_USER_IDS.add(int(m.id))
+    if bot.user:
+        _KNOWN_VOICE_USER_IDS.add(int(bot.user.id))
+
+    if ctx.guild.voice_client:
+        if is_voice_scribe_active(ctx.guild.id):
+            await stop_voice_scribe_session(
+                ctx.guild,
+                fallback_text_channel=ctx.channel,
+                triggered_by=ctx.author.display_name,
+                speak_ack=False,
+                reason="ย้ายห้องเสียง",
+            )
+        unregister_voice_sink(ctx.guild.id)
+        await ctx.guild.voice_client.disconnect(force=True)
+        await asyncio.sleep(0.5)
+
+    vc = (
+        await asyncio.wait_for(
+            target_channel.connect(cls=voice_recv.VoiceRecvClient, self_deaf=False, self_mute=False),
+            timeout=15.0,
+        )
+        if HAS_VOICE_RECV
+        else await asyncio.wait_for(
+            target_channel.connect(self_deaf=False, self_mute=False),
+            timeout=15.0,
+        )
+    )
+
+    await asyncio.sleep(1.5)
+
+    if HAS_VOICE_RECV and hasattr(vc, "listen"):
+        sink = SilenceGatedVoiceSink(ctx.guild, ctx.channel, vc=vc)
+        register_voice_sink(ctx.guild.id, sink)
+        vc.listen(sink)
+
+    conn = getattr(vc, "_connection", None)
+    dave_sess = getattr(conn, "dave_session", None)
+    print(
+        f"[Voice Join] Connected to '{target_channel.name}' "
+        f"(discord.py={discord.__version__}, davey={davey is not None}, "
+        f"dave_session={dave_sess is not None})",
+        flush=True,
+    )
+
+    if greet:
+        await ctx.send(f"เข้ามาในห้องเสียง `{target_channel.name}` แล้วค่ะ 🎙️")
+        await speak_in_voice_channel(
+            ctx.guild, "เข้ามาในห้องเสียงแล้วค่ะ มีเรื่องอะไรให้ช่วยก็พูดมาได้เลยนะคะ"
+        )
+    return vc
+
+
 @bot.command(name="join")
 async def join_voice(ctx):
     if not ctx.author.voice or not ctx.author.voice.channel:
@@ -905,46 +1037,7 @@ async def join_voice(ctx):
     target_channel = ctx.author.voice.channel
     print(f"[Voice Join] Command invoked by {ctx.author} for channel '{target_channel.name}'", flush=True)
     try:
-        from voice_engine import _KNOWN_VOICE_USER_IDS
-        for m in target_channel.members:
-            _KNOWN_VOICE_USER_IDS.add(int(m.id))
-        if bot.user:
-            _KNOWN_VOICE_USER_IDS.add(int(bot.user.id))
-
-        if ctx.guild.voice_client:
-            await ctx.guild.voice_client.disconnect(force=True)
-            await asyncio.sleep(0.5)
-
-        vc = (
-            await asyncio.wait_for(
-                target_channel.connect(cls=voice_recv.VoiceRecvClient, self_deaf=False, self_mute=False),
-                timeout=15.0,
-            )
-            if HAS_VOICE_RECV
-            else await asyncio.wait_for(
-                target_channel.connect(self_deaf=False, self_mute=False),
-                timeout=15.0,
-            )
-        )
-
-        await asyncio.sleep(1.5)
-
-        if HAS_VOICE_RECV and hasattr(vc, "listen"):
-            vc.listen(SilenceGatedVoiceSink(ctx.guild, ctx.channel, vc=vc))
-
-        conn = getattr(vc, "_connection", None)
-        dave_sess = getattr(conn, "dave_session", None)
-        print(
-            f"[Voice Join] Connected to '{target_channel.name}' "
-            f"(discord.py={discord.__version__}, davey={davey is not None}, "
-            f"dave_session={dave_sess is not None})",
-            flush=True,
-        )
-
-        await ctx.send(f"เข้ามาในห้องเสียง `{target_channel.name}` แล้วค่ะ 🎙️")
-        await speak_in_voice_channel(
-            ctx.guild, "เข้ามาในห้องเสียงแล้วค่ะ มีเรื่องอะไรให้ช่วยก็พูดมาได้เลยนะคะ"
-        )
+        await _connect_bot_to_voice_channel(ctx, target_channel, greet=True)
     except Exception as e:
         print(f"[Voice Join Error] {type(e).__name__}: {e}", flush=True)
         await ctx.send(
@@ -953,15 +1046,85 @@ async def join_voice(ctx):
         )
 
 
+@bot.command(name="scribe", aliases=["จดประชุม", "จดบันทึก", "สรุปเสียง", "meeting", "notes"])
+async def scribe_command(ctx, *, args: str = ""):
+    """
+    Starts (or stops if arg is 'stop'/'หยุด'/'สรุป') passive multi-speaker Voice Scribe mode.
+    Auto-joins the caller's voice channel if the bot is not connected yet.
+    """
+    if not ctx.guild:
+        await ctx.send("คำสั่งนี้ใช้ได้เฉพาะในเซิร์ฟเวอร์ที่มีห้องเสียงค่ะ")
+        return
+
+    arg_clean = args.strip()
+    if arg_clean.lower() in ("stop", "end", "finish", "หยุด", "หยุดจด", "หยุดบันทึก", "สรุป", "สรุปประชุม"):
+        if not is_voice_scribe_active(ctx.guild.id):
+            await ctx.send("ตอนนี้ยังไม่ได้เปิดโหมดจดบันทึกในห้องเสียงค่ะ")
+            return
+        await stop_voice_scribe_session(
+            ctx.guild,
+            fallback_text_channel=ctx.channel,
+            triggered_by=ctx.author.display_name,
+            speak_ack=True,
+        )
+        return
+
+    vc = ctx.guild.voice_client
+    if not vc or not vc.is_connected():
+        if not ctx.author.voice or not ctx.author.voice.channel:
+            await ctx.send("กรุณาเข้าไปในห้องเสียงก่อนนะคะ แล้วค่อยพิมพ์ `!scribe` หรือ `!join` ค่ะ")
+            return
+        try:
+            await _connect_bot_to_voice_channel(ctx, ctx.author.voice.channel, greet=False)
+        except Exception as e:
+            await ctx.send(f"ไม่สามารถเข้าห้องเสียงเพื่อเริ่มจดบันทึกได้ค่ะ (`{type(e).__name__}: {e}`)")
+            return
+
+    await start_voice_scribe_session(
+        ctx.guild,
+        ctx.channel,
+        started_by=ctx.author.display_name,
+        topic=arg_clean,
+        speak_ack=True,
+    )
+
+
+@bot.command(name="stopscribe", aliases=["หยุดจด", "หยุดบันทึก", "สรุปประชุม", "endscribe"])
+async def stop_scribe_command(ctx):
+    """Stops active Voice Scribe mode, summarizes everyone's discussion, and clears in-RAM transcript."""
+    if not ctx.guild or not is_voice_scribe_active(ctx.guild.id):
+        await ctx.send("ตอนนี้ยังไม่มีโหมดจดบันทึกที่กำลังทำงานอยู่ค่ะ")
+        return
+    await stop_voice_scribe_session(
+        ctx.guild,
+        fallback_text_channel=ctx.channel,
+        triggered_by=ctx.author.display_name,
+        speak_ack=True,
+    )
+
+
 @bot.command(name="leave")
 async def leave_voice(ctx):
-    vc = ctx.guild.voice_client
+    if ctx.guild and is_voice_scribe_active(ctx.guild.id):
+        await stop_voice_scribe_session(
+            ctx.guild,
+            fallback_text_channel=ctx.channel,
+            triggered_by=ctx.author.display_name,
+            speak_ack=False,
+            reason="ออกจากห้องเสียง (!leave)",
+        )
+    elif ctx.guild:
+        clear_voice_scribe_session(ctx.guild.id)
+
+    vc = ctx.guild.voice_client if ctx.guild else None
     if vc:
         if hasattr(vc, "stop_listening"):
             try:
                 vc.stop_listening()
             except Exception:
                 pass
+        if ctx.guild:
+            unregister_voice_sink(ctx.guild.id)
         await speak_in_voice_channel(
             ctx.guild, "ถ้าหมดธุระแล้ว ฉันขอตัวกลับไปอ่านหนังสือต่อนะคะ ลาก่อนค่ะ"
         )
@@ -999,12 +1162,19 @@ async def voice_status_command(ctx):
     ready = getattr(dave_s, "ready", False) if dave_s else False
     can_enc = getattr(dave_s, "can_encrypt", False) if dave_s else False
     uids = dave_s.get_user_ids() if (dave_s and hasattr(dave_s, "get_user_ids")) else []
+    scribe_sess = voice_scribe_sessions.get(ctx.guild.id)
+    scribe_line = (
+        f"กำลังจดบันทึก (`{len(scribe_sess.get('entries') or [])}` ประโยค)"
+        if (scribe_sess and scribe_sess.get("active"))
+        else "ปิดอยู่ (พิมพ์ `!scribe` เพื่อเริ่มจดประชุม)"
+    )
     await ctx.send(
         f"🎙️ **สถานะห้องเสียง (`{vc.channel.name}`):**\n"
+        f"- **Voice Scribe:** {scribe_line}\n"
         f"- **Primary Live STT:** `{GEMINI_TRANSCRIBE_LIVE_MODEL}` (Fallback: Groq Whisper-v3 + Google STT)\n"
+        f"- **TTS Yukino Filter:** `pitch={TTS_GOOGLE_PITCH}`, `speed={TTS_GOOGLE_SPEED}x`\n"
         f"- **DAVE E2EE Status:** `{status}` | **Ready:** `{ready}` | **Can Encrypt:** `{can_enc}`\n"
-        f"- **MLS Group User IDs:** `{uids}`\n"
-        f"- **ลองพูดในไมค์ว่า:** `\"ถ้าได้ยินแล้วพิมพ์ตอบในแชท\"` หรือสั่งค้นหา/จด OT ด้วยเสียงได้ทันทีค่ะ"
+        f"- **MLS Group User IDs:** `{uids}`"
     )
 
 
@@ -1183,6 +1353,7 @@ async def status_command(ctx):
         f"❄️ **สถานะระบบ (Yukinon System Status)**\n"
         f"- **เวลาปัจจุบัน:** `{m['system_time_th']}`\n"
         f"- **Uptime:** `{m['uptime_human']}` | **Ping:** `{ping_str}`\n"
+        f"- **Voice & Scribe:** `{d['active_voice_sessions']}` ห้องเสียง | `{d['active_scribe_sessions']}` จดบันทึก | TTS `{ai['tts_google_pitch']}p / {ai['tts_google_speed']}x`\n"
         f"- **Native Tools:** `{len(ai['registered_tools'])}` เครื่องมือ (`{', '.join(ai['registered_tools'])}`)\n"
         f"- **Container RAM:** `{mem['bot_ram_mb']} MB / {mem['render_limit_mb']} MB ({mem['ram_usage_pct']}%)`\n"
         f"- **Cached Contexts:** `{mem['active_chat_channels']}` แชท | "
