@@ -9,7 +9,6 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import psutil
-import aiohttp
 from aiohttp import web
 import discord
 from discord.ext import commands, tasks
@@ -37,13 +36,14 @@ from config import (
     GEMINI_DECISION_MODEL,
     GEMINI_HEAVY_MODEL,
     GEMINI_TRANSCRIBE_LIVE_MODEL,
-    OPENCLAW_GATEWAY_URL,
     AUDIO_EXTENSIONS,
+    IMAGE_EXTENSIONS,
     CUSTOM_EMOJI_REGEX,
     YUKIPEDIA_INTENT_PATTERN,
     MANGA_TRANSLATE_INTENT_PATTERN,
     IMAGE_GEN_INTENT_PATTERN,
     AGENTIC_IMAGE_TAG_REGEX,
+    WEATHER_INTENT_PATTERN,
     URL_REGEX,
     CODE_AND_LOG_EXTENSIONS,
     intents,
@@ -52,7 +52,7 @@ from config import (
     voice_wake_word_enabled,
     state,
     davey,
-    agent_notes_store,
+    get_http_session,
     release_unused_memory,
     prune_stale_attachments,
     close_http_session,
@@ -65,6 +65,7 @@ from persona import (
     maybe_react_to_discord_message,
     FAST_SYSTEM_PROMPT,
     CODE_SYSTEM_PROMPT,
+    YUKIPEDIA_SYSTEM_PROMPT,
 )
 from user_memory import (
     restore_user_profiles_from_discord,
@@ -77,13 +78,14 @@ from user_memory import (
     _parse_stored_ot_date,
     user_profiles,
 )
-from search_engine import detect_coding_intent
+from search_engine import detect_coding_intent, run_safe_web_search_async
 from llm import (
     query_local_ollama_chat,
     orchestrate_message_with_decision_1,
 )
 from media_context import extract_all_context, resolve_referenced_message
 from image_engine import (
+    _send_or_reply,
     send_chunked_response,
     send_generated_image_to_channel,
     process_manga_translation_request,
@@ -93,10 +95,6 @@ from voice_engine import (
     voice_recv,
     SilenceGatedVoiceSink,
     speak_in_voice_channel,
-)
-from agent import (
-    run_autonomous_agent_loop,
-    process_yukipedia_request,
 )
 from ui_interactions import (
     CodeReviewActionView,
@@ -109,6 +107,52 @@ from ui_interactions import (
     should_attach_interactive_view,
     is_failure_or_refusal_reply,
 )
+from tools import ToolExecutionContext, TOOL_SPECS
+
+OT_REPORT_CHANNEL_ID = int(os.getenv("OT_REPORT_CHANNEL_ID", "0") or "0")
+
+_COMPOUND_CONNECTOR_REGEX = re.compile(
+    r"(แล้ว(?:ก็)?|พร้อม(?:กับ|ทั้ง)?|และ(?:ช่วย)?|กับ|แถม|\band\s+(?:also|then)?\b|\bplus\b|,)",
+    re.IGNORECASE,
+)
+_MATH_EXPR_CUE_REGEX = re.compile(
+    r"(\d+\s*[\+\-\*/x×^%]\s*\d+|คำนวณ|แปลงค่าเงิน|กี่บาท|กี่เยน|กี่ดอลลาร์|\bcalculate\b|\bconvert\b)",
+    re.IGNORECASE,
+)
+_MEMORY_INLINE_CUE_REGEX = re.compile(
+    r"(จำไว้ว่า|ช่วยจำว่า|ปักหมุดความจำ|บันทึกความจำ|\bremember\s+that\b)",
+    re.IGNORECASE,
+)
+_OT_INLINE_CUE_REGEX = re.compile(
+    r"((?:จด|บันทึก|สรุป|ลบ)\s*(?:เวลา\s*)?ot\b)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_compound_request(text: str) -> bool:
+    """
+    Detects multi-intent compound prompts (e.g., weather + math + memory, or search + image gen)
+    so they bypass single-intent fast-paths and execute all actions in parallel via Native Function Calling!
+    """
+    if not text or len(text.strip()) < 14:
+        return False
+    if not _COMPOUND_CONNECTOR_REGEX.search(text):
+        return False
+
+    hit_domains = 0
+    if WEATHER_INTENT_PATTERN.search(text):
+        hit_domains += 1
+    if _MATH_EXPR_CUE_REGEX.search(text):
+        hit_domains += 1
+    if _MEMORY_INLINE_CUE_REGEX.search(text):
+        hit_domains += 1
+    if _OT_INLINE_CUE_REGEX.search(text):
+        hit_domains += 1
+    if IMAGE_GEN_INTENT_PATTERN.search(text):
+        hit_domains += 1
+    if re.search(r"(ข่าว|ราคา|ค้นหา|สรุป|เช็คข้อมูล|\bsearch\b|\bnews\b|\bprice\b)", text, re.IGNORECASE):
+        hit_domains += 1
+    return hit_domains >= 2
 
 
 def _format_uptime(seconds: int) -> str:
@@ -125,7 +169,7 @@ def _format_uptime(seconds: int) -> str:
 def _encode_low_res_decision_thumb_sync(raw_bytes: bytes) -> str:
     from PIL import Image
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-    img.thumbnail((512, 512), Image.Resampling.LANCZOS)
+    img.thumbnail((512, 512), Image.Resampling.BILINEAR)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=72)
     img.close()
@@ -138,7 +182,7 @@ async def _preload_image_attachments_and_thumb(
     preloaded: dict[int, bytes] = {}
     img_atts = [
         a for a in all_msg_atts
-        if a.filename.lower().endswith(config.IMAGE_EXTENSIONS) and a.size <= 8 * 1024 * 1024
+        if a.filename.lower().endswith(IMAGE_EXTENSIONS) and a.size <= 8 * 1024 * 1024
     ][:4]
     for att in img_atts:
         try:
@@ -200,6 +244,8 @@ def _collect_health_metrics() -> dict:
             "stored_user_profiles": len(user_profiles),
         },
         "ai_backends": {
+            "native_function_calling": True,
+            "registered_tools": [s["name"] for s in TOOL_SPECS],
             "modal_ollama_configured": bool(OLLAMA_BASE_URL),
             "fast_model": ACTIVE_FAST_MODEL,
             "code_model": GROQ_CODE_MODEL if GROQ_API_KEY else ACTIVE_CODE_MODEL,
@@ -221,7 +267,6 @@ def _collect_health_metrics() -> dict:
             "gemini_active_model": state.active_gemini_model if GEMINI_API_KEY else None,
             "gemini_grounding_cooldown_sec": gemini_cd,
             "edge_tts_cooldown_sec": edge_cd,
-            "openclaw_gateway_ready": bool(OPENCLAW_GATEWAY_URL),
         },
     }
 
@@ -247,15 +292,15 @@ async def handle_root(request: web.Request) -> web.Response:
         <meta charset="utf-8">
         <title>Yukinon Discord Bot - System Telemetry</title>
     </head>
-    <body style="font-family: system-ui, sans-serif; max-width: 720px; margin: 36px auto; line-height: 1.6; color: #1f2937; padding: 0 16px;">
-        <h2>❄️ Yukino Yukinoshita Discord Bot (Enterprise, Decision-Orchestrated & Multi-Cloud Edition)</h2>
+    <body style="font-family: system-ui, sans-serif; max-width: 740px; margin: 36px auto; line-height: 1.6; color: #1f2937; padding: 0 16px;">
+        <h2>❄️ Yukino Yukinoshita Discord Bot (Native Function-Calling & Multi-Cloud Edition)</h2>
         <p><b>System Time (TH):</b> {m['system_time_th']}</p>
         <p><b>Discord Gateway:</b> {gw_status}</p>
+        <p><b>Native Tools:</b> {len(ai['registered_tools'])} active (<code>{', '.join(ai['registered_tools'])}</code>)</p>
         <p><b>Voice & DAVE E2EE:</b> {d['active_voice_sessions']} active session(s) | DAVE Ready: {d['dave_e2ee_ready']} | Live STT: <code>{ai['gemini_transcribe_live_model']}</code>{edge_cd_note}</p>
         <p><b>Container RAM:</b> {mem['bot_ram_mb']} MB / {mem['render_limit_mb']} MB ({mem['ram_usage_pct']}%) |
            <b>Cached Contexts:</b> {mem['active_chat_channels']} chat(s), {mem['cached_attachments']} file(s), {mem['stored_user_profiles']} profile(s)</p>
         <hr style="border: 0; border-top: 1px solid #e5e7eb; margin: 16px 0;">
-        <p><b>Autonomous Agent / OpenClaw:</b> {"Connected" if OPENCLAW_GATEWAY_URL else "Decision-1 + 8-Skill Agent Active (OpenClaw Gateway on Standby)"}</p>
         <p><b>Google AI Studio:</b> {"Enabled (Orchestrator: <code>" + str(ai['gemini_decision_orchestrator']) + "</code> | Heavy Specialist: <code>" + str(ai['gemini_heavy_specialist']) + "</code> | Live STT: <code>" + str(ai['gemini_transcribe_live_model']) + "</code> | Gemma 4: <code>" + str(ai['gemma_active_model']) + "</code> | Flash-Lite: <code>" + str(ai['gemini_active_model']) + "</code>)" + gemini_cd_note if ai['gemini_enabled'] else "Disabled"}</p>
         <p><b>Cloudflare Workers AI:</b> {"Enabled (Code: <code>" + CF_CODE_MODEL + "</code> | Fast: <code>" + CF_CHAT_FAST_MODEL + "</code> | Vision/Gemma: <code>" + str(ai['cloudflare_gemma_model']) + "</code> | Image: <code>" + str(ai['cloudflare_image_model']) + "</code>)" if ai['cloudflare_enabled'] else "Disabled"}</p>
         <p><b>Groq LPU Acceleration:</b> {"Enabled (Code: <code>" + GROQ_CODE_MODEL + "</code> | Search: <code>" + str(ai['groq_search_model']) + "</code> | Vision: <code>" + str(ai['groq_vision_model']) + "</code>)" if ai['groq_enabled'] else "Disabled"}</p>
@@ -279,6 +324,24 @@ async def handle_healthz(request: web.Request) -> web.Response:
     )
 
 
+def _resolve_ot_report_channel(prof: dict):
+    """Scopes OT monthly reports to OT_REPORT_CHANNEL_ID -> user's saved ot_channel_id -> #work/#ot fallback."""
+    if OT_REPORT_CHANNEL_ID:
+        ch = bot.get_channel(OT_REPORT_CHANNEL_ID)
+        if ch:
+            return ch
+    saved_cid = prof.get("ot_channel_id")
+    if saved_cid:
+        ch = bot.get_channel(int(saved_cid))
+        if ch:
+            return ch
+    for guild in bot.guilds:
+        for ch in guild.text_channels:
+            if any(k in ch.name.lower() for k in ("work", "ot", "งาน")):
+                return ch
+    return None
+
+
 @tasks.loop(minutes=15)
 async def monthly_ot_auto_report_task():
     if not bot.is_ready():
@@ -291,17 +354,6 @@ async def monthly_ot_auto_report_task():
         return
 
     state.last_ot_auto_report_ym = ym_key
-    target_channel = None
-    for guild in bot.guilds:
-        for ch in guild.text_channels:
-            if any(k in ch.name.lower() for k in ("work", "ot", "งาน")):
-                target_channel = ch
-                break
-        if target_channel:
-            break
-
-    if not target_channel:
-        return
 
     for uid_str, prof in list(user_profiles.items()):
         ot_logs = prof.get("ot_logs") or []
@@ -312,6 +364,9 @@ async def monthly_ot_auto_report_task():
             for e in ot_logs
         )
         if has_prev_month_data:
+            target_channel = _resolve_ot_report_channel(prof)
+            if not target_channel:
+                continue
             summary_md = build_monthly_ot_summary_markdown(ot_logs, prev_year, prev_month)
             await send_chunked_response(
                 target_channel,
@@ -326,7 +381,8 @@ class YukinonBot(commands.Bot):
 
     async def setup_hook(self):
         register_app_commands(self)
-        state.http_session = aiohttp.ClientSession()
+        # Initialize shared pooled aiohttp session with 5-min DNS cache
+        get_http_session()
         app = web.Application()
         app.router.add_get("/", handle_root)
         app.router.add_get("/healthz", handle_healthz)
@@ -395,6 +451,129 @@ async def _send_response_with_interactive_view(
             view.delete_message_on_timeout = True
 
 
+async def _dispatch_post_tool_side_effects(
+    channel,
+    message: discord.Message,
+    answer: str,
+    user_request: str,
+    tool_ctx: ToolExecutionContext,
+):
+    """Executes queued reactions and FLUX image generations emitted by Native Function Calling."""
+    await maybe_react_to_discord_message(
+        message,
+        raw_llm_output=answer,
+        user_text=user_request,
+        queued_reactions=tool_ctx.reactions,
+    )
+    for img_prompt in tool_ctx.generated_images[:2]:
+        await send_generated_image_to_channel(channel, img_prompt, reply_to=message)
+
+
+async def process_yukipedia_request(ctx_or_message, raw_prompt: str = ""):
+    """
+    Unified 'Yukipedia Mode' dispatcher:
+      1) If image/link + manga translation requested -> runs Manga Localization.
+      2) If image/document/reply attached -> runs OCR/Document extraction + Yukipedia analysis.
+      3) Otherwise -> runs parallel async multi-engine Web Search + Native Tools in Yukipedia mode.
+    """
+    msg = ctx_or_message.message if hasattr(ctx_or_message, "message") else ctx_or_message
+    channel = ctx_or_message.channel
+    author = msg.author
+
+    clean_q = re.sub(
+        r"^(?:เปิดโหมด|โหมด|ถาม|ค้นหา|ช่วยค้น|เรียก)?\s*(?:yukipedia|ยูกิพีเดีย|ยูคิพีเดีย)\s*[:,-]?\s*",
+        "",
+        raw_prompt.strip(),
+        flags=re.IGNORECASE,
+    ).strip()
+
+    ref_msg = await resolve_referenced_message(msg) if msg.reference else None
+    all_atts = list(msg.attachments) + (list(ref_msg.attachments) if ref_msg else [])
+    has_images = any(a.filename.lower().endswith(IMAGE_EXTENSIONS) for a in all_atts)
+
+    if has_images and MANGA_TRANSLATE_INTENT_PATTERN.search(clean_q):
+        await process_manga_translation_request(msg, clean_q)
+        return
+
+    async with channel.typing():
+        extracted_ctx, spoken_clip_text = await extract_all_context(msg)
+        effective_query = clean_q or spoken_clip_text
+
+        if not extracted_ctx and ref_msg and ref_msg.content and ref_msg.content.strip():
+            extracted_ctx = f"=== ข้อความอ้างอิงที่ต้องการให้ Yukipedia ตรวจสอบ/แปล ===\n{ref_msg.content.strip()}"
+
+        if extracted_ctx and not effective_query:
+            effective_query = (
+                "สกัดข้อความ แปล และวิเคราะห์รายละเอียดทั้งหมดในฐานะ Yukipedia "
+                "พร้อมตรวจสอบคำผิดหรือจุดบกพร่องในต้นฉบับให้ด้วย"
+            )
+        elif not effective_query and not extracted_ctx:
+            await _send_or_reply(
+                channel,
+                msg,
+                content=(
+                    "หากจะพึ่งพาคลังความรู้ **Yukipedia** ของฉัน ก็ช่วยระบุหัวข้อที่ต้องการค้นหา "
+                    "หรือแนบภาพ/เอกสารที่ต้องการให้ฉันสกัดข้อความ (OCR) และแปลภาษาเข้ามาด้วยสิคะ "
+                    "(เช่น `!yukipedia สรุปข่าว...` หรือแนบรูปพร้อมพิมพ์ `!yukipedia แปลและตรวจคำผิด` ค่ะ)"
+                ),
+            )
+            return
+
+        search_block = ""
+        if effective_query and not extracted_ctx:
+            search_block = await run_safe_web_search_async(effective_query[:180], max_results=5)
+
+        composed_prompt = effective_query
+        if extracted_ctx:
+            composed_prompt = f"{composed_prompt}\n\n{extracted_ctx}"
+        if search_block:
+            composed_prompt = f"{composed_prompt}\n\n{search_block}"
+
+        dec_plan = await orchestrate_message_with_decision_1(
+            effective_query, extracted_ctx=extracted_ctx, purpose="Yukipedia"
+        )
+        tool_ctx = ToolExecutionContext(
+            channel_id=channel.id,
+            guild=msg.guild,
+            channel=channel,
+            speaker_user=author,
+            message=msg,
+            mode="general",
+        )
+        answer, did_search = await query_local_ollama_chat(
+            composed_prompt,
+            model=ACTIVE_FAST_MODEL,
+            system_prompt=YUKIPEDIA_SYSTEM_PROMPT,
+            channel_id=channel.id,
+            temperature=0.3,
+            allow_agentic_search=True,
+            has_fresh_attachment=bool(extracted_ctx or search_block),
+            speaker_user=author,
+            decision_plan=dec_plan,
+            tool_ctx=tool_ctx,
+        )
+        view = (
+            build_contextual_suggestion_view(
+                channel.id,
+                effective_query,
+                answer,
+                extracted_ctx=extracted_ctx,
+                source_message=msg,
+                decision_plan=dec_plan,
+            )
+            if should_attach_interactive_view(
+                effective_query,
+                answer,
+                did_search=bool(did_search or search_block),
+                extracted_ctx=extracted_ctx,
+                decision_plan=dec_plan,
+            )
+            else None
+        )
+        await _send_response_with_interactive_view(channel, answer, view, reply_to=msg)
+        await _dispatch_post_tool_side_effects(channel, msg, answer, effective_query, tool_ctx)
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or (message.guild and ALLOWED_GUILD_IDS and message.guild.id not in ALLOWED_GUILD_IDS):
@@ -435,8 +614,10 @@ async def on_message(message: discord.Message):
         else:
             clean_prompt = inherited
 
-    # 0A. Persistent User Memory Viewer & Editor ('ดูความจำ', 'จำไว้ว่า...', 'แก้หัวข้อที่ชอบ...', etc.)
-    if is_memory_command_text(clean_prompt):
+    is_compound_prompt = _looks_like_compound_request(clean_prompt)
+
+    # 0A. Pure Single-Intent Persistent User Memory Viewer & Editor (Zero API cost)
+    if is_memory_command_text(clean_prompt) and not is_compound_prompt:
         mem_reply, target_uid = await process_memory_request(message, clean_prompt)
         mem_view = MemoryActionView(requester_id=message.author.id, target_uid=target_uid)
         await _send_response_with_interactive_view(message.channel, mem_reply, mem_view, reply_to=message)
@@ -450,7 +631,7 @@ async def on_message(message: discord.Message):
     )
 
     all_msg_atts = list(message.attachments) + (list(ref_msg.attachments) if ref_msg else [])
-    has_image_att = any(a.filename.lower().endswith(config.IMAGE_EXTENSIONS) for a in all_msg_atts)
+    has_image_att = any(a.filename.lower().endswith(IMAGE_EXTENSIONS) for a in all_msg_atts)
     has_code_att = any(a.filename.lower().endswith(CODE_AND_LOG_EXTENSIONS) for a in all_msg_atts)
     has_doc_att = any(a.filename.lower().endswith((".pdf", ".docx", ".xlsx")) for a in all_msg_atts)
     has_embedded_media_or_link = (
@@ -460,8 +641,8 @@ async def on_message(message: discord.Message):
         or bool(ref_msg and URL_REGEX.search(ref_msg.content or ""))
     )
 
-    # Fast Instant Date/Time Check (zero API calls)
-    if not message.attachments and not message.embeds:
+    # 0B. Fast Instant Date/Time Check (Zero API cost)
+    if not message.attachments and not message.embeds and not is_compound_prompt:
         instant_dt = try_instant_datetime_reply(clean_prompt)
         if instant_dt:
             channel_memory[message.channel.id].append({"role": "user", "content": clean_prompt})
@@ -469,15 +650,57 @@ async def on_message(message: discord.Message):
             await message.channel.send(instant_dt)
             return
 
+    # 0C. Deterministic Single-Intent Fast-Path Triggers (skipped on compound prompts so Native Tools handle all intents!)
+    if not is_compound_prompt:
+        if is_ot_command_text(clean_prompt, channel_id=message.channel.id, user_id=message.author.id):
+            ot_reply = await process_ot_request(message, clean_prompt)
+            rec_date, rec_slot, rec_detail = parse_ot_record_metadata(ot_reply)
+            ot_view = (
+                OTActionView(message.author.id, rec_date, rec_slot, rec_detail)
+                if rec_date and not is_failure_or_refusal_reply(ot_reply)
+                else None
+            )
+            await _send_response_with_interactive_view(message.channel, ot_reply, ot_view, reply_to=message)
+            return
+
+        if YUKIPEDIA_INTENT_PATTERN.search(clean_prompt):
+            await process_yukipedia_request(message, clean_prompt)
+            return
+
+        if MANGA_TRANSLATE_INTENT_PATTERN.search(clean_prompt) or (
+            (has_image_att or has_embedded_media_or_link)
+            and re.search(r"(แปล|\btranslate\b|\btl\b)", clean_prompt, re.IGNORECASE)
+        ):
+            await process_manga_translation_request(message, clean_prompt)
+            return
+
+        if not message.attachments and IMAGE_GEN_INTENT_PATTERN.search(clean_prompt):
+            async with message.channel.typing():
+                await send_generated_image_to_channel(message.channel, clean_prompt, reply_to=message)
+            return
+
+    # 1. Single-Pass vs PreRoute Decision-1 Orchestration (eliminates redundant double calls!)
     text_without_urls = URL_REGEX.sub("", clean_prompt).strip()
     is_bare_link_only = bool(has_embedded_media_or_link and not text_without_urls and not all_msg_atts)
+    has_ambiguous_action_cue = bool(
+        re.search(r"(แปล|วาด|สร้างภาพ|รูป|\bot\b|โอที|translate|draw)", clean_prompt, re.IGNORECASE)
+    )
+    skip_preroute = (
+        is_bare_link_only
+        or is_compound_prompt
+        or has_code_att
+        or has_doc_att
+        or (has_embedded_media_or_link and not has_ambiguous_action_cue)
+    )
 
     preloaded_att_bytes, low_res_imgs = (
-        await _preload_image_attachments_and_thumb(all_msg_atts) if has_image_att else ({}, [])
+        await _preload_image_attachments_and_thumb(all_msg_atts)
+        if (has_image_att and not skip_preroute)
+        else ({}, [])
     )
     pre_plan = (
         None
-        if is_bare_link_only
+        if skip_preroute
         else await orchestrate_message_with_decision_1(
             clean_prompt,
             has_code_attachment=has_code_att,
@@ -488,10 +711,7 @@ async def on_message(message: discord.Message):
     pre_route = (pre_plan or {}).get("route", "")
     pre_conf = float((pre_plan or {}).get("route_confidence") or 0.0)
 
-    # 0B. Overtime (OT) Logger & Monthly Table Summarizer
-    if is_ot_command_text(clean_prompt, channel_id=message.channel.id, user_id=message.author.id) or (
-        pre_route == "ot_log" and pre_conf >= 0.82
-    ):
+    if pre_route == "ot_log" and pre_conf >= 0.82:
         preloaded_att_bytes.clear()
         ot_reply = await process_ot_request(message, clean_prompt)
         rec_date, rec_slot, rec_detail = parse_ot_record_metadata(ot_reply)
@@ -503,34 +723,12 @@ async def on_message(message: discord.Message):
         await _send_response_with_interactive_view(message.channel, ot_reply, ot_view, reply_to=message)
         return
 
-    # 0C. Natural Chat "Yukipedia Mode" Trigger
-    if YUKIPEDIA_INTENT_PATTERN.search(clean_prompt):
-        preloaded_att_bytes.clear()
-        await process_yukipedia_request(message, clean_prompt)
-        return
-
-    # 1. Natural Chat Manga / Image Translation Trigger
-    if (
-        MANGA_TRANSLATE_INTENT_PATTERN.search(clean_prompt)
-        or (
-            (has_image_att or has_embedded_media_or_link)
-            and re.search(r"(แปล|\btranslate\b|\btl\b)", clean_prompt, re.IGNORECASE)
-        )
-        or (
-            (has_image_att or has_embedded_media_or_link)
-            and pre_route == "manga_translate"
-            and pre_conf >= 0.78
-        )
-    ):
+    if (has_image_att or has_embedded_media_or_link) and pre_route == "manga_translate" and pre_conf >= 0.78:
         preloaded_att_bytes.clear()
         await process_manga_translation_request(message, clean_prompt)
         return
 
-    # 2. Natural Chat Image Generation Trigger
-    if not message.attachments and (
-        IMAGE_GEN_INTENT_PATTERN.search(clean_prompt)
-        or (pre_route == "image_gen" and pre_conf >= 0.82)
-    ):
+    if not message.attachments and pre_route == "image_gen" and pre_conf >= 0.82:
         preloaded_att_bytes.clear()
         async with message.channel.typing():
             await send_generated_image_to_channel(message.channel, clean_prompt, reply_to=message)
@@ -542,22 +740,29 @@ async def on_message(message: discord.Message):
         )
         preloaded_att_bytes.clear()
 
-        needs_refined_route = (
-            pre_plan is None
-            or pre_conf < 0.85
-            or has_embedded_media_or_link
-            or has_doc_att
-            or bool(spoken_clip_text and not clean_prompt)
-        )
-        if needs_refined_route and (extracted_ctx or spoken_clip_text):
-            decision_plan = await orchestrate_message_with_decision_1(
-                clean_prompt or spoken_clip_text,
-                extracted_ctx=extracted_ctx,
-                has_code_attachment=has_code_att,
-                purpose="Route",
-            ) or pre_plan
+        if is_compound_prompt:
+            decision_plan = {
+                "route": "compound",
+                "route_confidence": 0.95,
+                "needs_web_search": False,
+                "attach_buttons": True,
+                "button_domain": "general",
+            }
         else:
-            decision_plan = pre_plan
+            needs_refined_route = (
+                pre_plan is None
+                or pre_conf < 0.85
+                or bool(spoken_clip_text and not clean_prompt)
+            )
+            if needs_refined_route and (extracted_ctx or spoken_clip_text or skip_preroute):
+                decision_plan = await orchestrate_message_with_decision_1(
+                    clean_prompt or spoken_clip_text,
+                    extracted_ctx=extracted_ctx,
+                    has_code_attachment=has_code_att,
+                    purpose="Route",
+                ) or pre_plan
+            else:
+                decision_plan = pre_plan
 
         regex_coder = detect_coding_intent(
             clean_prompt,
@@ -567,6 +772,8 @@ async def on_message(message: discord.Message):
         )
         if decision_plan and decision_plan.get("route") == "code" and decision_plan.get("route_confidence", 0.0) >= 0.72:
             use_coder = True
+        elif decision_plan and decision_plan.get("route") == "compound":
+            use_coder = False
         else:
             use_coder = regex_coder
 
@@ -597,6 +804,15 @@ async def on_message(message: discord.Message):
         full_prompt = f"{user_request}\n\n{extra_blocks}" if extra_blocks else user_request
         model = ACTIVE_CODE_MODEL if use_coder else ACTIVE_FAST_MODEL
         sys_prompt = CODE_SYSTEM_PROMPT if use_coder else FAST_SYSTEM_PROMPT
+
+        tool_ctx = ToolExecutionContext(
+            channel_id=message.channel.id,
+            guild=message.guild,
+            channel=message.channel,
+            speaker_user=message.author,
+            message=message,
+            mode="code" if use_coder else "general",
+        )
         answer, did_search = await query_local_ollama_chat(
             full_prompt,
             model=model,
@@ -607,16 +823,19 @@ async def on_message(message: discord.Message):
             has_fresh_attachment=bool(extracted_ctx),
             speaker_user=message.author,
             decision_plan=decision_plan,
+            tool_ctx=tool_ctx,
         )
 
         use_reply = should_reply_to_message(
-            user_request, has_attachments=bool(message.attachments or extracted_ctx)
+            user_request, has_attachments=bool(message.attachments or extracted_ctx or tool_ctx.tools_used)
         )
         reply_target = message if use_reply else None
 
+        # Legacy [IMAGE: ...] tag safeguard (for fallback models without native tools)
         img_tag_match = AGENTIC_IMAGE_TAG_REGEX.search(answer)
         if (
             img_tag_match
+            and not tool_ctx.generated_images
             and CF_ACCOUNT_ID
             and CF_API_TOKEN
             and re.search(r"(รูป|ภาพ|วาด|เจน|สร้าง|image|picture|draw|art|photo)", clean_prompt, re.IGNORECASE)
@@ -627,15 +846,19 @@ async def on_message(message: discord.Message):
             return
 
         action_view = None
-        should_attach = should_attach_interactive_view(
+        if tool_ctx.ot_reply_meta and not is_failure_or_refusal_reply(answer):
+            rec_d, rec_s, rec_det = tool_ctx.ot_reply_meta
+            action_view = OTActionView(message.author.id, rec_d, rec_s, rec_det)
+        elif tool_ctx.memory_updated_uid and not is_failure_or_refusal_reply(answer) and not tool_ctx.did_search and not use_coder:
+            action_view = MemoryActionView(requester_id=message.author.id, target_uid=tool_ctx.memory_updated_uid)
+        elif should_attach_interactive_view(
             user_request,
             answer,
             use_coder=use_coder,
             did_search=did_search,
             extracted_ctx=extracted_ctx,
             decision_plan=decision_plan,
-        )
-        if should_attach:
+        ):
             if use_coder:
                 action_view = CodeReviewActionView(message.author.id, message.channel.id, user_request, answer)
             else:
@@ -649,7 +872,7 @@ async def on_message(message: discord.Message):
                 )
 
         await _send_response_with_interactive_view(message.channel, answer, action_view, reply_to=reply_target)
-        await maybe_react_to_discord_message(message, raw_llm_output=answer, user_text=user_request)
+        await _dispatch_post_tool_side_effects(message.channel, message, answer, user_request, tool_ctx)
         if has_audio and not use_coder:
             await speak_in_voice_channel(message.guild, answer, fallback_channel=message.channel)
 
@@ -815,6 +1038,14 @@ async def ask_fast(ctx, *, prompt: str = ""):
         dec_plan = None if is_dt else await orchestrate_message_with_decision_1(
             effective_prompt, extracted_ctx=ctx_text, purpose="AskCmd"
         )
+        tool_ctx = ToolExecutionContext(
+            channel_id=ctx.channel.id,
+            guild=ctx.guild,
+            channel=ctx.channel,
+            speaker_user=ctx.author,
+            message=ctx.message,
+            mode="general",
+        )
         answer, did_search = await query_local_ollama_chat(
             f"{effective_prompt}\n\n{ctx_text}" if ctx_text else effective_prompt,
             ACTIVE_FAST_MODEL,
@@ -823,9 +1054,10 @@ async def ask_fast(ctx, *, prompt: str = ""):
             has_fresh_attachment=bool(ctx_text),
             speaker_user=ctx.author,
             decision_plan=dec_plan,
+            tool_ctx=tool_ctx,
         )
         use_reply = should_reply_to_message(
-            effective_prompt, has_attachments=bool(ctx_text), is_instant_datetime=is_dt
+            effective_prompt, has_attachments=bool(ctx_text or tool_ctx.tools_used), is_instant_datetime=is_dt
         )
         view = (
             build_contextual_suggestion_view(
@@ -847,12 +1079,21 @@ async def ask_fast(ctx, *, prompt: str = ""):
             else None
         )
         await _send_response_with_interactive_view(ctx.channel, answer, view, reply_to=ctx.message if use_reply else None)
+        await _dispatch_post_tool_side_effects(ctx.channel, ctx.message, answer, effective_prompt, tool_ctx)
 
 
 @bot.command(name="code", aliases=["review", "diff", "trace"])
 async def ask_code(ctx, *, prompt: str = "วิเคราะห์โค้ดหรือ Stack Trace ที่แนบมาและระบุ Root Cause พร้อมวิธีแก้ไข"):
     async with ctx.typing():
         ctx_text, _ = await extract_all_context(ctx.message)
+        tool_ctx = ToolExecutionContext(
+            channel_id=ctx.channel.id,
+            guild=ctx.guild,
+            channel=ctx.channel,
+            speaker_user=ctx.author,
+            message=ctx.message,
+            mode="code",
+        )
         answer, _ = await query_local_ollama_chat(
             f"{prompt}\n\n{ctx_text}" if ctx_text else prompt,
             ACTIVE_CODE_MODEL,
@@ -863,6 +1104,7 @@ async def ask_code(ctx, *, prompt: str = "วิเคราะห์โค้�
             has_fresh_attachment=bool(ctx_text),
             speaker_user=ctx.author,
             decision_plan={"route": "code", "route_confidence": 0.99, "needs_web_search": False},
+            tool_ctx=tool_ctx,
         )
         view = (
             CodeReviewActionView(ctx.author.id, ctx.channel.id, prompt, answer)
@@ -887,8 +1129,16 @@ async def source_command(ctx, *, question: str = ""):
         )
         user_q = question.strip() or (
             "ช่วยระบุที่มาของภาพและลิงก์นี้อย่างละเอียด: "
-            "หากเป็นภาพวาด/อนิเมะ/มังงะ ให้บอกชื่อเรื่อง ชื่อตัวละคร ตอนที่/Chapter ชื่อผู้วาด และแนบลิงก์ที่มา (เช่น Pixiv/X/MyAnimeList/Danbooru) ถ้ามี "
+            "หากเป็นภาพวาด/อนิเมะ/มังงะ ให้บอกชื่อเรื่อง ชื่อตัวละคร ตอนที่/Chapter ชื่อผู้วาด และแนบลิงก์ที่มา (เช่น Pixiv/X/MyAnimeList) ถ้ามี "
             "หากเป็นภาพถ่ายสิ่งของหรืออุปกรณ์ ให้ระบุยี่ห้อ รุ่น และรายละเอียดสำคัญของสิ่งนั้นค่ะ"
+        )
+        tool_ctx = ToolExecutionContext(
+            channel_id=ctx.channel.id,
+            guild=ctx.guild,
+            channel=ctx.channel,
+            speaker_user=ctx.author,
+            message=ctx.message,
+            mode="general",
         )
         answer, did_search = await query_local_ollama_chat(
             f"{user_q}\n\n{ctx_text}",
@@ -900,6 +1150,7 @@ async def source_command(ctx, *, question: str = ""):
             has_fresh_attachment=True,
             speaker_user=ctx.author,
             decision_plan=dec_plan,
+            tool_ctx=tool_ctx,
         )
         view = (
             build_contextual_suggestion_view(
@@ -923,20 +1174,20 @@ async def status_command(ctx):
     m = _collect_health_metrics()
     d = m["discord"]
     mem = m["memory"]
+    ai = m["ai_backends"]
 
     ping_str = f"{d['gateway_ping_ms']} ms" if d["gateway_ping_ms"] is not None else "N/A"
     active_topics_count = len(getattr(config, "channel_active_topic", {}))
-    notes_count = sum(len(v) for v in getattr(config, "agent_notes_store", {}).values())
 
     await ctx.send(
         f"❄️ **สถานะระบบ (Yukinon System Status)**\n"
         f"- **เวลาปัจจุบัน:** `{m['system_time_th']}`\n"
         f"- **Uptime:** `{m['uptime_human']}` | **Ping:** `{ping_str}`\n"
+        f"- **Native Tools:** `{len(ai['registered_tools'])}` เครื่องมือ (`{', '.join(ai['registered_tools'])}`)\n"
         f"- **Container RAM:** `{mem['bot_ram_mb']} MB / {mem['render_limit_mb']} MB ({mem['ram_usage_pct']}%)`\n"
         f"- **Cached Contexts:** `{mem['active_chat_channels']}` แชท | "
         f"`{mem['cached_attachments']}` ไฟล์แนบ | "
         f"`{active_topics_count}` หัวข้อสนทนา | "
-        f"`{notes_count}` บันทึกช่วยจำ | "
         f"`{mem['stored_user_profiles']}` โปรไฟล์ผู้ใช้"
     )
 
@@ -948,22 +1199,18 @@ async def clear_memory(ctx, scope: str = ""):
         channel_last_attachment.clear()
         if hasattr(config, "channel_active_topic"):
             config.channel_active_topic.clear()
-        if hasattr(config, "agent_notes_store"):
-            config.agent_notes_store.clear()
         scope_label = "ทุกห้องแชท"
     else:
         channel_memory.pop(ctx.channel.id, None)
         channel_last_attachment.pop(ctx.channel.id, None)
         if hasattr(config, "channel_active_topic"):
             config.channel_active_topic.pop(ctx.channel.id, None)
-        if hasattr(config, "agent_notes_store"):
-            config.agent_notes_store.pop(ctx.channel.id, None)
         scope_label = "ห้องแชทนี้"
 
     before_mb, after_mb = release_unused_memory()
     freed_mb = round(max(0.0, before_mb - after_mb), 1)
     ram_note = (
-        f"คืนพื้นที่ RAM `{before_mb} MB` → `{after_mb} MB` (ลดลง `{freed_mb} MB`)"
+        f"คืนพื้นที่ RAM `{before_mb} MB` -> `{after_mb} MB` (ลดลง `{freed_mb} MB`)"
         if freed_mb > 0
         else f"RAM ปัจจุบัน: `{after_mb} MB / 512 MB`"
     )
@@ -1001,17 +1248,6 @@ async def memory_command(ctx, *, args: str = ""):
     reply, target_uid = await process_memory_request(ctx.message, query)
     mem_view = MemoryActionView(requester_id=ctx.author.id, target_uid=target_uid)
     await _send_response_with_interactive_view(ctx.channel, reply, mem_view, reply_to=ctx.message)
-
-
-@bot.command(name="agent", aliases=["claw", "auto"])
-async def agent_command(ctx, *, goal: str = ""):
-    if not goal.strip() and not ctx.message.attachments:
-        await ctx.send(
-            "หากต้องการให้ฉันทำงานแบบ **Autonomous Multi-Tool Agent** (วางแผน ค้นหา คำนวณ อ่านเว็บ และสร้างภาพต่อเนื่องกัน) "
-            "กรุณาระบุภารกิจที่ต้องการด้วยนะคะ เช่น `!agent ค้นหาราคาบิตคอยน์ล่าสุดเป็นบาท คำนวณมูลค่า 0.25 BTC แล้ววาดรูปแมวนั่งนับเงิน` ค่ะ"
-        )
-        return
-    await run_autonomous_agent_loop(ctx, goal)
 
 
 if __name__ == "__main__":

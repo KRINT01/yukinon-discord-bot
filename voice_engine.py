@@ -59,6 +59,9 @@ logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.ERROR)
 OPUS_SILENCE_FRAME = b"\xf8\xff\xfe"
 PCM_SILENCE_20MS = b"\x00" * 3840
 
+# Hard 18-second cap per continuous utterance (~3.45 MB @ 48kHz stereo 16-bit) to protect 512MB Render RAM
+MAX_UTTERANCE_BYTES = 192000 * 18
+
 # Host constants split to prevent chat/markdown auto-linkers from mangling URLs
 GTRANS_HOST = "translate." + "googleapis.com"
 GROQ_API_HOST = "api." + "groq.com"
@@ -98,6 +101,7 @@ STT_PHONETIC_FIXES = (
 _NATIVE_DPY_VOICE_WS_RECEIVED = _dpy_gateway.DiscordVoiceWebSocket.received_message
 _NATIVE_DPY_VOICE_WS_BINARY = getattr(_dpy_gateway.DiscordVoiceWebSocket, "received_binary_message", None)
 _ORIG_DPY_EXECUTE_TRANSITION = getattr(_dpy_voice_state.VoiceConnectionState, "_execute_transition", None)
+_KNOWN_VOICE_USER_IDS: set[int] = set()
 
 try:
     from discord.ext import voice_recv
@@ -108,7 +112,6 @@ try:
     _ORIG_VR_HOOK = getattr(_vr_gateway, "hook", None)
     _ORIG_DECODE_PACKET = _vr_opus.PacketDecoder._decode_packet
     _DAVE_LOG_TS = 0.0
-    _KNOWN_VOICE_USER_IDS: set[int] = set()
 
     if _ORIG_DPY_EXECUTE_TRANSITION is not None:
         async def _patched_dpy_execute_transition(self, transition_id: int):
@@ -432,7 +435,7 @@ def clean_text_for_speech(text: str) -> str:
     cleaned = re.sub(r"```[\s\S]*?```", " รายละเอียดของโค้ดฉันส่งไว้ให้ในแชทแล้วค่ะ ", cleaned)
     cleaned = URL_REGEX.sub(" ลิงก์อ้างอิงอยู่ในแชทแล้วค่ะ ", cleaned)
     cleaned = _normalize_thai_dates_and_times_for_tts(cleaned)
-    cleaned = re.sub(r"[\(\)\*\_\~\`\#\>|\[\]\"\']", " ", cleaned)
+    cleaned = re.sub(r"[\(\)\*\_\~\`\#\>|\"'\[\]]", " ", cleaned)
     cleaned = re.sub(r"[\U00010000-\U0010ffff]", "", cleaned)
     return re.sub(r"\s+", " ", cleaned).strip()[:450]
 
@@ -461,7 +464,7 @@ def _master_tts_audio_sync(mp3_bytes: bytes, extra_af: str = "") -> bytes:
     full_af = f"{extra_af},{base_af}" if extra_af else base_af
     proc = subprocess.run(
         [
-            "ffmpeg", "-i", "pipe:0",
+            "ffmpeg", "-threads", "1", "-i", "pipe:0",
             "-af", full_af,
             "-ac", "2", "-ar", "48000", "-b:a", "128k",
             "-write_xing", "0",
@@ -568,7 +571,7 @@ async def speak_in_voice_channel(guild: discord.Guild, text: str, fallback_chann
             if not vc or not vc.is_connected():
                 return
             done_event = asyncio.Event()
-            loop = state.bot.loop if state.bot else asyncio.get_running_loop()
+            loop = asyncio.get_running_loop()
 
             def _after_play(err):
                 if err:
@@ -636,7 +639,6 @@ async def transcribe_wav_bytes_gemini_live(wav_bytes: bytes) -> str:
     Tier 1 Primary STT: Streams 16kHz mono PCM audio to `gemini-3.5-transcribe-live`
     over Google AI Studio's Multimodal Live WebSocket (`BidiGenerateContent`) with
     custom vocabulary biasing for Thai/English/Japanese commands and character names.
-    Unlimited RPM / Unlimited RPD (20K TPM).
     """
     if not GEMINI_API_KEY or not GEMINI_TRANSCRIBE_LIVE_MODEL:
         return ""
@@ -681,7 +683,7 @@ async def transcribe_wav_bytes_gemini_live(wav_bytes: bytes) -> str:
     t0 = time.monotonic()
     session = get_http_session()
     try:
-        async with session.ws_connect(ws_url, timeout=10.0) as ws:
+        async with session.ws_connect(ws_url, timeout=10.0, heartbeat=20.0) as ws:
             await ws.send_json(setup_msg)
 
             setup_ok = False
@@ -756,21 +758,21 @@ async def transcribe_wav_bytes_gemini_live(wav_bytes: bytes) -> str:
                 elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                     break
 
-            raw_transcript = re.sub(r"\s+", " ", "".join(transcript_parts)).strip()
-            fixed_transcript = _apply_phonetic_fixes(raw_transcript)
-            elapsed = time.monotonic() - t0
-            if (
-                fixed_transcript
-                and len(fixed_transcript) >= 2
-                and fixed_transcript.lower() not in WHISPER_HALLUCINATIONS
-                and not NOISE_HALLUCINATION_REGEX.search(fixed_transcript)
-            ):
-                api_log(
-                    f"Gemini Transcribe Live -> {GEMINI_TRANSCRIBE_LIVE_MODEL} 200 OK "
-                    f"({elapsed:.2f}s): '{fixed_transcript[:80]}'"
-                )
-                return fixed_transcript
-            return ""
+        raw_transcript = re.sub(r"\s+", " ", "".join(transcript_parts)).strip()
+        fixed_transcript = _apply_phonetic_fixes(raw_transcript)
+        elapsed = time.monotonic() - t0
+        if (
+            fixed_transcript
+            and len(fixed_transcript) >= 2
+            and fixed_transcript.lower() not in WHISPER_HALLUCINATIONS
+            and not NOISE_HALLUCINATION_REGEX.search(fixed_transcript)
+        ):
+            api_log(
+                f"Gemini Transcribe Live -> {GEMINI_TRANSCRIBE_LIVE_MODEL} 200 OK "
+                f"({elapsed:.2f}s): '{fixed_transcript[:80]}'"
+            )
+            return fixed_transcript
+        return ""
     except Exception as e:
         err_s = str(e)
         if "429" in err_s or "quota" in err_s.lower():
@@ -857,11 +859,11 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
 def convert_audio_bytes_to_wav_sync(raw_bytes: bytes) -> bytes:
     """
     Converts raw 48kHz stereo Discord PCM/audio to 16kHz mono WAV with speech band-pass filtering
-    and dynamic audio normalization (dynaudnorm) so quiet microphones are amplified cleanly.
+    and dynamic audio normalization (`-threads 1` tuned for 0.1 vCPU Render containers).
     """
     proc = subprocess.run(
         [
-            "ffmpeg", "-i", "pipe:0",
+            "ffmpeg", "-threads", "1", "-i", "pipe:0",
             "-af", "highpass=f=85,lowpass=f=7500,dynaudnorm=f=150:g=15:p=0.92:m=10",
             "-ac", "1", "-ar", "16000", "-f", "wav", "pipe:1", "-loglevel", "error"
         ],
@@ -983,8 +985,11 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
         self.last_spoken = {}
         self._last_rms_log = 0.0
         self.running = True
-        loop = state.bot.loop if state.bot else asyncio.get_event_loop()
-        self.monitor_task = loop.create_task(self._silence_monitor_loop())
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = state.bot.loop if state.bot else asyncio.get_event_loop()
+        self.monitor_task = self._loop.create_task(self._silence_monitor_loop())
 
     @property
     def voice_client(self):
@@ -1032,16 +1037,19 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
             print(f"[Voice Mic Level] speaker={speaker.display_name}, rms={frame_rms}", flush=True)
 
         with self._lock:
+            buf = self.user_buffers[speaker]
             if frame_rms >= self.SPEECH_FRAME_RMS_THRESHOLD:
-                if speaker not in self.user_buffers or len(self.user_buffers[speaker]) == 0:
+                if len(buf) == 0:
                     for pre_frame in self.pre_roll_buffers[speaker]:
-                        self.user_buffers[speaker].extend(pre_frame)
+                        buf.extend(pre_frame)
                     self.pre_roll_buffers[speaker].clear()
-                self.user_buffers[speaker].extend(data.pcm)
+                if len(buf) < MAX_UTTERANCE_BYTES:
+                    buf.extend(data.pcm)
                 self.speech_frame_counts[speaker] += 1
                 self.last_spoken[speaker] = now
-            elif speaker in self.user_buffers and (now - self.last_spoken.get(speaker, 0) < 1.0):
-                self.user_buffers[speaker].extend(data.pcm)
+            elif len(buf) > 0 and (now - self.last_spoken.get(speaker, 0) < 1.0):
+                if len(buf) < MAX_UTTERANCE_BYTES:
+                    buf.extend(data.pcm)
             else:
                 self.pre_roll_buffers[speaker].append(data.pcm)
 
@@ -1056,14 +1064,15 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
             self.last_spoken.clear()
 
     async def _silence_monitor_loop(self):
-        loop = state.bot.loop if state.bot else asyncio.get_running_loop()
         while self.running:
             await asyncio.sleep(0.35)
             now = time.monotonic()
             ready_payloads = []
             with self._lock:
                 for user, last_t in list(self.last_spoken.items()):
-                    if now - last_t >= 1.1:
+                    buf_len = len(self.user_buffers.get(user, b""))
+                    # Flush after 1.1s silence OR immediately if continuous mic noise hits MAX_UTTERANCE_BYTES
+                    if (now - last_t >= 1.1) or (buf_len >= MAX_UTTERANCE_BYTES):
                         pcm_bytes = bytes(self.user_buffers.pop(user, b""))
                         active_frames = self.speech_frame_counts.pop(user, 0)
                         self.last_spoken.pop(user, None)
@@ -1075,7 +1084,7 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
                     f"({active_frames} active frames, {len(pcm_bytes)} bytes)",
                     flush=True,
                 )
-                loop.create_task(self._process_user_pcm(user, pcm_bytes))
+                self._loop.create_task(self._process_user_pcm(user, pcm_bytes))
 
     async def _process_user_pcm(self, user, pcm_bytes: bytes):
         try:

@@ -2,8 +2,8 @@ import re
 import json
 import time
 import socket
+import asyncio
 import ipaddress
-import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -48,8 +48,6 @@ from config import (
 
 ENGLISH_ENTITY_REGEX = re.compile(r"\b[A-Za-z][A-Za-z0-9_.:-]{1,25}(?:\s+[A-Za-z0-9_.:-]{1,25}){0,4}\b")
 
-# Kept deliberately narrow (articles, prepositions, and formatting/markup tokens only)
-# so legitimate multi-word titles containing words like 'Action', 'Status', or 'Twitter' still anchor topics.
 STOPWORD_ENTITIES = {
     "search", "google", "wikipedia", "wiki", "what", "when", "where", "which", "who", "how",
     "the", "and", "for", "with", "this", "that", "from", "are", "you", "can", "help", "not",
@@ -59,6 +57,32 @@ STOPWORD_ENTITIES = {
     "items", "in-bubble", "bubble", "ocr", "sfx", "canon", "lore",
 }
 _MARKUP_NOISE_WORDS = {"markdown", "json", "html", "in-bubble", "ocr", "sfx", "error", "extraction", "readable"}
+
+# Bounded 5-minute in-memory TTL cache for search results (eliminates redundant lookups on follow-up buttons)
+_SEARCH_CACHE: dict[str, tuple[float, str]] = {}
+_SEARCH_CACHE_TTL_SEC = 300.0
+_SEARCH_CACHE_MAX_ENTRIES = 32
+
+
+def _get_cached_search(cache_key: str) -> str:
+    entry = _SEARCH_CACHE.get(cache_key)
+    if not entry:
+        return ""
+    ts, val = entry
+    if (time.time() - ts) < _SEARCH_CACHE_TTL_SEC:
+        return val
+    _SEARCH_CACHE.pop(cache_key, None)
+    return ""
+
+
+def _store_cached_search(cache_key: str, value: str):
+    if not value:
+        return
+    now = time.time()
+    if len(_SEARCH_CACHE) >= _SEARCH_CACHE_MAX_ENTRIES:
+        oldest_key = min(_SEARCH_CACHE.keys(), key=lambda k: _SEARCH_CACHE[k][0])
+        _SEARCH_CACHE.pop(oldest_key, None)
+    _SEARCH_CACHE[cache_key] = (now, value)
 
 
 def _strip_context_and_system_blocks(text: str) -> str:
@@ -88,15 +112,6 @@ def detect_coding_intent(
     channel_id: int = None,
     extracted_ctx: str = "",
 ) -> bool:
-    """
-    Determines whether the message should route to Coding / Stack-Trace mode (Path A):
-    1) Checks if any uploaded file has a code/log extension.
-    2) Checks `CODE_INTENT_PATTERN` and `STACK_TRACE_SIGNATURE_REGEX` strictly against the user's
-       own typed message (with URLs and appended OCR/Search blocks stripped).
-    3) Checks `STACK_TRACE_SIGNATURE_REGEX` against `extracted_ctx` for terminal/error screenshots.
-    4) Uses `channel_has_recent_code_attachment(channel_id)` ONLY if the current message is not a fresh
-       non-code media/social-link/document post.
-    """
     for att in attachments:
         if att.filename.lower().endswith(CODE_AND_LOG_EXTENSIONS):
             return True
@@ -153,10 +168,6 @@ def _is_valid_entity_phrase(phrase: str) -> bool:
 
 
 def update_and_get_channel_topic(user_text: str, channel_id: int = None) -> str:
-    """
-    Maintains a persistent topic anchor per channel so follow-up messages that shorten the name
-    (e.g. 'PSO2 NGS' -> 'NGS') never lose the root subject, while preserving multi-word titles.
-    """
     if channel_id is None:
         return ""
     now = time.time()
@@ -428,22 +439,10 @@ async def fetch_live_weather_context(user_text: str, channel_id: int = None) -> 
     return ""
 
 
-def validate_safe_public_url(url: str) -> str:
-    cleaned = clean_url(url)
-    parsed = urlparse(cleaned)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError(f"Blocked unsafe URL scheme `{parsed.scheme}`.")
-    hostname = parsed.hostname
-    if not hostname or hostname.lower() in (
-        "localhost", "localhost.localdomain", "metadata.google.internal", "169.254.169.254"
-    ):
-        raise ValueError(f"SSRF Protection: Blocked internal host `{hostname}`.")
-    try:
-        addr_info = socket.getaddrinfo(
-            hostname, parsed.port or (443 if parsed.scheme == "https" else 80), proto=socket.IPPROTO_TCP
-        )
-    except Exception as e:
-        raise ValueError(f"DNS resolution failed for `{hostname}`: {e}")
+# ==============================================================================
+# SSRF-PROTECTED PUBLIC URL VALIDATION & ASYNC WEBPAGE SCRAPER
+# ==============================================================================
+def _check_resolved_addrs_safe(addr_info: list):
     for entry in addr_info:
         ip_obj = ipaddress.ip_address(entry[4][0])
         if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped:
@@ -454,6 +453,40 @@ def validate_safe_public_url(url: str) -> str:
             or (isinstance(ip_obj, ipaddress.IPv4Address) and ip_obj in CGNAT_NETWORK)
         ):
             raise ValueError(f"SSRF Protection: Blocked non-public IP `{ip_obj}`.")
+
+
+def _validate_url_syntax_and_host(url: str) -> tuple[str, str, int]:
+    cleaned = clean_url(url)
+    parsed = urlparse(cleaned)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Blocked unsafe URL scheme `{parsed.scheme}`.")
+    hostname = parsed.hostname
+    if not hostname or hostname.lower() in (
+        "localhost", "localhost.localdomain", "metadata.google.internal", "169.254.169.254"
+    ):
+        raise ValueError(f"SSRF Protection: Blocked internal host `{hostname}`.")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return cleaned, hostname, port
+
+
+def validate_safe_public_url(url: str) -> str:
+    cleaned, hostname, port = _validate_url_syntax_and_host(url)
+    try:
+        addr_info = socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
+    except Exception as e:
+        raise ValueError(f"DNS resolution failed for `{hostname}`: {e}")
+    _check_resolved_addrs_safe(addr_info)
+    return cleaned
+
+
+async def validate_safe_public_url_async(url: str) -> str:
+    cleaned, hostname, port = _validate_url_syntax_and_host(url)
+    loop = asyncio.get_running_loop()
+    try:
+        addr_info = await loop.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
+    except Exception as e:
+        raise ValueError(f"DNS resolution failed for `{hostname}`: {e}")
+    _check_resolved_addrs_safe(addr_info)
     return cleaned
 
 
@@ -470,17 +503,57 @@ def fetch_webpage_sync(url: str, max_chars: int = 14000) -> str:
     return extracted[:max_chars]
 
 
-def _search_google_ai_studio_grounded_sync(query: str) -> str:
+async def fetch_webpage_async(url: str, max_chars: int = 14000, timeout_sec: float = 6.0) -> str:
+    """Async SSRF-validated webpage fetcher using pooled aiohttp + trafilatura HTML extraction."""
+    safe_url = await validate_safe_public_url_async(url)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    session = get_http_session()
+    async with session.get(
+        safe_url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout_sec)
+    ) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"HTTP {resp.status} downloading URL.")
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if ctype and not any(k in ctype for k in ("text/", "xml", "json", "xhtml")):
+            raise RuntimeError(f"Non-text content type `{ctype}`.")
+        # Cap downloaded HTML at 1.5 MB to protect 512MB RAM
+        raw_chunks = bytearray()
+        async for chunk in resp.content.iter_chunked(65536):
+            raw_chunks.extend(chunk)
+            if len(raw_chunks) >= 1536 * 1024:
+                break
+        html_text = raw_chunks.decode("utf-8", errors="replace")
+
+    extracted = await asyncio.to_thread(
+        trafilatura.extract,
+        html_text,
+        include_tables=True,
+        include_comments=False,
+        favor_precision=True,
+    )
+    if not extracted:
+        raise RuntimeError("No readable article text found on page.")
+    return extracted[:max_chars]
+
+
+# ==============================================================================
+# PARALLEL ASYNC MULTI-ENGINE SEARCH BACKENDS
+# ==============================================================================
+async def _search_google_ai_studio_grounded_async(query: str) -> list[dict]:
+    """Fast async Gemini Google Search Grounding (auto-throttled for 30m on HTTP 429)."""
     if not GEMINI_API_KEY or time.time() < state.gemini_grounding_cooldown_until:
-        return ""
+        return []
     payload = {
         "contents": [
             {
                 "parts": [
                     {
                         "text": (
-                            f"Search Google for the latest accurate information about: {query}\n"
-                            "Provide a concise factual summary with dates, numbers, and key facts."
+                            f"Search Google for the latest accurate facts about: {query}\n"
+                            "Return a concise factual summary with concrete dates, numbers, and names."
                         )
                     }
                 ]
@@ -489,61 +562,58 @@ def _search_google_ai_studio_grounded_sync(query: str) -> str:
         "tools": [{"google_search": {}}],
         "generationConfig": {
             "temperature": 0.1,
+            "maxOutputTokens": 1024,
             "thinkingConfig": {"thinkingLevel": "MINIMAL"},
         },
     }
-    for model_id in ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3-flash-preview"):
+    session = get_http_session()
+    for model_id in ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite"):
         url = clean_url(
             f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
             f"{model_id}:generateContent?key={GEMINI_API_KEY}"
         )
         t0 = time.monotonic()
         try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=12) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            async with session.post(
+                url, json=payload, timeout=aiohttp.ClientTimeout(total=8)
+            ) as resp:
                 elapsed = time.monotonic() - t0
-                candidates = data.get("candidates") or []
-                if not candidates:
-                    continue
-                cand = candidates[0]
-                parts = (cand.get("content") or {}).get("parts") or []
-                summary_text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
-
-                chunks = (cand.get("groundingMetadata") or {}).get("groundingChunks") or []
-                sources = []
-                for idx, ch in enumerate(chunks[:5], 1):
-                    web_info = ch.get("web") or {}
-                    uri = web_info.get("uri", "")
-                    title = web_info.get("title", "Source")
-                    if uri:
-                        sources.append(f"[{idx}] {title}: {uri}")
-
-                if summary_text:
-                    api_log(f"Search (Gemini Grounding) -> {model_id} 200 OK ({elapsed:.2f}s)")
-                    sources_block = "\n".join(sources)
-                    return (
-                        f'<untrusted_web_search_results query="{query}" engine="google_search_grounding">\n'
-                        f"Verified Google Search Summary:\n{summary_text}\n\n"
-                        f"Sources:\n{sources_block}\n"
-                        f"</untrusted_web_search_results>"
-                    )
+                if resp.status == 200:
+                    data = await resp.json()
+                    candidates = data.get("candidates") or []
+                    if not candidates:
+                        continue
+                    cand = candidates[0]
+                    parts = (cand.get("content") or {}).get("parts") or []
+                    summary_text = "\n".join(
+                        p.get("text", "") for p in parts if p.get("text") and not p.get("thought", False)
+                    ).strip()
+                    chunks = (cand.get("groundingMetadata") or {}).get("groundingChunks") or []
+                    src_urls = [
+                        (ch.get("web") or {}).get("uri", "")
+                        for ch in chunks[:4]
+                        if (ch.get("web") or {}).get("uri")
+                    ]
+                    if summary_text:
+                        api_log(f"Search (Gemini Grounding) -> {model_id} 200 OK ({elapsed:.2f}s)")
+                        return [{
+                            "title": "[Google Search Grounded Summary]",
+                            "href": src_urls[0] if src_urls else "",
+                            "body": summary_text[:2800] + (
+                                ("\nVerified Sources: " + " | ".join(src_urls)) if src_urls else ""
+                            ),
+                            "skip_scrape": True,
+                        }]
+                elif resp.status == 429:
+                    state.gemini_grounding_cooldown_until = time.time() + 1800.0
+                    api_log(f"Search (Gemini Grounding) -> {model_id} HTTP 429 (cooldown 30m)")
+                    return []
         except Exception as e:
-            err_str = str(e)
-            if "429" in err_str:
-                state.gemini_grounding_cooldown_until = time.time() + 1800
-                api_log(f"Search (Gemini Grounding) -> {model_id} HTTP 429 (cooldown 30m)")
-                break
-            api_log(f"Search (Gemini Grounding) -> {model_id} skipped ({err_str})")
-    return ""
+            api_log(f"Search (Gemini Grounding) -> {model_id} skipped ({type(e).__name__})")
+    return []
 
 
-def _search_google_news_rss_sync(query: str, is_thai: bool, max_results: int = 5) -> list[dict]:
+async def _search_google_news_rss_async(query: str, is_thai: bool, max_results: int = 4) -> list[dict]:
     hl = "th" if is_thai else "en-US"
     gl = "TH" if is_thai else "US"
     ceid = "TH:th" if is_thai else "US:en"
@@ -551,30 +621,37 @@ def _search_google_news_rss_sync(query: str, is_thai: bool, max_results: int = 5
     results = []
     t0 = time.monotonic()
     try:
-        req = urllib.request.Request(rss_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            xml_bytes = resp.read()
-            root = ET.fromstring(xml_bytes)
-            for item in root.findall("./channel/item")[:max_results]:
-                title = (item.findtext("title") or "").strip()
-                link = (item.findtext("link") or "").strip()
-                pub_date = (item.findtext("pubDate") or "").strip()
-                source = (item.findtext("source") or "").strip()
-                results.append({
-                    "title": f"[{source}] {title}" if source else title,
-                    "href": link,
-                    "body": f"สำนักข่าว (Source): {source or 'Unknown'} | วันที่เผยแพร่: {pub_date} | พาดหัวข่าว: {title}",
-                })
+        session = get_http_session()
+        async with session.get(
+            rss_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=aiohttp.ClientTimeout(total=6)
+        ) as resp:
+            if resp.status != 200:
+                return []
+            xml_bytes = await resp.read()
+        root = ET.fromstring(xml_bytes)
+        for item in root.findall("./channel/item")[:max_results]:
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            pub_date = (item.findtext("pubDate") or "").strip()
+            source = (item.findtext("source") or "").strip()
+            results.append({
+                "title": f"[{source}] {title}" if source else title,
+                "href": link,
+                "body": f"สำนักข่าว (Source): {source or 'Unknown'} | วันที่เผยแพร่: {pub_date} | พาดหัวข่าว: {title}",
+                "skip_scrape": True,
+            })
         if results:
-            api_log(f"Search (Tier 1 Google News RSS) -> {len(results)} hits ({time.monotonic() - t0:.2f}s)")
+            api_log(f"Search (Google News RSS) -> {len(results)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception as e:
         api_log(f"Search (Google News RSS) -> failed ({type(e).__name__})")
     return results
 
 
-def _search_wikipedia_full_extract_sync(query: str, is_thai: bool, max_results: int = 2) -> list[dict]:
+async def _search_wikipedia_full_extract_async(query: str, is_thai: bool, max_results: int = 2) -> list[dict]:
     has_en_terms = bool(ENGLISH_ENTITY_REGEX.search(query))
     lang_hosts = ["en", "th"] if has_en_terms else (["th", "en"] if is_thai else ["en"])
+    session = get_http_session()
+    headers = {"User-Agent": "YukinonBot/2.0"}
     hits = []
 
     for lang_host in lang_hosts:
@@ -595,43 +672,50 @@ def _search_wikipedia_full_extract_sync(query: str, is_thai: bool, max_results: 
                 f"{HTTPS}{lang_host}.wikipedia.org/w/api.php"
                 f"?action=query&list=search&srsearch={quote_plus(q_for_wiki)}&utf8=&format=json&srlimit={max_results}"
             )
-            req = urllib.request.Request(search_url, headers={"User-Agent": "YukinonBot/2.0"})
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                search_items = ((data.get("query") or {}).get("search")) or []
-                for item in search_items[:max_results]:
-                    title = item.get("title", "")
-                    if not title:
-                        continue
-                    ext_url = clean_url(
-                        f"{HTTPS}{lang_host}.wikipedia.org/w/api.php"
-                        f"?action=query&prop=extracts&explaintext=1&exchars=4200"
-                        f"&titles={quote_plus(title)}&format=json"
-                    )
-                    req_e = urllib.request.Request(ext_url, headers={"User-Agent": "YukinonBot/2.0"})
-                    with urllib.request.urlopen(req_e, timeout=6) as e_resp:
-                        e_data = json.loads(e_resp.read().decode("utf-8"))
-                        pages = ((e_data.get("query") or {}).get("pages")) or {}
-                        extract = ""
-                        for _, p_obj in pages.items():
-                            extract = (p_obj.get("extract") or "").strip()
-                            if extract:
-                                break
-                        page_url = f"{HTTPS}{lang_host}.wikipedia.org/wiki/{quote_plus(title.replace(' ', '_'))}"
-                        if extract:
-                            hits.append({
-                                "title": f"[Wikipedia {lang_host.upper()}] {title}",
-                                "href": page_url,
-                                "body": extract[:4200],
-                            })
+            async with session.get(
+                search_url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status != 200:
+                    continue
+                data = await resp.json()
+            search_items = ((data.get("query") or {}).get("search")) or []
+            titles = [item.get("title", "") for item in search_items[:max_results] if item.get("title")]
+            if not titles:
+                continue
+
+            # Batch-fetch all matched Wikipedia page extracts in ONE HTTP request (instead of N serial requests!)
+            titles_param = "|".join(titles)
+            ext_url = clean_url(
+                f"{HTTPS}{lang_host}.wikipedia.org/w/api.php"
+                f"?action=query&prop=extracts&explaintext=1&exchars=3800"
+                f"&titles={quote_plus(titles_param)}&format=json"
+            )
+            async with session.get(
+                ext_url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)
+            ) as e_resp:
+                if e_resp.status != 200:
+                    continue
+                e_data = await e_resp.json()
+            pages = ((e_data.get("query") or {}).get("pages")) or {}
+            for _, p_obj in pages.items():
+                title = p_obj.get("title") or ""
+                extract = (p_obj.get("extract") or "").strip()
+                if title and extract:
+                    page_url = f"{HTTPS}{lang_host}.wikipedia.org/wiki/{quote_plus(title.replace(' ', '_'))}"
+                    hits.append({
+                        "title": f"[Wikipedia {lang_host.upper()}] {title}",
+                        "href": page_url,
+                        "body": extract[:3800],
+                        "skip_scrape": True,
+                    })
             if hits:
                 api_log(f"Search (Wikipedia:{lang_host} q='{q_for_wiki[:35]}') -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
         except Exception:
             pass
-    return hits
+    return hits[:max_results]
 
 
-def _search_jikan_anime_manga_sync(query: str, max_results: int = 2) -> list[dict]:
+async def _search_jikan_anime_manga_async(query: str, max_results: int = 2) -> list[dict]:
     clean_topic = re.sub(
         r"(อนิเมะ|มังงะ|ไลท์โนเวล|นิยาย|เรื่องย่อ|ตัวละคร|คืออะไร|สนุกไหม|คิดยังไงกับ|เรื่อง)",
         "",
@@ -646,25 +730,30 @@ def _search_jikan_anime_manga_sync(query: str, max_results: int = 2) -> list[dic
     t0 = time.monotonic()
     hits = []
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "YukinonBot/2.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            for item in (data.get("data") or [])[:max_results]:
-                title = item.get("title") or "Unknown"
-                title_jp = item.get("title_japanese") or ""
-                score = item.get("score") or "N/A"
-                status = item.get("status") or "Unknown"
-                episodes_or_ch = item.get("episodes") or item.get("chapters") or "?"
-                synopsis = (item.get("synopsis") or "").strip()[:1200]
-                mal_url = item.get("url") or ""
-                hits.append({
-                    "title": f"[MyAnimeList {media_type.upper()}] {title} ({title_jp})",
-                    "href": mal_url,
-                    "body": (
-                        f"Type: {item.get('type')} | Score: {score}/10 | Status: {status} | "
-                        f"Episodes/Chapters: {episodes_or_ch}\nSynopsis: {synopsis}"
-                    ),
-                })
+        session = get_http_session()
+        async with session.get(
+            url, headers={"User-Agent": "YukinonBot/2.0"}, timeout=aiohttp.ClientTimeout(total=6)
+        ) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+        for item in (data.get("data") or [])[:max_results]:
+            title = item.get("title") or "Unknown"
+            title_jp = item.get("title_japanese") or ""
+            score = item.get("score") or "N/A"
+            status = item.get("status") or "Unknown"
+            episodes_or_ch = item.get("episodes") or item.get("chapters") or "?"
+            synopsis = (item.get("synopsis") or "").strip()[:1200]
+            mal_url = item.get("url") or ""
+            hits.append({
+                "title": f"[MyAnimeList {media_type.upper()}] {title} ({title_jp})",
+                "href": mal_url,
+                "body": (
+                    f"Type: {item.get('type')} | Score: {score}/10 | Status: {status} | "
+                    f"Episodes/Chapters: {episodes_or_ch}\nSynopsis: {synopsis}"
+                ),
+                "skip_scrape": True,
+            })
         if hits:
             api_log(f"Search (Jikan MAL:{media_type}) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception:
@@ -672,7 +761,7 @@ def _search_jikan_anime_manga_sync(query: str, max_results: int = 2) -> list[dic
     return hits
 
 
-def _search_steam_games_sync(query: str, max_results: int = 2) -> list[dict]:
+async def _search_steam_games_async(query: str, max_results: int = 2) -> list[dict]:
     clean_game = re.sub(
         r"(เกม|สตีม|ราคาเกม|สเปคเกม|สนุกไหม|คิดยังไงกับ|คือเกมอะไร|\bgame\b|\bsteam\b|\bwiki\b|\bclasses\b|\bweapons\b|\blist\b)",
         "",
@@ -687,21 +776,26 @@ def _search_steam_games_sync(query: str, max_results: int = 2) -> list[dict]:
     t0 = time.monotonic()
     hits = []
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=7) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            for item in (data.get("items") or [])[:max_results]:
-                gid = item.get("id")
-                name = item.get("name") or "Unknown Game"
-                price_info = item.get("price") or {}
-                final_thb = (price_info.get("final", 0) / 100.0) if price_info else 0
-                price_str = f"{final_thb:,.2f} THB" if final_thb > 0 else "Free-to-Play / TBA"
-                store_url = f"{HTTPS}store.steampowered.com/app/{gid}" if gid else ""
-                hits.append({
-                    "title": f"[Steam Store TH] {name}",
-                    "href": store_url,
-                    "body": f"Game: {name} | Steam Thailand Price: {price_str} | AppID: {gid}",
-                })
+        session = get_http_session()
+        async with session.get(
+            url, headers={"User-Agent": "Mozilla/5.0"}, timeout=aiohttp.ClientTimeout(total=5)
+        ) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+        for item in (data.get("items") or [])[:max_results]:
+            gid = item.get("id")
+            name = item.get("name") or "Unknown Game"
+            price_info = item.get("price") or {}
+            final_thb = (price_info.get("final", 0) / 100.0) if price_info else 0
+            price_str = f"{final_thb:,.2f} THB" if final_thb > 0 else "Free-to-Play / TBA"
+            store_url = f"{HTTPS}store.steampowered.com/app/{gid}" if gid else ""
+            hits.append({
+                "title": f"[Steam Store TH] {name}",
+                "href": store_url,
+                "body": f"Game: {name} | Steam Thailand Price: {price_str} | AppID: {gid}",
+                "skip_scrape": True,
+            })
         if hits:
             api_log(f"Search (Steam Store) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception:
@@ -709,8 +803,77 @@ def _search_steam_games_sync(query: str, max_results: int = 2) -> list[dict]:
     return hits
 
 
-def run_safe_web_search_sync(query: str, max_results: int = 5) -> str:
-    clean_q = re.sub(r"[\r\n]+", " ", query).strip()
+async def _search_tavily_async(query: str, max_results: int = 5) -> list[dict]:
+    if not TAVILY_API_KEY:
+        return []
+    t0 = time.monotonic()
+    hits = []
+    try:
+        session = get_http_session()
+        async with session.post(
+            clean_url(f"{HTTPS}api.tavily.com/search"),
+            json={"api_key": TAVILY_API_KEY, "query": query, "max_results": max_results},
+            timeout=aiohttp.ClientTimeout(total=7),
+        ) as resp:
+            if resp.status != 200:
+                return []
+            t_data = await resp.json()
+        for r in t_data.get("results", []):
+            hits.append({
+                "title": r.get("title", ""),
+                "href": r.get("url", ""),
+                "body": r.get("content", ""),
+            })
+        if hits:
+            api_log(f"Search (Tavily) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
+    except Exception as e:
+        api_log(f"Search (Tavily) -> failed ({type(e).__name__})")
+    return hits
+
+
+def _search_ddgs_sync(query: str, region_code: str, timelimit: str | None, max_results: int = 5) -> list[dict]:
+    t0 = time.monotonic()
+    hits = []
+    try:
+        with DDGS(proxy=DDGS_PROXY, timeout=8) as ddgs:
+            timelimit_passes = [timelimit, None] if timelimit else [None]
+            for tl in timelimit_passes:
+                if hits:
+                    break
+                for backend_choice in ("auto", "brave", "bing", "google", "wikipedia", "yahoo"):
+                    try:
+                        ddg_hits = list(
+                            ddgs.text(
+                                query,
+                                region=region_code,
+                                safesearch="moderate",
+                                timelimit=tl,
+                                backend=backend_choice,
+                                max_results=max_results,
+                            )
+                        )
+                        if ddg_hits:
+                            hits.extend(ddg_hits)
+                            api_log(
+                                f"Search (DDGS:{backend_choice} tl={tl} q='{query[:45]}') -> "
+                                f"{len(ddg_hits)} hits ({time.monotonic() - t0:.2f}s)"
+                            )
+                            break
+                    except Exception:
+                        continue
+    except Exception as e:
+        api_log(f"Search (DDGS init) -> {type(e).__name__}")
+    return hits
+
+
+async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
+    """
+    High-speed parallel async multi-engine web search with 5-minute TTL caching:
+      - Fans out domain-appropriate backends (Gemini Grounding, Google News RSS, Jikan MAL,
+        Wikipedia batched extracts, Steam Store, Tavily, DDGS) concurrently via `asyncio.gather`.
+      - Deep-scrapes up to 2 short-snippet web pages concurrently via `fetch_webpage_async`.
+    """
+    clean_q = re.sub(r"[\r\n]+", " ", query or "").strip()
     clean_q = re.sub(
         r"^(สวัสดี|ยูกิโนะ|ยูกิน่อน|ยูกิพีเดีย|yukipedia|ช่วยหา|ค้นหา|ช่วยบอก|อยากรู้ว่า|สรุป)\s*",
         "",
@@ -719,6 +882,12 @@ def run_safe_web_search_sync(query: str, max_results: int = 5) -> str:
     ).strip()[:180]
     if not clean_q:
         return ""
+
+    cache_key = f"{clean_q.lower()}|{max_results}"
+    cached = _get_cached_search(cache_key)
+    if cached:
+        api_log(f"Search (Cache Hit) -> q='{clean_q[:45]}'")
+        return cached
 
     now_th = datetime.now(ZoneInfo("Asia/Bangkok"))
     current_year_ce = str(now_th.year)
@@ -729,6 +898,7 @@ def run_safe_web_search_sync(query: str, max_results: int = 5) -> str:
     region_code = "wt-wt" if has_en_entity else ("th-th" if is_thai else "wt-wt")
 
     is_news = bool(NEWS_QUERY_REGEX.search(clean_q))
+    is_recency = bool(RECENCY_INTENT_REGEX.search(clean_q))
     is_anime_manga = bool(ANIME_MANGA_QUERY_REGEX.search(clean_q))
     is_game = bool(GAME_QUERY_REGEX.search(clean_q))
 
@@ -736,124 +906,123 @@ def run_safe_web_search_sync(query: str, max_results: int = 5) -> str:
     if is_news and not re.search(r"\b202\d\b|\b256\d\b", clean_q):
         dated_q = f"{clean_q} {current_year_ce}".strip()
 
-    hits = []
-
+    # Phase 1: Parallel fan-out across fast domain-matched async APIs
+    phase1_tasks = []
+    if is_news or is_recency:
+        phase1_tasks.append(_search_google_ai_studio_grounded_async(dated_q))
     if is_news:
-        hits.extend(_search_google_news_rss_sync(dated_q, is_thai=is_thai, max_results=3))
-
+        phase1_tasks.append(_search_google_news_rss_async(dated_q, is_thai=is_thai, max_results=3))
     if is_anime_manga:
-        hits.extend(_search_jikan_anime_manga_sync(clean_q, max_results=2))
-        hits.extend(_search_wikipedia_full_extract_sync(clean_q, is_thai=is_thai, max_results=2))
+        phase1_tasks.append(_search_jikan_anime_manga_async(clean_q, max_results=2))
+        phase1_tasks.append(_search_wikipedia_full_extract_async(clean_q, is_thai=is_thai, max_results=2))
+    elif is_game:
+        phase1_tasks.append(_search_wikipedia_full_extract_async(clean_q, is_thai=is_thai, max_results=2))
+        phase1_tasks.append(_search_steam_games_async(clean_q, max_results=1))
+    elif not is_news:
+        phase1_tasks.append(_search_wikipedia_full_extract_async(clean_q, is_thai=is_thai, max_results=2))
 
-    if is_game:
-        hits.extend(_search_wikipedia_full_extract_sync(clean_q, is_thai=is_thai, max_results=2))
-        hits.extend(_search_steam_games_sync(clean_q, max_results=1))
+    if TAVILY_API_KEY:
+        phase1_tasks.append(_search_tavily_async(dated_q if is_news else clean_q, max_results=max_results))
 
-    if not is_news and not is_anime_manga and not is_game:
-        hits.extend(_search_wikipedia_full_extract_sync(clean_q, is_thai=is_thai, max_results=2))
+    # Launch DDGS concurrently whenever we don't have Tavily or need broader web snippets
+    preferred_tl = "m" if (is_news and not is_game and not is_anime_manga) else None
+    phase1_tasks.append(
+        asyncio.to_thread(_search_ddgs_sync, dated_q if is_news else clean_q, region_code, preferred_tl, max_results)
+    )
 
-    if len(hits) < 3 and TAVILY_API_KEY:
-        t0 = time.monotonic()
-        try:
-            t_req = urllib.request.Request(
-                clean_url(f"{HTTPS}api.tavily.com/search"),
-                data=json.dumps({
-                    "api_key": TAVILY_API_KEY,
-                    "query": dated_q if is_news else clean_q,
-                    "max_results": max_results,
-                }).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(t_req, timeout=10) as resp:
-                t_data = json.loads(resp.read().decode("utf-8"))
-                for r in t_data.get("results", []):
-                    hits.append({
-                        "title": r.get("title", ""),
-                        "href": r.get("url", ""),
-                        "body": r.get("content", ""),
-                    })
-            if hits:
-                api_log(f"Search (Tavily) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
-        except Exception as e:
-            api_log(f"Search (Tavily) -> failed ({type(e).__name__})")
+    batches = await asyncio.gather(*phase1_tasks, return_exceptions=True)
+    hits: list[dict] = []
+    for batch in batches:
+        if isinstance(batch, list):
+            hits.extend(batch)
 
-    if len(hits) < 5:
-        t0 = time.monotonic()
-        preferred_timelimit = "m" if (is_news and not is_game and not is_anime_manga) else None
-        q_ddg = dated_q if is_news else clean_q
-        try:
-            with DDGS(proxy=DDGS_PROXY, timeout=10) as ddgs:
-                timelimit_passes = [preferred_timelimit, None] if preferred_timelimit else [None]
-                for tl in timelimit_passes:
-                    if len(hits) >= max_results + 1:
-                        break
-                    for backend_choice in ("auto", "brave", "bing", "google", "wikipedia", "yahoo"):
-                        try:
-                            ddg_hits = list(
-                                ddgs.text(
-                                    q_ddg,
-                                    region=region_code,
-                                    safesearch="moderate",
-                                    timelimit=tl,
-                                    backend=backend_choice,
-                                    max_results=max_results,
-                                )
-                            )
-                            if ddg_hits:
-                                hits.extend(ddg_hits)
-                                api_log(
-                                    f"Search (DDGS:{backend_choice} tl={tl} q='{q_ddg[:45]}') -> "
-                                    f"{len(ddg_hits)} hits ({time.monotonic() - t0:.2f}s)"
-                                )
-                                break
-                        except Exception:
-                            continue
-        except Exception as e:
-            api_log(f"Search (DDGS init) -> {type(e).__name__}")
-
+    # Last-resort fallback if everything above returned empty
     if not hits:
-        hits.extend(_search_wikipedia_full_extract_sync(clean_q, is_thai=is_thai, max_results=2))
-    if not hits:
-        hits.extend(_search_google_news_rss_sync(clean_q, is_thai=is_thai, max_results=max_results))
+        fallback_batches = await asyncio.gather(
+            _search_wikipedia_full_extract_async(clean_q, is_thai=is_thai, max_results=2),
+            _search_google_news_rss_async(clean_q, is_thai=is_thai, max_results=max_results),
+            return_exceptions=True,
+        )
+        for batch in fallback_batches:
+            if isinstance(batch, list):
+                hits.extend(batch)
 
     if not hits:
         return ""
 
-    formatted_entries = []
-    deep_scraped_count = 0
-    seen_urls = set()
+    # Deduplicate and pick up to `max_results` entries
+    selected_items: list[dict] = []
+    seen_urls: set[str] = set()
     for item in hits:
-        if len(formatted_entries) >= max_results:
+        if len(selected_items) >= max_results:
             break
-        title = (item.get("title") or "Untitled").strip()
         href = (item.get("href") or item.get("url") or "").strip()
         if href and href in seen_urls:
             continue
         if href:
             seen_urls.add(href)
+        selected_items.append(item)
+
+    # Phase 2: Concurrently deep-scrape up to 2 short-snippet web articles
+    scrape_targets: list[tuple[int, str]] = []
+    for idx, item in enumerate(selected_items):
+        if len(scrape_targets) >= 2:
+            break
+        if item.get("skip_scrape"):
+            continue
+        href = (item.get("href") or item.get("url") or "").strip()
         snippet = (item.get("body") or "").strip()
-        idx = len(formatted_entries) + 1
-        entry_text = f"[{idx}] Title: {title}\nURL: {href}\nSnippet: {snippet}"
         if (
             href
-            and deep_scraped_count < 2
             and len(snippet) < 1200
-            and not any(skip in href for skip in ("news.google.com", "myanimelist.net", "steampowered.com", "youtube.com"))
+            and not any(skip in href for skip in ("news.google.com", "myanimelist.net", "steampowered.com", "youtube.com", "wikipedia.org"))
         ):
+            scrape_targets.append((idx, href))
+
+    scraped_excerpts: dict[int, str] = {}
+    if scrape_targets:
+        async def _safe_scrape(idx_i: int, target_u: str) -> tuple[int, str]:
             try:
-                article_excerpt = fetch_webpage_sync(href, max_chars=3500)
-                if article_excerpt:
-                    entry_text += f"\nFull Page Excerpt:\n{article_excerpt}"
-                    deep_scraped_count += 1
+                txt = await fetch_webpage_async(target_u, max_chars=3200, timeout_sec=5.0)
+                return idx_i, txt
             except Exception:
-                pass
+                return idx_i, ""
+
+        scrape_results = await asyncio.gather(*[_safe_scrape(i, u) for i, u in scrape_targets])
+        for i, txt in scrape_results:
+            if txt:
+                scraped_excerpts[i] = txt
+
+    formatted_entries = []
+    for idx, item in enumerate(selected_items):
+        title = (item.get("title") or "Untitled").strip()
+        href = (item.get("href") or item.get("url") or "").strip()
+        snippet = (item.get("body") or "").strip()
+        entry_text = f"[{idx + 1}] Title: {title}\nURL: {href}\nSnippet: {snippet}"
+        if idx in scraped_excerpts:
+            entry_text += f"\nFull Page Excerpt:\n{scraped_excerpts[idx]}"
         formatted_entries.append(entry_text)
+
     joined_results = "\n\n".join(formatted_entries)[:9000]
-    return (
+    output_block = (
         f'<untrusted_web_search_results query="{clean_q}" as_of_date="{current_date_iso}">\n'
         f"[ข้อมูลหลักฐานจากการค้นหาเว็บ ณ วันที่ {current_date_iso} (ปี ค.ศ. {current_year_ce}): "
         f"จงใช้เฉพาะข้อเท็จจริงที่มีอยู่ในข้อมูลนี้เท่านั้น ห้ามแต่งชื่ออาวุธ ชื่อคลาส ชื่อบริษัท หรือเนื้อเรื่องที่ไม่มีในข้อมูลนี้ขึ้นมาเองเด็ดขาด!]\n"
         f"{joined_results}\n"
         f"</untrusted_web_search_results>"
     )
+    _store_cached_search(cache_key, output_block)
+    return output_block
+
+
+def run_safe_web_search_sync(query: str, max_results: int = 5) -> str:
+    """Backward-compatible synchronous wrapper around `run_safe_web_search_async`."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(run_safe_web_search_async(query, max_results=max_results))
+    # If invoked from a worker thread where no loop is running, asyncio.run handles it;
+    # if somehow called inside a running loop, fall back to a dedicated loop in a thread.
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, run_safe_web_search_async(query, max_results=max_results)).result(timeout=20)

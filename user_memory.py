@@ -8,9 +8,10 @@ import discord
 
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from config import THAI_WEEKDAYS, THAI_MONTHS
 
 from config import (
+    THAI_WEEKDAYS,
+    THAI_MONTHS,
     GAME_QUERY_REGEX,
     ANIME_MANGA_QUERY_REGEX,
     CODE_INTENT_PATTERN,
@@ -18,6 +19,7 @@ from config import (
     WEATHER_INTENT_PATTERN,
     channel_active_topic,
     state,
+    api_log,
 )
 from persona import is_owner_user, get_current_thai_datetime_str
 
@@ -28,6 +30,9 @@ MEMORY_BACKUP_CHANNEL_ID = int(os.getenv("MEMORY_BACKUP_CHANNEL_ID", "0") or "0"
 user_profiles: dict[str, dict] = {}
 _DIRTY_SINCE_LAST_BACKUP = False
 _LAST_CLOUD_BACKUP_TS = 0.0
+_CLOUD_BACKUP_LOCK: asyncio.Lock | None = None
+_CONSOLIDATION_COOLDOWN: dict[str, float] = {}
+_CONSOLIDATION_IN_PROGRESS: set[str] = set()
 
 USER_MENTION_REGEX = re.compile(r"<@!?(\d+)>")
 AGENTIC_MEMO_TAG_REGEX = re.compile(r"\[MEMO:\s*([^\]]+?)\s*\]", re.IGNORECASE)
@@ -40,6 +45,13 @@ TOPIC_KEYWORDS_MAP = {
     "Cats & Pan-san": CAT_TOPIC_REGEX,
     "Weather Forecast": WEATHER_INTENT_PATTERN,
 }
+
+
+def _get_cloud_backup_lock() -> asyncio.Lock:
+    global _CLOUD_BACKUP_LOCK
+    if _CLOUD_BACKUP_LOCK is None:
+        _CLOUD_BACKUP_LOCK = asyncio.Lock()
+    return _CLOUD_BACKUP_LOCK
 
 
 def load_user_profiles_local():
@@ -57,12 +69,19 @@ def load_user_profiles_local():
 
 
 def save_user_profiles_local():
-    """Saves user_profiles.json to local disk."""
+    """Atomically saves user_profiles.json via temp-file + os.replace so restarts never corrupt JSON."""
+    tmp_path = f"{USER_PROFILES_FILE}.tmp"
     try:
-        with open(USER_PROFILES_FILE, "w", encoding="utf-8") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(user_profiles, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, USER_PROFILES_FILE)
     except Exception as e:
         print(f"[User Memory] Local save warning: {e}", flush=True)
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
 
 
 def _find_backup_channel(bot: discord.Client):
@@ -104,8 +123,8 @@ async def restore_user_profiles_from_discord(bot: discord.Client):
                                 )
                                 restored = True
                                 break
-                if restored:
-                    break
+                    if restored:
+                        break
         except Exception as e:
             print(f"[User Memory] Cloud restore note: {e}", flush=True)
 
@@ -113,7 +132,10 @@ async def restore_user_profiles_from_discord(bot: discord.Client):
 
 
 async def backup_user_profiles_to_discord(force: bool = False):
-    """Backs up user_profiles.json to the private Discord backup channel (throttled to at most once every 3 mins unless force=True)."""
+    """
+    Serialized cloud backup of user_profiles.json to #yukinon-memory (throttled to every 3 mins unless force=True).
+    Protected by `_CLOUD_BACKUP_LOCK` so concurrent edits never delete each other's latest backup!
+    """
     global _DIRTY_SINCE_LAST_BACKUP, _LAST_CLOUD_BACKUP_TS
     if not _DIRTY_SINCE_LAST_BACKUP and not force:
         return
@@ -127,24 +149,30 @@ async def backup_user_profiles_to_discord(force: bool = False):
     if not ch:
         return
 
-    try:
-        _LAST_CLOUD_BACKUP_TS = now
-        _DIRTY_SINCE_LAST_BACKUP = False
-        payload_bytes = json.dumps(user_profiles, ensure_ascii=False, indent=2).encode("utf-8")
+    async with _get_cloud_backup_lock():
+        now = time.time()
+        if not force and (not _DIRTY_SINCE_LAST_BACKUP or (now - _LAST_CLOUD_BACKUP_TS < 180.0)):
+            return
+        try:
+            _LAST_CLOUD_BACKUP_TS = now
+            _DIRTY_SINCE_LAST_BACKUP = False
+            payload_bytes = json.dumps(user_profiles, ensure_ascii=False, indent=2).encode("utf-8")
 
-        async for old_msg in ch.history(limit=10):
-            if old_msg.author.id == bot.user.id:
-                try:
-                    await old_msg.delete()
-                except Exception:
-                    pass
+            # Upload new backup FIRST, then delete older bot backups so memory is never momentarily missing
+            new_msg = await ch.send(
+                content=f"💾 **[Yukinon Persistent User Memory Backup]** (`{len(user_profiles)}` users | `{get_current_thai_datetime_str()}`)",
+                file=discord.File(io.BytesIO(payload_bytes), filename="user_profiles.json"),
+            )
 
-        await ch.send(
-            content=f"💾 **[Yukinon Persistent User Memory Backup]** (`{len(user_profiles)}` users | `{get_current_thai_datetime_str()}`)",
-            file=discord.File(io.BytesIO(payload_bytes), filename="user_profiles.json"),
-        )
-    except Exception as e:
-        print(f"[User Memory] Cloud backup note: {e}", flush=True)
+            async for old_msg in ch.history(limit=12):
+                if old_msg.author.id == bot.user.id and old_msg.id != new_msg.id:
+                    try:
+                        await old_msg.delete()
+                    except Exception:
+                        pass
+        except Exception as e:
+            _DIRTY_SINCE_LAST_BACKUP = True
+            print(f"[User Memory] Cloud backup note: {e}", flush=True)
 
 
 def ensure_user_profile_exists(
@@ -153,7 +181,7 @@ def ensure_user_profile_exists(
     username: str = "",
     is_owner: bool = False,
 ) -> dict:
-    """Returns an existing or newly initialized user profile dict with normalized list fields."""
+    """Returns an existing or newly initialized user profile dict with normalized structured fields."""
     now_str = get_current_thai_datetime_str()
     clean_disp = re.sub(r"[^\w\u0E00-\u0E7F\s().-]", "", display_name or "").strip()[:36]
     default_disp = "Partner (Owner)" if is_owner else (clean_disp or f"User_{uid_str[-4:]}")
@@ -168,6 +196,7 @@ def ensure_user_profile_exists(
             "interaction_count": 1,
             "first_seen": now_str,
             "last_seen": now_str,
+            "pinned_facts": [],
             "favorite_topics": [],
             "custom_notes": [],
             "recent_topics": [],
@@ -184,6 +213,8 @@ def ensure_user_profile_exists(
     prof.setdefault("interaction_count", 1)
     prof.setdefault("first_seen", now_str)
     prof.setdefault("last_seen", now_str)
+    if not isinstance(prof.get("pinned_facts"), list):
+        prof["pinned_facts"] = []
     if not isinstance(prof.get("favorite_topics"), list):
         prof["favorite_topics"] = []
     if not isinstance(prof.get("custom_notes"), list):
@@ -191,6 +222,113 @@ def ensure_user_profile_exists(
     if not isinstance(prof.get("recent_topics"), list):
         prof["recent_topics"] = []
     return prof
+
+
+def _dedupe_clean_list(items: list[str], max_items: int = 12, max_item_len: int = 140) -> list[str]:
+    out: list[str] = []
+    seen_lower: set[str] = set()
+    for raw in items:
+        s = re.sub(r"\s+", " ", str(raw or "")).strip()[:max_item_len]
+        if s and s.lower() not in seen_lower:
+            seen_lower.add(s.lower())
+            out.append(s)
+            if len(out) >= max_items:
+                break
+    return out
+
+
+async def consolidate_user_memory_async(uid_str: str):
+    """
+    Background LLM memory consolidator: triggered automatically when rolling `custom_notes`
+    exceeds 10 entries. Merges duplicates, promotes durable personal facts to `pinned_facts`,
+    and prunes outdated ephemeral notes without blocking the user's reply.
+    """
+    global _DIRTY_SINCE_LAST_BACKUP
+    now = time.time()
+    if uid_str in _CONSOLIDATION_IN_PROGRESS:
+        return
+    if now < _CONSOLIDATION_COOLDOWN.get(uid_str, 0.0):
+        return
+
+    prof = user_profiles.get(uid_str)
+    if not prof:
+        return
+    notes = list(prof.get("custom_notes") or [])
+    pinned = list(prof.get("pinned_facts") or [])
+    if len(notes) <= 10:
+        return
+
+    _CONSOLIDATION_IN_PROGRESS.add(uid_str)
+    _CONSOLIDATION_COOLDOWN[uid_str] = now + 1800.0
+    try:
+        from config import GROQ_API_KEY
+        from llm import (
+            call_groq_chat,
+            get_groq_search_and_chat_candidates,
+            call_gemma_ai_studio_chat,
+            call_cloudflare_gemma_chat,
+        )
+
+        consolidation_prompt = (
+            "You are a memory consolidation module. Deduplicate and organize the user's memory entries.\n"
+            "Rules:\n"
+            "1. Keep ALL existing `pinned_facts` unless an exact duplicate or directly contradicted by a newer entry.\n"
+            "2. Promote durable long-term facts (preferences, hardware, profession, pets, hobbies, recurring goals) "
+            "from `custom_notes` into `pinned_facts` (max 15 items total).\n"
+            "3. Keep only distinct, recent short-term context in `custom_notes` (max 8 items total), merging duplicates.\n"
+            "4. Preserve original language (Thai/English) concisely.\n"
+            "5. Return ONLY valid JSON: {\"pinned_facts\": [...], \"custom_notes\": [...]}\n\n"
+            f"Current pinned_facts: {json.dumps(pinned, ensure_ascii=False)}\n"
+            f"Current custom_notes: {json.dumps(notes, ensure_ascii=False)}"
+        )
+        msgs = [{"role": "user", "content": consolidation_prompt}]
+
+        raw_out = ""
+        if GROQ_API_KEY:
+            for g_mod in await get_groq_search_and_chat_candidates():
+                try:
+                    raw_out = await call_groq_chat(
+                        msgs, g_mod, temperature=0.0, is_coding=False, purpose="MemoryConsolidate"
+                    )
+                    if raw_out:
+                        break
+                except Exception:
+                    continue
+        if not raw_out:
+            raw_out = await call_gemma_ai_studio_chat(msgs, temperature=0.0, max_output_tokens=768, purpose="MemoryConsolidate")
+        if not raw_out:
+            raw_out = await call_cloudflare_gemma_chat(msgs, temperature=0.0, max_tokens=768, purpose="MemoryConsolidate")
+
+        if not raw_out:
+            return
+        m_json = re.search(r"\{[\s\S]*\}", raw_out)
+        if not m_json:
+            return
+        parsed = json.loads(m_json.group(0))
+        new_pinned = parsed.get("pinned_facts")
+        new_notes = parsed.get("custom_notes")
+        if isinstance(new_pinned, list) and isinstance(new_notes, list):
+            prof["pinned_facts"] = _dedupe_clean_list(new_pinned, max_items=15, max_item_len=150)
+            prof["custom_notes"] = _dedupe_clean_list(new_notes, max_items=8, max_item_len=150)
+            _DIRTY_SINCE_LAST_BACKUP = True
+            save_user_profiles_local()
+            api_log(
+                f"MemoryConsolidate -> uid={uid_str[-4:]} consolidated "
+                f"(pinned={len(prof['pinned_facts'])}, rolling={len(prof['custom_notes'])})"
+            )
+            await backup_user_profiles_to_discord(force=True)
+    except Exception as e:
+        api_log(f"MemoryConsolidate -> skipped ({type(e).__name__})")
+    finally:
+        _CONSOLIDATION_IN_PROGRESS.discard(uid_str)
+
+
+def _schedule_bg_task(coro):
+    try:
+        asyncio.get_running_loop().create_task(coro)
+    except RuntimeError:
+        if state.bot and getattr(state.bot, "loop", None):
+            state.bot.loop.create_task(coro)
 
 
 def record_user_interaction(
@@ -234,7 +372,7 @@ def record_user_interaction(
         if pattern.search(user_prompt) and label not in favs:
             favs.append(label)
 
-    profile["favorite_topics"] = favs[-10:]
+    profile["favorite_topics"] = favs[-12:]
 
     clean_q = re.sub(r"\s+", " ", user_prompt).strip()
     if len(clean_q) > 6:
@@ -246,21 +384,23 @@ def record_user_interaction(
 
     if learned_memo:
         notes = list(profile.get("custom_notes") or [])
-        clean_memo = learned_memo.strip()[:140]
+        clean_memo = learned_memo.strip()[:150]
         if clean_memo and clean_memo not in notes:
             notes.append(clean_memo)
-        profile["custom_notes"] = notes[-10:]
+        profile["custom_notes"] = notes[-14:]
 
     user_profiles[uid_str] = profile
     _DIRTY_SINCE_LAST_BACKUP = True
     save_user_profiles_local()
 
-    if state.bot and state.bot.loop:
-        state.bot.loop.create_task(backup_user_profiles_to_discord(force=False))
+    if len(profile.get("custom_notes") or []) > 10:
+        _schedule_bg_task(consolidate_user_memory_async(uid_str))
+
+    _schedule_bg_task(backup_user_profiles_to_discord(force=False))
 
 
 def get_speaker_memory_context(user) -> str:
-    """Returns a concise memory summary for the current speaker so Yukino remembers their history & preferences."""
+    """Returns a concise structured memory summary for the current speaker so Yukino remembers their history & facts."""
     if user is None:
         return ""
     uid_str = str(getattr(user, "id", ""))
@@ -273,6 +413,7 @@ def get_speaker_memory_context(user) -> str:
 
     cnt = profile.get("interaction_count", 1)
     favs = ", ".join(profile.get("favorite_topics") or []) or "ทั่วไป"
+    pinned = "; ".join(profile.get("pinned_facts") or [])
     notes = "; ".join(profile.get("custom_notes") or [])
     recents = " | ".join(profile.get("recent_topics") or [])
 
@@ -280,8 +421,10 @@ def get_speaker_memory_context(user) -> str:
         f"- ประวัติความคุ้นเคยกับผู้พูดคนนี้: เคยคุยกันมาแล้ว **{cnt} ครั้ง** (คุยล่าสุดเมื่อ: {profile.get('last_seen', 'ไม่นานมานี้')})",
         f"- หัวข้อ/ความสนใจที่ผู้พูดคนนี้ชอบถามบ่อย: **{favs}**",
     ]
+    if pinned:
+        lines.append(f"- ข้อมูลสำคัญถาวรที่ปักหมุดไว้ (Pinned Facts): **{pinned}**")
     if notes:
-        lines.append(f"- ข้อมูลจำเพาะ/ความชอบส่วนตัวที่เคยจำไว้: **{notes}**")
+        lines.append(f"- บันทึกความจำระยะสั้น (Rolling Notes): **{notes}**")
     if recents:
         lines.append(f"- เรื่องล่าสุดที่เคยคุยกัน: `{recents}`")
     return "\n".join(lines)
@@ -314,7 +457,8 @@ def resolve_user_mentions_and_build_dossier(
             readable_tag = "@[คู่หูชมรมบริการ / ผู้สร้างของฉัน]"
             resolved_text = re.sub(rf"<@!?{uid_str}>", readable_tag, resolved_text)
             favs = ", ".join((prof or {}).get("favorite_topics") or ["การเขียนโค้ด", "เกม", "เทคโนโลยี"])
-            notes = "; ".join((prof or {}).get("custom_notes") or [])
+            all_notes = list((prof or {}).get("pinned_facts") or []) + list((prof or {}).get("custom_notes") or [])
+            notes = "; ".join(all_notes[:10])
             asking_about_self = (speaker_user and str(getattr(speaker_user, "id", "")) == uid_str)
             dossier_entries.append(
                 f"- ข้อมูลของ {readable_tag}: เขาคือคู่หูคนสำคัญในชมรมบริการและผู้ดูแลของฉันเองค่ะ "
@@ -342,7 +486,8 @@ def resolve_user_mentions_and_build_dossier(
             cnt = prof.get("interaction_count", 1)
             last_t = prof.get("last_seen", "ไม่ระบุ")
             favs = ", ".join(prof.get("favorite_topics") or []) or "คุยเรื่องทั่วไป"
-            notes = "; ".join(prof.get("custom_notes") or [])
+            all_notes = list(prof.get("pinned_facts") or []) + list(prof.get("custom_notes") or [])
+            notes = "; ".join(all_notes[:10])
             recents = " / ".join(prof.get("recent_topics") or [])
             entry = (
                 f"- ข้อมูลของสมาชิกชื่อ **{clean_name}** (ยศในเซิร์ฟเวอร์: {roles_str}):\n"
@@ -375,8 +520,8 @@ MEMORY_COMMAND_REGEX = re.compile(
     r"^(?:"
     r"(?:ดู|เช็ค|เปิด|แสดง|สรุป|แก้|แก้ไข|อัปเดต|ลบ|ล้าง|รีเซ็ต)\s*(?:ข้อมูล)?(?:ความจำ|โปรไฟล์|บันทึกความจำ)\b|"
     r"(?:ความจำ|โปรไฟล์)(?:ของฉัน|ส่วนตัว)\b|"
-    r"(?:จำไว้ว่า|ช่วยจำว่า|บันทึกความจำว่า|เพิ่มบันทึก|เพิ่มโน้ต|เพิ่มหัวข้อที่ชอบ|เพิ่มความสนใจ)\b|"
-    r"(?:แก้|แก้ไข|อัปเดต|ลบ|ล้าง)\s*(?:หัวข้อที่ชอบ|ความสนใจ|บันทึก|โน้ต|เรื่องล่าสุด|หัวข้อล่าสุด|ชื่อแสดงผล)\b|"
+    r"(?:จำไว้ว่า|ช่วยจำว่า|ปักหมุดความจำว่า?|บันทึกความจำว่า|เพิ่มบันทึก|เพิ่มโน้ต|เพิ่มหัวข้อที่ชอบ|เพิ่มความสนใจ)\b|"
+    r"(?:แก้|แก้ไข|อัปเดต|ลบ|ล้าง)\s*(?:ข้อมูลถาวร|ปักหมุด|หัวข้อที่ชอบ|ความสนใจ|บันทึก|โน้ต|เรื่องล่าสุด|หัวข้อล่าสุด|ชื่อแสดงผล)\b|"
     r"(?:view|show|edit|update|clear|reset)\s+(?:my\s+)?(?:memory|profile)\b|"
     r"remember\s+that\b"
     r")",
@@ -391,37 +536,27 @@ def is_memory_command_text(text: str) -> bool:
     return bool(MEMORY_COMMAND_REGEX.search(cleaned))
 
 
-def _dedupe_clean_list(items: list[str], max_items: int = 12, max_item_len: int = 140) -> list[str]:
-    out: list[str] = []
-    seen_lower: set[str] = set()
-    for raw in items:
-        s = re.sub(r"\s+", " ", str(raw or "")).strip()[:max_item_len]
-        if s and s.lower() not in seen_lower:
-            seen_lower.add(s.lower())
-            out.append(s)
-        if len(out) >= max_items:
-            break
-    return out
-
-
 async def update_user_memory_fields(
     target_uid: str,
     display_name: str | None = None,
+    pinned_facts: list[str] | None = None,
     favorite_topics: list[str] | None = None,
     custom_notes: list[str] | None = None,
     recent_topics: list[str] | None = None,
 ) -> dict:
-    """Updates specified fields on `user_profiles[target_uid]`, saves locally, and force-syncs `#yukinon-memory`."""
+    """Updates specified fields on `user_profiles[target_uid]`, saves atomically, and force-syncs `#yukinon-memory`."""
     global _DIRTY_SINCE_LAST_BACKUP
     prof = ensure_user_profile_exists(target_uid)
     if display_name is not None and display_name.strip():
         clean_disp = re.sub(r"[^\w\u0E00-\u0E7F\s().-]", "", display_name).strip()[:36]
         if clean_disp:
             prof["display_name"] = clean_disp
+    if pinned_facts is not None:
+        prof["pinned_facts"] = _dedupe_clean_list(pinned_facts, max_items=15, max_item_len=150)
     if favorite_topics is not None:
         prof["favorite_topics"] = _dedupe_clean_list(favorite_topics, max_items=12, max_item_len=80)
     if custom_notes is not None:
-        prof["custom_notes"] = _dedupe_clean_list(custom_notes, max_items=12, max_item_len=150)
+        prof["custom_notes"] = _dedupe_clean_list(custom_notes, max_items=14, max_item_len=150)
     if recent_topics is not None:
         prof["recent_topics"] = _dedupe_clean_list(recent_topics, max_items=8, max_item_len=120)
 
@@ -439,15 +574,21 @@ def format_user_memory_card(target_uid: str, header_title: str = "แฟ้ม�
     cnt = int(prof.get("interaction_count") or 1)
     last_seen = prof.get("last_seen") or "-"
 
+    pinned = prof.get("pinned_facts") or []
     favs = prof.get("favorite_topics") or []
     notes = prof.get("custom_notes") or []
     recents = prof.get("recent_topics") or []
 
+    pinned_lines = (
+        "\n".join(f"  `P{i}.` {p}" for i, p in enumerate(pinned, 1))
+        if pinned
+        else "  *(ยังไม่มีข้อมูลถาวรที่ปักหมุดไว้)*"
+    )
     fav_str = ", ".join(f"`{x}`" for x in favs) if favs else "*(ยังไม่มีข้อมูล)*"
     notes_lines = (
         "\n".join(f"  `{i}.` {n}" for i, n in enumerate(notes, 1))
         if notes
-        else "  *(ยังไม่มีบันทึกความจำ)*"
+        else "  *(ยังไม่มีบันทึกระยะสั้น)*"
     )
     recent_lines = (
         "\n".join(f"  `{i}.` {r}" for i, r in enumerate(recents, 1))
@@ -458,16 +599,83 @@ def format_user_memory_card(target_uid: str, header_title: str = "แฟ้ม�
     return (
         f"🧠 **[{header_title}]**\n"
         f"- **ชื่อที่บันทึก (Display Name):** `{disp}` (คุยกันแล้ว `{cnt}` ครั้ง | อัปเดต: `{last_seen}`)\n"
+        f"- **ข้อมูลถาวรที่ปักหมุด (Pinned Facts):**\n{pinned_lines}\n"
         f"- **หัวข้อที่ชอบ (Favorite Topics):** {fav_str}\n"
-        f"- **บันทึกความจำ (Custom Notes):**\n{notes_lines}\n"
+        f"- **บันทึกระยะสั้น (Rolling Notes):**\n{notes_lines}\n"
         f"- **เรื่องที่คุยล่าสุด (Recent Topics):**\n{recent_lines}\n"
         f"-# [MEM_RECORD: uid={target_uid}]"
     )
 
 
+async def apply_tool_memory_action(speaker_user, action: str, value: str = "") -> tuple[str, str]:
+    """Native function-calling handler for `manage_user_memory`."""
+    uid_str = str(getattr(speaker_user, "id", ""))
+    if not uid_str:
+        return "[Memory Error: Missing user ID]", ""
+
+    owner_flag = is_owner_user(speaker_user)
+    raw_disp = getattr(speaker_user, "display_name", "") or getattr(speaker_user, "name", "")
+    prof = ensure_user_profile_exists(
+        uid_str,
+        display_name="Partner (Owner)" if owner_flag else raw_disp,
+        username=getattr(speaker_user, "name", ""),
+        is_owner=owner_flag,
+    )
+    act = (action or "view").strip().lower()
+    val = (value or "").strip()
+
+    if act == "view":
+        return format_user_memory_card(uid_str), uid_str
+
+    if act == "pin_fact" and val:
+        pinned = list(prof.get("pinned_facts") or [])
+        pinned.append(val)
+        await update_user_memory_fields(uid_str, pinned_facts=pinned)
+        return f"Pinned permanent fact to user memory: '{val}'.\n" + format_user_memory_card(uid_str), uid_str
+
+    if act == "add_note" and val:
+        notes = list(prof.get("custom_notes") or [])
+        notes.append(val)
+        await update_user_memory_fields(uid_str, custom_notes=notes)
+        if len(notes) > 10:
+            _schedule_bg_task(consolidate_user_memory_async(uid_str))
+        return f"Saved rolling note to user memory: '{val}'.", uid_str
+
+    if act == "add_topic" and val:
+        new_items = [x.strip() for x in re.split(r"[,;،]+", val) if x.strip()]
+        favs = list(prof.get("favorite_topics") or []) + new_items
+        await update_user_memory_fields(uid_str, favorite_topics=favs)
+        return f"Added favorite topic(s): {', '.join(new_items)}.", uid_str
+
+    if act == "delete_fact" and val:
+        pinned = list(prof.get("pinned_facts") or [])
+        cleaned_idx = re.sub(r"^[pP]", "", val)
+        if val.lower() in ("all", "ทั้งหมด"):
+            pinned = []
+        elif cleaned_idx.isdigit() and 1 <= int(cleaned_idx) <= len(pinned):
+            pinned.pop(int(cleaned_idx) - 1)
+        else:
+            pinned = [p for p in pinned if val.lower() not in p.lower()]
+        await update_user_memory_fields(uid_str, pinned_facts=pinned)
+        return f"Updated pinned facts after deleting '{val}'.\n" + format_user_memory_card(uid_str), uid_str
+
+    if act == "delete_note" and val:
+        notes = list(prof.get("custom_notes") or [])
+        if val.lower() in ("all", "ทั้งหมด"):
+            notes = []
+        elif val.isdigit() and 1 <= int(val) <= len(notes):
+            notes.pop(int(val) - 1)
+        else:
+            notes = [n for n in notes if val.lower() not in n.lower()]
+        await update_user_memory_fields(uid_str, custom_notes=notes)
+        return f"Updated rolling notes after deleting '{val}'.\n" + format_user_memory_card(uid_str), uid_str
+
+    return format_user_memory_card(uid_str), uid_str
+
+
 async def process_memory_request(message, raw_text: str) -> tuple[str, str]:
     """
-    Handles viewing, adding, editing, deleting, and resetting Persistent User Memory
+    Handles viewing, adding, pinning, editing, deleting, and resetting Persistent User Memory
     (`user_profiles.json` stored in `#yukinon-memory`), returning `(reply_text, target_uid)`.
     """
     speaker = message.author
@@ -500,6 +708,7 @@ async def process_memory_request(message, raw_text: str) -> tuple[str, str]:
     if re.match(r"^(?:รีเซ็ต|ล้าง)\s*(?:ข้อมูล)?(?:ความจำ|โปรไฟล์)(?:ทั้งหมด|ของฉัน)?$", text, re.IGNORECASE) or text.lower() in ("reset", "clear", "reset all", "clear all"):
         await update_user_memory_fields(
             target_uid,
+            pinned_facts=[],
             favorite_topics=[],
             custom_notes=[],
             recent_topics=[],
@@ -516,8 +725,24 @@ async def process_memory_request(message, raw_text: str) -> tuple[str, str]:
             target_uid,
         )
 
+    # Explicit "จำไว้ว่า..." / "ปักหมุดความจำ..." writes to permanent `pinned_facts` so FIFO never evicts it!
+    m_pin_fact = re.match(
+        r"^(?:จำไว้ว่า|ช่วยจำว่า|ปักหมุดความจำว่า?|บันทึกความจำว่า|pin\s+fact|remember\s+that)\s*[:：-]?\s*(.+)$",
+        text,
+        re.IGNORECASE,
+    )
+    if m_pin_fact:
+        new_fact = m_pin_fact.group(1).strip()
+        pinned = list(prof.get("pinned_facts") or [])
+        pinned.append(new_fact)
+        await update_user_memory_fields(target_uid, pinned_facts=pinned)
+        return (
+            format_user_memory_card(target_uid, header_title="ปักหมุดข้อมูลสำคัญลงในความจำถาวรเรียบร้อยแล้วค่ะ"),
+            target_uid,
+        )
+
     m_add_note = re.match(
-        r"^(?:จำไว้ว่า|ช่วยจำว่า|บันทึกความจำว่า|เพิ่มบันทึก|เพิ่มโน้ต|add\s+note|remember\s+that)\s*[:：-]?\s*(.+)$",
+        r"^(?:เพิ่มบันทึก|เพิ่มโน้ต|add\s+note)\s*[:：-]?\s*(.+)$",
         text,
         re.IGNORECASE,
     )
@@ -527,7 +752,7 @@ async def process_memory_request(message, raw_text: str) -> tuple[str, str]:
         notes.append(new_note)
         await update_user_memory_fields(target_uid, custom_notes=notes)
         return (
-            format_user_memory_card(target_uid, header_title="เพิ่มบันทึกความจำลงในระบบเรียบร้อยแล้วค่ะ"),
+            format_user_memory_card(target_uid, header_title="เพิ่มบันทึกระยะสั้นลงในระบบเรียบร้อยแล้วค่ะ"),
             target_uid,
         )
 
@@ -542,6 +767,20 @@ async def process_memory_request(message, raw_text: str) -> tuple[str, str]:
         await update_user_memory_fields(target_uid, favorite_topics=favs)
         return (
             format_user_memory_card(target_uid, header_title="เพิ่มหัวข้อที่ชอบเรียบร้อยแล้วค่ะ"),
+            target_uid,
+        )
+
+    m_edit_pinned = re.match(
+        r"^(?:แก้|แก้ไข|อัปเดต)\s*(?:ข้อมูลถาวร|ปักหมุด)\s*[:：-]?\s*(.+)$",
+        text,
+        re.IGNORECASE,
+    )
+    if m_edit_pinned:
+        val = m_edit_pinned.group(1).strip()
+        new_pinned = [] if val in ("-", "ว่าง", "none", "clear") else [x.strip() for x in re.split(r"[;\n]+", val) if x.strip()]
+        await update_user_memory_fields(target_uid, pinned_facts=new_pinned)
+        return (
+            format_user_memory_card(target_uid, header_title="อัปเดตข้อมูลถาวรที่ปักหมุดเรียบร้อยแล้วค่ะ"),
             target_uid,
         )
 
@@ -596,6 +835,27 @@ async def process_memory_request(message, raw_text: str) -> tuple[str, str]:
         await update_user_memory_fields(target_uid, display_name=m_edit_name.group(1).strip())
         return (
             format_user_memory_card(target_uid, header_title="อัปเดตชื่อที่แสดงในความจำเรียบร้อยแล้วค่ะ"),
+            target_uid,
+        )
+
+    m_del_pinned = re.match(
+        r"^(?:ลบ|ยกเลิก)\s*(?:ข้อมูลถาวร|ปักหมุด)\s*[:：-]?\s*(.+)$",
+        text,
+        re.IGNORECASE,
+    )
+    if m_del_pinned:
+        target_tok = m_del_pinned.group(1).strip()
+        pinned = list(prof.get("pinned_facts") or [])
+        cleaned_idx = re.sub(r"^[pP]", "", target_tok)
+        if target_tok.lower() in ("ทั้งหมด", "all"):
+            pinned = []
+        elif cleaned_idx.isdigit() and 1 <= int(cleaned_idx) <= len(pinned):
+            pinned.pop(int(cleaned_idx) - 1)
+        else:
+            pinned = [p for p in pinned if target_tok.lower() not in p.lower()]
+        await update_user_memory_fields(target_uid, pinned_facts=pinned)
+        return (
+            format_user_memory_card(target_uid, header_title="ลบรายการข้อมูลถาวรเรียบร้อยแล้วค่ะ"),
             target_uid,
         )
 
@@ -865,6 +1125,7 @@ async def recover_ot_logs_from_work_channels(bot: discord.Client):
                         start_s = _format_time_dot(start_s)
                         end_s = _format_time_dot(end_s)
                         prof = ensure_user_profile_exists(uid_s)
+                        prof.setdefault("ot_channel_id", ch.id)
                         ot_list = prof.setdefault("ot_logs", [])
                         if not any(_parse_stored_ot_date(x.get("date", "")) == parsed_key for x in ot_list):
                             ot_list.append({
@@ -897,6 +1158,7 @@ async def _save_and_format_ot_entry(
     clean_detail: str,
     has_new_detail: bool,
     time_note: str,
+    channel_id: int | None = None,
 ) -> str:
     global _DIRTY_SINCE_LAST_BACKUP
     target_date_th = _format_date_thai_ddmmyyyy(work_dt)
@@ -935,6 +1197,8 @@ async def _save_and_format_ot_entry(
 
     ot_logs.sort(key=lambda x: _parse_stored_ot_date(x.get("date", "")) or (0, 0, 0))
     prof["ot_logs"] = ot_logs
+    if channel_id:
+        prof["ot_channel_id"] = int(channel_id)
     _DIRTY_SINCE_LAST_BACKUP = True
     save_user_profiles_local()
     await backup_user_profiles_to_discord(force=True)
@@ -1017,7 +1281,7 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
     global _DIRTY_SINCE_LAST_BACKUP
     user = message.author
     uid_str = str(user.id)
-    chan_id = int(message.channel.id)
+    chan_id = int(getattr(getattr(message, "channel", None), "id", 0) or 0)
     pending_key = (chan_id, int(user.id))
 
     now_th = datetime.now(ZoneInfo("Asia/Bangkok"))
@@ -1027,7 +1291,7 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
     text = re.sub(r"^!ot\b\s*", "", text, flags=re.IGNORECASE).strip()
 
     if uid_str not in user_profiles:
-        record_user_interaction(user, text, channel_id=chan_id)
+        record_user_interaction(user, text, channel_id=chan_id or None)
     prof = user_profiles[uid_str]
     ot_logs: list[dict] = list(prof.get("ot_logs") or [])
 
@@ -1089,6 +1353,7 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
                 final_detail,
                 has_new_detail=bool(extra_detail or saved_detail),
                 time_note=note_label,
+                channel_id=chan_id or None,
             )
 
     if OT_DELETE_REGEX.search(text) or text.lower().startswith(("delete ", "remove ", "ลบ")):
@@ -1183,6 +1448,7 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
             clean_detail,
             has_new_detail=bool(rem_detail),
             time_note=note_str,
+            channel_id=chan_id or None,
         )
 
     if is_weekend or is_custom_date:
@@ -1239,6 +1505,7 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
                 clean_detail,
                 has_new_detail=bool(rem_detail),
                 time_note=note_str,
+                channel_id=chan_id or None,
             )
 
         saved_detail = detail_str.strip(" -:")
@@ -1317,5 +1584,6 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
         ot_hours,
         clean_detail,
         has_new_detail=bool(detail_str.strip()),
-        time_note=f"*(เวลาเลิกจริง {actual_finish_str} น. | คิดจาก 17.00 → เลื่อน +1 ชม. เป็น 18.00 - {noted_end_str} น.)*",
+        time_note=f"*(เวลาเลิกจริง {actual_finish_str} น. | คิดจาก 17.00 -> เลื่อน +1 ชม. เป็น 18.00 - {noted_end_str} น.)*",
+        channel_id=chan_id or None,
     )

@@ -4,7 +4,6 @@ import json
 import time
 import base64
 import asyncio
-import urllib.request
 from urllib.parse import urlparse, parse_qs, quote_plus
 
 import aiohttp
@@ -39,12 +38,13 @@ from config import (
     get_modal_headers,
     prune_stale_attachments,
     release_unused_memory,
+    save_temp_image_cache,
 )
 from persona import TYPHOON_OCR_PROMPT
 from search_engine import (
-    fetch_webpage_sync,
-    run_safe_web_search_sync,
-    validate_safe_public_url,
+    fetch_webpage_async,
+    run_safe_web_search_async,
+    validate_safe_public_url_async,
 )
 from llm import (
     discover_active_groq_vision_models,
@@ -320,7 +320,7 @@ def _guess_image_filename_from_url(url: str, fallback_prefix: str = "embed_img")
 
 async def _download_remote_image_safe(url: str, referer: str = "") -> tuple[bytes, str] | None:
     try:
-        safe_url = await asyncio.to_thread(validate_safe_public_url, url)
+        safe_url = await validate_safe_public_url_async(url)
     except Exception as e:
         api_log(f"Embed Image SSRF/URL skip ({url[:60]}): {e}")
         return None
@@ -910,6 +910,10 @@ async def collect_embedded_images_and_metadata(
     ref_msg: discord.Message | None = None,
     max_images: int = MAX_BATCH_IMAGES,
 ) -> tuple[list[tuple[bytes, str, str]], list[str], set[str]]:
+    """
+    Resolves X/Twitter (with multi-part thread continuation), Pixiv, Bluesky, direct image URLs,
+    and Discord native embeds with ZERO unnecessary 1.0s embed sleep on API-handled social links.
+    """
     effective_cap = min(MAX_BATCH_IMAGES, max(1, max_images))
     downloaded_images: list[tuple[bytes, str, str]] = []
     metadata_sections: list[str] = []
@@ -931,15 +935,6 @@ async def collect_embedded_images_and_metadata(
     if ref_msg is not None:
         target_msgs.append(ref_msg)
 
-    urls_in_curr = URL_REGEX.findall(message.content or "")
-    if urls_in_curr and not message.embeds:
-        try:
-            await asyncio.sleep(1.0)
-            refetched = await message.channel.fetch_message(message.id)
-            target_msgs[0] = refetched
-        except Exception:
-            pass
-
     all_urls: list[str] = []
     for m in target_msgs:
         for u in URL_REGEX.findall(m.content or ""):
@@ -947,6 +942,7 @@ async def collect_embedded_images_and_metadata(
             if cu and cu not in all_urls:
                 all_urls.append(cu)
 
+    # First resolve all direct social/image APIs (instant — zero Discord embed sleep!)
     for url in all_urls[:4]:
         tw_m = TWITTER_STATUS_URL_REGEX.search(url)
         if tw_m:
@@ -956,9 +952,9 @@ async def collect_embedded_images_and_metadata(
             if tw_meta:
                 resolved_social_api_post = True
                 metadata_sections.append(f"=== Embedded X (Twitter) Post Metadata & Caption ===\n{tw_meta}")
-                for p_url in tw_photos:
-                    _queue_img(p_url)
-                continue
+            for p_url in tw_photos:
+                _queue_img(p_url)
+            continue
 
         px_m = PIXIV_ILLUST_URL_REGEX.search(url)
         if px_m:
@@ -968,9 +964,9 @@ async def collect_embedded_images_and_metadata(
             if px_meta:
                 resolved_social_api_post = True
                 metadata_sections.append(f"=== Embedded Pixiv Artwork Metadata & Caption ===\n{px_meta}")
-                for p_url in px_photos:
-                    _queue_img(p_url, referer=f"{HTTPS}www.pixiv.net/artworks/{illust_id}")
-                continue
+            for p_url in px_photos:
+                _queue_img(p_url, referer=f"{HTTPS}www.pixiv.net/artworks/{illust_id}")
+            continue
 
         bsky_m = BSKY_POST_URL_REGEX.search(url)
         if bsky_m:
@@ -979,13 +975,23 @@ async def collect_embedded_images_and_metadata(
             if b_meta:
                 resolved_social_api_post = True
                 metadata_sections.append(f"=== Embedded Bluesky Post Metadata & Caption ===\n{b_meta}")
-                for p_url in b_photos:
-                    _queue_img(p_url)
-                continue
+            for p_url in b_photos:
+                _queue_img(p_url)
+            continue
 
         if DIRECT_IMAGE_URL_REGEX.match(url):
             handled_urls.add(url)
             _queue_img(url)
+
+    # Only wait briefly for Discord native embeds if we still have no API-resolved images/meta and an unhandled URL exists
+    if (not resolved_social_api_post and not candidate_image_urls) and all_urls and not message.embeds:
+        has_non_yt_unhandled = any((u not in handled_urls) and not extract_youtube_id(u) for u in all_urls)
+        if has_non_yt_unhandled and getattr(message, "id", 0):
+            try:
+                await asyncio.sleep(0.8)
+                target_msgs[0] = await message.channel.fetch_message(message.id)
+            except Exception:
+                pass
 
     if not resolved_social_api_post or not candidate_image_urls:
         for m in target_msgs:
@@ -1018,60 +1024,7 @@ async def collect_embedded_images_and_metadata(
     return downloaded_images, metadata_sections, handled_urls
 
 
-def fetch_youtube_context_sync(
-    video_id: str, discord_embed_info: dict | None = None, max_chars: int = 20000
-) -> str:
-    t0 = time.monotonic()
-    watch_url = clean_url(f"{HTTPS}www.youtube.com/watch?v={video_id}")
-    title = (discord_embed_info or {}).get("title", "").strip()
-    author = (discord_embed_info or {}).get("author", "").strip()
-    description = (discord_embed_info or {}).get("description", "").strip()
-    transcript_text = ""
-
-    if not title or not author:
-        for oe_endpoint in (
-            clean_url(f"{HTTPS}noembed.com/embed?url={quote_plus(watch_url)}"),
-            clean_url(f"{HTTPS}www.youtube.com/oembed?url={quote_plus(watch_url)}&format=json"),
-        ):
-            try:
-                req = urllib.request.Request(oe_endpoint, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=8) as resp:
-                    oe_data = json.loads(resp.read().decode("utf-8"))
-                    title = title or (oe_data.get("title") or "").strip()
-                    author = author or (oe_data.get("author_name") or "").strip()
-                    if title and author:
-                        break
-            except Exception:
-                continue
-
-    if len(description) < 200 or not title:
-        try:
-            req_page = urllib.request.Request(
-                watch_url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "Accept-Language": "ja,th;q=0.9,en-US;q=0.8,en;q=0.7",
-                },
-            )
-            with urllib.request.urlopen(req_page, timeout=10) as resp:
-                html_str = resp.read().decode("utf-8", errors="replace")
-
-                if not title:
-                    t_m = re.search(r'<meta\s+name="title"\s+content="([^"]+)"', html_str)
-                    if t_m:
-                        title = t_m.group(1).strip()
-
-                desc_m = re.search(r'"shortDescription"\s*:\s*"((?:\\.|[^"\\])*)"', html_str)
-                if desc_m:
-                    try:
-                        full_d = json.loads(f'"{desc_m.group(1)}"').strip()
-                    except Exception:
-                        full_d = desc_m.group(1).replace("\\n", "\n").strip()
-                    if len(full_d) > len(description):
-                        description = full_d
-        except Exception as e:
-            api_log(f"YouTube HTML metadata note ({video_id}): {type(e).__name__}")
-
+def _fetch_youtube_transcript_only_sync(video_id: str) -> str:
     proxy_cfg = (
         GenericProxyConfig(http_url=YOUTUBE_PROXY_URL, https_url=YOUTUBE_PROXY_URL)
         if YOUTUBE_PROXY_URL else None
@@ -1081,20 +1034,91 @@ def fetch_youtube_context_sync(
         preferred_langs = ["th", "ja", "en", "en-US", "en-GB"]
         try:
             fetched = ytt_api.fetch(video_id, languages=preferred_langs)
-            transcript_text = " ".join(s.text for s in fetched).strip()
+            return " ".join(s.text for s in fetched).strip()
         except Exception:
             transcript_list = ytt_api.list(video_id)
             for lang_code in preferred_langs:
                 try:
                     tr_obj = transcript_list.find_transcript([lang_code])
                     fetched = tr_obj.fetch()
-                    transcript_text = " ".join(s.text for s in fetched).strip()
-                    if transcript_text:
-                        break
+                    txt = " ".join(s.text for s in fetched).strip()
+                    if txt:
+                        return txt
                 except Exception:
                     continue
     except Exception:
         pass
+    return ""
+
+
+async def fetch_youtube_context_async(
+    video_id: str, discord_embed_info: dict | None = None, max_chars: int = 20000
+) -> str:
+    """
+    Async YouTube inspector: runs oEmbed/watch-page HTML scraping via pooled `aiohttp`
+    concurrently with `YouTubeTranscriptApi`, then enriches sparse trailers via async web search.
+    """
+    t0 = time.monotonic()
+    watch_url = clean_url(f"{HTTPS}www.youtube.com/watch?v={video_id}")
+    title = (discord_embed_info or {}).get("title", "").strip()
+    author = (discord_embed_info or {}).get("author", "").strip()
+    description = (discord_embed_info or {}).get("description", "").strip()
+    session = get_http_session()
+
+    async def _fetch_meta() -> tuple[str, str, str]:
+        loc_title, loc_author, loc_desc = title, author, description
+        if not loc_title or not loc_author:
+            for oe_endpoint in (
+                clean_url(f"{HTTPS}noembed.com/embed?url={quote_plus(watch_url)}"),
+                clean_url(f"{HTTPS}www.youtube.com/oembed?url={quote_plus(watch_url)}&format=json"),
+            ):
+                try:
+                    async with session.get(
+                        oe_endpoint,
+                        headers={"User-Agent": "Mozilla/5.0"},
+                        timeout=aiohttp.ClientTimeout(total=6),
+                    ) as resp:
+                        if resp.status == 200:
+                            oe_data = await resp.json(content_type=None)
+                            loc_title = loc_title or (oe_data.get("title") or "").strip()
+                            loc_author = loc_author or (oe_data.get("author_name") or "").strip()
+                            if loc_title and loc_author:
+                                break
+                except Exception:
+                    continue
+
+        if len(loc_desc) < 200 or not loc_title:
+            try:
+                async with session.get(
+                    watch_url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Accept-Language": "ja,th;q=0.9,en-US;q=0.8,en;q=0.7",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=8),
+                ) as resp:
+                    if resp.status == 200:
+                        html_str = await resp.text(errors="replace")
+                        if not loc_title:
+                            t_m = re.search(r'<meta\s+name="title"\s+content="([^"]+)"', html_str)
+                            if t_m:
+                                loc_title = t_m.group(1).strip()
+                        desc_m = re.search(r'"shortDescription"\s*:\s*"((?:\\.|[^"\\])*)"', html_str)
+                        if desc_m:
+                            try:
+                                full_d = json.loads(f'"{desc_m.group(1)}"').strip()
+                            except Exception:
+                                full_d = desc_m.group(1).replace("\\n", "\n").strip()
+                            if len(full_d) > len(loc_desc):
+                                loc_desc = full_d
+            except Exception as e:
+                api_log(f"YouTube HTML metadata note ({video_id}): {type(e).__name__}")
+        return loc_title, loc_author, loc_desc
+
+    (title, author, description), transcript_text = await asyncio.gather(
+        _fetch_meta(),
+        asyncio.to_thread(_fetch_youtube_transcript_only_sync, video_id),
+    )
 
     search_enrichment = ""
     if len(transcript_text) < 120 and title:
@@ -1105,7 +1129,9 @@ def fetch_youtube_context_sync(
             flags=re.IGNORECASE,
         ).strip()
         try:
-            search_enrichment = run_safe_web_search_sync(f"{clean_title_for_search or title} {author}".strip(), max_results=4)
+            search_enrichment = await run_safe_web_search_async(
+                f"{clean_title_for_search or title} {author}".strip(), max_results=4
+            )
         except Exception:
             pass
 
@@ -1129,6 +1155,13 @@ def fetch_youtube_context_sync(
     return "\n\n".join(sections)[:max_chars]
 
 
+def fetch_youtube_context_sync(
+    video_id: str, discord_embed_info: dict | None = None, max_chars: int = 20000
+) -> str:
+    """Backward-compatible synchronous wrapper around `fetch_youtube_context_async`."""
+    return asyncio.run(fetch_youtube_context_async(video_id, discord_embed_info=discord_embed_info, max_chars=max_chars))
+
+
 async def _search_saucenao_async(raw_bytes: bytes, filename: str) -> str:
     if not SAUCENAO_API_KEY:
         return ""
@@ -1147,42 +1180,42 @@ async def _search_saucenao_async(raw_bytes: bytes, filename: str) -> str:
                 return ""
             data = await resp.json(content_type=None)
 
-            results = data.get("results") or []
-            matches = []
-            for item in results:
-                hdr = item.get("header") or {}
-                sim = float(hdr.get("similarity") or 0.0)
-                if sim < 68.0:
-                    continue
-                d = item.get("data") or {}
-                title = d.get("title") or d.get("source") or d.get("eng_name") or d.get("jp_name") or ""
-                part = d.get("part") or ""
-                author = d.get("member_name") or d.get("author") or d.get("creator") or ""
-                if isinstance(author, list):
-                    author = ", ".join(str(x) for x in author)
-                characters = d.get("characters") or ""
-                material = d.get("material") or ""
-                pixiv_id = d.get("pixiv_id")
-                ext_urls = d.get("ext_urls") or []
-                if pixiv_id and not any("pixiv.net" in u for u in ext_urls):
-                    ext_urls.insert(0, f"{HTTPS}www.pixiv.net/artworks/{pixiv_id}")
+        results = data.get("results") or []
+        matches = []
+        for item in results:
+            hdr = item.get("header") or {}
+            sim = float(hdr.get("similarity") or 0.0)
+            if sim < 68.0:
+                continue
+            d = item.get("data") or {}
+            title = d.get("title") or d.get("source") or d.get("eng_name") or d.get("jp_name") or ""
+            part = d.get("part") or ""
+            author = d.get("member_name") or d.get("author") or d.get("creator") or ""
+            if isinstance(author, list):
+                author = ", ".join(str(x) for x in author)
+            characters = d.get("characters") or ""
+            material = d.get("material") or ""
+            pixiv_id = d.get("pixiv_id")
+            ext_urls = d.get("ext_urls") or []
+            if pixiv_id and not any("pixiv.net" in u for u in ext_urls):
+                ext_urls.insert(0, f"{HTTPS}www.pixiv.net/artworks/{pixiv_id}")
 
-                info_parts = [f"Similarity: {sim:.1f}%"]
-                if title:
-                    info_parts.append(f"Title/Source: {title}{f' ({part})' if part else ''}")
-                if material:
-                    info_parts.append(f"Series/Material: {material}")
-                if characters:
-                    info_parts.append(f"Character(s): {characters}")
-                if author:
-                    info_parts.append(f"Artist/Author: {author}")
-                if ext_urls:
-                    info_parts.append(f"URLs: {' | '.join(ext_urls[:2])}")
-                matches.append("- " + " | ".join(info_parts))
+            info_parts = [f"Similarity: {sim:.1f}%"]
+            if title:
+                info_parts.append(f"Title/Source: {title}{f' ({part})' if part else ''}")
+            if material:
+                info_parts.append(f"Series/Material: {material}")
+            if characters:
+                info_parts.append(f"Character(s): {characters}")
+            if author:
+                info_parts.append(f"Artist/Author: {author}")
+            if ext_urls:
+                info_parts.append(f"URLs: {' | '.join(ext_urls[:2])}")
+            matches.append("- " + " | ".join(info_parts))
 
-            if matches:
-                api_log(f"ReverseImage (SauceNAO) -> {len(matches)} match(es) ({time.monotonic() - t0:.2f}s)")
-                return "=== SauceNAO Reverse Image Matches (Pixiv / Manga / Art) ===\n" + "\n".join(matches[:3])
+        if matches:
+            api_log(f"ReverseImage (SauceNAO) -> {len(matches)} match(es) ({time.monotonic() - t0:.2f}s)")
+            return "=== SauceNAO Reverse Image Matches (Pixiv / Manga / Art) ===\n" + "\n".join(matches[:3])
     except Exception as e:
         api_log(f"ReverseImage (SauceNAO) -> skipped ({type(e).__name__})")
     return ""
@@ -1192,14 +1225,16 @@ async def _search_iqdb_keyless_async(raw_bytes: bytes, filename: str) -> str:
     t0 = time.monotonic()
     iqdb_url = f"{HTTPS}iqdb.org/"
     try:
-        from PIL import Image
-        img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-        img.thumbnail((600, 600), Image.Resampling.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
-        thumb_bytes = buf.getvalue()
-        img.close()
+        def _make_thumb(b: bytes) -> bytes:
+            from PIL import Image
+            img = Image.open(io.BytesIO(b)).convert("RGB")
+            img.thumbnail((600, 600), Image.Resampling.BILINEAR)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            img.close()
+            return buf.getvalue()
 
+        thumb_bytes = await asyncio.to_thread(_make_thumb, raw_bytes)
         form = aiohttp.FormData()
         form.add_field("file", thumb_bytes, filename="query.jpg", content_type="image/jpeg")
         session = get_http_session()
@@ -1213,31 +1248,31 @@ async def _search_iqdb_keyless_async(raw_bytes: bytes, filename: str) -> str:
                 return ""
             html_text = await resp.text()
 
-            if "Best match" not in html_text:
-                return ""
-            sim_m = re.search(r"(\d+)%\s*similarity", html_text)
-            if not sim_m or int(sim_m.group(1)) < 72:
-                return ""
-            sim_pct = int(sim_m.group(1))
+        if "Best match" not in html_text:
+            return ""
+        sim_m = re.search(r"(\d+)%\s*similarity", html_text)
+        if not sim_m or int(sim_m.group(1)) < 72:
+            return ""
+        sim_pct = int(sim_m.group(1))
 
-            link_m = re.search(
-                r"Best match.*?href=[\"']((?:https?:)?//[^\"']+)[\"'][^>]*>\s*<img[^>]*alt=[\"']([^\"']*)[\"']",
-                html_text,
-                re.DOTALL | re.IGNORECASE,
-            )
-            if not link_m:
-                return ""
-            match_url = link_m.group(1)
-            if match_url.startswith("//"):
-                match_url = "https:" + match_url
-            alt_tags = link_m.group(2).strip()
+        link_m = re.search(
+            r"Best match.*?href=[\"']((?:https?:)?//[^\"']+)[\"'][^>]*>\s*<img[^>]*alt=[\"']([^\"']*)[\"']",
+            html_text,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if not link_m:
+            return ""
+        match_url = link_m.group(1)
+        if match_url.startswith("//"):
+            match_url = "https:" + match_url
+        alt_tags = link_m.group(2).strip()
 
-            api_log(f"ReverseImage (IQDB Keyless) -> {sim_pct}% match ({time.monotonic() - t0:.2f}s)")
-            return (
-                f"=== IQDB Reverse Illustration Match ===\n"
-                f"- Similarity: {sim_pct}% | Source Archive URL: {match_url}\n"
-                f"- Detected Tags / Character / Series: {alt_tags}"
-            )
+        api_log(f"ReverseImage (IQDB Keyless) -> {sim_pct}% match ({time.monotonic() - t0:.2f}s)")
+        return (
+            f"=== IQDB Reverse Illustration Match ===\n"
+            f"- Similarity: {sim_pct}% | Source Archive URL: {match_url}\n"
+            f"- Detected Tags / Character / Series: {alt_tags}"
+        )
     except Exception:
         return ""
 
@@ -1257,47 +1292,47 @@ async def _search_tracemoe_async(raw_bytes: bytes, mime_type: str) -> str:
                 return ""
             data = await resp.json()
 
-            docs = data.get("result") or []
-            if not docs:
-                return ""
-            top = docs[0]
-            sim = float(top.get("similarity") or 0.0) * 100.0
-            if sim < 87.0:
-                return ""
+        docs = data.get("result") or []
+        if not docs:
+            return ""
+        top = docs[0]
+        sim = float(top.get("similarity") or 0.0) * 100.0
+        if sim < 87.0:
+            return ""
 
-            anilist = top.get("anilist") or {}
-            title_obj = anilist.get("title") if isinstance(anilist, dict) else {}
-            romaji = (title_obj or {}).get("romaji") or ""
-            english = (title_obj or {}).get("english") or ""
-            native = (title_obj or {}).get("native") or ""
-            mal_id = anilist.get("idMal") if isinstance(anilist, dict) else None
-            ani_id = anilist.get("id") if isinstance(anilist, dict) else None
+        anilist = top.get("anilist") or {}
+        title_obj = anilist.get("title") if isinstance(anilist, dict) else {}
+        romaji = (title_obj or {}).get("romaji") or ""
+        english = (title_obj or {}).get("english") or ""
+        native = (title_obj or {}).get("native") or ""
+        mal_id = anilist.get("idMal") if isinstance(anilist, dict) else None
+        ani_id = anilist.get("id") if isinstance(anilist, dict) else None
 
-            ep = top.get("episode") or "Movie/OVA"
-            from_sec = int(float(top.get("from") or 0))
-            mm, ss = divmod(from_sec, 60)
-            hh, mm = divmod(mm, 60)
-            ts_str = f"{hh:02d}:{mm:02d}:{ss:02d}" if hh > 0 else f"{mm:02d}:{ss:02d}"
+        ep = top.get("episode") or "Movie/OVA"
+        from_sec = int(float(top.get("from") or 0))
+        mm, ss = divmod(from_sec, 60)
+        hh, mm = divmod(mm, 60)
+        ts_str = f"{hh:02d}:{mm:02d}:{ss:02d}" if hh > 0 else f"{mm:02d}:{ss:02d}"
 
-            mal_link = f"{HTTPS}myanimelist.net/anime/{mal_id}" if mal_id else (
-                f"{HTTPS}anilist.co/anime/{ani_id}" if ani_id else ""
-            )
-            api_log(f"ReverseImage (trace.moe) -> '{romaji or native}' Ep.{ep} at {ts_str} ({sim:.1f}%, {time.monotonic() - t0:.2f}s)")
-            return (
-                f"=== trace.moe Anime Screenshot Match ===\n"
-                f"- Anime Title: {romaji} / {english} ({native})\n"
-                f"- Episode: {ep} | Exact Scene Timestamp: {ts_str} | Similarity: {sim:.1f}%\n"
-                + (f"- Reference Link: {mal_link}" if mal_link else "")
-            ).strip()
+        mal_link = f"{HTTPS}myanimelist.net/anime/{mal_id}" if mal_id else (
+            f"{HTTPS}anilist.co/anime/{ani_id}" if ani_id else ""
+        )
+        api_log(f"ReverseImage (trace.moe) -> '{romaji or native}' Ep.{ep} at {ts_str} ({sim:.1f}%, {time.monotonic() - t0:.2f}s)")
+        return (
+            f"=== trace.moe Anime Screenshot Match ===\n"
+            f"- Anime Title: {romaji} / {english} ({native})\n"
+            f"- Episode: {ep} | Exact Scene Timestamp: {ts_str} | Similarity: {sim:.1f}%\n"
+            + (f"- Reference Link: {mal_link}" if mal_link else "")
+        ).strip()
     except Exception as e:
         api_log(f"ReverseImage (trace.moe) -> skipped ({type(e).__name__})")
-        return ""
+    return ""
 
 
 def _compress_image_for_vision_ocr_sync(raw_bytes: bytes, max_dim: int = 1280, quality: int = 90) -> tuple[str, str, bool]:
     from PIL import Image, ImageStat
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-    img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+    img.thumbnail((max_dim, max_dim), Image.Resampling.BILINEAR)
 
     hsv_stat = ImageStat.Stat(img.convert("HSV"))
     mean_saturation = hsv_stat.mean[1] if len(hsv_stat.mean) > 1 else 0.0
@@ -1411,12 +1446,6 @@ async def extract_multi_images_batch_ocr(
     images_list: list[tuple[bytes, str, str]],
     post_meta_hint: str = "",
 ) -> str:
-    """
-    Inspects 2 to 12 sequential comic/illustration pages together in a SINGLE unified
-    multimodal batch call (`gemini-3.1-flash-lite` -> `gemini-3.5-flash-lite` -> `gemini-3-flash-preview`),
-    hedged cleanly against Cloudflare Workers AI (`@cf/google/gemma-4-26b-a4b-it`) so Google AI Studio
-    never suffers same-key concurrency contention.
-    """
     target_list = images_list[:MAX_BATCH_IMAGES]
     if len(target_list) < 2:
         return ""
@@ -1483,7 +1512,7 @@ async def extract_multi_images_batch_ocr(
                 encoded_images, batch_prompt, timeout_sec=gemini_timeout, max_output_tokens=out_tokens
             )
         )
-        done, _ = await asyncio.wait({gemini_task}, timeout=20.0)
+        done, _ = await asyncio.wait({gemini_task}, timeout=16.0)
         if gemini_task in done:
             try:
                 res = gemini_task.result()
@@ -1495,7 +1524,7 @@ async def extract_multi_images_batch_ocr(
                 encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=out_tokens
             )
 
-        api_log(f"Hedge (MultiImageOCR {len(encoded_images)}p) -> Gemini >20s; racing Cloudflare batch in parallel")
+        api_log(f"Hedge (MultiImageOCR {len(encoded_images)}p) -> Gemini >16s; racing Cloudflare batch in parallel")
         cf_task = asyncio.create_task(
             _call_cf_multi_image_batch(
                 encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=out_tokens
@@ -1663,7 +1692,7 @@ async def extract_image_via_transient_ocr(
             except Exception as e:
                 api_log(f"Image OCR (Tier 2 Groq) -> {g_mod} failed ({type(e).__name__}); fallback to Tier 3")
 
-    # Tier 3: Gemini (`gemini-3.1-flash-lite` -> `gemini-3.5-flash-lite` -> `gemini-3-flash-preview`)
+    # Tier 3: Gemini (`gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> `gemini-3-flash-preview`)
     if not vision_result and GEMINI_API_KEY:
         vision_result = await _call_gemini_single_image_vision(
             ocr_prompt, mime_type, b64_img, purpose="Image OCR Tier 3 Gemini"
@@ -1737,7 +1766,7 @@ async def extract_image_via_transient_ocr(
                 and not _is_pure_sfx_query(verify_q)
             ):
                 try:
-                    web_verify = await asyncio.to_thread(run_safe_web_search_sync, verify_q, 3)
+                    web_verify = await run_safe_web_search_async(verify_q, max_results=3)
                     if web_verify:
                         out_parts.append(f"=== Web Verification for Image (`{verify_q}`) ===\n{web_verify}")
                 except Exception:
@@ -1827,11 +1856,14 @@ async def extract_all_context(
                 )
             elif fname.endswith(IMAGE_EXTENSIONS) and len(image_att_batch) < MAX_BATCH_IMAGES:
                 image_att_batch.append((raw_bytes, att.filename, ""))
-                raw_bytes = None
+            raw_bytes = None
         except Exception as e:
             blocks.append(f"[Error reading `{att.filename}`: {e}]")
 
     if image_att_batch:
+        # Spill raw attachment bytes to /tmp (zero RAM cost) for instant In-Bubble button follow-ups
+        if getattr(message, "id", 0):
+            await asyncio.to_thread(save_temp_image_cache, message.id, image_att_batch, [])
         if len(image_att_batch) >= 2:
             batch_vis = await extract_multi_images_batch_ocr(image_att_batch, post_meta_hint=message.content or "")
             if batch_vis:
@@ -1871,7 +1903,13 @@ async def extract_all_context(
     for meta_sec in embed_meta_sections:
         blocks.append(meta_sec)
 
+    embed_filenames = [f[1] for f in embed_images]
+    has_embed_imgs = bool(embed_images)
+
     if embed_images and processed_image_count < MAX_BATCH_IMAGES:
+        # Spill downloaded X/Pixiv/Bluesky images to /tmp so 'แปลลงภาพ (In-Bubble)' skips re-downloading!
+        if getattr(message, "id", 0):
+            await asyncio.to_thread(save_temp_image_cache, message.id, embed_images, embed_meta_sections)
         remaining_slots = MAX_BATCH_IMAGES - processed_image_count
         target_embed_imgs = embed_images[:remaining_slots]
         meta_hint = "\n".join(embed_meta_sections)
@@ -1961,17 +1999,8 @@ async def extract_all_context(
         if urls_in_msg:
             url_source_msg = ref_msg
 
-    if urls_in_msg and not url_source_msg.embeds:
-        try:
-            await asyncio.sleep(1.0)
-            url_source_msg = await message.channel.fetch_message(url_source_msg.id)
-        except Exception:
-            pass
-
-    for url in urls_in_msg:
-        cu = clean_url(url)
-        if cu in handled_social_urls:
-            continue
+    unhandled_urls = [clean_url(u) for u in urls_in_msg if clean_url(u) not in handled_social_urls]
+    for cu in unhandled_urls:
         yt_id = extract_youtube_id(cu)
         if yt_id:
             embed_info = {}
@@ -1984,19 +2013,19 @@ async def extract_all_context(
                     }
                     break
             try:
-                yt_context = await asyncio.to_thread(fetch_youtube_context_sync, yt_id, embed_info)
+                yt_context = await fetch_youtube_context_async(yt_id, embed_info)
                 if yt_context:
                     blocks.append(f"=== YouTube Video Information (`{cu}`) ===\n{yt_context}")
             except Exception as e:
                 print(f"YouTube context error ({yt_id}): {e}")
         else:
-            has_rich_embed_already = bool(embed_meta_sections and embed_images)
-            if has_rich_embed_already:
+            if embed_meta_sections and has_embed_imgs:
                 continue
             try:
+                page_text = await fetch_webpage_async(cu)
                 blocks.append(
                     f'<untrusted_web_search_results url="{cu}">\n'
-                    + await asyncio.to_thread(fetch_webpage_sync, cu)
+                    + page_text
                     + "\n</untrusted_web_search_results>"
                 )
             except Exception as e:
@@ -2020,7 +2049,7 @@ async def extract_all_context(
         att_names = (
             [a.filename for a in target_attachments]
             if target_attachments
-            else ([f[1] for f in embed_images] or ["embed_context"])
+            else (embed_filenames or ["embed_context"])
         )
         channel_last_attachment[message.channel.id].append({
             "filenames": att_names,

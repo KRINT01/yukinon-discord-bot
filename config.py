@@ -2,9 +2,12 @@ import os
 import re
 import gc
 import sys
+import json
 import time
+import shutil
 import ctypes
 import asyncio
+import tempfile
 import ipaddress
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -109,10 +112,6 @@ DDGS_PROXY = os.getenv("DDGS_PROXY", "").strip() or None
 YOUTUBE_PROXY_URL = os.getenv("YOUTUBE_PROXY_URL", "").strip()
 SAUCENAO_API_KEY = os.getenv("SAUCENAO_API_KEY", "").strip()
 
-# Optional External OpenClaw Gateway Bridge (Dormant when unset)
-OPENCLAW_GATEWAY_URL = clean_url(os.getenv("OPENCLAW_GATEWAY_URL", "")).rstrip("/")
-OPENCLAW_API_KEY = os.getenv("OPENCLAW_API_KEY", "").strip()
-
 # Render Free Web Service dynamically injects PORT (defaults to 10000)
 PORT = int(os.getenv("PORT", "10000"))
 
@@ -143,11 +142,14 @@ intents.voice_states = True
 # Concurrency locks & boot timestamp
 ollama_lock = asyncio.Lock()
 tts_lock = asyncio.Lock()
+# Global OOM guard: serializes heavy multi-page Pillow CV/Render jobs on 512 MB Render containers
+manga_semaphore = asyncio.Semaphore(1)
 BOOT_TIME = time.time()
 
 
 class RuntimeState:
     """Centralized mutable runtime state shared safely across all modules."""
+
     def __init__(self):
         self.bot = None
         self.http_session: aiohttp.ClientSession | None = None
@@ -170,9 +172,18 @@ state = RuntimeState()
 
 
 def get_http_session() -> aiohttp.ClientSession:
-    """Returns the shared aiohttp.ClientSession (creating one if not yet initialized)."""
+    """
+    Returns the shared pooled aiohttp.ClientSession with 5-minute DNS caching and
+    keep-alive connection reuse across Google AI Studio, Cloudflare, Groq, FxTwitter, and Pixiv.
+    """
     if state.http_session is None or state.http_session.closed:
-        state.http_session = aiohttp.ClientSession()
+        connector = aiohttp.TCPConnector(
+            limit=40,
+            limit_per_host=12,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True,
+        )
+        state.http_session = aiohttp.ClientSession(connector=connector)
     return state.http_session
 
 
@@ -196,14 +207,141 @@ channel_active_topic = {}
 channel_last_attachment: dict[int, deque] = defaultdict(lambda: deque(maxlen=4))
 # Stores the most recent live weather report per channel (30-min TTL) for follow-up questions
 channel_last_weather = {}
-# Persistent in-memory notes per channel for Autonomous Agent mode
-agent_notes_store = defaultdict(list)
 # False = reply to all speech in voice channel; True = require wake word ("ยูกิโนะ", etc.)
 voice_wake_word_enabled = defaultdict(lambda: False)
 
+# ==============================================================================
+# ZERO-RAM /tmp IMAGE CACHE (5-min TTL, 30 MB cap — speeds up In-Bubble follow-ups)
+# ==============================================================================
+TEMP_IMG_CACHE_DIR = os.path.join(tempfile.gettempdir(), "yukinon_img_cache")
+TEMP_IMG_CACHE_TTL_SEC = 300
+TEMP_IMG_CACHE_MAX_BYTES = 30 * 1024 * 1024
+
+
+def _dir_size_bytes(path: str) -> int:
+    total = 0
+    try:
+        for entry in os.scandir(path):
+            if entry.is_file():
+                total += entry.stat().st_size
+    except OSError:
+        pass
+    return total
+
+
+def prune_temp_image_cache(ttl_sec: int = TEMP_IMG_CACHE_TTL_SEC):
+    """Evicts expired (>ttl_sec) or oldest /tmp image cache buckets beyond 30 MB."""
+    if not os.path.isdir(TEMP_IMG_CACHE_DIR):
+        return
+    now = time.time()
+    buckets: list[tuple[float, int, str]] = []
+    try:
+        for entry in os.scandir(TEMP_IMG_CACHE_DIR):
+            if not entry.is_dir():
+                continue
+            try:
+                mtime = entry.stat().st_mtime
+            except OSError:
+                continue
+            if (now - mtime) >= ttl_sec:
+                shutil.rmtree(entry.path, ignore_errors=True)
+            else:
+                buckets.append((mtime, _dir_size_bytes(entry.path), entry.path))
+    except OSError:
+        return
+
+    total_sz = sum(sz for _, sz, _ in buckets)
+    if total_sz > TEMP_IMG_CACHE_MAX_BYTES:
+        buckets.sort(key=lambda x: x[0])
+        for _, sz, b_path in buckets:
+            if total_sz <= TEMP_IMG_CACHE_MAX_BYTES:
+                break
+            shutil.rmtree(b_path, ignore_errors=True)
+            total_sz -= sz
+
+
+def save_temp_image_cache(
+    msg_id: int,
+    images_list: list,
+    meta_sections: list[str] | None = None,
+) -> None:
+    """
+    Spills downloaded embed/attachment image bytes to `/tmp/yukinon_img_cache/<msg_id>/`
+    so clicking 'แปลลงภาพ (In-Bubble)' reuses them instantly with zero RAM footprint.
+    """
+    if not msg_id or not images_list:
+        return
+    try:
+        os.makedirs(TEMP_IMG_CACHE_DIR, exist_ok=True)
+        bucket_dir = os.path.join(TEMP_IMG_CACHE_DIR, str(int(msg_id)))
+        tmp_dir = f"{bucket_dir}.tmp"
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        os.makedirs(tmp_dir, exist_ok=True)
+
+        manifest_files = []
+        for idx, item in enumerate(images_list[:12]):
+            raw_b = item[0]
+            orig_fname = str(item[1] or f"img_{idx + 1}.jpg")
+            if not raw_b:
+                continue
+            safe_ext = os.path.splitext(orig_fname)[1].lower()
+            if safe_ext not in (".jpg", ".jpeg", ".png", ".webp"):
+                safe_ext = ".jpg"
+            disk_name = f"p{idx + 1:02d}{safe_ext}"
+            with open(os.path.join(tmp_dir, disk_name), "wb") as f:
+                f.write(raw_b)
+            manifest_files.append({"disk": disk_name, "filename": orig_fname})
+
+        if not manifest_files:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return
+
+        manifest = {
+            "ts": time.time(),
+            "files": manifest_files,
+            "meta_sections": list(meta_sections or []),
+        }
+        with open(os.path.join(tmp_dir, "meta.json"), "w", encoding="utf-8") as mf:
+            json.dump(manifest, mf, ensure_ascii=False)
+
+        shutil.rmtree(bucket_dir, ignore_errors=True)
+        os.replace(tmp_dir, bucket_dir)
+        prune_temp_image_cache()
+    except Exception:
+        pass
+
+
+def load_temp_image_cache(
+    msg_id: int, ttl_sec: int = TEMP_IMG_CACHE_TTL_SEC
+) -> tuple[list[tuple[bytes, str]], list[str]] | None:
+    """Loads cached `(pages_input, meta_sections)` for `msg_id` from `/tmp` if fresh."""
+    if not msg_id:
+        return None
+    bucket_dir = os.path.join(TEMP_IMG_CACHE_DIR, str(int(msg_id)))
+    meta_path = os.path.join(bucket_dir, "meta.json")
+    if not os.path.isfile(meta_path):
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as mf:
+            manifest = json.load(mf)
+        if (time.time() - float(manifest.get("ts") or 0.0)) >= ttl_sec:
+            shutil.rmtree(bucket_dir, ignore_errors=True)
+            return None
+        pages: list[tuple[bytes, str]] = []
+        for entry in manifest.get("files") or []:
+            fpath = os.path.join(bucket_dir, entry["disk"])
+            if os.path.isfile(fpath):
+                with open(fpath, "rb") as f:
+                    pages.append((f.read(), entry.get("filename") or entry["disk"]))
+        if not pages:
+            return None
+        return pages, list(manifest.get("meta_sections") or [])
+    except Exception:
+        return None
+
 
 def prune_stale_attachments(ttl_sec: int = 1800):
-    """Evicts cached channel attachments older than ttl_sec (default 30 mins) to free RAM."""
+    """Evicts cached channel attachments older than ttl_sec (default 30 mins) and stale /tmp image caches."""
     now = time.time()
     empty_cids = []
     for cid, entries in list(channel_last_attachment.items()):
@@ -213,6 +351,7 @@ def prune_stale_attachments(ttl_sec: int = 1800):
             empty_cids.append(cid)
     for cid in empty_cids:
         channel_last_attachment.pop(cid, None)
+    prune_temp_image_cache()
 
 
 def get_cached_channel_attachments(channel_id: int | None, ttl_sec: int = 1800, max_total_chars: int = 85000) -> str:

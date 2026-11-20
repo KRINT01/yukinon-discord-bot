@@ -576,7 +576,7 @@ def build_contextual_suggestion_view(
 
 
 # ==============================================================================
-# 3. INTERACTIVE PERSISTENT USER MEMORY MODAL & ACTION BUTTONS
+# 3. INTERACTIVE PERSISTENT USER MEMORY MODAL & ACTION BUTTONS (5-Field Structured)
 # ==============================================================================
 class MemoryEditModal(discord.ui.Modal, title="แก้ไขความจำถาวร (User Memory)"):
     display_name_input = discord.ui.TextInput(
@@ -585,17 +585,24 @@ class MemoryEditModal(discord.ui.Modal, title="แก้ไขความจำ
         required=True,
         max_length=36,
     )
+    pinned_facts_input = discord.ui.TextInput(
+        label="ข้อมูลสำคัญถาวรที่ปักหมุด (แยกบรรทัดหรือ ;)",
+        style=discord.TextStyle.paragraph,
+        placeholder="ข้อมูลถาวรที่ไม่ให้ถูกลบอัตโนมัติ (เช่น สเปคคอม, กาแฟที่ชอบ, งานที่ทำ)",
+        required=False,
+        max_length=900,
+    )
     favorite_topics_input = discord.ui.TextInput(
         label="หัวข้อที่ชอบ (คั่นด้วยเครื่องหมายจุลภาค ,)",
         style=discord.TextStyle.paragraph,
-        placeholder="เช่น PSO2 NGS, Anime & Manga, Software & Coding, Specialty Coffee",
+        placeholder="เช่น PSO2 NGS, Anime & Manga, Software & Coding",
         required=False,
         max_length=400,
     )
     custom_notes_input = discord.ui.TextInput(
-        label="บันทึกความจำ / ข้อมูลจำเพาะ (แยกบรรทัดหรือ ;)",
+        label="บันทึกระยะสั้น (Rolling Notes — แยกบรรทัดหรือ ;)",
         style=discord.TextStyle.paragraph,
-        placeholder="พิมพ์ข้อมูลจำเพาะหรือความชอบส่วนตัวทีละบรรทัด หรือคั่นด้วย ;",
+        placeholder="พิมพ์บันทึกระยะสั้นทีละบรรทัด หรือคั่นด้วย ;",
         required=False,
         max_length=800,
     )
@@ -612,16 +619,19 @@ class MemoryEditModal(discord.ui.Modal, title="แก้ไขความจำ
         self.target_uid = str(target_uid)
         prof = ensure_user_profile_exists(self.target_uid)
         self.display_name_input.default = prof.get("display_name") or ""
+        self.pinned_facts_input.default = "\n".join(prof.get("pinned_facts") or [])
         self.favorite_topics_input.default = ", ".join(prof.get("favorite_topics") or [])
         self.custom_notes_input.default = "\n".join(prof.get("custom_notes") or [])
         self.recent_topics_input.default = "\n".join(prof.get("recent_topics") or [])
 
     async def on_submit(self, interaction: discord.Interaction):
         new_disp = self.display_name_input.value.strip()
+        raw_pinned = self.pinned_facts_input.value.strip()
         raw_favs = self.favorite_topics_input.value.strip()
         raw_notes = self.custom_notes_input.value.strip()
         raw_recents = self.recent_topics_input.value.strip()
 
+        new_pinned = [x.strip() for x in re.split(r"[;\n]+", raw_pinned) if x.strip()] if raw_pinned else []
         new_favs = [x.strip() for x in re.split(r"[,;،\n]+", raw_favs) if x.strip()] if raw_favs else []
         new_notes = [x.strip() for x in re.split(r"[;\n]+", raw_notes) if x.strip()] if raw_notes else []
         new_recents = [x.strip() for x in re.split(r"[;\n]+", raw_recents) if x.strip()] if raw_recents else []
@@ -629,6 +639,7 @@ class MemoryEditModal(discord.ui.Modal, title="แก้ไขความจำ
         await update_user_memory_fields(
             self.target_uid,
             display_name=new_disp or None,
+            pinned_facts=new_pinned,
             favorite_topics=new_favs,
             custom_notes=new_notes,
             recent_topics=new_recents,
@@ -676,6 +687,7 @@ class MemoryActionView(AutoDisappearingView):
     async def btn_reset_memory(self, interaction: discord.Interaction, button: discord.ui.Button):
         await update_user_memory_fields(
             self.target_uid,
+            pinned_facts=[],
             favorite_topics=[],
             custom_notes=[],
             recent_topics=[],
@@ -734,17 +746,25 @@ class OTEditModal(discord.ui.Modal, title="แก้ไขรายการบ�
                 self.guild = inter.guild
 
         reply = await process_ot_request(_ProxyMsg(interaction), cmd_str)
-        view = OTActionView(
-            owner_id=interaction.user.id,
-            record_date=self.date_input.value.strip(),
-            record_slot=self.time_input.value.strip(),
-            record_detail=self.detail_input.value.strip(),
+        rec_date, rec_slot, rec_detail = parse_ot_record_metadata(reply)
+        view = (
+            OTActionView(
+                owner_id=interaction.user.id,
+                record_date=rec_date,
+                record_slot=rec_slot,
+                record_detail=rec_detail,
+            )
+            if rec_date and not is_failure_or_refusal_reply(reply)
+            else None
         )
-        await interaction.response.send_message(reply, view=view)
-        try:
-            view.message = await interaction.original_response()
-        except Exception:
-            pass
+        if view is not None:
+            await interaction.response.send_message(reply, view=view)
+            try:
+                view.message = await interaction.original_response()
+            except Exception:
+                pass
+        else:
+            await interaction.response.send_message(reply)
 
 
 class OTActionView(AutoDisappearingView):
@@ -822,17 +842,18 @@ def parse_ot_record_metadata(ot_reply_text: str) -> tuple[str, str, str]:
 # 5. NATIVE SLASH COMMANDS & RIGHT-CLICK CONTEXT MENUS
 # ==============================================================================
 def register_app_commands(bot: discord.ext.commands.Bot):
-    @bot.tree.command(name="memory", description="ดู แก้ไข เพิ่ม หรือรีเซ็ตข้อมูลความจำถาวร (user_profiles.json)")
+    @bot.tree.command(name="memory", description="ดู แก้ไข ปักหมุด หรือรีเซ็ตข้อมูลความจำถาวร (user_profiles.json)")
     @app_commands.describe(
         action="เลือกการทำงานกับความจำถาวร",
-        value="ข้อความสำหรับเพิ่มบันทึกหรือเพิ่มหัวข้อที่ชอบ (กรณีเลือก Add)",
+        value="ข้อความสำหรับปักหมุดข้อมูลถาวร เพิ่มบันทึก หรือเพิ่มหัวข้อที่ชอบ",
         member="เลือกสมาชิกที่ต้องการดู/แก้ไข (เฉพาะเจ้าของบอท เว้นว่างเพื่อดูของตัวเอง)",
     )
     @app_commands.choices(
         action=[
             app_commands.Choice(name="ดูข้อมูลความจำ (View & Buttons)", value="view"),
             app_commands.Choice(name="เปิดหน้าต่างแก้ไข (Edit Modal)", value="edit_modal"),
-            app_commands.Choice(name="เพิ่มบันทึกความจำ (Add Note)", value="add_note"),
+            app_commands.Choice(name="ปักหมุดข้อมูลถาวร (Pin Fact)", value="pin_fact"),
+            app_commands.Choice(name="เพิ่มบันทึกระยะสั้น (Add Note)", value="add_note"),
             app_commands.Choice(name="เพิ่มหัวข้อที่ชอบ (Add Topic)", value="add_topic"),
             app_commands.Choice(name="ล้างเรื่องล่าสุด (Clear Recent)", value="clear_recent"),
         ]
@@ -865,7 +886,9 @@ def register_app_commands(bot: discord.ext.commands.Bot):
                 self.guild = interaction.guild
 
         mention_prefix = f"<@{target_uid}> " if target_uid != str(interaction.user.id) else ""
-        if action == "add_note" and value.strip():
+        if action == "pin_fact" and value.strip():
+            cmd_str = f"{mention_prefix}ปักหมุดความจำ {value.strip()}"
+        elif action == "add_note" and value.strip():
             cmd_str = f"{mention_prefix}เพิ่มบันทึก {value.strip()}"
         elif action == "add_topic" and value.strip():
             cmd_str = f"{mention_prefix}เพิ่มหัวข้อที่ชอบ {value.strip()}"
@@ -1154,7 +1177,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
 
         await process_manga_translation_request(_FakeCtx(), f"translate manga to {language}")
 
-    # --- Right-Click Message Context Menus ---
+    # --- Right-Click Message Context Menus (5 max per Discord app) ---
     @bot.tree.context_menu(name="Analyze Code / Stack Trace")
     async def ctx_analyze_code(interaction: discord.Interaction, message: discord.Message):
         await interaction.response.defer(thinking=True)
@@ -1283,3 +1306,19 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             ephemeral=True,
         )
         await process_manga_translation_request(message, "แปลมังงะเป็นภาษาไทย")
+
+    @bot.tree.context_menu(name="Translate Manga Page (EN)")
+    async def ctx_translate_manga_en(interaction: discord.Interaction, message: discord.Message):
+        has_imgs = any(a.filename.lower().endswith(IMAGE_EXTENSIONS) for a in message.attachments)
+        has_embeds_or_links = bool(message.embeds) or bool(URL_REGEX.search(message.content or ""))
+        if not has_imgs and not has_embeds_or_links:
+            await interaction.response.send_message(
+                "ข้อความที่เลือกไม่มีไฟล์รูปภาพหรือลิงก์ที่มีรูปภาพแนบอยู่ค่ะ กรุณาคลิกขวาที่ข้อความที่มีรูปมังงะหรือลิงก์ X/Pixiv นะคะ",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            "รับทราบค่ะ เดี๋ยวฉันจัดการแปลหน้านี้เป็นภาษาอังกฤษให้ รอสักครู่นะคะ",
+            ephemeral=True,
+        )
+        await process_manga_translation_request(message, "translate manga to English")
