@@ -63,7 +63,12 @@ from persona import (
     FAST_SYSTEM_PROMPT,
     VOICE_SYSTEM_PROMPT,
 )
-from llm import query_local_ollama_chat, orchestrate_message_with_decision_1
+from llm import (
+    query_local_ollama_chat,
+    orchestrate_message_with_decision_1,
+    orchestrate_voice_utterance_with_decision_1,
+    check_voice_scribe_stop_with_decision_1,
+)
 
 # Silence noisy RTCP SenderReport logs (type=200) and opus flush warnings from discord-ext-voice-recv
 logging.getLogger("discord.ext.voice_recv").setLevel(logging.ERROR)
@@ -87,6 +92,10 @@ GEMINI_WS_HOST = "generativelanguage." + "googleapis.com"
 
 # Active voice sink registry (keyed by guild_id) so Scribe Stop can flush mid-sentence buffers cleanly
 _ACTIVE_VOICE_SINKS: dict[int, "SilenceGatedVoiceSink"] = {}
+
+# Phase 3: Rolling per-guild multi-speaker voice room history (last 8 turns) & last bot reply timestamp
+_VOICE_ROOM_HISTORY: dict[int, deque] = defaultdict(lambda: deque(maxlen=8))
+_VOICE_LAST_BOT_REPLY_TS: dict[int, float] = {}
 
 # Spoken test phrases (including common STT phonetic variations like ชัด/แชท, ตัดสอบ/ทดสอบ, หยิน/ยิน)
 VOICE_TEST_PHRASE_REGEX = re.compile(
@@ -114,6 +123,12 @@ VOICE_SCRIBE_STOP_UNAMBIGUOUS_REGEX = re.compile(
 VOICE_SCRIBE_STOP_WAKE_SHORT_REGEX = re.compile(
     r"(?:สรุป(?:เลย|ให้หน่อย|ได้แล้ว|หน่อย)?|หยุด(?:เลย|ได้แล้ว)?|พอแล้ว|จบแล้ว|"
     r"\b(?:stop|summarize|summary|finish|done)\b)",
+    re.IGNORECASE,
+)
+# Phase 3: Soft stop/bot cue gate during Scribe Mode — only invokes Decision-1 ScribeStopCheck when present (0 overhead on normal meeting speech)
+_VOICE_SCRIBE_SOFT_STOP_CUE_REGEX = re.compile(
+    r"(หยุด|สรุป|พอแล้ว|พอแค่นี้|จบแล้ว|เสร็จแล้ว|เลิก|ปิดโหมด|ยูกิ|ยูคิ|บอท|"
+    r"\b(?:yukino|yukinon|yuki|bot|stop|summar\w*|wrap\s+up|finish\w*|done)\b)",
     re.IGNORECASE,
 )
 
@@ -447,7 +462,28 @@ def register_voice_sink(guild_id: int, sink: "SilenceGatedVoiceSink") -> None:
 
 
 def unregister_voice_sink(guild_id: int) -> None:
-    _ACTIVE_VOICE_SINKS.pop(int(guild_id), None)
+    gid = int(guild_id)
+    _ACTIVE_VOICE_SINKS.pop(gid, None)
+    _VOICE_ROOM_HISTORY.pop(gid, None)
+    _VOICE_LAST_BOT_REPLY_TS.pop(gid, None)
+
+
+def _record_voice_room_turn(guild_id: int | None, speaker_label: str, text: str, is_bot: bool = False) -> None:
+    if not guild_id or not text:
+        return
+    gid = int(guild_id)
+    now = time.time()
+    clean_t = re.sub(r"\s+", " ", text).strip()[:240]
+    if not clean_t:
+        return
+    _VOICE_ROOM_HISTORY[gid].append({
+        "ts": now,
+        "speaker": "Yukinon" if is_bot else (speaker_label or "Member")[:32],
+        "is_bot": is_bot,
+        "text": clean_t,
+    })
+    if is_bot:
+        _VOICE_LAST_BOT_REPLY_TS[gid] = now
 
 
 THAI_DAY_NUMBER_WORDS = {
@@ -747,6 +783,7 @@ async def speak_in_voice_channel(guild: discord.Guild, text: str, fallback_chann
             audio_source = discord.FFmpegPCMAudio(mp3_path, options="-vn -loglevel error")
             vc.play(audio_source, after=_after_play)
             await asyncio.wait_for(done_event.wait(), timeout=60)
+            _VOICE_LAST_BOT_REPLY_TS[int(guild.id)] = time.time()
         except Exception as e:
             print(f"TTS voice channel playback error: {e}", flush=True)
             try:
@@ -792,7 +829,7 @@ def _is_voice_scribe_start_command(text: str) -> bool:
     return bool(VOICE_SCRIBE_START_REGEX.search(text))
 
 
-def _is_voice_scribe_stop_command(text: str) -> bool:
+def _is_voice_scribe_stop_command_deterministic(text: str) -> bool:
     if not text:
         return False
     if re.search(r"(\bot\b|โอ\s*ที)", text, re.IGNORECASE):
@@ -929,8 +966,9 @@ async def stop_voice_scribe_session(
     reason: str = "",
 ) -> bool:
     """
-    Flushes any in-progress speaker buffers, summarizes the full multi-speaker transcript,
-    posts the summary + full transcript to Discord, and guarantees the in-RAM session is cleared.
+    Flushes any in-progress speaker buffers (excluding current task to avoid 6s self-wait),
+    summarizes the full multi-speaker transcript, posts the summary + full transcript to Discord,
+    and guarantees the in-RAM session is cleared.
     """
     if not guild:
         return False
@@ -945,7 +983,7 @@ async def stop_voice_scribe_session(
     target_channel = fallback_text_channel or sess.get("text_channel")
 
     try:
-        # 1. Flush any speakers who just finished talking right before !stop / !leave
+        # 1. Flush any speakers who just finished talking right before !stop / !leave / voice stop
         sink = _ACTIVE_VOICE_SINKS.get(gid)
         if sink is not None:
             try:
@@ -1022,7 +1060,16 @@ async def stop_voice_scribe_session(
             has_fresh_attachment=True,
             speaker_user=None,
             speaker_name="",
-            decision_plan={"route": "chat", "route_confidence": 0.99, "needs_web_search": False},
+            decision_plan={
+                "route": "chat",
+                "route_confidence": 0.99,
+                "needs_web_search": False,
+                "search_confidence": 0.99,
+                "needs_tool_use": False,
+                "tool_confidence": 0.99,
+                "complexity_score": 2.0,
+                "complexity_confidence": 0.90,
+            },
         )
 
         from image_engine import send_chunked_response
@@ -1457,6 +1504,39 @@ def _strip_wake_word_prefix(text: str) -> str:
     return text
 
 
+def _count_humans_in_voice_channel(guild: discord.Guild | None) -> int:
+    if not guild or not guild.voice_client or not getattr(guild.voice_client, "channel", None):
+        return 1
+    humans = [m for m in guild.voice_client.channel.members if not m.bot]
+    return max(1, len(humans))
+
+
+def _build_recent_group_voice_context_block(
+    recent_turns: list[dict],
+    current_speaker_label: str,
+    window_sec: float = 60.0,
+) -> str:
+    """Formats recent multi-speaker room utterances (last 60s) so Yukino understands group references."""
+    if not recent_turns:
+        return ""
+    now = time.time()
+    lines: list[str] = []
+    has_other_speaker = False
+    for t in recent_turns[-5:]:
+        if (now - float(t.get("ts") or 0.0)) > window_sec:
+            continue
+        sp = str(t.get("speaker") or "Speaker")
+        txt = str(t.get("text") or "").strip()
+        if not txt:
+            continue
+        if not t.get("is_bot") and sp != current_speaker_label:
+            has_other_speaker = True
+        lines.append(f"- {sp}: {txt}")
+    if not lines or not has_other_speaker:
+        return ""
+    return "[บริบทบทสนทนาล่าสุดในห้องเสียง]:\n" + "\n".join(lines)
+
+
 async def handle_spoken_voice_command(
     guild: discord.Guild,
     text_channel,
@@ -1480,21 +1560,41 @@ async def handle_spoken_voice_command(
     ):
         return
 
-    # 0. Passive Multi-Speaker Voice Scribe Mode: silently record everyone until Stop command!
-    if guild and is_voice_scribe_active(guild.id):
-        sess = voice_scribe_sessions.get(int(guild.id))
-        if sess and not sess.get("stopping") and _is_voice_scribe_stop_command(cleaned):
-            print(f"[Voice Scribe] Stop command detected from {speaker_name}: '{cleaned}'", flush=True)
-            await stop_voice_scribe_session(
-                guild,
-                fallback_text_channel=text_channel,
-                triggered_by=speaker_name,
-                speak_ack=True,
-            )
-            return
+    gid = int(guild.id) if guild else 0
+    speaker_is_owner = is_owner_user(speaker_user)
+    speaker_label_ai = "Partner (Owner)" if speaker_is_owner else (speaker_name or "Member")
+
+    # 0. Passive Multi-Speaker Voice Scribe Mode:
+    #    Silently record everyone; stop on deterministic command OR Decision-1 natural stop confirmation!
+    if guild and is_voice_scribe_active(gid):
+        sess = voice_scribe_sessions.get(gid)
+        if sess and not sess.get("stopping"):
+            should_stop = _is_voice_scribe_stop_command_deterministic(cleaned)
+            if (
+                not should_stop
+                and not re.search(r"(\bot\b|โอ\s*ที)", cleaned, re.IGNORECASE)
+                and _VOICE_SCRIBE_SOFT_STOP_CUE_REGEX.search(cleaned)
+            ):
+                stop_check = await check_voice_scribe_stop_with_decision_1(
+                    cleaned,
+                    speaker_label=speaker_label_ai,
+                    recent_scribe_entries=sess.get("entries") or [],
+                )
+                if stop_check and stop_check.get("is_stop_scribe_command"):
+                    should_stop = True
+
+            if should_stop:
+                print(f"[Voice Scribe] Stop command detected from {speaker_name}: '{cleaned}'", flush=True)
+                await stop_voice_scribe_session(
+                    guild,
+                    fallback_text_channel=text_channel,
+                    triggered_by=speaker_name,
+                    speak_ack=True,
+                )
+                return
 
         _, hit_limit = _append_scribe_entry(
-            guild.id, speaker_user, speaker_name, cleaned, utterance_ts=utterance_ts
+            gid, speaker_user, speaker_name, cleaned, utterance_ts=utterance_ts
         )
         if hit_limit and sess and not sess.get("stopping"):
             await stop_voice_scribe_session(
@@ -1506,7 +1606,13 @@ async def handle_spoken_voice_command(
             )
         return
 
-    print(f"[Voice STT] {speaker_name} spoke: '{cleaned}' (wake_word_required={voice_wake_word_enabled[guild.id]})", flush=True)
+    human_count_in_vc = _count_humans_in_voice_channel(guild)
+    explicit_wake = _has_wake_word_prefix_or_near_start(cleaned)
+    print(
+        f"[Voice STT] {speaker_name} spoke: '{cleaned}' "
+        f"(wake_word_required={voice_wake_word_enabled[gid]}, vc_humans={human_count_in_vc}, wake={explicit_wake})",
+        flush=True,
+    )
 
     # 1. Instant Voice-Test Trigger (Always replies in chat even if wakeword is on)
     if VOICE_TEST_PHRASE_REGEX.search(cleaned):
@@ -1515,6 +1621,8 @@ async def handle_spoken_voice_command(
             "ไม่ต้องพูดย้ำหลายรอบหรอกนะคะ"
         )
         test_reply = sanitize_yukino_output(test_reply, cleaned, speaker_user, speaker_name)
+        _record_voice_room_turn(gid, speaker_label_ai, cleaned, is_bot=False)
+        _record_voice_room_turn(gid, "Yukinon", test_reply, is_bot=True)
         if text_channel:
             await text_channel.send(
                 f"✅ **[🎙️ ทดสอบไมค์ — ได้ยินเสียงของ `{speaker_name}` ชัดเจนค่ะ]:** `{cleaned}`\n"
@@ -1523,26 +1631,13 @@ async def handle_spoken_voice_command(
         await speak_in_voice_channel(guild, test_reply, fallback_channel=text_channel)
         return
 
-    lower_txt = cleaned.lower()
-    if voice_wake_word_enabled[guild.id]:
-        if not any(lower_txt.startswith(w) or w in lower_txt[:22] for w in VOICE_WAKE_WORDS):
-            print(f"[Voice STT] Ignored '{cleaned}' (no wake word detected; use !wakeword off to disable).", flush=True)
-            return
+    if voice_wake_word_enabled[gid] and not explicit_wake:
+        print(f"[Voice STT] Ignored '{cleaned}' (no wake word detected; use !wakeword off to disable).", flush=True)
+        _record_voice_room_turn(gid, speaker_label_ai, cleaned, is_bot=False)
+        return
 
     command_body = _strip_wake_word_prefix(cleaned)
     chan_id = text_channel.id if text_channel else 0
-
-    # 1B. Spoken Start Voice Scribe Trigger ('ยูกิโนะ เริ่มจดบันทึก' / 'จดประชุม')
-    if guild and _is_voice_scribe_start_command(command_body):
-        topic_hint = VOICE_SCRIBE_START_REGEX.sub("", command_body).strip(" :-")
-        await start_voice_scribe_session(
-            guild,
-            text_channel,
-            started_by=speaker_name,
-            topic=topic_hint,
-            speak_ack=True,
-        )
-        return
 
     class _VoiceProxyMsg:
         def __init__(self):
@@ -1551,44 +1646,149 @@ async def handle_spoken_voice_command(
             self.guild = guild
             self.content = command_body
 
-    # 2. Deterministic Voice Overtime (OT) Command ('จด OT 6 โมงถึงทุ่มนึง' / 'สรุป OT')
-    if speaker_user and is_ot_command_text(command_body, channel_id=chan_id, user_id=speaker_user.id):
-        ot_reply = await process_ot_request(_VoiceProxyMsg(), command_body)
-        if text_channel:
-            await text_channel.send(f"**[🎙️ `{speaker_name}`]:** {cleaned}\n{ot_reply}")
-        await speak_in_voice_channel(guild, ot_reply, fallback_channel=text_channel)
-        return
+    # Snapshot recent room history BEFORE appending current utterance so Decision-1 sees clean prior context
+    recent_turns_snapshot = list(_VOICE_ROOM_HISTORY.get(gid) or ())
+    last_bot_age = time.time() - _VOICE_LAST_BOT_REPLY_TS.get(gid, 0.0)
+    _record_voice_room_turn(gid, speaker_label_ai, cleaned, is_bot=False)
 
-    # 3. Voice Persistent Memory Command ('จำไว้ว่า...' / 'ดูความจำ')
-    if speaker_user and is_memory_command_text(command_body):
-        mem_reply, _ = await process_memory_request(_VoiceProxyMsg(), command_body)
-        if text_channel:
-            await text_channel.send(f"**[🎙️ `{speaker_name}`]:** {cleaned}\n{mem_reply}")
-        await speak_in_voice_channel(guild, mem_reply, fallback_channel=text_channel)
-        return
+    # 2. Fast deterministic triggers when explicitly addressed OR alone in VC (0 API latency)
+    is_direct_single_or_wake = explicit_wake or (human_count_in_vc == 1)
+    if is_direct_single_or_wake:
+        if guild and _is_voice_scribe_start_command(command_body):
+            topic_hint = VOICE_SCRIBE_START_REGEX.sub("", command_body).strip(" :-")
+            await start_voice_scribe_session(
+                guild,
+                text_channel,
+                started_by=speaker_name,
+                topic=topic_hint,
+                speak_ack=True,
+            )
+            return
 
-    # 4. Voice Orchestrator (Decision-1) -> direct OT dispatch if classified as ot_log
-    dec_plan = await orchestrate_message_with_decision_1(command_body, purpose="VoiceRoute")
-    if (
-        speaker_user
-        and dec_plan
-        and dec_plan.get("route") == "ot_log"
-        and float(dec_plan.get("route_confidence") or 0.0) >= 0.78
-    ):
-        normalized_ot_cmd = command_body
-        if not is_ot_command_text(normalized_ot_cmd, channel_id=chan_id, user_id=speaker_user.id):
-            normalized_ot_cmd = f"จด OT {normalized_ot_cmd}"
-        ot_reply = await process_ot_request(_VoiceProxyMsg(), normalized_ot_cmd)
-        if text_channel:
-            await text_channel.send(f"**[🎙️ `{speaker_name}`]:** {cleaned}\n{ot_reply}")
-        await speak_in_voice_channel(guild, ot_reply, fallback_channel=text_channel)
-        return
+        if speaker_user and is_ot_command_text(command_body, channel_id=chan_id, user_id=speaker_user.id):
+            ot_reply = await process_ot_request(_VoiceProxyMsg(), command_body)
+            _record_voice_room_turn(gid, "Yukinon", ot_reply, is_bot=True)
+            if text_channel:
+                await text_channel.send(f"**[🎙️ `{speaker_name}`]:** {cleaned}\n{ot_reply}")
+            await speak_in_voice_channel(guild, ot_reply, fallback_channel=text_channel)
+            return
+
+        if speaker_user and is_memory_command_text(command_body):
+            mem_reply, _ = await process_memory_request(_VoiceProxyMsg(), command_body)
+            _record_voice_room_turn(gid, "Yukinon", mem_reply, is_bot=True)
+            if text_channel:
+                await text_channel.send(f"**[🎙️ `{speaker_name}`]:** {cleaned}\n{mem_reply}")
+            await speak_in_voice_channel(guild, mem_reply, fallback_channel=text_channel)
+            return
+
+    # 3. Phase 3 Multi-Speaker Voice Orchestrator (Single Forward Pass via Decision-1):
+    #    Decides `addressed_to_bot`, `voice_action`, `route`, `complexity`, and guardrails together!
+    dec_plan = await orchestrate_voice_utterance_with_decision_1(
+        command_body,
+        speaker_label=speaker_label_ai,
+        recent_voice_turns=recent_turns_snapshot,
+        human_count_in_vc=human_count_in_vc,
+        last_bot_reply_age_sec=last_bot_age,
+        explicit_wake_word=explicit_wake,
+        channel_id=chan_id or None,
+        purpose="VoiceRoute",
+    )
+
+    # 4. Smart Multi-Speaker "Should I Speak?" Gate
+    if dec_plan is not None:
+        addressed_prob = float(dec_plan.get("addressed_prob") or 0.0)
+        v_action = str(dec_plan.get("voice_action") or "reply_chat")
+        v_action_conf = float(dec_plan.get("voice_action_confidence") or 0.0)
+
+        if not explicit_wake:
+            if human_count_in_vc >= 2:
+                if addressed_prob < 0.45 or (v_action == "ignore_side_talk" and addressed_prob < 0.58):
+                    print(
+                        f"[Voice Group Filter] Ignored side chatter from {speaker_name} "
+                        f"(addressed={addressed_prob:.2f}, action={v_action}): '{cleaned}'",
+                        flush=True,
+                    )
+                    return
+            else:
+                # Alone in VC: only stay silent on unmistakable self-muttering / game callouts
+                if v_action == "ignore_side_talk" and v_action_conf >= 0.85 and addressed_prob < 0.25:
+                    print(
+                        f"[Voice Filter] Ignored unaddressed solo remark from {speaker_name} "
+                        f"(addressed={addressed_prob:.2f}, conf={v_action_conf:.2f}): '{cleaned}'",
+                        flush=True,
+                    )
+                    return
+
+        # 4A. Natural-language Start Scribe ('เดี๋ยวคุยงานกันนะ ช่วยนั่งฟังจดให้หน่อย')
+        if (
+            guild
+            and v_action == "start_scribe"
+            and v_action_conf >= 0.72
+            and (explicit_wake or human_count_in_vc == 1 or addressed_prob >= 0.55)
+            and not re.search(r"(\bot\b|โอ\s*ที)", command_body, re.IGNORECASE)
+        ):
+            topic_hint = VOICE_SCRIBE_START_REGEX.sub("", command_body).strip(" :-")
+            if topic_hint == command_body:
+                topic_hint = ""
+            await start_voice_scribe_session(
+                guild,
+                text_channel,
+                started_by=speaker_name,
+                topic=topic_hint,
+                speak_ack=True,
+            )
+            return
+
+        # 4B. Dynamic OT dispatch
+        if (
+            speaker_user
+            and (
+                (v_action == "ot_log" and v_action_conf >= 0.75)
+                or (dec_plan.get("route") == "ot_log" and float(dec_plan.get("route_confidence") or 0.0) >= 0.78)
+            )
+        ):
+            normalized_ot_cmd = command_body
+            if not is_ot_command_text(normalized_ot_cmd, channel_id=chan_id, user_id=speaker_user.id):
+                normalized_ot_cmd = f"จด OT {normalized_ot_cmd}"
+            ot_reply = await process_ot_request(_VoiceProxyMsg(), normalized_ot_cmd)
+            _record_voice_room_turn(gid, "Yukinon", ot_reply, is_bot=True)
+            if text_channel:
+                await text_channel.send(f"**[🎙️ `{speaker_name}`]:** {cleaned}\n{ot_reply}")
+            await speak_in_voice_channel(guild, ot_reply, fallback_channel=text_channel)
+            return
+
+        # 4C. Dynamic Memory dispatch (deterministic command form; natural phrasing uses native tool)
+        if speaker_user and v_action == "memory_op" and v_action_conf >= 0.78:
+            if is_memory_command_text(command_body):
+                mem_reply, _ = await process_memory_request(_VoiceProxyMsg(), command_body)
+                _record_voice_room_turn(gid, "Yukinon", mem_reply, is_bot=True)
+                if text_channel:
+                    await text_channel.send(f"**[🎙️ `{speaker_name}`]:** {cleaned}\n{mem_reply}")
+                await speak_in_voice_channel(guild, mem_reply, fallback_channel=text_channel)
+                return
+            dec_plan["needs_tool_use"] = True
+            dec_plan["tool_confidence"] = max(float(dec_plan.get("tool_confidence") or 0.0), 0.90)
+    else:
+        # Decision-1 unavailable fallback: stay quiet on unaddressed 2+ human chatter outside active 15s reply window
+        if human_count_in_vc >= 2 and not explicit_wake and last_bot_age > 15.0:
+            print(
+                f"[Voice Group Filter] Decision-1 unavailable; skipped unaddressed group speech from {speaker_name}: '{cleaned}'",
+                flush=True,
+            )
+            return
 
     # 5. Voice Chat / Search / Weather / Tools (never leak Owner username into prompt text!)
-    if is_owner_user(speaker_user):
+    if speaker_is_owner:
         voice_prompt = command_body
     else:
         voice_prompt = f"{speaker_name} พูดในห้องเสียงว่า: {command_body}"
+
+    if human_count_in_vc >= 2:
+        group_ctx_block = _build_recent_group_voice_context_block(
+            recent_turns_snapshot, speaker_label_ai, window_sec=60.0
+        )
+        if group_ctx_block:
+            voice_prompt = f"{voice_prompt}\n\n{group_ctx_block}"
 
     answer, _ = await query_local_ollama_chat(
         voice_prompt,
@@ -1601,6 +1801,7 @@ async def handle_spoken_voice_command(
         speaker_name=speaker_name,
         decision_plan=dec_plan,
     )
+    _record_voice_room_turn(gid, "Yukinon", answer, is_bot=True)
     if text_channel:
         await text_channel.send(f"**[🎙️ `{speaker_name}`]:** {cleaned}\n**[🔊 Yukinon Voice]:** {answer}")
     await speak_in_voice_channel(guild, answer, fallback_channel=text_channel)
@@ -1728,7 +1929,7 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
         return task
 
     async def flush_pending_utterances(self, timeout_sec: float = 6.0) -> None:
-        """Flushes any buffered speaker utterances immediately and awaits in-flight STT tasks."""
+        """Flushes any buffered speaker utterances immediately and awaits other in-flight STT tasks."""
         ready_payloads = []
         with self._lock:
             for user in list(self.last_spoken.keys()):
@@ -1745,6 +1946,7 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
         for user, pcm_bytes, utt_ts in ready_payloads:
             self._spawn_pcm_task(user, pcm_bytes, utt_ts)
 
+        # Exclude current task so voice-triggered Scribe Stop never waits 6s on itself!
         cur_task = asyncio.current_task()
         pending = [t for t in list(self._inflight_tasks) if not t.done() and t is not cur_task]
         if pending:
@@ -1825,4 +2027,4 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
             else:
                 print(f"[Voice STT] Audio captured from {user.display_name}, but STT returned empty text.", flush=True)
         except Exception as e:
-            print(f"Voice PCM processing error: {type(e).__name__}: {e}", flush=True)
+            print(f"Voice PCM processing error: {e}", flush=True)
