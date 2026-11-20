@@ -339,8 +339,151 @@ class CodeReviewActionView(AutoDisappearingView):
 
 
 # ==============================================================================
-# 2. DYNAMIC DOMAIN-TAILORED SUGGESTION VIEW
+# 2. DYNAMIC DOMAIN-TAILORED SUGGESTION VIEW (PHASE 4: DECISION-1 TOP-K RANKING)
 # ==============================================================================
+# Each entry: key -> (label, emoji, instruction, use_search)
+FOLLOWUP_ACTION_REGISTRY: dict[str, tuple[str, str, str, bool]] = {
+    "pros_cons": (
+        "เทียบข้อดี-ข้อเสีย",
+        "⚖️",
+        "ช่วยวิเคราะห์ข้อดี ข้อเสีย ความคุ้มค่า และข้อควรระวังของเรื่องนี้ในมุมมองที่ตรงไปตรงมาสไตล์ยูกิโนะให้หน่อยค่ะ",
+        True,
+    ),
+    "summary_3": (
+        "สรุปสั้น 3 ข้อ",
+        "📌",
+        "ช่วยสรุปใจความสำคัญและข้อสรุปหลักจากคำตอบ/เนื้อหาเมื่อครู่ให้กระชับที่สุดเพียง 3 ข้อ (Bullet points) ค่ะ",
+        False,
+    ),
+    "action_checklist": (
+        "สกัด Action Items / Checklist",
+        "📋",
+        "ช่วยสกัดขั้นตอนที่ต้องทำ (Action Items), เงื่อนไขสำคัญ หรือ Checklist ที่นำไปใช้งานต่อได้ทันทีจากเนื้อหาข้างต้นค่ะ",
+        False,
+    ),
+    "deep_dive_details": (
+        "เจาะลึกรายละเอียดสำคัญ",
+        "🔍",
+        "ช่วยขยายความรายละเอียดเชิงลึก ตัวเลข เงื่อนไข หรือจุดที่มักถูกมองข้ามจากเนื้อหาข้างต้นให้ชัดเจนขึ้นค่ะ",
+        False,
+    ),
+    "thai_price_check": (
+        "เช็ครุ่น & ราคาในไทย",
+        "🏷️",
+        "จากสินค้า โมเดล หรือฟิกเกอร์ที่ระบุไว้ในคำตอบก่อนหน้า ช่วยค้นหาข้อมูลรุ่นที่วางจำหน่ายจริง "
+        "ไลน์สินค้า/สเกลที่เป็นไปได้ และราคาตลาดโดยประมาณในไทย (เช่น Shopee / ร้านโมเดล / ราคาเปิดตัว) ให้หน่อยค่ะ",
+        True,
+    ),
+    "compare_alternatives": (
+        "เทียบสเกล / ตัวเลือกอื่น",
+        "💡",
+        "ช่วยเปรียบเทียบความแตกต่างระหว่างสเกล รุ่นย่อย หรือตัวเลือกอื่นที่ใกล้เคียงกัน "
+        "(เช่น รายละเอียด สเปค ความคุ้มค่า และข้อควรระวัง) แบบตรงไปตรงมาสไตล์ยูกิโนะค่ะ",
+        True,
+    ),
+    "game_build_tips": (
+        "แนะนำแนวทางเล่น / Build",
+        "🎮",
+        "ช่วยแนะนำแนวทางการเล่น การจัดสาย/อุปกรณ์ หรือเคล็ดลับสำคัญสำหรับผู้เล่นในเรื่องนี้พร้อมเช็คข้อมูลล่าสุดให้หน่อยค่ะ",
+        True,
+    ),
+    "news_impact": (
+        "เช็คผลกระทบ & แนวโน้ม",
+        "📈",
+        "ช่วยค้นหาอัปเดตล่าสุดและวิเคราะห์ผลกระทบ แนวโน้ม หรือข้อมูลเบื้องหลังเพิ่มเติมของประเด็นนี้ให้หน่อยค่ะ",
+        True,
+    ),
+    "character_lore_jokes": (
+        "เจาะลึกตัวละคร & มุก",
+        "📖",
+        "ช่วยอธิบายเจาะลึกเฉพาะความสัมพันธ์ของตัวละครในเรื่อง (Canon lore/นิสัยตัวละคร) และเกร็ดคำศัพท์หรือมุกภาษาญี่ปุ่นในฉากนี้เพิ่มเติม "
+        "โดยไม่ต้องแปลบทสนทนาซ้ำทั้งหมดค่ะ",
+        False,
+    ),
+    "find_artist_works": (
+        "หาผลงานอื่นของศิลปิน",
+        "🔎",
+        "ช่วยค้นหาข้อมูลเพิ่มเติมเกี่ยวกับศิลปิน ผู้วาด (บัญชี X / Pixiv) หรือผลงาน/ซีรีส์ที่เกี่ยวข้องกับโพสต์นี้ให้หน่อยค่ะ",
+        True,
+    ),
+}
+
+
+def _select_dynamic_button_specs(
+    domain: str,
+    button_scores: dict[str, float] | None,
+    has_foreign_dialogue: bool,
+    has_artist_or_social: bool,
+    triage_type: str,
+) -> list[tuple[str, str, discord.ButtonStyle, str, bool]] | None:
+    """
+    Phase 4 Dynamic Button Ranker:
+    Selects the top 2-3 follow-up buttons using Decision-1's calibrated `button_scores`
+    (scored at 0 extra latency during the main orchestration pass), while preserving
+    structural pins (`🎨 แปลลงภาพ (In-Bubble)` for visual Japanese comic dialogue) and
+    context-aware eligibility guardrails. Returns `None` to fall back to static domain
+    defaults if Decision-1 scores are absent or fewer than 2 strong actions qualify.
+    """
+    if not isinstance(button_scores, dict) or not button_scores:
+        return None
+
+    specs: list[tuple[str, str, discord.ButtonStyle, str, bool]] = []
+    used_keys: set[str] = set()
+
+    # Structural pin: Japanese comic/manga dialogue ALWAYS gets In-Bubble as primary Button #1
+    if domain == "social_art" and has_foreign_dialogue:
+        specs.append((
+            "แปลลงภาพ (In-Bubble)",
+            "🎨",
+            discord.ButtonStyle.primary,
+            "__IN_BUBBLE_MANGA_TH__",
+            False,
+        ))
+        used_keys.add("__in_bubble__")
+
+    scored_candidates: list[tuple[float, str]] = []
+    for key, raw_p in button_scores.items():
+        if key not in FOLLOWUP_ACTION_REGISTRY or key in used_keys:
+            continue
+        try:
+            prob = float(raw_p)
+        except Exception:
+            continue
+
+        # Context-aware eligibility guardrails to keep buttons sharp and relevant
+        if key == "find_artist_works":
+            if not has_artist_or_social or domain == "product" or triage_type == "real_world_product":
+                continue
+        if key == "character_lore_jokes":
+            if domain not in ("social_art", "game") and prob < 0.75:
+                continue
+            if triage_type == "real_world_product" and prob < 0.78:
+                continue
+        if key == "game_build_tips" and domain != "game" and prob < 0.75:
+            continue
+        if key == "thai_price_check" and domain not in ("product", "general") and prob < 0.75:
+            continue
+        if key == "news_impact" and domain != "news" and prob < 0.72:
+            continue
+
+        if prob >= 0.55:
+            scored_candidates.append((prob, key))
+
+    scored_candidates.sort(key=lambda x: x[0], reverse=True)
+
+    for _, key in scored_candidates:
+        if len(specs) >= 3:
+            break
+        label, emoji, instruction, use_search = FOLLOWUP_ACTION_REGISTRY[key]
+        style = discord.ButtonStyle.primary if len(specs) == 0 else discord.ButtonStyle.secondary
+        specs.append((label, emoji, style, instruction, use_search))
+        used_keys.add(key)
+
+    if len(specs) < 2:
+        return None
+    return specs
+
+
 class GeneralAssistantActionView(AutoDisappearingView):
     def __init__(
         self,
@@ -472,7 +615,7 @@ def build_contextual_suggestion_view(
         if dom_conf >= 0.65:
             dec_domain = str(decision_plan.get("button_domain") or "").strip().lower()
 
-    # Physical product / scale model kit / collectible photo -> dedicated product buttons (never manga buttons!)
+    # Physical product / scale model kit / collectible photo -> dedicated product domain (never manga buttons!)
     if triage_type == "real_world_product" and triage_conf >= 0.65:
         domain = "product"
     elif dec_domain in ("document", "social_art", "game", "news"):
@@ -501,6 +644,34 @@ def build_contextual_suggestion_view(
     else:
         domain = "general"
 
+    # Trust ImageTriage's visual dialogue flag first; only fall back to OCR body (never tweet captions!)
+    if triage_has_jp is not None:
+        has_foreign_dialogue = triage_has_jp
+    else:
+        has_foreign_dialogue = _has_japanese_in_ocr_body_only(extracted_ctx)
+
+    has_artist_or_social = bool(
+        any(
+            tag in ctx_lower
+            for tag in ("=== embedded x", "=== embedded pixiv", "=== embedded bluesky", "author / artist:", "artist / illustrator:")
+        )
+        or domain == "social_art"
+    )
+
+    # Phase 4: Prefer Decision-1 dynamic top-K button ranking when calibrated `button_scores` are available
+    dynamic_specs = _select_dynamic_button_specs(
+        domain=domain,
+        button_scores=(decision_plan or {}).get("button_scores"),
+        has_foreign_dialogue=has_foreign_dialogue,
+        has_artist_or_social=has_artist_or_social,
+        triage_type=triage_type,
+    )
+    if dynamic_specs:
+        return GeneralAssistantActionView(
+            channel_id, user_query, bot_reply, dynamic_specs, source_message=source_message
+        )
+
+    # Fallback static domain-tailored specs (when Decision-1 was unavailable or on cooldown)
     if domain == "product":
         specs = [
             (
@@ -556,12 +727,6 @@ def build_contextual_suggestion_view(
         return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs, source_message=source_message)
 
     if domain == "social_art":
-        # Trust ImageTriage's visual dialogue flag first; only fall back to OCR body (never tweet captions!)
-        if triage_has_jp is not None:
-            has_foreign_dialogue = triage_has_jp
-        else:
-            has_foreign_dialogue = _has_japanese_in_ocr_body_only(extracted_ctx)
-
         specs = []
         if has_foreign_dialogue:
             specs.append(

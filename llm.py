@@ -127,6 +127,81 @@ _NATIVE_TOOL_CUE_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+# Phase 4: Atomic follow-up button relevance questions evaluated in the SAME Decision-1 forward pass (0 extra latency!)
+_DYNAMIC_FOLLOWUP_BUTTON_QUESTIONS: dict[str, dict] = {
+    "btn_pros_cons": {
+        "type": "noul",
+        "instructions": (
+            "Would a follow-up button 'Compare Pros & Cons' (value, trade-offs, drawbacks) be genuinely helpful "
+            "after answering the latest user message?"
+        ),
+    },
+    "btn_summary_3": {
+        "type": "noul",
+        "instructions": (
+            "Would a follow-up button '3-Bullet TL;DR Summary' be genuinely helpful because the topic, "
+            "document, article, video, or answer involves multi-point information worth condensing?"
+        ),
+    },
+    "btn_action_checklist": {
+        "type": "noul",
+        "instructions": (
+            "Would a follow-up button 'Extract Action Items / Step-by-Step Checklist' be genuinely helpful "
+            "for a document, guide, plan, workflow, or practical problem?"
+        ),
+    },
+    "btn_deep_dive_details": {
+        "type": "noul",
+        "instructions": (
+            "Would a follow-up button 'Deep Dive into Key Details & Edge Cases' be genuinely helpful "
+            "for exploring numbers, nuances, or technical/document details further?"
+        ),
+    },
+    "btn_thai_price_check": {
+        "type": "noul",
+        "instructions": (
+            "Would a follow-up button 'Check Exact Model & Thailand Market Price' be genuinely helpful "
+            "because the user is looking at physical hardware, electronics, coffee gear, a scale model kit, "
+            "a collectible figure, or a purchasable consumer product?"
+        ),
+    },
+    "btn_compare_alternatives": {
+        "type": "noul",
+        "instructions": (
+            "Would a follow-up button 'Compare Alternatives / Similar Models or Scales' be genuinely helpful "
+            "for comparing competing products, model scales, hardware options, or alternative approaches?"
+        ),
+    },
+    "btn_game_build_tips": {
+        "type": "noul",
+        "instructions": (
+            "Would a follow-up button 'Gameplay Guide / Class & Build Tips' be genuinely helpful "
+            "because the topic is about a video game, RPG classes, builds, weapons, or gameplay mechanics?"
+        ),
+    },
+    "btn_news_impact": {
+        "type": "noul",
+        "instructions": (
+            "Would a follow-up button 'Check Impact, Latest Updates & Trends' be genuinely helpful "
+            "because the topic is breaking news, current events, market/price movement, or an ongoing release?"
+        ),
+    },
+    "btn_character_lore_jokes": {
+        "type": "noul",
+        "instructions": (
+            "Would a follow-up button 'Explain Character Lore & Japanese Wordplay/Jokes' be genuinely helpful "
+            "because the user shared anime, manga, fanart, or a Japanese comic scene?"
+        ),
+    },
+    "btn_find_artist_works": {
+        "type": "noul",
+        "instructions": (
+            "Would a follow-up button 'Find Artist Profile & Related Works (X/Pixiv)' be genuinely helpful "
+            "because the user shared an illustration, fanart, or comic post by an artist?"
+        ),
+    },
+}
+
 
 def get_google_model_cooldown(model_id: str) -> float:
     return _GEMINI_MODEL_COOLDOWN_UNTIL.get(model_id, 0.0)
@@ -457,6 +532,8 @@ async def call_gemini_hydrogen_chat(
 #          (`document` block) + native Gemini PDF extraction fallback.
 # Phase 3: Multi-speaker voice room awareness (`addressed_to_bot`, `voice_action`,
 #          natural `start_scribe` / `stop_scribe` detection).
+# Phase 4: Search snippet relevance/clickbait denoising, Fact-Check Arbitrator
+#          verdict, and zero-latency dynamic follow-up button ranking.
 # ==============================================================================
 def _build_recent_channel_history_preview(channel_id: int | None, max_chars: int = 1200) -> str:
     """Compact 2-turn conversation + active topic snapshot so Decision-1 resolves short follow-ups."""
@@ -664,6 +741,9 @@ async def orchestrate_message_with_decision_1(
         },
     }
 
+    if not has_code_attachment:
+        questions.update(_DYNAMIC_FOLLOWUP_BUTTON_QUESTIONS)
+
     answers = await call_gemini_decision_orchestrator(shared_input, questions, timeout_sec=4.0, purpose=purpose)
     if not answers:
         return None
@@ -729,6 +809,12 @@ async def orchestrate_message_with_decision_1(
     btn_domain = str(domain_ans.get("choice") or "general")
     domain_conf = float(domain_ans.get("confidence") or 0.0)
 
+    button_scores: dict[str, float] = {}
+    for q_key in _DYNAMIC_FOLLOWUP_BUTTON_QUESTIONS:
+        b_ans = answers.get(q_key)
+        if isinstance(b_ans, dict) and b_ans.get("noul") is not None:
+            button_scores[q_key[4:]] = round(float(b_ans.get("noul") or 0.0), 3)
+
     if has_code_attachment:
         chosen_route = "code"
         route_conf = 0.99
@@ -768,6 +854,7 @@ async def orchestrate_message_with_decision_1(
         "buttons_confidence": buttons_conf,
         "button_domain": btn_domain,
         "domain_confidence": domain_conf,
+        "button_scores": button_scores,
     }
 
 
@@ -1074,6 +1161,183 @@ async def check_voice_scribe_stop_with_decision_1(
         "is_stop_scribe_command": stop_prob >= 0.78 and addr_prob >= 0.65,
         "stop_prob": stop_prob,
         "addressed_prob": addr_prob,
+    }
+
+
+async def filter_search_snippets_with_decision_1(
+    query: str,
+    items: list[dict],
+    max_keep: int = 5,
+    purpose: str = "SearchFilter",
+) -> list[dict]:
+    """
+    Phase 4 Search Snippet Relevance & Clickbait Denoiser (Single Forward Pass, ~200-350ms):
+    Scores up to 8 candidate snippets simultaneously with `rel_1..N` (0..3 ordered rubric)
+    and `clickbait_1..N` (`noul` yes/no), dropping off-topic SEO spam / unverified rumor
+    snippets BEFORE deep-scraping or feeding them to Gemma 4 / Gemini Flash-Lite.
+    """
+    if not items or len(items) < 2:
+        return list(items[:max_keep])
+    if not GEMINI_API_KEY or not GEMINI_DECISION_MODEL:
+        return list(items[:max_keep])
+    if time.time() < state.gemini_decision_cooldown_until:
+        return list(items[:max_keep])
+
+    candidates = list(items[:8])
+    lines = [f"Search Query: {query[:180]}", "", "Candidate Search Results:"]
+    questions: dict[str, dict] = {}
+
+    for idx, item in enumerate(candidates, 1):
+        title = re.sub(r"\s+", " ", str(item.get("title") or "Untitled")).strip()[:140]
+        href = str(item.get("href") or item.get("url") or "").strip()[:140]
+        body = re.sub(r"\s+", " ", str(item.get("body") or "")).strip()[:280]
+        lines.append(f"[{idx}] Title: {title} | URL: {href}\nSnippet: {body}")
+
+        questions[f"rel_{idx}"] = {
+            "type": "score",
+            "instructions": (
+                f"Rate how relevant and useful Search Result [{idx}] is for answering the Search Query accurately."
+            ),
+            "criteria": [
+                "Completely off-topic, wrong entity/game/person, or empty/useless.",
+                "Loosely related keyword overlap only; lacks concrete facts answering the query.",
+                "Relevant context that partially answers the query.",
+                "Directly and authoritatively answers the query with concrete facts, specs, dates, or official info.",
+            ],
+        }
+        questions[f"clickbait_{idx}"] = {
+            "type": "noul",
+            "instructions": (
+                f"Is Search Result [{idx}] clickbait, unverified social gossip/rumor, SEO content-farm spam, "
+                "or a low-credibility tabloid headline rather than factual information?"
+            ),
+        }
+
+    shared_input = "\n".join(lines)
+    answers = await call_gemini_decision_orchestrator(
+        shared_input, questions, timeout_sec=3.5, purpose=purpose
+    )
+    if not answers:
+        return list(candidates[:max_keep])
+
+    scored_rows: list[tuple[float, float, float, int, dict]] = []
+    survivors: list[tuple[float, int, dict]] = []
+    dropped_cnt = 0
+
+    for idx, item in enumerate(candidates, 1):
+        r_ans = answers.get(f"rel_{idx}") or {}
+        c_ans = answers.get(f"clickbait_{idx}") or {}
+        rel_score = float(r_ans.get("score") if r_ans.get("score") is not None else 1.5)
+        cb_prob = float(c_ans.get("noul") if c_ans.get("noul") is not None else 0.1)
+
+        title_u = str(item.get("title") or "")
+        is_grounded = title_u.startswith("[Google Search Grounded Summary]")
+        is_authoritative = (
+            is_grounded
+            or title_u.startswith("[Wikipedia ")
+            or title_u.startswith("[MyAnimeList ")
+            or title_u.startswith("[Steam Store ")
+        )
+        auth_bonus = 0.30 if is_grounded else (0.18 if is_authoritative else 0.0)
+        eff_score = rel_score - (0.90 * cb_prob) + auth_bonus
+        scored_rows.append((eff_score, rel_score, cb_prob, idx, item))
+
+        # Keep grounded summaries unless clearly off-topic; drop low-rel (<1.15) or clickbait (>=0.75)
+        if is_grounded and rel_score >= 0.80:
+            survivors.append((eff_score, idx, item))
+        elif rel_score >= 1.15 and cb_prob < 0.75:
+            survivors.append((eff_score, idx, item))
+        else:
+            dropped_cnt += 1
+
+    if not survivors:
+        # Safety fallback: never return empty when search returned raw hits — keep top 2 by effective score
+        scored_rows.sort(key=lambda x: (-x[0], x[3]))
+        kept = [row[4] for row in scored_rows[: min(2, max_keep)]]
+        api_log(
+            f"SearchFilter -> fallback kept {len(kept)}/{len(candidates)} snippets "
+            f"(all scored low; best_rel={scored_rows[0][1]:.2f})"
+        )
+        return kept
+
+    survivors.sort(key=lambda x: (-x[0], x[1]))
+    kept = [row[2] for row in survivors[:max_keep]]
+    api_log(
+        f"SearchFilter -> kept {len(kept)}/{len(candidates)} snippets "
+        f"(dropped {dropped_cnt} clickbait/low-rel)"
+    )
+    return kept
+
+
+async def arbitrate_fact_check_with_decision_1(
+    previous_claim: str,
+    user_challenge: str,
+    search_evidence: str,
+    topic: str = "",
+    purpose: str = "FactCheckArbitrator",
+) -> dict | None:
+    """
+    Phase 4 Objective Fact-Check Arbitrator (~200-350ms, 0 output tokens):
+    Evaluates `(previous_claim, user_challenge, search_evidence)` to return a calibrated
+    verdict (`bot_was_right`, `user_was_right`, `partial_truth`, `inconclusive`) so
+    Flash-Lite / Gemma neither cave in with sycophantic false apologies nor double down on mistakes.
+    """
+    if not previous_claim or not user_challenge or not search_evidence:
+        return None
+    if not GEMINI_API_KEY or not GEMINI_DECISION_MODEL:
+        return None
+    if time.time() < state.gemini_decision_cooldown_until:
+        return None
+
+    shared_input = (
+        f"Topic: {topic or '(General)'}\n\n"
+        f"=== Assistant's Previous Answer (Being Disputed) ===\n{previous_claim[:1500]}\n\n"
+        f"=== User's Correction / Challenge ===\n{user_challenge[:600]}\n\n"
+        f"=== Grounded Web Search Evidence ===\n{search_evidence[:5500]}"
+    )
+    questions = {
+        "verdict": {
+            "type": "choice",
+            "instructions": (
+                "Compare the Assistant's Previous Answer against the User's Correction using ONLY the Grounded Web Search Evidence. "
+                "Which side is factually supported by the search evidence?"
+            ),
+            "criteria": {
+                "bot_was_right": "The search evidence clearly confirms the assistant's previous answer was factually accurate and the user's challenge is mistaken or wrong.",
+                "inconclusive": "The search evidence does not contain clear facts directly resolving the disputed claim.",
+                "partial_truth": "Both sides are partially right, or the answer depends on version/edition/timeframe nuance shown in the search evidence.",
+                "user_was_right": "The search evidence clearly proves the assistant's previous answer contained a factual error/hallucination and the user's correction is accurate.",
+            },
+        },
+        "evidence_sufficient": {
+            "type": "noul",
+            "instructions": (
+                "Does the Grounded Web Search Evidence contain direct, concrete facts that clearly resolve the disputed claim?"
+            ),
+        },
+    }
+
+    answers = await call_gemini_decision_orchestrator(
+        shared_input, questions, timeout_sec=3.5, purpose=purpose
+    )
+    if not answers:
+        return None
+
+    v_ans = answers.get("verdict") or {}
+    e_ans = answers.get("evidence_sufficient") or {}
+    verdict = str(v_ans.get("choice") or "inconclusive")
+    verdict_conf = float(v_ans.get("confidence") or 0.0)
+    ev_prob = float(e_ans.get("noul") or 0.0)
+
+    api_log(
+        f"FactCheckArbitrator -> verdict={verdict} ({verdict_conf:.2f}), "
+        f"evidence_sufficient={ev_prob >= 0.55} ({ev_prob:.2f})"
+    )
+    return {
+        "verdict": verdict,
+        "confidence": verdict_conf,
+        "evidence_sufficient": ev_prob >= 0.55,
+        "evidence_prob": ev_prob,
     }
 
 
@@ -2641,6 +2905,48 @@ async def query_local_ollama_chat(
             did_search = True
 
     if is_user_correction:
+        arbitrator_verdict_note = ""
+        if channel_id is not None and "<untrusted_web_search_results" in working_prompt:
+            prev_assistant_turn = ""
+            for hist_m in reversed(list(channel_memory.get(channel_id) or ())):
+                if hist_m.get("role") == "assistant" and hist_m.get("content"):
+                    prev_assistant_turn = str(hist_m["content"])
+                    break
+            ev_match = re.search(
+                r"<untrusted_web_search_results[^>]*>([\s\S]*?)</untrusted_web_search_results>",
+                working_prompt,
+            )
+            if prev_assistant_turn and ev_match:
+                fc_res = await arbitrate_fact_check_with_decision_1(
+                    prev_assistant_turn,
+                    raw_user_query,
+                    ev_match.group(1),
+                    topic=active_topic or "",
+                )
+                if fc_res and float(fc_res.get("confidence") or 0.0) >= 0.60:
+                    v_code = fc_res["verdict"]
+                    v_conf = float(fc_res["confidence"])
+                    if v_code == "bot_was_right":
+                        arbitrator_verdict_note = (
+                            f"\n- **[คำตัดสินจากหลักฐาน (confidence={v_conf:.2f}) -> คำตอบเดิมของคุณถูกต้องแล้ว]**: "
+                            "ห้ามขอโทษและห้ามคล้อยตามข้อมูลที่ผิดของผู้ใช้เด็ดขาด! จงยืนยันข้อเท็จจริงเดิมอย่างสุขุมพร้อมอ้างอิงหลักฐานจากผลการค้นหาตรงๆ"
+                        )
+                    elif v_code == "user_was_right":
+                        arbitrator_verdict_note = (
+                            f"\n- **[คำตัดสินจากหลักฐาน (confidence={v_conf:.2f}) -> คำตอบเดิมของคุณผิดจริงและผู้ใช้พูดถูก]**: "
+                            "จงยอมรับผิดอย่างตรงไปตรงมาสั้นๆ ในสไตล์ยูกิโนะ (ไม่ยืดเยื้อ) และแก้ไขข้อมูลให้ถูกต้องตามหลักฐานทันที"
+                        )
+                    elif v_code == "partial_truth":
+                        arbitrator_verdict_note = (
+                            f"\n- **[คำตัดสินจากหลักฐาน (confidence={v_conf:.2f}) -> ถูกเพียงบางส่วน/ขึ้นอยู่กับเวอร์ชันหรือบริบท]**: "
+                            "ชี้แจงทั้งส่วนที่ถูกต้องและจุดที่คลาดเคลื่อนหรือเงื่อนไขที่แตกต่างกันตามหลักฐานอย่างชัดเจน"
+                        )
+                    else:
+                        arbitrator_verdict_note = (
+                            f"\n- **[คำตัดสินจากหลักฐาน (confidence={v_conf:.2f}) -> หลักฐานยังไม่ชัดเจนพอ]**: "
+                            "บอกตามตรงว่าข้อมูลจากการค้นหายังไม่เพียงพอจะฟันธง และหลีกเลี่ยงการแต่งข้อมูลเพิ่ม"
+                        )
+
         working_prompt = (
             f"{working_prompt}\n\n"
             f"[คำสั่งระบบสำหรับการตรวจสอบข้อเท็จจริง (Fact-Check Arbitrator Mode — หัวข้อ: {active_topic or 'ตามบริบทสนทนา'})]:\n"
@@ -2649,6 +2955,7 @@ async def query_local_ollama_chat(
             "   - หากคำตอบก่อนหน้าของคุณมีข้อมูลที่แต่งขึ้นเองหรือผิดพลาดจริง: จงยอมรับอย่างตรงไปตรงมาและแก้ไขเฉพาะจุดที่ผิดให้ถูกต้องตามหลักฐานทันที\n"
             "   - หากหลักฐานจากการค้นหายืนยันว่าสิ่งที่คุณพูดถูกต้องอยู่แล้วและผู้ใช้เข้าใจผิดเอง: จงยืนยันตามข้อเท็จจริงจากผลการค้นหา\n"
             "3. ห้ามเบี่ยงประเด็นไปอธิบายประวัติของบริษัทที่ไม่เกี่ยวข้อง และห้ามใช้คำลงท้ายว่า 'ครับ' เด็ดขาด"
+            f"{arbitrator_verdict_note}"
         )
 
     # Complexity-driven routing:

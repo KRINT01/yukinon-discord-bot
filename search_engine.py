@@ -91,7 +91,7 @@ def _strip_context_and_system_blocks(text: str) -> str:
         return ""
     head = re.split(
         r"\n\n(?:===|<untrusted_web_search_results|<mentioned_users_dossier>|\[Attachment |\[PDF Notice:|\[Web extraction error:|"
-        r"\[กฎสำคัญ\]|\[บริบทหัวข้อก่อนหน้า\]|\[สรุปคำตอบก่อนหน้า|\[เนื้อหาอ้างอิงจากไฟล์)",
+        r"\[กฎสำคัญ\]|\[บริบทหัวข้อก่อนหน้า\]|\[บริบทบทสนทนาล่าสุดในห้องเสียง\]|\[สรุปคำตอบก่อนหน้า|\[เนื้อหาอ้างอิงจากไฟล์|\[ข้อมูลบริบทระบบปัจจุบัน\])",
         text,
         maxsplit=1,
     )[0]
@@ -868,10 +868,12 @@ def _search_ddgs_sync(query: str, region_code: str, timelimit: str | None, max_r
 
 async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
     """
-    High-speed parallel async multi-engine web search with 5-minute TTL caching:
+    High-speed parallel async multi-engine web search with 5-minute TTL caching + Phase 4 Decision-1 denoising:
       - Fans out domain-appropriate backends (Gemini Grounding, Google News RSS, Jikan MAL,
         Wikipedia batched extracts, Steam Store, Tavily, DDGS) concurrently via `asyncio.gather`.
-      - Deep-scrapes up to 2 short-snippet web pages concurrently via `fetch_webpage_async`.
+      - Filters off-topic & clickbait/rumor snippets in ONE Decision-1 forward pass (~250ms)
+        BEFORE deep-scraping, keeping only the cleanest, highest-relevance evidence for Gemma/Flash-Lite.
+      - Deep-scrapes up to 2 surviving short-snippet web pages concurrently via `fetch_webpage_async`.
     """
     clean_q = re.sub(r"[\r\n]+", " ", query or "").strip()
     clean_q = re.sub(
@@ -950,20 +952,33 @@ async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
     if not hits:
         return ""
 
-    # Deduplicate and pick up to `max_results` entries
-    selected_items: list[dict] = []
+    # Deduplicate up to 8 candidates so Decision-1 can rank and drop clickbait/irrelevant hits BEFORE scraping
+    deduped_candidates: list[dict] = []
     seen_urls: set[str] = set()
     for item in hits:
-        if len(selected_items) >= max_results:
+        if len(deduped_candidates) >= max(8, max_results):
             break
         href = (item.get("href") or item.get("url") or "").strip()
         if href and href in seen_urls:
             continue
         if href:
             seen_urls.add(href)
-        selected_items.append(item)
+        deduped_candidates.append(item)
 
-    # Phase 2: Concurrently deep-scrape up to 2 short-snippet web articles
+    # Phase 4: Single-pass Decision-1 Snippet Relevance & Clickbait Filter (lazy import avoids circular import)
+    if len(deduped_candidates) >= 2 and GEMINI_API_KEY:
+        try:
+            from llm import filter_search_snippets_with_decision_1
+            selected_items = await filter_search_snippets_with_decision_1(
+                clean_q, deduped_candidates, max_keep=max_results
+            )
+        except Exception as e:
+            api_log(f"SearchFilter -> skipped ({type(e).__name__})")
+            selected_items = deduped_candidates[:max_results]
+    else:
+        selected_items = deduped_candidates[:max_results]
+
+    # Phase 2: Concurrently deep-scrape up to 2 surviving short-snippet web articles
     scrape_targets: list[tuple[int, str]] = []
     for idx, item in enumerate(selected_items):
         if len(scrape_targets) >= 2:
@@ -1021,8 +1036,6 @@ def run_safe_web_search_sync(query: str, max_results: int = 5) -> str:
         asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(run_safe_web_search_async(query, max_results=max_results))
-    # If invoked from a worker thread where no loop is running, asyncio.run handles it;
-    # if somehow called inside a running loop, fall back to a dedicated loop in a thread.
     import concurrent.futures
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         return pool.submit(asyncio.run, run_safe_web_search_async(query, max_results=max_results)).result(timeout=20)
