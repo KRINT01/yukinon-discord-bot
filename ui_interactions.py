@@ -129,9 +129,15 @@ def should_attach_interactive_view(
     if valid_ctx or did_search:
         return True
 
-    if decision_plan and float(decision_plan.get("route_confidence") or 0.0) >= 0.65:
-        if decision_plan.get("attach_buttons"):
-            return True
+    # Gate on attach_buttons' OWN confidence (`buttons_confidence`) rather than `route_confidence`
+    if decision_plan:
+        btn_conf = float(
+            decision_plan.get("buttons_confidence")
+            if decision_plan.get("buttons_confidence") is not None
+            else (decision_plan.get("route_confidence") or 0.0)
+        )
+        if btn_conf >= 0.65:
+            return bool(decision_plan.get("attach_buttons"))
 
     if _SUBSTANTIVE_REQUEST_REGEX.search(user_request or ""):
         return True
@@ -233,7 +239,16 @@ class CodeReviewActionView(AutoDisappearingView):
             allow_agentic_search=False,
             has_fresh_attachment=True,
             speaker_user=interaction.user,
-            decision_plan={"route": "code", "route_confidence": 0.99, "needs_web_search": False},
+            decision_plan={
+                "route": "code",
+                "route_confidence": 0.99,
+                "needs_web_search": False,
+                "search_confidence": 0.99,
+                "needs_tool_use": False,
+                "tool_confidence": 0.90,
+                "complexity_score": 2.0,
+                "complexity_confidence": 0.90,
+            },
         )
         await send_chunked_response(interaction.channel, answer)
         try:
@@ -345,19 +360,17 @@ class GeneralAssistantActionView(AutoDisappearingView):
             if artist_hint and ("ศิลปิน" in btn_label or "ผลงาน" in btn_label):
                 search_hint_tag = f"\n[SEARCH_HINT: {artist_hint}]"
 
-        dec_plan = await orchestrate_message_with_decision_1(
-            f"Follow-up action ({btn_label}): {instruction}",
-            extracted_ctx=cached_ctx[:2500],
-            purpose="ButtonFollowup",
-        )
-        if dec_plan is None:
-            dec_plan = {
-                "route": "web_search" if use_search else "chat",
-                "route_confidence": 0.90,
-                "needs_web_search": use_search,
-            }
-        else:
-            dec_plan["needs_web_search"] = use_search
+        # Deterministic button plan — skips redundant ~350ms Decision-1 `ButtonFollowup` round-trip!
+        dec_plan = {
+            "route": "web_search" if use_search else "chat",
+            "route_confidence": 0.95,
+            "needs_web_search": use_search,
+            "search_confidence": 0.95,
+            "needs_tool_use": use_search,
+            "tool_confidence": 0.95,
+            "complexity_score": 1.6 if use_search else 1.3,
+            "complexity_confidence": 0.90,
+        }
 
         composed = (
             f"{instruction}{search_hint_tag}\n\n"
@@ -397,9 +410,16 @@ def build_contextual_suggestion_view(
     ctx_lower = (extracted_ctx or "").lower()
     combined = f"{user_query} {bot_reply}".lower()
 
+    # Gate on button_domain's OWN confidence (`domain_confidence`) rather than `route_confidence`
     dec_domain = ""
-    if decision_plan and float(decision_plan.get("route_confidence") or 0.0) >= 0.65:
-        dec_domain = str(decision_plan.get("button_domain") or "").strip().lower()
+    if decision_plan:
+        dom_conf = float(
+            decision_plan.get("domain_confidence")
+            if decision_plan.get("domain_confidence") is not None
+            else (decision_plan.get("route_confidence") or 0.0)
+        )
+        if dom_conf >= 0.65:
+            dec_domain = str(decision_plan.get("button_domain") or "").strip().lower()
 
     if dec_domain in ("document", "social_art", "game", "news"):
         domain = dec_domain
@@ -957,7 +977,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             allow_agentic_search=False,
             has_fresh_attachment=bool(att_block),
             speaker_user=interaction.user,
-            decision_plan={"route": "code", "route_confidence": 0.99, "needs_web_search": False},
+            decision_plan={"route": "code", "route_confidence": 0.99, "needs_web_search": False, "search_confidence": 0.99},
         )
         view = (
             CodeReviewActionView(interaction.user.id, interaction.channel_id, prompt, answer)
@@ -1031,7 +1051,11 @@ def register_app_commands(bot: discord.ext.commands.Bot):
     @app_commands.describe(query="หัวข้อหรือคำถามที่ต้องการให้ Yukipedia ค้นหาและวิเคราะห์")
     async def slash_yukipedia(interaction: discord.Interaction, query: str):
         await interaction.response.defer(thinking=True)
-        dec_plan = await orchestrate_message_with_decision_1(query, purpose="SlashYukipedia")
+        dec_plan = await orchestrate_message_with_decision_1(
+            query,
+            purpose="SlashYukipedia",
+            channel_id=interaction.channel_id,
+        )
         answer, did_search = await query_local_ollama_chat(
             query,
             model=ACTIVE_FAST_MODEL,
@@ -1090,7 +1114,10 @@ def register_app_commands(bot: discord.ext.commands.Bot):
         fake_msg = _FakeSourceMsg()
         extracted_ctx, _ = await extract_all_context(fake_msg)
         dec_plan = await orchestrate_message_with_decision_1(
-            question.strip() or link.strip(), extracted_ctx=extracted_ctx, purpose="SlashSource"
+            question.strip() or link.strip(),
+            extracted_ctx=extracted_ctx,
+            purpose="SlashSource",
+            channel_id=interaction.channel_id,
         )
         user_q = question.strip() or (
             "ช่วยระบุที่มาของภาพและลิงก์นี้อย่างละเอียด: "
@@ -1194,7 +1221,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             allow_agentic_search=False,
             has_fresh_attachment=bool(extracted_ctx),
             speaker_user=interaction.user,
-            decision_plan={"route": "code", "route_confidence": 0.99, "needs_web_search": False},
+            decision_plan={"route": "code", "route_confidence": 0.99, "needs_web_search": False, "search_confidence": 0.99},
         )
         view = (
             CodeReviewActionView(interaction.user.id, interaction.channel_id, base_text, answer)
@@ -1211,7 +1238,10 @@ def register_app_commands(bot: discord.ext.commands.Bot):
         extracted_ctx, _ = await extract_all_context(message)
         base_text = message.content.strip() or "ช่วยตรวจสอบข้อเท็จจริงและสรุปเนื้อหาในข้อความนี้ให้หน่อย"
         dec_plan = await orchestrate_message_with_decision_1(
-            base_text, extracted_ctx=extracted_ctx, purpose="CtxYukipedia"
+            base_text,
+            extracted_ctx=extracted_ctx,
+            purpose="CtxYukipedia",
+            channel_id=interaction.channel_id,
         )
         full_prompt = f"{base_text}\n\n{extracted_ctx}" if extracted_ctx else base_text
 
@@ -1255,7 +1285,10 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             )
             return
         dec_plan = await orchestrate_message_with_decision_1(
-            message.content or "", extracted_ctx=extracted_ctx, purpose="CtxFindSource"
+            message.content or "",
+            extracted_ctx=extracted_ctx,
+            purpose="CtxFindSource",
+            channel_id=interaction.channel_id,
         )
         user_q = (
             "ช่วยระบุที่มาของภาพและลิงก์นี้อย่างละเอียด: "

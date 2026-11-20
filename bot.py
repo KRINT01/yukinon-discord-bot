@@ -301,12 +301,12 @@ async def handle_root(request: web.Request) -> web.Response:
 
     html = f"""
     <html>
-    <head>
+      <head>
         <meta charset="utf-8">
         <title>Yukinon Discord Bot - System Telemetry</title>
-    </head>
-    <body style="font-family: system-ui, sans-serif; max-width: 740px; margin: 36px auto; line-height: 1.6; color: #1f2937; padding: 0 16px;">
-        <h2>❄️ Yukino Yukinoshita Discord Bot (Native Function-Calling, Voice Scribe &amp; Multi-Cloud Edition)</h2>
+      </head>
+      <body style="font-family: system-ui, sans-serif; max-width: 740px; margin: 36px auto; line-height: 1.6; color: #1f2937; padding: 0 16px;">
+        <h2>❄️ Yukino Yukinoshita Discord Bot (Decision-1 Orchestrated, Native Tools &amp; Voice Scribe Edition)</h2>
         <p><b>System Time (TH):</b> {m['system_time_th']}</p>
         <p><b>Discord Gateway:</b> {gw_status}</p>
         <p><b>Native Tools:</b> {len(ai['registered_tools'])} active (<code>{', '.join(ai['registered_tools'])}</code>)</p>
@@ -319,7 +319,7 @@ async def handle_root(request: web.Request) -> web.Response:
         <p><b>Groq LPU Acceleration:</b> {"Enabled (Code: <code>" + GROQ_CODE_MODEL + "</code> | Search: <code>" + str(ai['groq_search_model']) + "</code> | Vision: <code>" + str(ai['groq_vision_model']) + "</code>)" if ai['groq_enabled'] else "Disabled"}</p>
         <p><b>Modal GPU Ollama:</b> {"Configured" if ai['modal_ollama_configured'] else "Not Configured"} (Fallback: <code>{ai['fast_model']}</code>)</p>
         <p><b>Uptime:</b> {m['uptime_human']} ({m['uptime_sec']}s)</p>
-    </body>
+      </body>
     </html>
     """
     return web.Response(
@@ -547,9 +547,9 @@ async def _dispatch_post_tool_side_effects(
 async def process_yukipedia_request(ctx_or_message, raw_prompt: str = ""):
     """
     Unified 'Yukipedia Mode' dispatcher:
-      1) If image/link + manga translation requested -> runs Manga Localization.
-      2) If image/document/reply attached -> runs OCR/Document extraction + Yukipedia analysis.
-      3) Otherwise -> runs parallel async multi-engine Web Search + Native Tools in Yukipedia mode.
+    1) If image/link + manga translation requested -> runs Manga Localization.
+    2) If image/document/reply attached -> runs OCR/Document extraction + Yukipedia analysis.
+    3) Otherwise -> runs Web Search & Decision-1 in parallel for faster Yukipedia answers.
     """
     msg = ctx_or_message.message if hasattr(ctx_or_message, "message") else ctx_or_message
     channel = ctx_or_message.channel
@@ -594,9 +594,25 @@ async def process_yukipedia_request(ctx_or_message, raw_prompt: str = ""):
             )
             return
 
-        search_block = ""
+        # Run Web Search and Decision-1 concurrently when no attachment context is present
         if effective_query and not extracted_ctx:
-            search_block = await run_safe_web_search_async(effective_query[:180], max_results=5)
+            search_block, dec_plan = await asyncio.gather(
+                run_safe_web_search_async(effective_query[:180], max_results=5),
+                orchestrate_message_with_decision_1(
+                    effective_query,
+                    extracted_ctx="",
+                    purpose="Yukipedia",
+                    channel_id=channel.id,
+                ),
+            )
+        else:
+            search_block = ""
+            dec_plan = await orchestrate_message_with_decision_1(
+                effective_query,
+                extracted_ctx=extracted_ctx,
+                purpose="Yukipedia",
+                channel_id=channel.id,
+            )
 
         composed_prompt = effective_query
         if extracted_ctx:
@@ -604,9 +620,6 @@ async def process_yukipedia_request(ctx_or_message, raw_prompt: str = ""):
         if search_block:
             composed_prompt = f"{composed_prompt}\n\n{search_block}"
 
-        dec_plan = await orchestrate_message_with_decision_1(
-            effective_query, extracted_ctx=extracted_ctx, purpose="Yukipedia"
-        )
         tool_ctx = ToolExecutionContext(
             channel_id=channel.id,
             guild=msg.guild,
@@ -754,7 +767,7 @@ async def on_message(message: discord.Message):
                 await send_generated_image_to_channel(message.channel, clean_prompt, reply_to=message)
             return
 
-    # 1. Single-Pass vs PreRoute Decision-1 Orchestration (eliminates redundant double calls!)
+    # 1. Single-Pass vs PreRoute Decision-1 Orchestration (context-aware with last 2 turns of channel_memory!)
     text_without_urls = URL_REGEX.sub("", clean_prompt).strip()
     is_bare_link_only = bool(has_embedded_media_or_link and not text_without_urls and not all_msg_atts)
     has_ambiguous_action_cue = bool(
@@ -781,6 +794,7 @@ async def on_message(message: discord.Message):
             has_code_attachment=has_code_att,
             inline_images_b64=low_res_imgs,
             purpose="PreRoute",
+            channel_id=message.channel.id,
         )
     )
     pre_route = (pre_plan or {}).get("route", "")
@@ -816,13 +830,19 @@ async def on_message(message: discord.Message):
         preloaded_att_bytes.clear()
 
         if is_compound_prompt:
-            decision_plan = {
-                "route": "compound",
-                "route_confidence": 0.95,
-                "needs_web_search": False,
-                "attach_buttons": True,
-                "button_domain": "general",
-            }
+            # Still run Decision-1 once for complexity, tone, guardrails, and passive memory (forcing compound route)
+            decision_plan = await orchestrate_message_with_decision_1(
+                clean_prompt or spoken_clip_text,
+                extracted_ctx=extracted_ctx,
+                has_code_attachment=has_code_att,
+                purpose="CompoundRoute",
+                channel_id=message.channel.id,
+            ) or {}
+            decision_plan["route"] = "compound"
+            decision_plan["route_confidence"] = 0.95
+            decision_plan["needs_web_search"] = False
+            decision_plan["needs_tool_use"] = True
+            decision_plan["tool_confidence"] = 0.99
         else:
             needs_refined_route = (
                 pre_plan is None
@@ -835,6 +855,7 @@ async def on_message(message: discord.Message):
                     extracted_ctx=extracted_ctx,
                     has_code_attachment=has_code_att,
                     purpose="Route",
+                    channel_id=message.channel.id,
                 ) or pre_plan
             else:
                 decision_plan = pre_plan
@@ -1206,7 +1227,10 @@ async def ask_fast(ctx, *, prompt: str = ""):
         )
         is_dt = (not ctx_text) and (try_instant_datetime_reply(effective_prompt) is not None)
         dec_plan = None if is_dt else await orchestrate_message_with_decision_1(
-            effective_prompt, extracted_ctx=ctx_text, purpose="AskCmd"
+            effective_prompt,
+            extracted_ctx=ctx_text,
+            purpose="AskCmd",
+            channel_id=ctx.channel.id,
         )
         tool_ctx = ToolExecutionContext(
             channel_id=ctx.channel.id,
@@ -1273,7 +1297,7 @@ async def ask_code(ctx, *, prompt: str = "วิเคราะห์โค้�
             allow_agentic_search=False,
             has_fresh_attachment=bool(ctx_text),
             speaker_user=ctx.author,
-            decision_plan={"route": "code", "route_confidence": 0.99, "needs_web_search": False},
+            decision_plan={"route": "code", "route_confidence": 0.99, "needs_web_search": False, "search_confidence": 0.99},
             tool_ctx=tool_ctx,
         )
         view = (
@@ -1295,7 +1319,10 @@ async def source_command(ctx, *, question: str = ""):
             )
             return
         dec_plan = await orchestrate_message_with_decision_1(
-            question.strip() or ctx.message.content, extracted_ctx=ctx_text, purpose="SourceCmd"
+            question.strip() or ctx.message.content,
+            extracted_ctx=ctx_text,
+            purpose="SourceCmd",
+            channel_id=ctx.channel.id,
         )
         user_q = question.strip() or (
             "ช่วยระบุที่มาของภาพและลิงก์นี้อย่างละเอียด: "
