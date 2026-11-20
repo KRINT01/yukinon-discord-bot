@@ -96,7 +96,7 @@ TOOL_SPECS: list[dict[str, Any]] = [
         "parameters": {
             "expression": {
                 "type": "string",
-                "description": "Mathematical expression using digits and operators + - * / ** % ( ), e.g. '(4500 * 0.22) * 1.07'.",
+                "description": "Mathematical expression using digits and operators + - * / ** % ( ).",
                 "required": True,
             },
         },
@@ -112,8 +112,10 @@ TOOL_SPECS: list[dict[str, Any]] = [
             "command": {
                 "type": "string",
                 "description": (
-                    "Normalized Thai OT command string, e.g. 'จด OT แก้ระบบ e-Tax', "
-                    "'จด OT 15/11/2569 18.00 - 21.00 Deploy K8s', 'สรุป OT', 'สรุป OT เดือนตุลาคม', or 'ลบ OT เมื่อวาน'."
+                    "Thai OT command built strictly from the user's actual words without inventing any times, dates, or task details. "
+                    "Syntax: 'จด OT [<date>] [<HH.MM> - <HH.MM>] [<task>]', 'สรุป OT [<month>]', or 'ลบ OT [<date>]'. "
+                    "Thai time reference: 6 โมงเย็น=18.00, ทุ่มนึง/1 ทุ่ม=19.00, 2 ทุ่ม=20.00, 3 ทุ่ม=21.00. "
+                    "NEVER invent a task description if the user did not mention one."
                 ),
                 "required": True,
             },

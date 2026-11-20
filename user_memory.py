@@ -123,8 +123,8 @@ async def restore_user_profiles_from_discord(bot: discord.Client):
                                 )
                                 restored = True
                                 break
-                    if restored:
-                        break
+                if restored:
+                    break
         except Exception as e:
             print(f"[User Memory] Cloud restore note: {e}", flush=True)
 
@@ -906,15 +906,15 @@ async def process_memory_request(message, raw_text: str) -> tuple[str, str]:
 # OVERTIME (OT) TRACKER & MONTHLY TABLE SUMMARIZER
 # ==============================================================================
 OT_TRIGGER_REGEX = re.compile(
-    r"^(?:จด|บันทึก|ลง|เพิ่ม|แก้|อัปเดต|สรุป|ดู|เช็ค|ตาราง|ยอด|ลบ|ยกเลิก)\s*(?:เวลา\s*)?ot\b",
+    r"^(?:จด|บันทึก|ลง|เพิ่ม|แก้|อัปเดต|สรุป|ดู|เช็ค|ตาราง|ยอด|ลบ|ยกเลิก)\s*(?:เวลา\s*)?(?:ot|โอที)\b",
     re.IGNORECASE,
 )
 OT_SUMMARY_REGEX = re.compile(
-    r"^(?:สรุป|ดู|เช็ค|ตาราง|ยอด)\s*(?:เวลา\s*)?ot\b|ot\s*เดือน",
+    r"^(?:สรุป|ดู|เช็ค|ตาราง|ยอด)\s*(?:เวลา\s*)?(?:ot|โอที)\b|(?:ot|โอที)\s*เดือน",
     re.IGNORECASE,
 )
 OT_DELETE_REGEX = re.compile(
-    r"^(?:ลบ|ยกเลิก)\s*(?:เวลา\s*)?ot\b",
+    r"^(?:ลบ|ยกเลิก)\s*(?:เวลา\s*)?(?:ot|โอที)\b",
     re.IGNORECASE,
 )
 WEEKEND_TIME_REPLY_REGEX = re.compile(
@@ -945,6 +945,113 @@ _MONTH_PATTERN_STR = "|".join(
     re.escape(k) for k in sorted(ALL_THAI_MONTH_TOKENS.keys(), key=len, reverse=True)
 )
 THAI_SHORT_WEEKDAYS = ("จ.", "อ.", "พ.", "พฤ.", "ศ.", "ส.", "อา.")
+
+# Colloquial Thai spoken-time parser helpers (converts '6 โมงถึงทุ่มนึง' -> '18.00 ถึง 19.00')
+_THAI_SPOKEN_NUM_MAP = {
+    "หนึ่ง": 1, "นึง": 1, "เอ็ด": 1, "สอง": 2, "สาม": 3, "สี่": 4, "ห้า": 5,
+    "หก": 6, "เจ็ด": 7, "แปด": 8, "เก้า": 9, "สิบ": 10, "สิบเอ็ด": 11,
+}
+_THAI_NUM_TOKEN_PAT = r"(?:สิบเอ็ด|สิบ|หนึ่ง|นึง|สอง|สาม|สี่|ห้า|หก|เจ็ด|แปด|เก้า|1[0-1]|[1-9])"
+_THAI_MIN_SUFFIX_PAT = r"(?:\s*(ครึ่ง)|\s*(\d{1,2})\s*นาที|\s*ตรง)?"
+
+
+def _parse_thai_small_num(tok: str | None) -> int:
+    if not tok:
+        return 1
+    t = tok.strip()
+    if t.isdigit():
+        return int(t)
+    return _THAI_SPOKEN_NUM_MAP.get(t, 1)
+
+
+def _parse_thai_minutes_suffix(half_grp: str | None, min_grp: str | None) -> int:
+    if half_grp:
+        return 30
+    if min_grp and min_grp.isdigit():
+        return min(59, max(0, int(min_grp)))
+    return 0
+
+
+def _normalize_colloquial_thai_times_in_ot_text(text: str) -> str:
+    """
+    Converts spoken Thai time expressions into 24-hour `HH.MM` format so OT parsing works
+    identically for voice commands and casual Thai text:
+      - '6 โมงถึงทุ่มนึง' -> '18.00 ถึง 19.00'
+      - 'หกโมงเย็นถึงสองทุ่มครึ่ง' -> '18.00 ถึง 20.30'
+      - 'บ่ายโมงถึงสี่โมงเย็น' -> '13.00 ถึง 16.00'
+      - '9 โมงเช้าถึงเที่ยงครึ่ง' -> '09.00 ถึง 12.30'
+    """
+    if not text:
+        return text
+    s = text
+
+    # 1. เที่ยงคืน -> 00.MM
+    s = re.sub(
+        rf"เที่ยงคืน{_THAI_MIN_SUFFIX_PAT}",
+        lambda m: f" 00.{_parse_thai_minutes_suffix(m.group(1), m.group(2)):02d} ",
+        s,
+    )
+    # 2. เที่ยง / เที่ยงวัน -> 12.MM
+    s = re.sub(
+        rf"เที่ยง(?:วัน)?{_THAI_MIN_SUFFIX_PAT}",
+        lambda m: f" 12.{_parse_thai_minutes_suffix(m.group(1), m.group(2)):02d} ",
+        s,
+    )
+    # 3. ตี 1..5 -> 01..05.MM
+    s = re.sub(
+        rf"ตี\s*(หนึ่ง|สอง|สาม|สี่|ห้า|[1-5]){_THAI_MIN_SUFFIX_PAT}",
+        lambda m: f" {_parse_thai_small_num(m.group(1)):02d}.{_parse_thai_minutes_suffix(m.group(2), m.group(3)):02d} ",
+        s,
+    )
+    # 4. บ่ายโมง (13:00) & บ่าย 1..5 โมง (13..17)
+    s = re.sub(
+        rf"บ่าย\s*โมง{_THAI_MIN_SUFFIX_PAT}",
+        lambda m: f" 13.{_parse_thai_minutes_suffix(m.group(1), m.group(2)):02d} ",
+        s,
+    )
+    s = re.sub(
+        rf"บ่าย\s*(หนึ่ง|สอง|สาม|สี่|ห้า|[1-5])\s*(?:โมง)?{_THAI_MIN_SUFFIX_PAT}",
+        lambda m: f" {12 + _parse_thai_small_num(m.group(1)):02d}.{_parse_thai_minutes_suffix(m.group(2), m.group(3)):02d} ",
+        s,
+    )
+    # 5. X ทุ่ม (1..5 ทุ่ม -> 19..23)
+    s = re.sub(
+        rf"(หนึ่ง|สอง|สาม|สี่|ห้า|[1-5])\s*ทุ่ม{_THAI_MIN_SUFFIX_PAT}",
+        lambda m: f" {18 + _parse_thai_small_num(m.group(1)):02d}.{_parse_thai_minutes_suffix(m.group(2), m.group(3)):02d} ",
+        s,
+    )
+    # 6. ทุ่มนึง / ทุ่มหนึ่ง / ทุ่มครึ่ง / ทุ่ม XX นาที -> 19.MM
+    s = re.sub(
+        rf"ทุ่ม(?:\s*(?:นึง|หนึ่ง))?{_THAI_MIN_SUFFIX_PAT}",
+        lambda m: f" 19.{_parse_thai_minutes_suffix(m.group(1), m.group(2)):02d} ",
+        s,
+    )
+    # 7. X โมงเย็น (4..6 โมงเย็น -> 16..18)
+    s = re.sub(
+        rf"(สี่|ห้า|หก|[4-6])\s*โมง\s*เย็น{_THAI_MIN_SUFFIX_PAT}",
+        lambda m: f" {12 + _parse_thai_small_num(m.group(1)):02d}.{_parse_thai_minutes_suffix(m.group(2), m.group(3)):02d} ",
+        s,
+    )
+    # 8. X โมงเช้า (6..11 โมงเช้า -> 06..11)
+    s = re.sub(
+        rf"({_THAI_NUM_TOKEN_PAT})\s*โมง\s*เช้า{_THAI_MIN_SUFFIX_PAT}",
+        lambda m: f" {_parse_thai_small_num(m.group(1)):02d}.{_parse_thai_minutes_suffix(m.group(2), m.group(3)):02d} ",
+        s,
+    )
+    # 9. Bare 'X โมง' in OT context (1..6 โมง -> 13..18 evening/afternoon; 7..11 โมง -> 07..11 morning)
+    def _bare_mong_repl(m):
+        h_raw = _parse_thai_small_num(m.group(1))
+        mm = _parse_thai_minutes_suffix(m.group(2), m.group(3))
+        hh = (12 + h_raw) if 1 <= h_raw <= 6 else h_raw
+        return f" {hh:02d}.{mm:02d} "
+
+    s = re.sub(
+        rf"({_THAI_NUM_TOKEN_PAT})\s*โมง{_THAI_MIN_SUFFIX_PAT}",
+        _bare_mong_repl,
+        s,
+    )
+
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def _normalize_ot_year_ce(yy_str: str | None, default_year_ce: int) -> int:
@@ -1086,7 +1193,8 @@ def is_ot_command_text(text: str, channel_id: int = None, user_id: int = None) -
     if OT_TRIGGER_REGEX.search(cleaned):
         return True
     if _has_active_pending_weekend_ot(channel_id, user_id):
-        if WEEKEND_TIME_REPLY_REGEX.match(cleaned) or cleaned.lower() in ("ยกเลิก", "cancel"):
+        norm_c = _normalize_colloquial_thai_times_in_ot_text(cleaned)
+        if WEEKEND_TIME_REPLY_REGEX.match(norm_c) or cleaned.lower() in ("ยกเลิก", "cancel"):
             return True
     return False
 
@@ -1300,7 +1408,8 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
             pending_weekend_ot.pop(pending_key, None)
             return "ยกเลิกการรอเวลาเริ่มทำ OT ให้แล้วค่ะ"
 
-        tm_match = WEEKEND_TIME_REPLY_REGEX.match(text)
+        norm_reply = _normalize_colloquial_thai_times_in_ot_text(text)
+        tm_match = WEEKEND_TIME_REPLY_REGEX.match(norm_reply)
         if tm_match:
             pending_data = pending_weekend_ot.pop(pending_key)
             saved_work_dt: datetime = pending_data["work_dt"]
@@ -1358,7 +1467,7 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
 
     if OT_DELETE_REGEX.search(text) or text.lower().startswith(("delete ", "remove ", "ลบ")):
         pending_weekend_ot.pop(pending_key, None)
-        del_body = re.sub(r"^(?:ลบ|ยกเลิก|delete|remove)\s*(?:เวลา\s*)?(?:ot)?\s*", "", text, flags=re.IGNORECASE).strip()
+        del_body = re.sub(r"^(?:ลบ|ยกเลิก|delete|remove)\s*(?:เวลา\s*)?(?:ot|โอที)?\s*", "", text, flags=re.IGNORECASE).strip()
         custom_del_dt, _ = _extract_custom_date_from_text(del_body, default_work_dt)
         target_dt = custom_del_dt or default_work_dt
         target_key = (target_dt.year, target_dt.month, target_dt.day)
@@ -1407,7 +1516,7 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
         return build_monthly_ot_summary_markdown(ot_logs, target_year, target_month)
 
     detail_str = re.sub(
-        r"^(?:จด|บันทึก|ลง|เพิ่ม|แก้|อัปเดต)\s*(?:เวลา\s*)?ot\b\s*",
+        r"^(?:จด|บันทึก|ลง|เพิ่ม|แก้|อัปเดต)\s*(?:เวลา\s*)?(?:ot|โอที)\b\s*",
         "",
         text,
         flags=re.IGNORECASE,
@@ -1418,6 +1527,9 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
     work_dt = custom_dt if is_custom_date else default_work_dt
     target_date_th = _format_date_thai_ddmmyyyy(work_dt)
     is_weekend = (work_dt.weekday() >= 5)
+
+    # Convert colloquial spoken Thai times ('6 โมงถึงทุ่มนึง' -> '18.00 ถึง 19.00') before range/until matching
+    detail_str = _normalize_colloquial_thai_times_in_ot_text(detail_str)
 
     range_time_m = re.match(
         r"^(?:ตั้งแต่(?:\s*เวลา)?|เริ่ม(?:\s*เวลา)?)?\s*(\d{1,2})[:.](\d{2})\s*(?:น\.?)?\s*(?:-|ถึง|to)\s*(\d{1,2})[:.](\d{2})(?:\s*น\.?)?\s*(.*)",

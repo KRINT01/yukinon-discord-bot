@@ -1664,8 +1664,9 @@ async def query_local_ollama_chat(
 
     # Auto-provision a lightweight ToolExecutionContext if none passed so voice/slash callers gain tools too
     is_coding = (model == ACTIVE_CODE_MODEL) or (dec_route == "code" and dec_conf >= 0.70)
+    is_voice_mode = ("ห้องเสียง" in system_prompt) or (tool_ctx is not None and tool_ctx.mode == "voice")
     if tool_ctx is None:
-        inferred_mode = "code" if is_coding else ("voice" if "ห้องเสียง" in system_prompt else "general")
+        inferred_mode = "code" if is_coding else ("voice" if is_voice_mode else "general")
         tool_ctx = ToolExecutionContext(
             channel_id=channel_id,
             speaker_user=speaker_user,
@@ -1743,6 +1744,7 @@ async def query_local_ollama_chat(
             "3. ห้ามเบี่ยงประเด็นไปอธิบายประวัติของบริษัทที่ไม่เกี่ยวข้อง และห้ามใช้คำลงท้ายว่า 'ครับ' เด็ดขาด"
         )
 
+    # In Voice mode, do NOT let a stale text-channel `active_topic` push casual voice chat to Groq `gpt-oss-20b`!
     prefer_high_knowledge_llm = bool(
         is_coding
         or is_compound
@@ -1751,7 +1753,7 @@ async def query_local_ollama_chat(
         or is_user_correction
         or is_factual_domain
         or is_japanese_or_social_media
-        or bool(active_topic)
+        or (bool(active_topic) and not is_voice_mode)
     )
 
     async def _run_inference_pass(user_content: str) -> str:
@@ -1759,20 +1761,20 @@ async def query_local_ollama_chat(
         raw_history = []
         if channel_id is not None:
             raw_history = list(channel_memory[channel_id])
-            if is_user_correction or did_search:
-                sanitized_history = []
-                for m in raw_history[-6:]:
-                    if m.get("role") == "assistant":
-                        short_prev = m.get("content", "")[:200].replace("\n", " ")
-                        sanitized_history.append({
-                            "role": "assistant",
-                            "content": f"[สรุปคำตอบก่อนหน้า: {short_prev}...]",
-                        })
-                    else:
-                        sanitized_history.append(m)
-                messages.extend(sanitized_history)
-            else:
-                messages.extend(raw_history)
+        if is_user_correction or did_search:
+            sanitized_history = []
+            for m in raw_history[-6:]:
+                if m.get("role") == "assistant":
+                    short_prev = m.get("content", "")[:200].replace("\n", " ")
+                    sanitized_history.append({
+                        "role": "assistant",
+                        "content": f"[สรุปคำตอบก่อนหน้า: {short_prev}...]",
+                    })
+                else:
+                    sanitized_history.append(m)
+            messages.extend(sanitized_history)
+        else:
+            messages.extend(raw_history)
 
         messages.append({"role": "user", "content": user_content})
 
@@ -1837,18 +1839,18 @@ async def query_local_ollama_chat(
         if prefer_high_knowledge_llm and not is_coding:
             target_temp = 0.2 if (did_search or is_user_correction or is_compound) else temperature
 
-            # Compound multi-intent & Japanese/social-media prioritize Gemini native parallel tool calling first!
-            if is_compound or is_japanese_or_social_media:
-                if GEMINI_API_KEY:
-                    ans = await call_gemini_chat_messages(
-                        messages,
-                        temperature=target_temp,
-                        purpose="CompoundTools" if is_compound else "MangaSocialChat",
-                        thinking_level="LOW",
-                        tool_ctx=active_tool_ctx,
-                    )
-                    if ans:
-                        return ans
+            # Compound multi-intent, Voice tool/factual queries, & Japanese/social-media prioritize Gemini Flash-Lite first!
+            prefer_gemini_first = bool(is_compound or is_japanese_or_social_media or is_voice_mode)
+            if prefer_gemini_first and GEMINI_API_KEY:
+                ans = await call_gemini_chat_messages(
+                    messages,
+                    temperature=target_temp,
+                    purpose="CompoundTools" if is_compound else ("VoiceTools" if is_voice_mode else "MangaSocialChat"),
+                    thinking_level="MINIMAL" if (is_voice_mode and not active_tool_ctx) else "LOW",
+                    tool_ctx=active_tool_ctx,
+                )
+                if ans:
+                    return ans
 
             if GROQ_API_KEY:
                 groq_search_candidates = await get_groq_search_and_chat_candidates()
@@ -1867,7 +1869,7 @@ async def query_local_ollama_chat(
                     except Exception:
                         continue
 
-            if not (is_compound or is_japanese_or_social_media) and GEMINI_API_KEY:
+            if not prefer_gemini_first and GEMINI_API_KEY:
                 try:
                     ans = await call_gemini_chat_messages(
                         messages,
@@ -1906,14 +1908,25 @@ async def query_local_ollama_chat(
             if ans:
                 return ans
 
-        # PATH C: Casual Chat, Weather & Voice Chat (fast 6.5s Groq hedge on CF cold starts)
+        # PATH C: Casual Chat, Weather & Voice Chat (Thai-strong Gemma 4 / Gemini Flash-Lite before Groq)
         chat_temp = 0.25 if (did_search or is_user_correction or is_weather_query) else temperature
+
+        if is_voice_mode and GEMINI_API_KEY:
+            ans = await call_gemini_chat_messages(
+                messages,
+                temperature=chat_temp,
+                purpose="VoiceChat",
+                thinking_level="MINIMAL",
+                tool_ctx=active_tool_ctx,
+            )
+            if ans:
+                return ans
 
         ans = await _call_cf_gemma_hedged_with_groq(
             messages,
             temperature=chat_temp,
             max_tokens=1024,
-            purpose="Chat",
+            purpose="VoiceChat" if is_voice_mode else "Chat",
             hedge_delay_sec=6.5,
         )
         if ans:

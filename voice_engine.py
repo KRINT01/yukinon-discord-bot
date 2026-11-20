@@ -47,7 +47,7 @@ from config import (
     api_log,
     get_http_session,
 )
-from persona import sanitize_yukino_output, VOICE_SYSTEM_PROMPT
+from persona import is_owner_user, sanitize_yukino_output, VOICE_SYSTEM_PROMPT
 from llm import query_local_ollama_chat, orchestrate_message_with_decision_1
 
 # Silence noisy RTCP SenderReport logs (type=200) and opus flush warnings from discord-ext-voice-recv
@@ -61,6 +61,9 @@ PCM_SILENCE_20MS = b"\x00" * 3840
 
 # Hard 18-second cap per continuous utterance (~3.45 MB @ 48kHz stereo 16-bit) to protect 512MB Render RAM
 MAX_UTTERANCE_BYTES = 192000 * 18
+
+# Consistent TTS voice selection: defaults to steady Google TTS + Yukino filter (set TTS_PRIMARY_ENGINE=edge to override)
+TTS_PRIMARY_ENGINE = os.getenv("TTS_PRIMARY_ENGINE", "google").strip().lower()
 
 # Host constants split to prevent chat/markdown auto-linkers from mangling URLs
 GTRANS_HOST = "translate." + "googleapis.com"
@@ -76,11 +79,39 @@ VOICE_TEST_PHRASE_REGEX = re.compile(
     re.IGNORECASE,
 )
 
-# Vocabulary hint for Whisper & Gemini 3.5 Transcribe Live so Thai/English commands & names are spelled accurately
+# Custom vocabulary terms for Gemini 3.5 Transcribe Live (up to 100 terms for optimal biasing)
+GEMINI_LIVE_CUSTOM_VOCAB = [
+    "ยูกิโนะ",
+    "ยูกิน่อน",
+    "Yukino",
+    "Yukinon",
+    "จด OT",
+    "สรุป OT",
+    "ลบ OT",
+    "แก้ OT",
+    "ดูความจำ",
+    "จำไว้ว่า",
+    "ยูกิพีเดีย",
+    "Yukipedia",
+    "แปลมังงะ",
+    "PSO2",
+    "NGS",
+    "e-Tax",
+    "Spring Boot",
+    "Oracle",
+    "Kubernetes",
+    "Docker",
+    "ทุ่มนึง",
+    "สองทุ่ม",
+    "สามทุ่ม",
+    "หกโมง",
+]
+
+# Vocabulary hint for Groq Whisper fallback
 WHISPER_THAI_PROMPT_HINT = (
     "ยูกิโนะ ยูกิน่อน Yukino Yukinon สวัสดีค่ะ แนะนำตัวหน่อย ได้ยินไหม ถ้าได้ยินแล้วพิมพ์ตอบในแชท "
     "ทดสอบไมค์ เทสเสียง ทดสอบ วันนี้วันอะไร ตอนนี้เวลากี่โมง อากาศวันนี้เป็นยังไง "
-    "จด OT สรุป OT ดูความจำ ยูกิพีเดีย Yukipedia PSO2 NGS แปลมังงะ"
+    "จด OT 6 โมงถึงทุ่มนึง สรุป OT ลบ OT ดูความจำ ยูกิพีเดีย Yukipedia PSO2 NGS แปลมังงะ"
 )
 
 STT_PHONETIC_FIXES = (
@@ -93,9 +124,10 @@ STT_PHONETIC_FIXES = (
     (re.compile(r"ตัดสอบ"), "ทดสอบ"),
     (re.compile(r"^เธอสิ่ง(กัน)?$"), "เทสเสียง"),
     (re.compile(r"^สอบสิ่ง$"), "ทดสอบเสียง"),
-    (re.compile(r"\bจด\s*โอที\b", re.IGNORECASE), "จด OT"),
-    (re.compile(r"\bสรุป\s*โอที\b", re.IGNORECASE), "สรุป OT"),
-    (re.compile(r"\bลบ\s*โอที\b", re.IGNORECASE), "ลบ OT"),
+    (re.compile(r"(?:จด|กด|จอด)\s*(?:โอ\s*ที|ot)\b", re.IGNORECASE), "จด OT"),
+    (re.compile(r"สรุป\s*(?:โอ\s*ที|ot)\b", re.IGNORECASE), "สรุป OT"),
+    (re.compile(r"(?:ลบ|ยกเลิก)\s*(?:โอ\s*ที|ot)\b", re.IGNORECASE), "ลบ OT"),
+    (re.compile(r"(?:แก้|แก้ไข)\s*(?:โอ\s*ที|ot)\b", re.IGNORECASE), "แก้ OT"),
 )
 
 _NATIVE_DPY_VOICE_WS_RECEIVED = _dpy_gateway.DiscordVoiceWebSocket.received_message
@@ -417,7 +449,8 @@ def _normalize_thai_dates_and_times_for_tts(text: str) -> str:
             return f" {_format_colloquial_thai_time(hh, mm)} "
         return m.group(0)
 
-    s = re.sub(r"\b(\d{1,2}):(\d{2})\s*(?:น\.)?", _time_repl, s)
+    # Convert both HH:MM and HH.MM (e.g., 18.00 - 19.00 น.) into colloquial Thai speech
+    s = re.sub(r"\b(\d{1,2})[:.](\d{2})\s*(?:น\.)?", _time_repl, s)
 
     def _day_num_repl(m):
         prefix = m.group(1)
@@ -431,7 +464,9 @@ def _normalize_thai_dates_and_times_for_tts(text: str) -> str:
 
 
 def clean_text_for_speech(text: str) -> str:
-    cleaned = sanitize_yukino_output(text)
+    # Strip hidden OT/Memory record footers before speaking
+    cleaned = re.sub(r"-#\s*\[(?:OT_RECORD|MEM_RECORD):[^\]]*\]", " ", text or "")
+    cleaned = sanitize_yukino_output(cleaned)
     cleaned = re.sub(r"```[\s\S]*?```", " รายละเอียดของโค้ดฉันส่งไว้ให้ในแชทแล้วค่ะ ", cleaned)
     cleaned = URL_REGEX.sub(" ลิงก์อ้างอิงอยู่ในแชทแล้วค่ะ ", cleaned)
     cleaned = _normalize_thai_dates_and_times_for_tts(cleaned)
@@ -460,7 +495,13 @@ def _split_tts_chunks(text: str, max_len: int = 190) -> list[str]:
 
 
 def _master_tts_audio_sync(mp3_bytes: bytes, extra_af: str = "") -> bytes:
-    base_af = "equalizer=f=3200:t=q:w=1.2:g=-2.5,acompressor=threshold=-18dB:ratio=2:attack=15:release=150,volume=1.35"
+    # 220ms lead-in delay prevents clipped opening syllables on Discord Opus playback start
+    base_af = (
+        "adelay=220:all=1,"
+        "equalizer=f=3200:t=q:w=1.2:g=-2.5,"
+        "acompressor=threshold=-18dB:ratio=2:attack=15:release=150,"
+        "volume=1.35"
+    )
     full_af = f"{extra_af},{base_af}" if extra_af else base_af
     proc = subprocess.run(
         [
@@ -479,7 +520,7 @@ def _master_tts_audio_sync(mp3_bytes: bytes, extra_af: str = "") -> bytes:
     return proc.stdout
 
 
-async def _fallback_google_tts_with_yukino_pitch(spoken_text: str, lang_code: str) -> bytes:
+async def _google_tts_with_yukino_filter(spoken_text: str, lang_code: str) -> bytes:
     raw_mp3_parts = bytearray()
     headers = {"User-Agent": "Mozilla/5.0"}
     session = get_http_session()
@@ -488,11 +529,14 @@ async def _fallback_google_tts_with_yukino_pitch(spoken_text: str, lang_code: st
             f"{HTTPS}{GTRANS_HOST}/translate_tts"
             f"?ie=UTF-8&client=tw-ob&tl={lang_code}&q={quote_plus(chunk)}"
         )
-        async with session.get(
-            tts_url, headers=headers, timeout=aiohttp.ClientTimeout(total=12)
-        ) as resp:
-            if resp.status == 200:
-                raw_mp3_parts.extend(await resp.read())
+        try:
+            async with session.get(
+                tts_url, headers=headers, timeout=aiohttp.ClientTimeout(total=12)
+            ) as resp:
+                if resp.status == 200:
+                    raw_mp3_parts.extend(await resp.read())
+        except Exception as e:
+            api_log(f"Google TTS chunk warning: {type(e).__name__}: {str(e)[:80]}")
 
     if not raw_mp3_parts:
         return b""
@@ -504,43 +548,62 @@ async def _fallback_google_tts_with_yukino_pitch(spoken_text: str, lang_code: st
         return bytes(raw_mp3_parts)
 
 
+async def _edge_tts_with_mastering(spoken_text: str, is_thai: bool) -> bytes:
+    if time.time() < state.edge_tts_cooldown_until:
+        return b""
+    voice_name = TTS_VOICE_TH if is_thai else TTS_VOICE_EN
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
+        mp3_path = tmp_mp3.name
+    try:
+        comm_kwargs = {"text": spoken_text, "voice": voice_name, "proxy": DDGS_PROXY}
+        if TTS_RATE and TTS_RATE not in ("+0%", "-0%", "0%"):
+            comm_kwargs["rate"] = TTS_RATE
+        if TTS_PITCH and TTS_PITCH not in ("+0Hz", "-0Hz", "0Hz"):
+            comm_kwargs["pitch"] = TTS_PITCH
+
+        communicate = edge_tts.Communicate(**comm_kwargs)
+        await asyncio.wait_for(communicate.save(mp3_path), timeout=4.5)
+        if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 256:
+            with open(mp3_path, "rb") as f:
+                raw_edge_mp3 = f.read()
+            try:
+                return await asyncio.to_thread(_master_tts_audio_sync, raw_edge_mp3)
+            except Exception:
+                return raw_edge_mp3
+    except Exception as e:
+        state.edge_tts_cooldown_until = time.time() + 1800
+        print(f"edge-tts unavailable ({e}); cooling down for 30m...", flush=True)
+    finally:
+        try:
+            os.remove(mp3_path)
+        except OSError:
+            pass
+    return b""
+
+
 async def synthesize_tts_mp3_bytes(text: str) -> bytes:
+    """
+    Consistent voice synthesis:
+    - Default (`TTS_PRIMARY_ENGINE=google`): Google TTS + Yukino filter for every turn
+      (including join greeting), falling back to Edge-TTS only if Google TTS fails.
+    - Optional (`TTS_PRIMARY_ENGINE=edge`): Edge-TTS primary with Google TTS fallback.
+    """
     spoken_text = clean_text_for_speech(text)
     if not spoken_text:
         return b""
     is_thai = bool(THAI_CHAR_REGEX.search(spoken_text))
-    voice_name = TTS_VOICE_TH if is_thai else TTS_VOICE_EN
-
-    if time.time() >= state.edge_tts_cooldown_until:
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
-            mp3_path = tmp_mp3.name
-        try:
-            comm_kwargs = {"text": spoken_text, "voice": voice_name, "proxy": DDGS_PROXY}
-            if TTS_RATE and TTS_RATE not in ("+0%", "-0%", "0%"):
-                comm_kwargs["rate"] = TTS_RATE
-            if TTS_PITCH and TTS_PITCH not in ("+0Hz", "-0Hz", "0Hz"):
-                comm_kwargs["pitch"] = TTS_PITCH
-
-            communicate = edge_tts.Communicate(**comm_kwargs)
-            await asyncio.wait_for(communicate.save(mp3_path), timeout=4.5)
-            if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 256:
-                with open(mp3_path, "rb") as f:
-                    raw_edge_mp3 = f.read()
-                try:
-                    return await asyncio.to_thread(_master_tts_audio_sync, raw_edge_mp3)
-                except Exception:
-                    return raw_edge_mp3
-        except Exception as e:
-            state.edge_tts_cooldown_until = time.time() + 1800
-            print(f"edge-tts unavailable ({e}); locking to steady Google TTS + Yukino filter for 30m...", flush=True)
-        finally:
-            try:
-                os.remove(mp3_path)
-            except OSError:
-                pass
-
     lang_code = "th" if is_thai else "en"
-    return await _fallback_google_tts_with_yukino_pitch(spoken_text, lang_code)
+
+    if TTS_PRIMARY_ENGINE == "edge":
+        edge_bytes = await _edge_tts_with_mastering(spoken_text, is_thai)
+        if edge_bytes:
+            return edge_bytes
+        return await _google_tts_with_yukino_filter(spoken_text, lang_code)
+
+    google_bytes = await _google_tts_with_yukino_filter(spoken_text, lang_code)
+    if google_bytes:
+        return google_bytes
+    return await _edge_tts_with_mastering(spoken_text, is_thai)
 
 
 async def speak_in_voice_channel(guild: discord.Guild, text: str, fallback_channel=None):
@@ -621,7 +684,8 @@ def transcribe_wav_bytes_google_sync(wav_bytes: bytes) -> str:
 
 NOISE_HALLUCINATION_REGEX = re.compile(r"(<\|.*?\|>|[ðþæøåÐÞÆØÅ]|(.)\2\2)", re.IGNORECASE)
 WHISPER_HALLUCINATIONS = {
-    "ขอบคุณครับ", "ขอบคุณค่ะ", "โปรดติดตามตอนต่อไป", "พากย์ไทยโดย", "ซับไทยโดย",
+    "ขอบคุณครับ", "ขอบคุณค่ะ", "ขอบคุณที่รับชม", "โปรดติดตามตอนต่อไป",
+    "พากย์ไทยโดย", "ซับไทยโดย", "ซับไทย", "โอ้โห", "อ๋อ", "อืม", "เอ่อ",
     "thank you", "thanks for watching", "you", "bye", ".", "..", "..."
 }
 
@@ -631,14 +695,37 @@ def _extract_pcm16k_from_wav_bytes(wav_bytes: bytes) -> tuple[bytes, int]:
     with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
         rate = wf.getframerate() or 16000
         pcm = wf.readframes(wf.getnframes())
+    # Ensure even byte length for 16-bit PCM alignment
+    if len(pcm) % 2 == 1:
+        pcm = pcm[:-1]
     return pcm, rate
+
+
+def _parse_ws_json_frame(msg: aiohttp.WSMessage) -> dict | None:
+    """Parses Google Live API WebSocket frames (sent as BINARY or TEXT UTF-8 JSON)."""
+    if msg.type == aiohttp.WSMsgType.TEXT:
+        try:
+            data = json.loads(msg.data)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+    if msg.type == aiohttp.WSMsgType.BINARY:
+        try:
+            data = json.loads(msg.data.decode("utf-8"))
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+    return None
 
 
 async def transcribe_wav_bytes_gemini_live(wav_bytes: bytes) -> str:
     """
     Tier 1 Primary STT: Streams 16kHz mono PCM audio to `gemini-3.5-transcribe-live`
-    over Google AI Studio's Multimodal Live WebSocket (`BidiGenerateContent`) with
-    custom vocabulary biasing for Thai/English/Japanese commands and character names.
+    over Google AI Studio's Multimodal Live WebSocket (`BidiGenerateContent`):
+      - Parses BOTH `BINARY` and `TEXT` JSON frames (fixes `setupComplete` TimeoutError!).
+      - Uses official `inputAudioTranscription` (`languageCodes`, `customVocabulary`, `mode="SMART"`)
+        with manual VAD (`activityStart` / `activityEnd`) for instant utterance finalization.
+      - Reads `serverContent.inputTranscription` (and `interimInputTranscription` fallback).
     """
     if not GEMINI_API_KEY or not GEMINI_TRANSCRIBE_LIVE_MODEL:
         return ""
@@ -659,137 +746,198 @@ async def transcribe_wav_bytes_gemini_live(wav_bytes: bytes) -> str:
         f"?key={GEMINI_API_KEY}"
     )
 
-    setup_msg = {
-        "setup": {
-            "model": f"models/{GEMINI_TRANSCRIBE_LIVE_MODEL}",
-            "generationConfig": {
-                "responseModalities": ["TEXT"],
-                "temperature": 0.0,
+    setup_configs = (
+        (
+            "manual_smart",
+            {
+                "setup": {
+                    "model": f"models/{GEMINI_TRANSCRIBE_LIVE_MODEL}",
+                    "generationConfig": {
+                        "responseModalities": ["TEXT"],
+                    },
+                    "inputAudioTranscription": {
+                        "languageCodes": ["th-TH", "en-US"],
+                        "customVocabulary": GEMINI_LIVE_CUSTOM_VOCAB,
+                        "mode": "SMART",
+                    },
+                    "realtimeInputConfig": {
+                        "automaticActivityDetection": {
+                            "disabled": True,
+                        }
+                    },
+                }
             },
-            "systemInstruction": {
-                "parts": [
-                    {
-                        "text": (
-                            "You are a strict, verbatim speech-to-text transcriber for Thai, English, and Japanese voice commands. "
-                            "Output ONLY the exact spoken words in plain text without answering, translating, or adding commentary. "
-                            f"Domain & Custom Vocabulary Bias: {WHISPER_THAI_PROMPT_HINT}"
-                        )
-                    }
-                ]
+        ),
+        (
+            "hybrid_auto",
+            {
+                "setup": {
+                    "model": f"models/{GEMINI_TRANSCRIBE_LIVE_MODEL}",
+                    "generationConfig": {
+                        "responseModalities": ["TEXT"],
+                    },
+                    "inputAudioTranscription": {
+                        "languageCodes": ["th-TH", "en-US"],
+                        "customVocabulary": GEMINI_LIVE_CUSTOM_VOCAB,
+                    },
+                }
             },
-        }
-    }
+        ),
+    )
 
-    t0 = time.monotonic()
     session = get_http_session()
-    try:
-        async with session.ws_connect(ws_url, timeout=10.0, heartbeat=20.0) as ws:
-            await ws.send_json(setup_msg)
+    last_err = ""
 
-            setup_ok = False
-            setup_deadline = time.monotonic() + 3.5
-            while time.monotonic() < setup_deadline:
-                rem = max(0.2, setup_deadline - time.monotonic())
-                msg = await ws.receive(timeout=rem)
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    data = json.loads(msg.data)
+    for mode_label, setup_msg in setup_configs:
+        t0 = time.monotonic()
+        try:
+            async with session.ws_connect(ws_url, timeout=10.0, heartbeat=20.0) as ws:
+                await ws.send_json(setup_msg)
+
+                setup_ok = False
+                setup_deadline = time.monotonic() + 4.5
+                while time.monotonic() < setup_deadline:
+                    rem = max(0.2, setup_deadline - time.monotonic())
+                    msg = await ws.receive(timeout=rem)
+                    if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        close_reason = getattr(msg, "extra", "") or str(msg.data or "")
+                        raise RuntimeError(f"WS closed during setup ({msg.data} {close_reason})")
+                    data = _parse_ws_json_frame(msg)
+                    if not data:
+                        continue
                     if "setupComplete" in data:
                         setup_ok = True
                         break
                     if "error" in data:
-                        raise RuntimeError(str(data["error"])[:160])
-                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                    break
+                        raise RuntimeError(str(data["error"])[:180])
 
-            if not setup_ok:
-                raise RuntimeError("Live STT setup handshake incomplete")
+                if not setup_ok:
+                    raise RuntimeError("Live STT setup handshake timed out")
 
-            padded_pcm = pcm_bytes + (b"\x00" * (sample_rate * 2 * 4 // 10))
-            chunk_size = 3200
-            for offset in range(0, len(padded_pcm), chunk_size):
-                chunk = padded_pcm[offset : offset + chunk_size]
-                await ws.send_json({
-                    "realtimeInput": {
-                        "mediaChunks": [
-                            {
+                use_manual_vad = (mode_label == "manual_smart")
+                if use_manual_vad:
+                    await ws.send_json({"realtimeInput": {"activityStart": {}}})
+
+                # 100ms chunks (3200 bytes @ 16kHz 16-bit mono) + 300ms trailing silence padding
+                padded_pcm = pcm_bytes + (b"\x00" * (sample_rate * 2 * 3 // 10))
+                chunk_size = 3200
+                for offset in range(0, len(padded_pcm), chunk_size):
+                    chunk = padded_pcm[offset : offset + chunk_size]
+                    if len(chunk) % 2 == 1:
+                        chunk = chunk[:-1]
+                    if not chunk:
+                        continue
+                    await ws.send_json({
+                        "realtimeInput": {
+                            "audio": {
                                 "mimeType": f"audio/pcm;rate={sample_rate}",
                                 "data": base64.b64encode(chunk).decode("ascii"),
                             }
-                        ]
-                    }
-                })
+                        }
+                    })
 
-            await ws.send_json({"clientContent": {"turnComplete": True}})
+                if use_manual_vad:
+                    await ws.send_json({"realtimeInput": {"activityEnd": {}}})
+                else:
+                    await ws.send_json({"realtimeInput": {"audioStreamEnd": True}})
 
-            transcript_parts: list[str] = []
-            read_deadline = time.monotonic() + 7.5
-            while time.monotonic() < read_deadline:
-                rem = max(0.2, read_deadline - time.monotonic())
-                try:
-                    msg = await ws.receive(timeout=rem)
-                except asyncio.TimeoutError:
-                    break
+                final_parts: list[str] = []
+                latest_interim = ""
+                fallback_model_parts: list[str] = []
+                read_deadline = time.monotonic() + 6.5
 
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    data = json.loads(msg.data)
+                while time.monotonic() < read_deadline:
+                    rem = max(0.15, read_deadline - time.monotonic())
+                    # Once we have finalized inputTranscription, wait at most 0.75s for trailing chunks
+                    recv_timeout = min(rem, 0.75) if final_parts else rem
+                    try:
+                        msg = await ws.receive(timeout=recv_timeout)
+                    except asyncio.TimeoutError:
+                        break
+
+                    if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+
+                    data = _parse_ws_json_frame(msg)
+                    if not data:
+                        continue
                     if "error" in data:
-                        raise RuntimeError(str(data["error"])[:160])
+                        raise RuntimeError(str(data["error"])[:180])
+
                     sc = data.get("serverContent") or {}
+                    if not isinstance(sc, dict):
+                        continue
+
+                    input_tr = sc.get("inputTranscription")
+                    if isinstance(input_tr, dict):
+                        tr_txt = (input_tr.get("text") or "").strip()
+                        if tr_txt:
+                            # SMART mode emits full cumulative text; VERBATIM emits incremental pieces
+                            if use_manual_vad:
+                                final_parts = [tr_txt]
+                            else:
+                                final_parts.append(tr_txt)
+                        if input_tr.get("finished"):
+                            break
+
+                    interim_tr = sc.get("interimInputTranscription")
+                    if isinstance(interim_tr, dict) and interim_tr.get("text"):
+                        latest_interim = str(interim_tr["text"]).strip()
+
                     model_turn = sc.get("modelTurn") or {}
                     for part in model_turn.get("parts") or []:
                         if isinstance(part, dict) and part.get("text") and not part.get("thought", False):
-                            transcript_parts.append(part["text"])
-                    input_tr = sc.get("inputTranscription") or {}
-                    if isinstance(input_tr, dict) and input_tr.get("text"):
-                        transcript_parts.append(input_tr["text"])
-                    if sc.get("turnComplete"):
-                        break
-                elif msg.type == aiohttp.WSMsgType.BINARY:
-                    try:
-                        data = json.loads(msg.data.decode("utf-8"))
-                        sc = data.get("serverContent") or {}
-                        for part in (sc.get("modelTurn") or {}).get("parts") or []:
-                            if isinstance(part, dict) and part.get("text") and not part.get("thought", False):
-                                transcript_parts.append(part["text"])
-                        if sc.get("turnComplete"):
-                            break
-                    except Exception:
-                        pass
-                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                    break
+                            fallback_model_parts.append(part["text"])
 
-        raw_transcript = re.sub(r"\s+", " ", "".join(transcript_parts)).strip()
-        fixed_transcript = _apply_phonetic_fixes(raw_transcript)
-        elapsed = time.monotonic() - t0
-        if (
-            fixed_transcript
-            and len(fixed_transcript) >= 2
-            and fixed_transcript.lower() not in WHISPER_HALLUCINATIONS
-            and not NOISE_HALLUCINATION_REGEX.search(fixed_transcript)
-        ):
-            api_log(
-                f"Gemini Transcribe Live -> {GEMINI_TRANSCRIBE_LIVE_MODEL} 200 OK "
-                f"({elapsed:.2f}s): '{fixed_transcript[:80]}'"
-            )
-            return fixed_transcript
-        return ""
-    except Exception as e:
-        err_s = str(e)
-        if "429" in err_s or "quota" in err_s.lower():
+                    if sc.get("turnComplete") or sc.get("generationComplete"):
+                        break
+
+                chosen_raw = (
+                    " ".join(final_parts)
+                    if final_parts
+                    else (latest_interim or "".join(fallback_model_parts))
+                )
+                raw_transcript = re.sub(r"\s+", " ", chosen_raw).strip()
+                fixed_transcript = _apply_phonetic_fixes(raw_transcript)
+                elapsed = time.monotonic() - t0
+                if (
+                    fixed_transcript
+                    and len(fixed_transcript) >= 2
+                    and fixed_transcript.lower() not in WHISPER_HALLUCINATIONS
+                    and not NOISE_HALLUCINATION_REGEX.search(fixed_transcript)
+                ):
+                    api_log(
+                        f"Gemini Transcribe Live ({mode_label}) -> {GEMINI_TRANSCRIBE_LIVE_MODEL} 200 OK "
+                        f"({elapsed:.2f}s): '{fixed_transcript[:80]}'"
+                    )
+                    return fixed_transcript
+                api_log(
+                    f"Gemini Transcribe Live ({mode_label}) -> empty/filtered transcript ({elapsed:.2f}s)"
+                )
+                return ""
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)[:120]}"
+            # If manual_smart setup was rejected by server schema, try hybrid_auto immediately
+            if mode_label == "manual_smart" and ("429" not in last_err and "quota" not in last_err.lower()):
+                api_log(f"Gemini Transcribe Live (manual_smart) note ({last_err}); retrying hybrid_auto")
+                continue
+            break
+
+    if last_err:
+        if "429" in last_err or "quota" in last_err.lower():
             state.gemini_transcribe_live_cooldown_until = time.time() + 60.0
         else:
             state.gemini_transcribe_live_cooldown_until = time.time() + 45.0
         api_log(
-            f"Gemini Transcribe Live -> {GEMINI_TRANSCRIBE_LIVE_MODEL} fallback "
-            f"({type(e).__name__}: {err_s[:90]})"
+            f"Gemini Transcribe Live -> {GEMINI_TRANSCRIBE_LIVE_MODEL} fallback ({last_err})"
         )
-        return ""
+    return ""
 
 
 async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
     """
     3-Tier Hybrid Speech-to-Text Pipeline:
-      - Tier 1: `gemini-3.5-transcribe-live` (Real-time Live API WebSocket, Unlimited RPM/RPD, custom Thai/EN/JP vocab)
+      - Tier 1: `gemini-3.5-transcribe-live` (Real-time Live API WebSocket, custom Thai/EN/JP vocab)
       - Tier 2: Groq `whisper-large-v3` (with segment logprob / no_speech_prob VAD filter)
       - Tier 3: Google SpeechRecognition (`th-TH` / `en-US` cross-check)
     """
@@ -825,7 +973,7 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
                         comp_ratio = float(seg.get("compression_ratio", 1.0))
                         seg_text = (seg.get("text") or "").strip()
 
-                        if no_speech > 0.60 or avg_logprob < -1.35 or comp_ratio > 2.4:
+                        if no_speech > 0.55 or avg_logprob < -1.25 or comp_ratio > 2.4:
                             print(
                                 f"[Voice VAD Filter] Dropped noise segment '{seg_text}' "
                                 f"(no_speech={no_speech:.2f}, logprob={avg_logprob:.2f}, comp={comp_ratio:.2f})",
@@ -838,14 +986,14 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
                             valid_parts.append(seg_text)
 
                     txt = _apply_phonetic_fixes(" ".join(valid_parts).strip())
-                    if txt and not NOISE_HALLUCINATION_REGEX.search(txt):
+                    if txt and txt.lower() not in WHISPER_HALLUCINATIONS and not NOISE_HALLUCINATION_REGEX.search(txt):
                         whisper_candidate = txt
         except Exception as e:
             print(f"Groq Whisper STT error (falling back to Google STT): {e}", flush=True)
 
     if not whisper_candidate or low_confidence:
         google_txt = await asyncio.to_thread(transcribe_wav_bytes_google_sync, wav_bytes)
-        if google_txt:
+        if google_txt and google_txt.lower() not in WHISPER_HALLUCINATIONS:
             if whisper_candidate and google_txt != whisper_candidate:
                 print(
                     f"[Voice STT Cross-Check] Whisper='{whisper_candidate}' (low conf) -> Using Google STT='{google_txt}'",
@@ -858,13 +1006,14 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
 
 def convert_audio_bytes_to_wav_sync(raw_bytes: bytes) -> bytes:
     """
-    Converts raw 48kHz stereo Discord PCM/audio to 16kHz mono WAV with speech band-pass filtering
-    and dynamic audio normalization (`-threads 1` tuned for 0.1 vCPU Render containers).
+    Converts raw 48kHz stereo Discord PCM/audio to 16kHz mono WAV with fan-hum rejection
+    (180Hz high-pass cuts PC/UPS/switch fan rumble) and capped gentle normalization (m=3)
+    so ambient fan noise is never over-amplified into phantom STT hallucinations.
     """
     proc = subprocess.run(
         [
             "ffmpeg", "-threads", "1", "-i", "pipe:0",
-            "-af", "highpass=f=85,lowpass=f=7500,dynaudnorm=f=150:g=15:p=0.92:m=10",
+            "-af", "highpass=f=180,lowpass=f=6800,dynaudnorm=f=150:g=15:p=0.88:m=3",
             "-ac", "1", "-ar", "16000", "-f", "wav", "pipe:1", "-loglevel", "error"
         ],
         input=raw_bytes,
@@ -935,7 +1084,7 @@ async def handle_spoken_voice_command(
             self.guild = guild
             self.content = command_body
 
-    # 2. Voice Overtime (OT) Command ('ยูกิโนะ จด OT ...' / 'สรุป OT')
+    # 2. Deterministic Voice Overtime (OT) Command ('จด OT 6 โมงถึงทุ่มนึง' / 'สรุป OT')
     if speaker_user and is_ot_command_text(command_body, channel_id=chan_id, user_id=speaker_user.id):
         ot_reply = await process_ot_request(_VoiceProxyMsg(), command_body)
         if text_channel:
@@ -951,10 +1100,31 @@ async def handle_spoken_voice_command(
         await speak_in_voice_channel(guild, mem_reply, fallback_channel=text_channel)
         return
 
-    # 4. Voice Search, Weather, Yukipedia & General Conversation (Decision-1 Orchestrated)
+    # 4. Voice Orchestrator (Decision-1) -> direct OT dispatch if classified as ot_log
     dec_plan = await orchestrate_message_with_decision_1(command_body, purpose="VoiceRoute")
+    if (
+        speaker_user
+        and dec_plan
+        and dec_plan.get("route") == "ot_log"
+        and float(dec_plan.get("route_confidence") or 0.0) >= 0.78
+    ):
+        normalized_ot_cmd = command_body
+        if not is_ot_command_text(normalized_ot_cmd, channel_id=chan_id, user_id=speaker_user.id):
+            normalized_ot_cmd = f"จด OT {normalized_ot_cmd}"
+        ot_reply = await process_ot_request(_VoiceProxyMsg(), normalized_ot_cmd)
+        if text_channel:
+            await text_channel.send(f"**[🎙️ `{speaker_name}`]:** {cleaned}\n{ot_reply}")
+        await speak_in_voice_channel(guild, ot_reply, fallback_channel=text_channel)
+        return
+
+    # 5. Voice Chat / Search / Weather / Tools (never leak Owner username into prompt text!)
+    if is_owner_user(speaker_user):
+        voice_prompt = command_body
+    else:
+        voice_prompt = f"{speaker_name} พูดในห้องเสียงว่า: {command_body}"
+
     answer, _ = await query_local_ollama_chat(
-        f"{speaker_name} พูดในห้องเสียงว่า: {command_body}",
+        voice_prompt,
         model=ACTIVE_FAST_MODEL,
         system_prompt=VOICE_SYSTEM_PROMPT,
         channel_id=text_channel.id if text_channel else None,
@@ -970,8 +1140,18 @@ async def handle_spoken_voice_command(
 
 
 class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
-    SPEECH_FRAME_RMS_THRESHOLD = 55
-    MIN_ACTIVE_SPEECH_FRAMES = 8
+    """
+    Adaptive Noise-Floor VAD Sink tuned for rooms with steady fan noise (PC/UPS/switch/desk fans):
+      - Tracks a slow per-speaker ambient noise floor EMA so steady fan hum (rms 30-65) never triggers STT.
+      - Requires dynamic SNR margin (`frame_rms >= max(110, floor * 2.25)`) to start capturing,
+        hysteresis (`max(85, floor * 1.75)`) to preserve soft word endings,
+        and minimum peak RMS + active frames before sending to STT.
+    """
+
+    BASE_SPEECH_RMS_MIN = 110.0
+    CONTINUE_SPEECH_RMS_MIN = 85.0
+    MIN_PEAK_RMS = 145.0
+    MIN_ACTIVE_SPEECH_FRAMES = 10
 
     def __init__(self, guild: discord.Guild, text_channel, vc=None):
         super().__init__()
@@ -982,6 +1162,8 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
         self.pre_roll_buffers = defaultdict(lambda: deque(maxlen=20))
         self.user_buffers = defaultdict(bytearray)
         self.speech_frame_counts = defaultdict(int)
+        self.peak_rms = defaultdict(float)
+        self.noise_floors = defaultdict(lambda: 45.0)
         self.last_spoken = {}
         self._last_rms_log = 0.0
         self.running = True
@@ -1027,31 +1209,48 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
         if self.guild.voice_client and self.guild.voice_client.is_playing():
             return
         try:
-            frame_rms = audioop.rms(data.pcm, 2)
+            frame_rms = float(audioop.rms(data.pcm, 2))
         except Exception:
             return
 
         now = time.monotonic()
-        if frame_rms > 25 and (now - self._last_rms_log > 5.0):
-            self._last_rms_log = now
-            print(f"[Voice Mic Level] speaker={speaker.display_name}, rms={frame_rms}", flush=True)
-
         with self._lock:
+            floor = self.noise_floors[speaker]
+            start_thresh = max(self.BASE_SPEECH_RMS_MIN, floor * 2.25)
+            cont_thresh = max(self.CONTINUE_SPEECH_RMS_MIN, floor * 1.75)
+
             buf = self.user_buffers[speaker]
-            if frame_rms >= self.SPEECH_FRAME_RMS_THRESHOLD:
-                if len(buf) == 0:
+            is_capturing = len(buf) > 0
+            effective_thresh = cont_thresh if is_capturing else start_thresh
+
+            if frame_rms >= effective_thresh:
+                if not is_capturing:
                     for pre_frame in self.pre_roll_buffers[speaker]:
                         buf.extend(pre_frame)
                     self.pre_roll_buffers[speaker].clear()
                 if len(buf) < MAX_UTTERANCE_BYTES:
                     buf.extend(data.pcm)
                 self.speech_frame_counts[speaker] += 1
+                if frame_rms > self.peak_rms[speaker]:
+                    self.peak_rms[speaker] = frame_rms
                 self.last_spoken[speaker] = now
-            elif len(buf) > 0 and (now - self.last_spoken.get(speaker, 0) < 1.0):
+            elif is_capturing and (now - self.last_spoken.get(speaker, 0) < 0.95):
                 if len(buf) < MAX_UTTERANCE_BYTES:
                     buf.extend(data.pcm)
             else:
+                # Update ambient noise floor EMA gently while idle (clamped to [15, 95] so loud noise can't deafen VAD)
+                if frame_rms > 5.0:
+                    updated_floor = (floor * 0.94) + (min(frame_rms, 110.0) * 0.06)
+                    self.noise_floors[speaker] = max(15.0, min(95.0, updated_floor))
                 self.pre_roll_buffers[speaker].append(data.pcm)
+
+            if frame_rms > 25.0 and (now - self._last_rms_log > 5.0):
+                self._last_rms_log = now
+                print(
+                    f"[Voice Mic Level] speaker={speaker.display_name}, "
+                    f"rms={int(frame_rms)}, floor={int(self.noise_floors[speaker])}, thresh={int(start_thresh)}",
+                    flush=True,
+                )
 
     def cleanup(self):
         self.running = False
@@ -1061,6 +1260,8 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
             self.pre_roll_buffers.clear()
             self.user_buffers.clear()
             self.speech_frame_counts.clear()
+            self.peak_rms.clear()
+            self.noise_floors.clear()
             self.last_spoken.clear()
 
     async def _silence_monitor_loop(self):
@@ -1075,13 +1276,26 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
                     if (now - last_t >= 1.1) or (buf_len >= MAX_UTTERANCE_BYTES):
                         pcm_bytes = bytes(self.user_buffers.pop(user, b""))
                         active_frames = self.speech_frame_counts.pop(user, 0)
+                        peak = self.peak_rms.pop(user, 0.0)
+                        floor = self.noise_floors.get(user, 45.0)
                         self.last_spoken.pop(user, None)
-                        if active_frames >= self.MIN_ACTIVE_SPEECH_FRAMES and len(pcm_bytes) >= 30720:
-                            ready_payloads.append((user, pcm_bytes, active_frames))
-            for user, pcm_bytes, active_frames in ready_payloads:
+                        min_peak = max(self.MIN_PEAK_RMS, floor * 2.6)
+                        if (
+                            active_frames >= self.MIN_ACTIVE_SPEECH_FRAMES
+                            and peak >= min_peak
+                            and len(pcm_bytes) >= 38400
+                        ):
+                            ready_payloads.append((user, pcm_bytes, active_frames, peak, floor))
+                        elif active_frames > 0:
+                            print(
+                                f"[Voice VAD Dropped Noise] speaker={user.display_name}, "
+                                f"frames={active_frames}, peak={int(peak)} < {int(min_peak)} (floor={int(floor)})",
+                                flush=True,
+                            )
+            for user, pcm_bytes, active_frames, peak, floor in ready_payloads:
                 print(
                     f"[Voice VAD] Captured speech from {user.display_name} "
-                    f"({active_frames} active frames, {len(pcm_bytes)} bytes)",
+                    f"({active_frames} active frames, peak={int(peak)}, floor={int(floor)}, {len(pcm_bytes)} bytes)",
                     flush=True,
                 )
                 self._loop.create_task(self._process_user_pcm(user, pcm_bytes))
