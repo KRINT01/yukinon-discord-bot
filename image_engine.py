@@ -900,11 +900,13 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
 ) -> tuple[str, list[dict]]:
     """
     Fully vectorized OpenCV + NumPy Stage 1 detector & Set-of-Mark JPEG builder:
-      - Decodes via `cv2.imdecode`, builds `vis_bgr` (<=1024px) and `small_bgr` (<=360px) in C.
+      - Decodes via `cv2.imdecode`, builds crisp `vis_bgr` (<=1024px via `INTER_AREA`) and `small_bgr` (<=360px) in C.
       - Pass A1 (`gray >= 232`): clean base white bubble pass.
       - Pass A2 (`INTER_AREA` dark-outline preservation): recovers 1px thin-bordered ovals on white panels.
-      - Pass B (`gray <= 95`): enclosed dark speech bubbles & dark caption boxes.
-      - Draws red contours + centered top-edge red badges natively via `cv2`.
+      - Pass B (`gray <= 95`): enclosed dark speech bubbles guarded by `already_covered` overlap rejection,
+        true HSV saturation (`mean_s < 22`, `sat_ratio < 0.16`), dark background uniformity (`std <= 24`),
+        and eroded interior bright-text check so dark colored panels are NEVER misclassified!
+      - Draws crisp red contours + compact top-right-rim red badges that NEVER cover vertical kanji.
     """
     arr = np.frombuffer(raw_bytes, dtype=np.uint8)
     img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -915,8 +917,9 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
     vis_scale = min(1.0, vision_max_dim / float(max(orig_w, orig_h)))
     vw = max(32, int(round(orig_w * vis_scale)))
     vh = max(32, int(round(orig_h * vis_scale)))
+    # INTER_AREA gives anti-aliased LANCZOS-grade kanji sharpness for OCR at C speed
     vis_bgr = (
-        cv2.resize(img_bgr, (vw, vh), interpolation=cv2.INTER_LINEAR)
+        cv2.resize(img_bgr, (vw, vh), interpolation=cv2.INTER_AREA)
         if vis_scale < 1.0
         else img_bgr.copy()
     )
@@ -928,7 +931,9 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
     small_bgr = cv2.resize(vis_bgr, (sw, sh), interpolation=cv2.INTER_LINEAR)
     small_gray = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2GRAY)
     small_chroma = small_bgr.max(axis=2) - small_bgr.min(axis=2)
-    del small_bgr
+    small_hsv = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2HSV)
+    small_sat = small_hsv[:, :, 1]
+    del small_hsv, small_bgr
 
     # Zero-thickening dark-outline preservation via C box-area downscale
     vis_gray = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2GRAY)
@@ -983,12 +988,12 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
         )
     )
 
-    # Pass B: Enclosed dark speech bubbles / dark caption boxes
+    # Pass B: Enclosed dark speech bubbles / dark caption boxes (strict anti-dark-panel guards!)
     dark_bin = np.where(small_gray <= 95, np.uint8(255), np.uint8(0))
     num_d, d_labels, d_stats, _ = cv2.connectedComponentsWithStats(dark_bin, connectivity=4)
     if num_d > 1:
         d_margin = _collect_margin_labels_cv2(d_labels, sw, sh)
-        max_dw, max_dh = int(sw * 0.55), int(sh * 0.55)
+        max_dw, max_dh = int(sw * 0.50), int(sh * 0.50)
         for lbl in range(1, num_d):
             if lbl in d_margin:
                 continue
@@ -1014,15 +1019,39 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
             filled_area = max(1, int(np.count_nonzero(filled_crop)))
             holes_area = int(np.count_nonzero((filled_crop > 0) & (comp_crop == 0)))
             rect_fill = filled_area / float(max(1, cw * ch))
-            if filled_area > max_area_px or holes_area < 4 or rect_fill < 0.65:
+            if filled_area > max_area_px or holes_area < 5 or rect_fill < 0.65:
+                continue
+
+            # Guard 1: Reject dark panels that enclose/overlap already-detected white speech bubbles!
+            ov_px = int(np.count_nonzero(filled_crop & already_covered[cy1:cy2, cx1:cx2]))
+            if ov_px > 20 or ov_px > filled_area * 0.04:
                 continue
 
             mask_bool = filled_crop > 0
-            c_sub = small_chroma[cy1:cy2, cx1:cx2]
+            s_sub = small_sat[cy1:cy2, cx1:cx2]
             g_sub = small_gray[cy1:cy2, cx1:cx2]
-            mean_c = float(c_sub[mask_bool].mean()) if np.any(mask_bool) else 255.0
-            bright_px = int(np.count_nonzero(mask_bool & (g_sub >= 210)))
-            if mean_c < 18.0 and 0.02 <= (bright_px / float(filled_area)) <= 0.42:
+            s_vals = s_sub[mask_bool]
+            mean_s = float(s_vals.mean()) if s_vals.size else 255.0
+            sat_ratio = float(np.count_nonzero(s_vals >= 28)) / float(max(1, s_vals.size))
+
+            # Guard 2: True HSV Saturation rejects dark colored artwork (navy clothes, dark brown walls, shadows)
+            if mean_s >= 22.0 or sat_ratio >= 0.16:
+                continue
+
+            # Guard 3: Dark bubble background must be uniform (rejects shaded character panels)
+            dark_vals = g_sub[mask_bool & (g_sub <= 135)]
+            if dark_vals.size < max(16, int(filled_area * 0.45)) or float(dark_vals.std()) > 24.0:
+                continue
+
+            # Guard 4: Bright achromatic text must sit strictly inside the eroded interior
+            inner_core = cv2.erode(filled_crop, _CV2_K5, iterations=1)
+            if not np.any(inner_core):
+                inner_core = cv2.erode(filled_crop, _CV2_K3, iterations=1)
+            inner_bright_px = int(np.count_nonzero((inner_core > 0) & (g_sub >= 205) & (s_sub < 28)))
+            bright_px = int(np.count_nonzero(mask_bool & (g_sub >= 210) & (s_sub < 28)))
+
+            if inner_bright_px >= 4 and 0.02 <= (bright_px / float(filled_area)) <= 0.38:
+                already_covered[cy1:cy2, cx1:cx2] |= filled_crop
                 bbox_norm = [
                     int(round((cy1 / float(sh)) * 1000.0)),
                     int(round((cx1 / float(sw)) * 1000.0)),
@@ -1052,9 +1081,9 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
     for idx, b_obj in enumerate(detected, 1):
         b_obj["bubble_id"] = idx
 
-    # Draw crisp red contours + centered top-edge red pill ID badges directly in C
-    font_scale = max(0.55, vw / 1350.0)
-    thickness = 2
+    # Draw crisp red contours + compact top-right-rim badges (keeps top vertical kanji 100% visible!)
+    font_scale = max(0.45, vw / 1550.0)
+    thickness = 1 if vw < 1050 else 2
     for b_obj in detected:
         bid = b_obj["bubble_id"]
         ymin, xmin, ymax, xmax = b_obj["bbox_norm"]
@@ -1071,19 +1100,18 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
 
         label = str(bid)
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-        pw = tw + 12
-        ph = th + 8
-        vcx = (vx1 + vx2) // 2
-        bx1 = max(0, min(vw - pw - 1, vcx - (pw // 2)))
-        bx2 = bx1 + pw
-        by1 = max(0, vy1 - (ph // 3))
-        by2 = min(vh - 1, by1 + ph)
+        pw = tw + 8
+        ph = th + 6
+        bx2 = min(vw - 1, vx2 + 4)
+        bx1 = max(0, bx2 - pw)
+        by2 = min(vh - 1, max(ph, vy1 + 4))
+        by1 = max(0, by2 - ph)
         cv2.rectangle(vis_bgr, (bx1, by1), (bx2, by2), (15, 15, 225), -1)
-        cv2.rectangle(vis_bgr, (bx1, by1), (bx2, by2), (255, 255, 255), 2)
+        cv2.rectangle(vis_bgr, (bx1, by1), (bx2, by2), (255, 255, 255), 1)
         cv2.putText(
             vis_bgr,
             label,
-            (bx1 + 6, by1 + ph - 5),
+            (bx1 + 4, by1 + ph - 4),
             cv2.FONT_HERSHEY_SIMPLEX,
             font_scale,
             (255, 255, 255),
@@ -1356,7 +1384,7 @@ def _detect_page_bubbles_and_build_som_b64_pil_sync(
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     try:
         vis_img = img.copy()
-        vis_img.thumbnail((vision_max_dim, vision_max_dim), Image.Resampling.BILINEAR)
+        vis_img.thumbnail((vision_max_dim, vision_max_dim), Image.Resampling.LANCZOS)
         vw, vh = vis_img.size
 
         scale = min(1.0, SOM_CV_MAX_DIM / float(max(vw, vh)))
@@ -1366,6 +1394,7 @@ def _detect_page_bubbles_and_build_som_b64_pil_sync(
         small_rgb = vis_img.resize((sw, sh), Image.Resampling.BILINEAR)
         small_gray = small_rgb.convert("L")
         small_chroma = _compute_rgb_chroma_band_pil(small_rgb)
+        small_sat = small_rgb.convert("HSV").getchannel("S")
         small_rgb.close()
 
         vis_gray = vis_img.convert("L")
@@ -1405,11 +1434,10 @@ def _detect_page_bubbles_and_build_som_b64_pil_sync(
                 raw_a2, small_gray, small_chroma, sw, sh, already_covered, is_secondary_pass=True
             )
         )
-        already_covered.close()
 
         dark_bin = small_gray.point(lambda p: 255 if p <= 95 else 0)
         raw_dark = _extract_components_bytearray_bfs_pil(
-            dark_bin, min_w_px, min_h_px, int(sw * 0.55), int(sh * 0.55), max_area_px, step=3, core_radius=1
+            dark_bin, min_w_px, min_h_px, int(sw * 0.50), int(sh * 0.50), max_area_px, step=3, core_radius=1
         )
         dark_bin.close()
 
@@ -1428,20 +1456,63 @@ def _detect_page_bubbles_and_build_som_b64_pil_sync(
             holes_crop.close()
 
             rect_fill = filled_area / float(max(1, cw * ch))
-            if filled_area > max_area_px or holes_area < 4 or rect_fill < 0.65:
+            if filled_area > max_area_px or holes_area < 5 or rect_fill < 0.65:
+                filled_crop.close()
+                continue
+
+            # Guard 1: Reject dark panels overlapping already-detected white speech bubbles
+            cov_crop = already_covered.crop((cx1, cy1, cx2, cy2))
+            ov_px = ImageChops.darker(filled_crop, cov_crop).histogram()[255]
+            cov_crop.close()
+            if ov_px > 20 or ov_px > filled_area * 0.04:
                 filled_crop.close()
                 continue
 
             g_crop = small_gray.crop((cx1, cy1, cx2, cy2))
-            c_crop = small_chroma.crop((cx1, cy1, cx2, cy2))
-            mean_c = ImageStat.Stat(c_crop, mask=filled_crop).mean[0]
-            bright_txt = ImageChops.darker(g_crop.point(lambda p: 255 if p >= 210 else 0), filled_crop)
-            bright_px = bright_txt.histogram()[255]
-            bright_txt.close()
-            g_crop.close()
-            c_crop.close()
+            s_crop = small_sat.crop((cx1, cy1, cx2, cy2))
+            s_hist = s_crop.histogram(mask=filled_crop)
+            mean_s = ImageStat.Stat(s_crop, mask=filled_crop).mean[0]
+            sat_ratio = sum(s_hist[28:]) / float(max(1, sum(s_hist)))
 
-            if mean_c < 18.0 and 0.02 <= (bright_px / float(filled_area)) <= 0.42:
+            # Guard 2: True HSV saturation rejects dark colored panels
+            if mean_s >= 22.0 or sat_ratio >= 0.16:
+                g_crop.close()
+                s_crop.close()
+                filled_crop.close()
+                continue
+
+            # Guard 3: Uniform dark background check
+            dark_bg_mask = ImageChops.darker(g_crop.point(lambda p: 255 if p <= 135 else 0), filled_crop)
+            dark_bg_px = dark_bg_mask.histogram()[255]
+            dark_std = ImageStat.Stat(g_crop, mask=dark_bg_mask).stddev[0] if dark_bg_px > 0 else 99.0
+            dark_bg_mask.close()
+            if dark_bg_px < max(16, int(filled_area * 0.45)) or dark_std > 24.0:
+                g_crop.close()
+                s_crop.close()
+                filled_crop.close()
+                continue
+
+            # Guard 4: Eroded interior bright text check
+            inner_core = filled_crop.filter(ImageFilter.MinFilter(5))
+            if not inner_core.getbbox():
+                inner_core.close()
+                inner_core = filled_crop.filter(ImageFilter.MinFilter(3))
+            achrom_b = s_crop.point(lambda p: 255 if p < 28 else 0)
+            bright_b = g_crop.point(lambda p: 255 if p >= 210 else 0)
+            inner_bright = ImageChops.darker(ImageChops.darker(bright_b, achrom_b), inner_core)
+            inner_bright_px = inner_bright.histogram()[255]
+            bright_txt = ImageChops.darker(ImageChops.darker(bright_b, achrom_b), filled_crop)
+            bright_px = bright_txt.histogram()[255]
+            inner_bright.close()
+            inner_core.close()
+            bright_txt.close()
+            achrom_b.close()
+            bright_b.close()
+            g_crop.close()
+            s_crop.close()
+
+            if inner_bright_px >= 4 and 0.02 <= (bright_px / float(filled_area)) <= 0.38:
+                already_covered.paste(255, (cx1, cy1, cx2, cy2), mask=filled_crop)
                 bbox_norm = [
                     int(round((cy1 / float(sh)) * 1000.0)),
                     int(round((cx1 / float(sw)) * 1000.0)),
@@ -1457,8 +1528,10 @@ def _detect_page_bubbles_and_build_som_b64_pil_sync(
             else:
                 filled_crop.close()
 
+        already_covered.close()
         small_gray.close()
         small_chroma.close()
+        small_sat.close()
 
         if len(detected) > 24:
             detected.sort(
@@ -1478,7 +1551,7 @@ def _detect_page_bubbles_and_build_som_b64_pil_sync(
             b_obj["bubble_id"] = idx
 
         vdraw = ImageDraw.Draw(vis_img)
-        badge_font_size = max(15, int(vw * 0.022))
+        badge_font_size = max(14, int(vw * 0.019))
         badge_font = _load_manga_font(badge_font_size, is_thai=False)
 
         for b_obj in detected:
@@ -1505,16 +1578,15 @@ def _detect_page_bubbles_and_build_som_b64_pil_sync(
             tb = vdraw.textbbox((0, 0), label, font=badge_font)
             tw = tb[2] - tb[0]
             th = tb[3] - tb[1]
-            pw = tw + 10
+            pw = tw + 8
             ph = th + 6
-            vcx = (vx1 + vx2) // 2
-            bx1 = max(0, min(vw - pw - 1, vcx - (pw // 2)))
-            bx2 = bx1 + pw
-            by1 = max(0, vy1 - (ph // 3))
-            by2 = min(vh - 1, by1 + ph)
-            vdraw.rectangle([bx1, by1, bx2, by2], fill=(225, 15, 15), outline=(255, 255, 255), width=2)
+            bx2 = min(vw - 1, vx2 + 4)
+            bx1 = max(0, bx2 - pw)
+            by2 = min(vh - 1, max(ph, vy1 + 4))
+            by1 = max(0, by2 - ph)
+            vdraw.rectangle([bx1, by1, bx2, by2], fill=(225, 15, 15), outline=(255, 255, 255), width=1)
             vdraw.text(
-                (bx1 + 5 - tb[0], by1 + 3 - tb[1]),
+                (bx1 + 4 - tb[0], by1 + 3 - tb[1]),
                 label,
                 font=badge_font,
                 fill=(255, 255, 255),
@@ -2008,7 +2080,7 @@ async def extract_and_translate_manga_pages_batch(
     """
     Set-of-Mark (SoM) CV-Anchored Multi-Page Manga Batch Pipeline:
       1) Detects enclosed speech bubbles via vectorized OpenCV+NumPy (or PIL fallback)
-         and stamps centered top-edge red badges `[1]`, `[2]`, ...
+         and stamps compact top-right-rim red badges `[1]`, `[2]`, ...
       2) Calls `MangaBatch` strictly across:
          `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> (newer >3.5 `flash-lite`)
          -> `gemma-4-31b-it` -> `gemma-4-26b-a4b-it`
@@ -2080,7 +2152,7 @@ async def extract_and_translate_manga_pages_batch(
     manga_batch_instruction = f"""
 You are a professional Manga, Manhwa, and Comic Localizer.
 You are given {num_pages} sequential manga page image(s) (labeled PAGE 1 to PAGE {num_pages}).
-Every enclosed speech bubble and caption box has ALREADY been outlined in RED with a RED NUMBERED BADGE (`1`, `2`, `3`, ...) centered at its top edge!
+Every enclosed speech bubble and caption box has ALREADY been outlined in RED with a RED NUMBERED BADGE (`1`, `2`, `3`, ...) at its top-right rim!
 {context_block}
 Analyze all {num_pages} page(s) in sequence so character names, titles/ranks, pronouns, and ongoing story stay consistent across every page,
 and translate EVERY SINGLE speech bubble and narration/caption box on EVERY page into natural, idiomatic {target_lang_name}.
@@ -2823,12 +2895,38 @@ def _fast_dilate_mask_cv2(mask_u8: "np.ndarray", kernel_half: int = 3) -> "np.nd
     return np.where(up >= 64, np.uint8(255), np.uint8(0))
 
 
-def _build_true_chroma_art_shield_cv2(sub_bgr: "np.ndarray", chroma_thresh: int = 34) -> "np.ndarray":
+def _build_true_chroma_art_shield_cv2(
+    sub_bgr: "np.ndarray",
+    chroma_thresh: int = 34,
+    is_dark: bool = False,
+) -> "np.ndarray":
     """
-    Returns a uint8 `non_chroma` mask (`255` = safe to erase, `0` = protected colored art)
-    computed in C via NumPy max-min chroma + half-res OpenCV morphological opening.
+    Returns a uint8 `non_chroma` mask (`255` = safe to erase, `0` = protected colored art).
+    - Light bubbles: uses pure RGB chroma (`>= 34`) so warm-black kanji is never shielded.
+    - Dark bubbles: combines HSV saturation (`>= 26`) + RGB chroma (`>= 24`) to shield pale skin/eyes/hair.
     """
     wh, ww = sub_bgr.shape[:2]
+    if is_dark:
+        if ww >= 24 and wh >= 24:
+            sw, sh = max(8, ww // 2), max(8, wh // 2)
+            small_bgr = cv2.resize(sub_bgr, (sw, sh), interpolation=cv2.INTER_LINEAR)
+            small_c = small_bgr.max(axis=2) - small_bgr.min(axis=2)
+            small_s = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2HSV)[:, :, 1]
+            bin_c = np.where((small_c >= 24) | (small_s >= 26), np.uint8(255), np.uint8(0))
+            if not np.any(bin_c):
+                return np.full((wh, ww), 255, dtype=np.uint8)
+            opened = cv2.erode(bin_c, _CV2_K3, iterations=1)
+            shield_small = cv2.dilate(opened, _CV2_K5, iterations=1)
+            up = cv2.resize(shield_small, (ww, wh), interpolation=cv2.INTER_LINEAR)
+            return np.where(up >= 64, np.uint8(0), np.uint8(255))
+        c_band = sub_bgr.max(axis=2) - sub_bgr.min(axis=2)
+        s_band = cv2.cvtColor(sub_bgr, cv2.COLOR_BGR2HSV)[:, :, 1]
+        bin_c = np.where((c_band >= 24) | (s_band >= 26), np.uint8(255), np.uint8(0))
+        if not np.any(bin_c):
+            return np.full((wh, ww), 255, dtype=np.uint8)
+        shield = cv2.dilate(bin_c, _CV2_K3, iterations=1)
+        return np.where(shield > 0, np.uint8(0), np.uint8(255))
+
     chroma_band = sub_bgr.max(axis=2) - sub_bgr.min(axis=2)
     if ww >= 24 and wh >= 24:
         sw, sh = max(8, ww // 2), max(8, wh // 2)
@@ -2980,7 +3078,14 @@ def _refine_cv_bubble_mask_locally_cv2(
     y1: int,
     x2: int,
     y2: int,
+    other_cv_boxes: list[tuple[int, int, int, int]] | None = None,
 ) -> tuple[int, int, int, int, "np.ndarray", float]:
+    """
+    Locally refines a light CV bubble with strict anti-leak guards:
+      - Preserves thin 1px dark borders via `INTER_AREA` downscale of `gray < 185`.
+      - Caps area growth at `1.75x`, enforces solidity retention (`>= 0.78x`),
+        and rejects any expansion that spills into a neighboring CV bubble.
+    """
     height, width = img_bgr.shape[:2]
     bw, bh = x2 - x1, y2 - y1
     orig_fill = float(cv_obj.get("rect_fill") or 0.70)
@@ -2999,8 +3104,8 @@ def _refine_cv_bubble_mask_locally_cv2(
     if bool(cv_obj.get("is_dark")) or bw < 16 or bh < 14 or orig_mask_np is None:
         return _fallback_orig()
 
-    pad_x = min(int(width * 0.14), max(28, int(bw * 0.45)))
-    pad_y = min(int(height * 0.18), max(36, int(bh * 0.75)))
+    pad_x = min(int(width * 0.12), max(24, int(bw * 0.35)))
+    pad_y = min(int(height * 0.16), max(32, int(bh * 0.65)))
     wx1 = max(0, x1 - pad_x)
     wy1 = max(0, y1 - pad_y)
     wx2 = min(width, x2 + pad_x)
@@ -3011,10 +3116,19 @@ def _refine_cv_bubble_mask_locally_cv2(
     sw = max(16, int(round(ww * scale)))
     sh = max(16, int(round(wh * scale)))
 
-    win_bgr = cv2.resize(img_bgr[wy1:wy2, wx1:wx2], (sw, sh), interpolation=cv2.INTER_LINEAR)
+    win_full_bgr = img_bgr[wy1:wy2, wx1:wx2]
+    win_full_gray = cv2.cvtColor(win_full_bgr, cv2.COLOR_BGR2GRAY)
+    win_dark_full = np.where(win_full_gray < 185, np.uint8(255), np.uint8(0))
+    win_dark_box = cv2.resize(win_dark_full, (sw, sh), interpolation=cv2.INTER_AREA)
+
+    win_bgr = cv2.resize(win_full_bgr, (sw, sh), interpolation=cv2.INTER_LINEAR)
     win_gray = cv2.cvtColor(win_bgr, cv2.COLOR_BGR2GRAY)
     win_chroma = win_bgr.max(axis=2) - win_bgr.min(axis=2)
-    local_bin = np.where((win_gray >= 216) & (win_chroma < 20), np.uint8(255), np.uint8(0))
+    local_bin = np.where(
+        (win_gray >= 220) & (win_chroma < 16) & (win_dark_box < 24),
+        np.uint8(255),
+        np.uint8(0),
+    )
 
     ox_s = int(round((x1 - wx1) * scale))
     oy_s = int(round((y1 - wy1) * scale))
@@ -3054,20 +3168,39 @@ def _refine_cv_bubble_mask_locally_cv2(
         + (1 if cx2 >= sw - 1 else 0)
         + (1 if cy2 >= sh - 1 else 0)
     )
-    if edge_touches >= 3 or (cx1 <= 1 and cx2 >= sw - 1) or (cy1 <= 1 and cy2 >= sh - 1):
+    if edge_touches >= 2 or (cx1 <= 1 and cx2 >= sw - 1) or (cy1 <= 1 and cy2 >= sh - 1):
         return _fallback_orig()
 
     filled_s = _fill_mask_holes_cv2(comp[cy1:cy2, cx1:cx2])
     new_area_s = max(1, int(np.count_nonzero(filled_s)))
-    if new_area_s > orig_area_s * 2.8 or new_area_s < orig_area_s * 0.85:
+    new_rect_fill = new_area_s / float(max(1, cw_s * ch_s))
+    if (
+        new_area_s > orig_area_s * 1.75
+        or new_area_s < orig_area_s * 0.85
+        or new_rect_fill < orig_fill * 0.78
+    ):
         return _fallback_orig()
 
-    new_rect_fill = new_area_s / float(max(1, cw_s * ch_s))
     rx1 = max(0, wx1 + int(round(cx1 / scale)))
     ry1 = max(0, wy1 + int(round(cy1 / scale)))
     rx2 = min(width, wx1 + int(round(cx2 / scale)))
     ry2 = min(height, wy1 + int(round(cy2 / scale)))
     rw, rh = max(4, rx2 - rx1), max(4, ry2 - ry1)
+
+    if other_cv_boxes:
+        new_area_full = max(1, rw * rh)
+        old_area_full = max(1, bw * bh)
+        for ox1, oy1, ox2, oy2 in other_cv_boxes:
+            other_area = max(1, (ox2 - ox1) * (oy2 - oy1))
+            ov_x = max(0, min(rx2, ox2) - max(rx1, ox1))
+            ov_y = max(0, min(ry2, oy2) - max(ry1, oy1))
+            ov_new = (ov_x * ov_y) / float(min(new_area_full, other_area))
+            if ov_new >= 0.15:
+                o_ov_x = max(0, min(x2, ox2) - max(x1, ox1))
+                o_ov_y = max(0, min(y2, oy2) - max(y1, oy1))
+                ov_old = (o_ov_x * o_ov_y) / float(min(old_area_full, other_area))
+                if ov_new > ov_old + 0.05:
+                    return _fallback_orig()
 
     m_full = np.where(
         cv2.resize(filled_s, (rw, rh), interpolation=cv2.INTER_LINEAR) >= 128,
@@ -3112,6 +3245,8 @@ def _clean_exact_cv_bubble_and_build_render_slots_cv2(
     base_gray: "np.ndarray",
     cv_obj: dict,
     trans_text: str,
+    other_cv_boxes: list[tuple[int, int, int, int]] | None = None,
+    white_exclusion_mask: "np.ndarray | None" = None,
 ) -> list[list]:
     height, width = img_bgr.shape[:2]
     ymin, xmin, ymax, xmax = cv_obj["bbox_norm"]
@@ -3124,7 +3259,7 @@ def _clean_exact_cv_bubble_and_build_render_slots_cv2(
 
     is_dark = bool(cv_obj.get("is_dark"))
     rx1, ry1, rx2, ry2, mask_full, rect_fill = _refine_cv_bubble_mask_locally_cv2(
-        img_bgr, cv_obj, x1, y1, x2, y2
+        img_bgr, cv_obj, x1, y1, x2, y2, other_cv_boxes=other_cv_boxes
     )
     bw, bh = rx2 - rx1, ry2 - ry1
     if bw < 16 or bh < 14:
@@ -3134,9 +3269,15 @@ def _clean_exact_cv_bubble_and_build_render_slots_cv2(
     if not np.any(safe_core):
         safe_core = mask_full
 
+    # Never let a dark bubble erase or overwrite an enclosed white speech bubble
+    if is_dark and white_exclusion_mask is not None:
+        safe_core = np.where(white_exclusion_mask[ry1:ry2, rx1:rx2] > 0, np.uint8(0), safe_core)
+        if not np.any(safe_core):
+            return []
+
     sub_gray = base_gray[ry1:ry2, rx1:rx2]
     sub_bgr = img_bgr[ry1:ry2, rx1:rx2]
-    non_chroma = _build_true_chroma_art_shield_cv2(sub_bgr, chroma_thresh=34)
+    non_chroma = _build_true_chroma_art_shield_cv2(sub_bgr, chroma_thresh=34, is_dark=is_dark)
 
     if is_dark:
         dark_bgr, bg_lum, _ = _sample_dark_bg_bgr_and_lum_cv2(img_bgr, base_gray, rx1, ry1, rx2, ry2)
@@ -3234,18 +3375,23 @@ def _clean_unmarked_open_bubble_and_measure_box_cv2(
         return None
 
     if median_lum < 125.0:
+        s_band = cv2.cvtColor(sub_bgr_chk, cv2.COLOR_BGR2HSV)[:, :, 1]
+        if float(s_band.mean()) >= 22.0 or (float(np.count_nonzero(s_band >= 28)) / float(total_px)) >= 0.16:
+            return None
         dark_bgr, bg_lum, bg_std = _sample_dark_bg_bgr_and_lum_cv2(img_bgr, base_gray, raw_x1, raw_y1, raw_x2, raw_y2)
         bright_ratio = float(np.count_nonzero(sub_g >= 220)) / float(total_px)
-        if bg_std > 26.0 or not (0.02 <= bright_ratio <= 0.38):
+        if bg_std > 24.0 or not (0.02 <= bright_ratio <= 0.38):
             return None
 
         pad = 6
         wx1, wy1 = max(0, raw_x1 - pad), max(0, raw_y1 - pad)
         wx2, wy2 = min(width, raw_x2 + pad), min(height, raw_y2 + pad)
         sg = base_gray[wy1:wy2, wx1:wx2]
+        s_bgr_d = img_bgr[wy1:wy2, wx1:wx2]
+        non_chroma_d = _build_true_chroma_art_shield_cv2(s_bgr_d, chroma_thresh=24, is_dark=True)
         diff = np.where(np.abs(sg.astype(np.int16) - bg_lum) > 18, np.uint8(255), np.uint8(0))
         erase_d = _fast_dilate_mask_cv2(diff, kernel_half=3)
-        img_bgr[wy1:wy2, wx1:wx2][erase_d > 0] = dark_bgr
+        s_bgr_d[(erase_d > 0) & (non_chroma_d > 0)] = dark_bgr
         sc_val = max(0, bg_lum - 20)
         return raw_x1, raw_y1, raw_x2, raw_y2, (250, 250, 250), (sc_val, sc_val, sc_val), (raw_x1, raw_y1, raw_x2, raw_y2)
 
@@ -3260,7 +3406,7 @@ def _clean_unmarked_open_bubble_and_measure_box_cv2(
 
     sg = base_gray[wy1:wy2, wx1:wx2]
     s_bgr = img_bgr[wy1:wy2, wx1:wx2]
-    non_chroma = _build_true_chroma_art_shield_cv2(s_bgr, chroma_thresh=30)
+    non_chroma = _build_true_chroma_art_shield_cv2(s_bgr, chroma_thresh=30, is_dark=False)
 
     w_seed = np.where(sg >= 228, np.uint8(255), np.uint8(0))
     w_zone = _fast_dilate_mask_cv2(w_seed, kernel_half=5)
@@ -3293,6 +3439,41 @@ def _render_translated_manga_image_cv2_sync(
     cv_map: dict[int, dict] = {
         int(c["bubble_id"]): c for c in (cv_bubbles or []) if c.get("bubble_id") is not None
     }
+    cv_boxes_px: dict[int, tuple[int, int, int, int]] = {}
+    has_dark_cv = False
+    for cid, c_obj in cv_map.items():
+        cy1_n, cx1_n, cy2_n, cx2_n = c_obj["bbox_norm"]
+        cv_boxes_px[cid] = (
+            max(0, int((cx1_n / 1000.0) * width)),
+            max(0, int((cy1_n / 1000.0) * height)),
+            min(width, int((cx2_n / 1000.0) * width)),
+            min(height, int((cy2_n / 1000.0) * height)),
+        )
+        if c_obj.get("is_dark"):
+            has_dark_cv = True
+
+    white_exclusion_mask: "np.ndarray | None" = None
+    if has_dark_cv:
+        white_exclusion_mask = np.zeros((height, width), dtype=np.uint8)
+        for cid, c_obj in cv_map.items():
+            if c_obj.get("is_dark"):
+                continue
+            bx1, by1, bx2, by2 = cv_boxes_px[cid]
+            if (bx2 - bx1) >= 4 and (by2 - by1) >= 4:
+                m_src = c_obj.get("mask_np")
+                if m_src is None and c_obj.get("mask_small") is not None:
+                    m_src = np.array(c_obj["mask_small"], dtype=np.uint8)
+                if m_src is not None:
+                    m_up = np.where(
+                        cv2.resize(m_src, (bx2 - bx1, by2 - by1), interpolation=cv2.INTER_NEAREST) >= 128,
+                        np.uint8(255),
+                        np.uint8(0),
+                    )
+                    white_exclusion_mask[by1:by2, bx1:bx2] |= m_up
+        if np.any(white_exclusion_mask):
+            white_exclusion_mask = cv2.dilate(white_exclusion_mask, _CV2_K5, iterations=1)
+        else:
+            white_exclusion_mask = None
 
     prepared_renders: list[list] = []
     used_cv_ids: set[int] = set()
@@ -3305,7 +3486,15 @@ def _render_translated_manga_image_cv2_sync(
         if not tr_txt or bid is None or bid in used_cv_ids or bid not in cv_map:
             continue
 
-        slots = _clean_exact_cv_bubble_and_build_render_slots_cv2(img_bgr, base_gray, cv_map[bid], tr_txt)
+        other_boxes = [box for cid, box in cv_boxes_px.items() if cid != bid]
+        slots = _clean_exact_cv_bubble_and_build_render_slots_cv2(
+            img_bgr,
+            base_gray,
+            cv_map[bid],
+            tr_txt,
+            other_cv_boxes=other_boxes,
+            white_exclusion_mask=white_exclusion_mask,
+        )
         if not slots:
             continue
         used_cv_ids.add(bid)
@@ -3339,14 +3528,9 @@ def _render_translated_manga_image_cv2_sync(
 
         snapped_cv_id = None
         best_ov = 0.0
-        for cid, c_obj in cv_map.items():
+        for cid, (cx1_p, cy1_p, cx2_p, cy2_p) in cv_boxes_px.items():
             if cid in used_cv_ids:
                 continue
-            cy1_n, cx1_n, cy2_n, cx2_n = c_obj["bbox_norm"]
-            cx1_p = int((cx1_n / 1000.0) * width)
-            cy1_p = int((cy1_n / 1000.0) * height)
-            cx2_p = int((cx2_n / 1000.0) * width)
-            cy2_p = int((cy2_n / 1000.0) * height)
             ov_x = max(0, min(rx2, cx2_p) - max(rx1, cx1_p))
             ov_y = max(0, min(ry2, cy2_p) - max(ry1, cy1_p))
             ov_ratio = (ov_x * ov_y) / float(min(area_new, max(1, (cx2_p - cx1_p) * (cy2_p - cy1_p))))
@@ -3355,8 +3539,14 @@ def _render_translated_manga_image_cv2_sync(
                 snapped_cv_id = cid
 
         if snapped_cv_id is not None:
+            other_boxes = [box for cid, box in cv_boxes_px.items() if cid != snapped_cv_id]
             slots = _clean_exact_cv_bubble_and_build_render_slots_cv2(
-                img_bgr, base_gray, cv_map[snapped_cv_id], tr_txt
+                img_bgr,
+                base_gray,
+                cv_map[snapped_cv_id],
+                tr_txt,
+                other_cv_boxes=other_boxes,
+                white_exclusion_mask=white_exclusion_mask,
             )
             if slots:
                 used_cv_ids.add(snapped_cv_id)
@@ -3382,6 +3572,7 @@ def _render_translated_manga_image_cv2_sync(
         prepared_renders.append([lx1, ly1, lx2, ly2, fg_text, stroke_col, tr_txt, hard_bounds])
         rendered_rects.append(hard_bounds)
 
+    white_exclusion_mask = None
     if not prepared_renders:
         return None
 
@@ -3453,9 +3644,31 @@ def _fast_dilate_mask_half_res_pil(mask_l: Image.Image, kernel_half: int = 3) ->
     return out
 
 
-def _build_true_chroma_art_shield_pil(sub_rgb: Image.Image, chroma_thresh: int = 34) -> Image.Image:
+def _build_true_chroma_art_shield_pil(
+    sub_rgb: Image.Image,
+    chroma_thresh: int = 34,
+    is_dark: bool = False,
+) -> Image.Image:
     chroma_band = _compute_rgb_chroma_band_pil(sub_rgb)
     ww, wh = chroma_band.size
+    if is_dark:
+        sat_band = sub_rgb.convert("HSV").getchannel("S")
+        c_bin = chroma_band.point(lambda p: 255 if p >= 24 else 0)
+        s_bin = sat_band.point(lambda p: 255 if p >= 26 else 0)
+        chroma_band.close()
+        sat_band.close()
+        combined = ImageChops.lighter(c_bin, s_bin)
+        c_bin.close()
+        s_bin.close()
+        if not combined.getbbox():
+            combined.close()
+            return Image.new("L", (ww, wh), 255)
+        shield = _fast_dilate_mask_half_res_pil(combined, kernel_half=3)
+        combined.close()
+        non_chroma = ImageChops.invert(shield)
+        shield.close()
+        return non_chroma
+
     if ww >= 24 and wh >= 24:
         sw, sh = max(8, ww // 2), max(8, wh // 2)
         small_c = chroma_band.resize((sw, sh), Image.Resampling.BILINEAR)
@@ -3639,6 +3852,7 @@ def _refine_cv_bubble_mask_locally_pil(
     y1: int,
     x2: int,
     y2: int,
+    other_cv_boxes: list[tuple[int, int, int, int]] | None = None,
 ) -> tuple[int, int, int, int, Image.Image, float]:
     width, height = img.size
     bw, bh = x2 - x1, y2 - y1
@@ -3653,8 +3867,8 @@ def _refine_cv_bubble_mask_locally_pil(
     if bool(cv_obj.get("is_dark")) or bw < 16 or bh < 14:
         return _fallback_orig()
 
-    pad_x = min(int(width * 0.14), max(28, int(bw * 0.45)))
-    pad_y = min(int(height * 0.18), max(36, int(bh * 0.75)))
+    pad_x = min(int(width * 0.12), max(24, int(bw * 0.35)))
+    pad_y = min(int(height * 0.16), max(32, int(bh * 0.65)))
     wx1 = max(0, x1 - pad_x)
     wy1 = max(0, y1 - pad_y)
     wx2 = min(width, x2 + pad_x)
@@ -3665,18 +3879,29 @@ def _refine_cv_bubble_mask_locally_pil(
     sw = max(16, int(round(ww * scale)))
     sh = max(16, int(round(wh * scale)))
 
-    win_rgb = img.crop((wx1, wy1, wx2, wy2)).resize((sw, sh), Image.Resampling.BILINEAR)
+    win_full_rgb = img.crop((wx1, wy1, wx2, wy2))
+    win_full_gray = win_full_rgb.convert("L")
+    win_dark_full = win_full_gray.point(lambda p: 255 if p < 185 else 0)
+    win_full_gray.close()
+    win_dark_box = win_dark_full.resize((sw, sh), Image.Resampling.BOX)
+    win_dark_full.close()
+
+    win_rgb = win_full_rgb.resize((sw, sh), Image.Resampling.BILINEAR)
+    win_full_rgb.close()
     win_gray = win_rgb.convert("L")
     win_chroma = _compute_rgb_chroma_band_pil(win_rgb)
     win_rgb.close()
 
-    g_ok = win_gray.point(lambda p: 255 if p >= 216 else 0)
-    c_ok = win_chroma.point(lambda p: 255 if p < 20 else 0)
+    g_ok = win_gray.point(lambda p: 255 if p >= 220 else 0)
+    c_ok = win_chroma.point(lambda p: 255 if p < 16 else 0)
+    d_ok = win_dark_box.point(lambda p: 0 if p >= 24 else 255)
     win_gray.close()
     win_chroma.close()
-    local_bin = ImageChops.darker(g_ok, c_ok)
+    win_dark_box.close()
+    local_bin = ImageChops.darker(ImageChops.darker(g_ok, c_ok), d_ok)
     g_ok.close()
     c_ok.close()
+    d_ok.close()
 
     ox_s = int(round((x1 - wx1) * scale))
     oy_s = int(round((y1 - wy1) * scale))
@@ -3722,7 +3947,7 @@ def _refine_cv_bubble_mask_locally_pil(
         + (1 if cx2 >= sw - 1 else 0)
         + (1 if cy2 >= sh - 1 else 0)
     )
-    if edge_touches >= 3 or (cx1 <= 1 and cx2 >= sw - 1) or (cy1 <= 1 and cy2 >= sh - 1):
+    if edge_touches >= 2 or (cx1 <= 1 and cx2 >= sw - 1) or (cy1 <= 1 and cy2 >= sh - 1):
         comp.close()
         return _fallback_orig()
 
@@ -3738,16 +3963,36 @@ def _refine_cv_bubble_mask_locally_pil(
     holes_c.close()
 
     new_area_s = max(1, filled_s.histogram()[255])
-    if new_area_s > orig_area_s * 2.8 or new_area_s < orig_area_s * 0.85:
+    new_rect_fill = new_area_s / float(max(1, cw_s * ch_s))
+    if (
+        new_area_s > orig_area_s * 1.75
+        or new_area_s < orig_area_s * 0.85
+        or new_rect_fill < orig_fill * 0.78
+    ):
         filled_s.close()
         return _fallback_orig()
 
-    new_rect_fill = new_area_s / float(max(1, cw_s * ch_s))
     rx1 = max(0, wx1 + int(round(cx1 / scale)))
     ry1 = max(0, wy1 + int(round(cy1 / scale)))
     rx2 = min(width, wx1 + int(round(cx2 / scale)))
     ry2 = min(height, wy1 + int(round(cy2 / scale)))
     rw, rh = max(4, rx2 - rx1), max(4, ry2 - ry1)
+
+    if other_cv_boxes:
+        new_area_full = max(1, rw * rh)
+        old_area_full = max(1, bw * bh)
+        for ox1, oy1, ox2, oy2 in other_cv_boxes:
+            other_area = max(1, (ox2 - ox1) * (oy2 - oy1))
+            ov_x = max(0, min(rx2, ox2) - max(rx1, ox1))
+            ov_y = max(0, min(ry2, oy2) - max(ry1, oy1))
+            ov_new = (ov_x * ov_y) / float(min(new_area_full, other_area))
+            if ov_new >= 0.15:
+                o_ov_x = max(0, min(x2, ox2) - max(x1, ox1))
+                o_ov_y = max(0, min(y2, oy2) - max(y1, oy1))
+                ov_old = (o_ov_x * o_ov_y) / float(min(old_area_full, other_area))
+                if ov_new > ov_old + 0.05:
+                    filled_s.close()
+                    return _fallback_orig()
 
     m_full = filled_s.resize((rw, rh), Image.Resampling.BILINEAR).point(lambda p: 255 if p >= 128 else 0)
     filled_s.close()
@@ -3800,6 +4045,8 @@ def _clean_exact_cv_bubble_and_build_render_slots_pil(
     base_gray: Image.Image,
     cv_obj: dict,
     trans_text: str,
+    other_cv_boxes: list[tuple[int, int, int, int]] | None = None,
+    white_exclusion_mask: Image.Image | None = None,
 ) -> list[list]:
     width, height = img.size
     ymin, xmin, ymax, xmax = cv_obj["bbox_norm"]
@@ -3812,7 +4059,7 @@ def _clean_exact_cv_bubble_and_build_render_slots_pil(
 
     is_dark = bool(cv_obj.get("is_dark"))
     rx1, ry1, rx2, ry2, mask_full, rect_fill = _refine_cv_bubble_mask_locally_pil(
-        img, cv_obj, x1, y1, x2, y2
+        img, cv_obj, x1, y1, x2, y2, other_cv_boxes=other_cv_boxes
     )
     bw, bh = rx2 - rx1, ry2 - ry1
     if bw < 16 or bh < 14:
@@ -3826,9 +4073,21 @@ def _clean_exact_cv_bubble_and_build_render_slots_pil(
     else:
         mask_full.close()
 
+    if is_dark and white_exclusion_mask is not None:
+        excl_crop = white_exclusion_mask.crop((rx1, ry1, rx2, ry2))
+        inv_excl = ImageChops.invert(excl_crop)
+        excl_crop.close()
+        clipped_core = ImageChops.darker(safe_core, inv_excl)
+        inv_excl.close()
+        safe_core.close()
+        safe_core = clipped_core
+        if not safe_core.getbbox():
+            safe_core.close()
+            return []
+
     sub_gray = base_gray.crop((rx1, ry1, rx2, ry2))
     sub_rgb = img.crop((rx1, ry1, rx2, ry2))
-    non_chroma = _build_true_chroma_art_shield_pil(sub_rgb, chroma_thresh=34)
+    non_chroma = _build_true_chroma_art_shield_pil(sub_rgb, chroma_thresh=34, is_dark=is_dark)
     sub_rgb.close()
 
     try:
@@ -3939,19 +4198,27 @@ def _clean_unmarked_open_bubble_and_measure_box_pil(
 
     sub_rgb_check = img.crop((raw_x1, raw_y1, raw_x2, raw_y2))
     ch_band = _compute_rgb_chroma_band_pil(sub_rgb_check)
-    sub_rgb_check.close()
     ch_hist = ch_band.histogram()
     mean_chroma = ImageStat.Stat(ch_band).mean[0]
     ch_band.close()
     chroma_ratio = sum(ch_hist[28:]) / float(max(1, sum(ch_hist)))
 
     if mean_chroma >= 18.0 or chroma_ratio >= 0.18:
+        sub_rgb_check.close()
         return None
 
     if median_lum < 125:
+        s_band = sub_rgb_check.convert("HSV").getchannel("S")
+        sub_rgb_check.close()
+        s_hist = s_band.histogram()
+        mean_s = ImageStat.Stat(s_band).mean[0]
+        s_band.close()
+        if mean_s >= 22.0 or (sum(s_hist[28:]) / float(max(1, sum(s_hist)))) >= 0.16:
+            return None
+
         dark_rgb, bg_lum, bg_std = _sample_dark_bg_rgb_and_lum_pil(img, base_gray, raw_x1, raw_y1, raw_x2, raw_y2)
         bright_ratio = sum(box_hist[220:]) / float(total_px)
-        if bg_std > 26.0 or not (0.02 <= bright_ratio <= 0.38):
+        if bg_std > 24.0 or not (0.02 <= bright_ratio <= 0.38):
             return None
 
         pad = 6
@@ -3959,17 +4226,24 @@ def _clean_unmarked_open_bubble_and_measure_box_pil(
         wx2, wy2 = min(width, raw_x2 + pad), min(height, raw_y2 + pad)
         ww, wh = wx2 - wx1, wy2 - wy1
         sg = base_gray.crop((wx1, wy1, wx2, wy2))
+        srgb_d = img.crop((wx1, wy1, wx2, wy2))
+        non_chroma_d = _build_true_chroma_art_shield_pil(srgb_d, chroma_thresh=24, is_dark=True)
+        srgb_d.close()
         diff = sg.point(lambda p: 255 if abs(int(p) - bg_lum) > 18 else 0)
         sg.close()
         erase_d = _fast_dilate_mask_half_res_pil(diff, kernel_half=3)
         diff.close()
-        patch = Image.new("RGB", (ww, wh), dark_rgb)
-        img.paste(patch, (wx1, wy1), mask=erase_d)
-        patch.close()
+        final_erase = ImageChops.darker(erase_d, non_chroma_d)
         erase_d.close()
+        non_chroma_d.close()
+        patch = Image.new("RGB", (ww, wh), dark_rgb)
+        img.paste(patch, (wx1, wy1), mask=final_erase)
+        patch.close()
+        final_erase.close()
         stroke_c = (max(0, bg_lum - 20), max(0, bg_lum - 20), max(0, bg_lum - 20))
         return raw_x1, raw_y1, raw_x2, raw_y2, (250, 250, 250), stroke_c, (raw_x1, raw_y1, raw_x2, raw_y2)
 
+    sub_rgb_check.close()
     white_ratio = sum(box_hist[220:]) / float(total_px)
     ink_ratio = sum(box_hist[:155]) / float(total_px)
     if white_ratio < 0.38 or ink_ratio < 0.010:
@@ -3982,7 +4256,7 @@ def _clean_unmarked_open_bubble_and_measure_box_pil(
 
     sg = base_gray.crop((wx1, wy1, wx2, wy2))
     srgb = img.crop((wx1, wy1, wx2, wy2))
-    non_chroma = _build_true_chroma_art_shield_pil(srgb, chroma_thresh=30)
+    non_chroma = _build_true_chroma_art_shield_pil(srgb, chroma_thresh=30, is_dark=False)
     srgb.close()
 
     w_seed = sg.point(lambda p: 255 if p >= 228 else 0)
@@ -4025,8 +4299,36 @@ def _render_translated_manga_image_pil_sync(
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     base_gray = img.convert("L")
     width, height = img.size
+    white_exclusion_mask: Image.Image | None = None
 
     try:
+        cv_boxes_px: dict[int, tuple[int, int, int, int]] = {}
+        has_dark_cv = False
+        for cid, c_obj in cv_map.items():
+            cy1_n, cx1_n, cy2_n, cx2_n = c_obj["bbox_norm"]
+            cv_boxes_px[cid] = (
+                max(0, int((cx1_n / 1000.0) * width)),
+                max(0, int((cy1_n / 1000.0) * height)),
+                min(width, int((cx2_n / 1000.0) * width)),
+                min(height, int((cy2_n / 1000.0) * height)),
+            )
+            if c_obj.get("is_dark"):
+                has_dark_cv = True
+
+        if has_dark_cv:
+            excl_buf = Image.new("L", (width, height), 0)
+            for cid, c_obj in cv_map.items():
+                if c_obj.get("is_dark") or c_obj.get("mask_small") is None:
+                    continue
+                bx1, by1, bx2, by2 = cv_boxes_px[cid]
+                if (bx2 - bx1) >= 4 and (by2 - by1) >= 4:
+                    m_up = c_obj["mask_small"].resize((bx2 - bx1, by2 - by1), Image.Resampling.NEAREST)
+                    excl_buf.paste(255, (bx1, by1, bx2, by2), mask=m_up)
+                    m_up.close()
+            if excl_buf.getbbox():
+                white_exclusion_mask = excl_buf.filter(ImageFilter.MaxFilter(5))
+            excl_buf.close()
+
         prepared_renders: list[list] = []
         used_cv_ids: set[int] = set()
         rendered_rects: list[tuple[int, int, int, int]] = []
@@ -4037,7 +4339,15 @@ def _render_translated_manga_image_pil_sync(
             if not tr_txt or bid is None or bid in used_cv_ids or bid not in cv_map:
                 continue
 
-            slots = _clean_exact_cv_bubble_and_build_render_slots_pil(img, base_gray, cv_map[bid], tr_txt)
+            other_boxes = [box for cid, box in cv_boxes_px.items() if cid != bid]
+            slots = _clean_exact_cv_bubble_and_build_render_slots_pil(
+                img,
+                base_gray,
+                cv_map[bid],
+                tr_txt,
+                other_cv_boxes=other_boxes,
+                white_exclusion_mask=white_exclusion_mask,
+            )
             if not slots:
                 continue
             used_cv_ids.add(bid)
@@ -4070,14 +4380,9 @@ def _render_translated_manga_image_pil_sync(
 
             snapped_cv_id = None
             best_ov = 0.0
-            for cid, c_obj in cv_map.items():
+            for cid, (cx1_p, cy1_p, cx2_p, cy2_p) in cv_boxes_px.items():
                 if cid in used_cv_ids:
                     continue
-                cy1_n, cx1_n, cy2_n, cx2_n = c_obj["bbox_norm"]
-                cx1_p = int((cx1_n / 1000.0) * width)
-                cy1_p = int((cy1_n / 1000.0) * height)
-                cx2_p = int((cx2_n / 1000.0) * width)
-                cy2_p = int((cy2_n / 1000.0) * height)
                 ov_x = max(0, min(rx2, cx2_p) - max(rx1, cx1_p))
                 ov_y = max(0, min(ry2, cy2_p) - max(ry1, cy1_p))
                 ov_ratio = (ov_x * ov_y) / float(min(area_new, max(1, (cx2_p - cx1_p) * (cy2_p - cy1_p))))
@@ -4086,8 +4391,14 @@ def _render_translated_manga_image_pil_sync(
                     snapped_cv_id = cid
 
             if snapped_cv_id is not None:
+                other_boxes = [box for cid, box in cv_boxes_px.items() if cid != snapped_cv_id]
                 slots = _clean_exact_cv_bubble_and_build_render_slots_pil(
-                    img, base_gray, cv_map[snapped_cv_id], tr_txt
+                    img,
+                    base_gray,
+                    cv_map[snapped_cv_id],
+                    tr_txt,
+                    other_cv_boxes=other_boxes,
+                    white_exclusion_mask=white_exclusion_mask,
                 )
                 if slots:
                     used_cv_ids.add(snapped_cv_id)
@@ -4155,6 +4466,8 @@ def _render_translated_manga_image_pil_sync(
         img.save(out_io, format="JPEG", quality=94, subsampling=0)
         return out_io.getvalue()
     finally:
+        if white_exclusion_mask is not None:
+            white_exclusion_mask.close()
         img.close()
         base_gray.close()
 
@@ -4197,7 +4510,8 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
       - Vectorized OpenCV + NumPy CV Set-of-Mark (SoM) detection & render masking (with pure-PIL fallback)
       - Shared `llm.py` Google AI Studio catalog & cooldowns + 25-second `3.5-flash-lite` -> `3.1-flash-lite` hedge
       - Throttled live Discord progress messages (1/3 CV -> 2/3 AI -> 3/3 Render -> auto-delete)
-      - Local mask refinement, automatic two-lobe figure-8 typesetting, syllable-aware Thai wrapping
+      - Border-safe local mask refinement, HSV dark-panel rejection, two-lobe figure-8 typesetting,
+        and syllable-aware Thai wrapping
     """
     from media_context import resolve_referenced_message, collect_embedded_images_and_metadata
 
