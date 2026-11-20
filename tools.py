@@ -17,10 +17,6 @@ from search_engine import (
     fetch_webpage_async,
     fetch_live_weather_context,
 )
-from media_context import (
-    extract_youtube_id,
-    fetch_youtube_context_async,
-)
 
 MAX_TOOL_OUTPUT_CHARS = 7500
 MAX_TOOLS_PER_TURN = 6
@@ -384,6 +380,9 @@ async def execute_tool_call(
             url = str(args.get("url") or "").strip()
             if not url:
                 return "[Tool Error: 'url' is required.]"
+            # Lazy import prevents circular import: llm -> tools -> media_context -> llm
+            from media_context import extract_youtube_id, fetch_youtube_context_async
+
             vid = extract_youtube_id(url) or url[:11]
             res = await fetch_youtube_context_async(vid, max_chars=7000)
             ctx.tools_used.append(t_name)
