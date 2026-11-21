@@ -43,7 +43,7 @@ from manga_cv_render import (
     _release_cv_page_masks,
 )
 
-MANGA_TRANSLATOR_VERSION = "v7"
+MANGA_TRANSLATOR_VERSION = "v8"
 MANGA_CV_VER = getattr(_mcr_mod, "MANGA_CV_RENDER_VERSION", "old")
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
 # Bundle 2 dynamic parallel hedge: faster 15s recovery on typical 2-4p X threads, patient 25s on 5-12p batches
@@ -53,6 +53,15 @@ MANGA_BATCH_HEDGE_DELAY_LARGE_SEC = 25.0
 _FLASH_LITE_EXCLUDED = ("2.5", "2.0", "1.5", "latest", "image", "tts", "audio", "live", "embedding")
 _HANGUL_REGEX = re.compile(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF]")
 _SOURCE_EAST_ASIAN_REGEX = re.compile(r"[\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]")
+_LATIN_TOKEN_REGEX = re.compile(r"[A-Za-z]+")
+# Impossible trailing consonant glued after a Thai 'ะ' particle (e.g. ค่ะร, คะร, นะร, ล่ะร)
+_THAI_STRAY_AFTER_SARA_A_REGEX = re.compile(
+    r"(ค่ะ|คะ|นะคะ|นะ|ล่ะ|จ้ะ|จ๊ะ|เถอะ|เหอะ|เรอะ|เหรอ|สิ)[ก-ฮ](?=$|[\s.!?~\x22\x27)\]])"
+)
+_THAI_ALLOWED_ACRONYMS = frozenset({
+    "OK", "NG", "HP", "MP", "LV", "XP", "EXP", "VIP", "TV", "PC", "VR",
+    "AI", "VS", "DM", "SNS", "LINE", "BGM", "NPC", "ID", "DIY", "GPS", "USB", "PDF",
+})
 
 # Set-of-Mark (SoM) JSON responseSchema with explicit `propertyOrdering`:
 # - Every numbered CV bubble `[k]` maps 1-to-1 via `"bubble_id": k` (zero coordinate drift!).
@@ -273,11 +282,32 @@ def _extract_norm_box_2d(raw_box) -> list[float] | None:
     return coords
 
 
+def _has_unexpected_latin_in_thai(cleaned_tr: str, src_text: str) -> bool:
+    """
+    Returns True if a Thai translation contains leaked Latin/English letters or words
+    (e.g. `เอ๋? Ehehe...`, `Eหมอนี่...`, `ทะ...Eเป็น`) that did NOT appear in `source_text`
+    and are not standard uppercase acronyms like `OK`, `HP`, `MP`, `VR`, `DM`.
+    """
+    tr_tokens = _LATIN_TOKEN_REGEX.findall(cleaned_tr or "")
+    if not tr_tokens:
+        return False
+    src_tokens_lower = {t.lower() for t in _LATIN_TOKEN_REGEX.findall(src_text or "")}
+    for tok in tr_tokens:
+        if tok in _THAI_ALLOWED_ACRONYMS:
+            continue
+        if tok.lower() in src_tokens_lower:
+            continue
+        return True
+    return False
+
+
 def _needs_target_language_repair(tr_text: str, src_text: str, target_lang_name: str) -> bool:
     """
-    Detects when a single bubble inside a multi-page batch drifted into the wrong language
-    (e.g., Korean Hangul `하하, 뭐 신경 쓰지 마.` when translating to Thai, or stripped to
-    punctuation after removing leaked foreign script).
+    Detects when a bubble drifted into the wrong language or had a lightweight-LLM token slip:
+    - Korean Hangul (`하하, 뭐 신경 쓰지 마.`)
+    - Missing target-language script when Japanese/Korean source had real text
+    - Mixed leaked Latin/English inside Thai (`เอ๋? Ehehe...`, `Eหมอนี่...`)
+    - Impossible trailing Thai consonant glued onto `ะ` particles (`ค่ะร`, `คะร`, `นะร`)
     """
     raw_tr = str(tr_text or "").strip()
     if _HANGUL_REGEX.search(raw_tr):
@@ -287,6 +317,10 @@ def _needs_target_language_repair(tr_text: str, src_text: str, target_lang_name:
         if not THAI_CHAR_REGEX.search(cleaned):
             if _SOURCE_EAST_ASIAN_REGEX.search(src_text or ""):
                 return True
+        if _has_unexpected_latin_in_thai(cleaned, src_text):
+            return True
+        if _THAI_STRAY_AFTER_SARA_A_REGEX.search(cleaned):
+            return True
     elif target_lang_name.lower() == "english":
         if not re.search(r"[A-Za-z]", cleaned):
             if _SOURCE_EAST_ASIAN_REGEX.search(src_text or ""):
@@ -418,29 +452,29 @@ async def _repair_wrong_language_batch_async(
 
     if GEMINI_API_KEY:
         repair_prompt = (
-            f"Translate EVERY item below from Japanese into natural, conversational {target_lang_name} manga dialogue.\n"
-            f"CRITICAL: Output STRICTLY in {target_lang_name} ONLY — NEVER output Korean (Hangul), Chinese, Arabic, "
-            "or heart/music symbols/emojis. Return ONLY a JSON object mapping string index to translated string, "
-            'e.g. {"0": "...", "1": "..."}.\n\n'
+            f"Retranslate EVERY item below from Japanese (`source_text`) into clean, natural, correctly spelled {target_lang_name} manga dialogue.\n"
+            f"RULES: Use ONLY pure {target_lang_name} script and standard ASCII punctuation (..., ~, -, !, ?, '). "
+            "Do NOT mix English/romanized words (like Ehehe or single Latin letters) into Thai, and fix any garbled endings or typos. "
+            'Return ONLY a JSON object mapping string index to the corrected translation, e.g. {"0": "...", "1": "..."}.\n\n'
             + json.dumps(items_payload, ensure_ascii=False)
         )
         payload = {
             "contents": [{"parts": [{"text": repair_prompt}]}],
             "generationConfig": {
-                "temperature": 0.1,
+                "temperature": 0.0,
                 "maxOutputTokens": 1024,
                 "responseMimeType": "application/json",
-                "thinkingConfig": {"thinkingLevel": "MINIMAL"},
+                "thinkingConfig": {"thinkingLevel": "LOW"},
             },
         }
         try:
             data = await call_gemini_generate_content_self_healing(
                 payload,
-                timeout_sec=10,
+                timeout_sec=12,
                 purpose=f"MangaLangRepair[{req_id}]",
-                max_models=2,
-                max_wall_sec=14.0,
-                preferred_models=["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
+                max_models=3,
+                max_wall_sec=16.0,
+                preferred_models=["gemini-3-flash-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
             )
             if data:
                 r_parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
@@ -456,8 +490,11 @@ async def _repair_wrong_language_batch_async(
                                 ki = int(k_str)
                             except Exception:
                                 continue
+                            if not (0 <= ki < len(defective)):
+                                continue
+                            src_i = defective[ki][2].get("source_text") or ""
                             clean_val = _sanitize_text_for_manga_font(str(val or ""))
-                            if clean_val and not _HANGUL_REGEX.search(str(val or "")):
+                            if clean_val and not _needs_target_language_repair(clean_val, src_i, target_lang_name):
                                 repaired_map[ki] = clean_val
         except Exception as e:
             api_log(f"MangaLangRepair [req={req_id}] Gemini note ({type(e).__name__})")
@@ -495,6 +532,12 @@ async def _repair_wrong_language_batch_async(
             b["translated_text"] = repaired_map[i]
             b.pop("_raw_translated_text", None)
             repaired_cnt += 1
+        elif target_lang_name.lower() == "thai":
+            cur_t = b.get("translated_text") or ""
+            fixed_t = _THAI_STRAY_AFTER_SARA_A_REGEX.sub(r"\1", cur_t)
+            if fixed_t != cur_t:
+                b["translated_text"] = fixed_t
+                repaired_cnt += 1
 
     api_log(f"MangaLangRepair [req={req_id}] -> repaired {repaired_cnt}/{len(defective)} bubble(s)")
     return cleaned_batch
@@ -781,7 +824,7 @@ async def _invoke_manga_batch_single_model(
         f"{model_id}:generateContent?key={GEMINI_API_KEY}"
     )
     gen_cfg = {
-        "temperature": 0.1,
+        "temperature": 0.0,
         "maxOutputTokens": 24576 if is_gemma else 32768,
         "responseMimeType": "application/json",
     }
@@ -1037,8 +1080,7 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
    - Identify the actual character speaking each bubble visually (follow the tail; never copy one character's name onto every bubble).
    - Keep character names, titles/ranks, and faction names consistent across all pages using accurate Japanese phonetics.
    - Match pronouns and politeness particles strictly to each speaker's visual gender and setting: in Thai, visually female characters (including female subordinates, guards, and attendants) must use female/neutral endings (`ค่ะ`, `คะ`, `นะคะ`, `นะ`, `ล่ะ`, `สิ`) — NEVER use male `ครับ`/`ผม` unless the speaker is clearly drawn as male!
-   - STRICT TARGET LANGUAGE & FONT-SAFE OUTPUT: Write EVERY `translated_text` and `summary` STRICTLY in {target_lang_name} ONLY — NEVER switch any bubble to Korean (Hangul), Chinese, or Arabic, NEVER glue stray random Latin letters inside Thai words, and NEVER include heart/music symbols (`♥`, `♡`, `♪`, `★`) or emojis (use standard ASCII punctuation `...`, `~`, `-`, `'`, `!`, `?` only).
-   - THAI SPELLING & NATURAL GASPS (when translating to Thai): Double-check Thai spelling and vowel-before-tone order (`เป็น` not `เป้น`, `เห็น` not `เห้น`, `เด็ก` not `เด้ก`); translate brief startled gasps like `…っ!!` naturally as `...อ๊ะ!!` or `...อึก!!` (never garbled `อ๊ิก`).
+   - PURE TARGET LANGUAGE & FONT-SAFE OUTPUT: Write EVERY `translated_text` and `summary` purely in natural, correctly spelled {target_lang_name} using ONLY standard {target_lang_name} script and ASCII punctuation (`...`, `~`, `-`, `'`, `!`, `?`) — no emojis, no heart/music symbols, and no mixed English/romanized syllables inside Thai (e.g. render `えへへ` as `เอะเฮะ`, `…っ!!` as `...อ๊ะ!!`, `コイツ` as `ไอ้หมอนี่`).
    - When translating to English, preserve Japanese honorifics attached directly with a hyphen and NO space (`-san`, `-kun`, `-chan`, `-sama`, `-sensei`, `-senpai`).
 4. Return ONLY valid JSON matching this exact structure for all {num_pages} page(s) (write `summary` in {target_lang_name}):
 {{
@@ -1230,8 +1272,7 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
    - For real spoken dialogue/narration WITHOUT a numbered badge (e.g. vertical text on open white panels), output a SEPARATE entry with `"bubble_id": null`, `"should_translate": true`, `"source_text"`, and `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY the Japanese text in its own panel).
 3. Accurate Speaker Attribution, Names & Visual Gender:
    - Identify the actual speaker visually; match Thai/English tone to visual gender (never use male Thai `ครับ`/`ผม` for female characters/guards).
-   - STRICT TARGET LANGUAGE & FONT-SAFE OUTPUT: Write EVERY `translated_text` and `summary` STRICTLY in {target_lang_name} ONLY — NEVER switch any bubble to Korean (Hangul), Chinese, or Arabic, NEVER glue stray random Latin letters inside Thai words, and NEVER include heart/music symbols (`♥`, `♡`, `♪`, `★`) or emojis (use standard ASCII punctuation `...`, `~`, `-`, `'`, `!`, `?` only).
-   - THAI SPELLING & NATURAL GASPS (when translating to Thai): Double-check Thai spelling and vowel-before-tone order (`เป็น` not `เป้น`, `เห็น` not `เห้น`, `เด็ก` not `เด้ก`); translate brief startled gasps like `…っ!!` naturally as `...อ๊ะ!!` or `...อึก!!` (never garbled `อ๊ิก`).
+   - PURE TARGET LANGUAGE & FONT-SAFE OUTPUT: Write EVERY `translated_text` and `summary` purely in natural, correctly spelled {target_lang_name} using ONLY standard {target_lang_name} script and ASCII punctuation (`...`, `~`, `-`, `'`, `!`, `?`) — no emojis, no heart/music symbols, and no mixed English/romanized syllables inside Thai (e.g. render `えへへ` as `เอะเฮะ`, `…っ!!` as `...อ๊ะ!!`, `コイツ` as `ไอ้หมอนี่`).
 4. Return ONLY valid JSON matching this exact structure (write `summary` in {target_lang_name}):
 {{
   "summary": "Brief 1-sentence scene context in {target_lang_name}",
@@ -1267,7 +1308,7 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
                 }
             ],
             "generationConfig": {
-                "temperature": 0.1,
+                "temperature": 0.0,
                 "responseMimeType": "application/json",
                 "responseSchema": MANGA_SINGLE_SOM_SCHEMA,
                 "thinkingConfig": {"thinkingLevel": "LOW"},
@@ -1370,7 +1411,7 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
                             ],
                         }
                     ],
-                    "temperature": 0.1,
+                    "temperature": 0.0,
                     "max_tokens": 4096,
                 }
                 async with session.post(
