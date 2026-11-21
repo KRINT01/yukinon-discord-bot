@@ -24,6 +24,7 @@ except ImportError:
 
 from config import THAI_CHAR_REGEX
 
+MANGA_CV_RENDER_VERSION = "v5"
 SOM_CV_MAX_DIM = 360  # Fast 360px grid derived from single 1024px resize (~1-2.5s for 10 pages with OpenCV+NumPy!)
 # Bundle 2 RAM & Discord upload optimization: quality=90 with standard 4:2:0 subsampling (~50% smaller than 94/4:4:4)
 MANGA_RENDER_JPEG_QUALITY = 90
@@ -71,7 +72,7 @@ _STRAY_SINGLE_LATIN_IN_THAI_REGEX = re.compile(
 # Pre-allocated reusable OpenCV morphological kernels
 _CV2_K3 = np.ones((3, 3), np.uint8) if HAS_CV2 else None
 _CV2_K5 = np.ones((5, 5), np.uint8) if HAS_CV2 else None
-_CV2_ELLIPSE_9 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)) if HAS_CV2 else None
+_CV2_ELLIPSE_13 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)) if HAS_CV2 else None
 
 
 # ==============================================================================
@@ -597,13 +598,14 @@ def _fill_mask_holes_cv2(comp_crop: "np.ndarray") -> "np.ndarray":
 def _close_rim_bays_cv2(filled_crop: "np.ndarray") -> "np.ndarray":
     """
     Seals concave kanji-to-border bays on validated pastel/borderless bubbles (e.g. kanji
-    touching dark gloom shading lines near the bubble rim) without leaking outward.
+    touching dark gloom shading lines near the bubble rim) using a 13x13 elliptical closing
+    strictly inside the bubble's own bounding box without leaking outward.
     """
     ch, cw = filled_crop.shape
-    pad = 5
+    pad = 7
     buf = np.zeros((ch + pad * 2, cw + pad * 2), dtype=np.uint8)
     buf[pad:-pad, pad:-pad] = filled_crop
-    closed = cv2.morphologyEx(buf, cv2.MORPH_CLOSE, _CV2_ELLIPSE_9)
+    closed = cv2.morphologyEx(buf, cv2.MORPH_CLOSE, _CV2_ELLIPSE_13)
     closed = _fill_mask_holes_cv2(closed)
     return closed[pad:-pad, pad:-pad]
 
@@ -826,7 +828,7 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
       bubbles (pale blue, pink, lavender, green, cream, yellow) with 2px border trim + nested
       white-halo deduplication.
     - Pass B (`gray <= 95`): enclosed dark speech bubbles with strict anti-dark-panel guards.
-    - Draws crisp RED bubble contours + high-contrast BLACK/WHITE/YELLOW numbered badges so
+    - Draws crisp RED bubble contours + high-contrast RED/WHITE/BLACK numbered badges so
       badges stand out clearly even next to red SFX (`ガチャ`, `ぎゅっ`) or top edges!
     """
     arr = np.frombuffer(raw_bytes, dtype=np.uint8)
@@ -1039,7 +1041,7 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
     for idx, b_obj in enumerate(detected, 1):
         b_obj["bubble_id"] = idx
 
-    # Draw crisp RED contours + high-contrast BLACK/WHITE/YELLOW numbered badges
+    # Draw crisp RED contours + high-contrast RED/WHITE/BLACK numbered badges
     # (stands out unmistakably against white, pastel bubbles, AND bright red SFX like ガチャ!)
     font_scale = max(0.50, vw / 1450.0)
     thickness = 2
@@ -1558,9 +1560,18 @@ def _clean_exact_cv_bubble_and_build_render_slots_cv2(
     if bw < 16 or bh < 14:
         return []
 
-    safe_core = cv2.erode(mask_full, _CV2_K3, iterations=1)
-    if not np.any(safe_core):
-        safe_core = mask_full
+    if is_pastel:
+        # Keep full sealed mask on pastel/borderless bubbles (only trim 1px at very outer dark borders)
+        # so rim-touching kanji like 調子乗/思 on gloom bubbles are erased cleanly!
+        outer_ring = cv2.subtract(mask_full, cv2.erode(mask_full, _CV2_K3, iterations=1))
+        hard_border_px = (outer_ring > 0) & (base_gray[ry1:ry2, rx1:rx2] < 105)
+        safe_core = np.where(hard_border_px, np.uint8(0), mask_full)
+        if not np.any(safe_core):
+            safe_core = mask_full
+    else:
+        safe_core = cv2.erode(mask_full, _CV2_K3, iterations=1)
+        if not np.any(safe_core):
+            safe_core = mask_full
 
     # Never let a dark bubble erase or overwrite an enclosed white/pastel speech bubble
     if is_dark and white_exclusion_mask is not None:

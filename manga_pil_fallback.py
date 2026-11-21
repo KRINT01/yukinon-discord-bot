@@ -337,7 +337,7 @@ def _filter_white_components_pil(
             # Close small concave rim bays after passing validation
             pad_m = Image.new("L", (cw + 8, ch + 8), 0)
             pad_m.paste(filled_crop, (4, 4))
-            closed_m = pad_m.filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.MinFilter(5))
+            closed_m = pad_m.filter(ImageFilter.MaxFilter(7)).filter(ImageFilter.MinFilter(7))
             pad_m.close()
             filled_crop.close()
             filled_crop = closed_m.crop((4, 4, cw + 4, ch + 4))

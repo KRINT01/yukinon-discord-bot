@@ -34,6 +34,7 @@ from llm import (
     get_google_model_cooldown,
     set_google_model_cooldown,
 )
+import manga_cv_render as _mcr_mod
 from manga_cv_render import (
     HAS_CV2,
     _sanitize_text_for_manga_font,
@@ -42,6 +43,8 @@ from manga_cv_render import (
     _release_cv_page_masks,
 )
 
+MANGA_TRANSLATOR_VERSION = "v6"
+MANGA_CV_VER = getattr(_mcr_mod, "MANGA_CV_RENDER_VERSION", "old")
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
 # Bundle 2 dynamic parallel hedge: faster 15s recovery on typical 2-4p X threads, patient 25s on 5-12p batches
 MANGA_BATCH_HEDGE_DELAY_SMALL_SEC = 15.0
@@ -84,9 +87,9 @@ MANGA_BATCH_SOM_SCHEMA = {
                             "propertyOrdering": [
                                 "id",
                                 "bubble_id",
-                                "should_translate",
                                 "speaker_or_note",
                                 "source_text",
+                                "should_translate",
                                 "box_2d",
                                 "translated_text",
                             ],
@@ -134,9 +137,9 @@ MANGA_SINGLE_SOM_SCHEMA = {
                 "propertyOrdering": [
                     "id",
                     "bubble_id",
-                    "should_translate",
                     "speaker_or_note",
                     "source_text",
+                    "should_translate",
                     "box_2d",
                     "translated_text",
                 ],
@@ -289,6 +292,86 @@ def _needs_target_language_repair(tr_text: str, src_text: str, target_lang_name:
             if _SOURCE_EAST_ASIAN_REGEX.search(src_text or ""):
                 return True
     return False
+
+
+
+async def _recover_omitted_pages_async(
+    pages_input: list[tuple[bytes, str]],
+    batch_results: list[tuple[list[dict], str]],
+    cv_bubbles_per_page: list[list[dict]],
+    target_lang_name: str,
+    series_context_hint: str = "",
+    req_id: str = "",
+    max_pages_to_recover: int = 2,
+) -> tuple[list[tuple[list[dict], str]], list[list[dict]]]:
+    """
+    Automatic safeguard for multi-page batches: if a page had >=2 CV bubbles and Gemini
+    omitted >=50% of them OR skipped a high-confidence rectangular narration box (`rect_fill >= 0.90`),
+    re-runs ONLY that single page (up to `max_pages_to_recover` pages, ~2-3s each) so white
+    caption boxes (e.g. Page 1 narration) are never silently lost!
+    """
+    num_pages = len(pages_input)
+    if num_pages <= 1:
+        return batch_results, cv_bubbles_per_page
+
+    suspect_indices: list[tuple[int, list[int]]] = []
+    for p_idx in range(num_pages):
+        page_cv = cv_bubbles_per_page[p_idx] if p_idx < len(cv_bubbles_per_page) else []
+        if not page_cv:
+            continue
+        bubbles, _ = batch_results[p_idx]
+        returned_bids = {
+            int(b["bubble_id"]) for b in bubbles if b.get("bubble_id") is not None
+        }
+        missing_rect_boxes = [
+            int(c["bubble_id"])
+            for c in page_cv
+            if (not c.get("is_pastel"))
+            and (not c.get("is_dark"))
+            and float(c.get("rect_fill") or 0.0) >= 0.90
+            and int(c["bubble_id"]) not in returned_bids
+        ]
+        severe_drop = (len(page_cv) >= 2 and len(bubbles) < max(2, int(len(page_cv) * 0.55)))
+        if missing_rect_boxes or severe_drop:
+            missing_all = [int(c["bubble_id"]) for c in page_cv if int(c["bubble_id"]) not in returned_bids]
+            suspect_indices.append((p_idx, missing_all))
+
+    if not suspect_indices:
+        return batch_results, cv_bubbles_per_page
+
+    recovered_pages = 0
+    for p_idx, missing_ids in suspect_indices[:max_pages_to_recover]:
+        raw_b, fname = pages_input[p_idx]
+        old_bubbles, old_summary = batch_results[p_idx]
+        api_log(
+            f"MangaPageRecover [req={req_id}] -> Page {p_idx + 1}/{num_pages} ({fname}) "
+            f"returned {len(old_bubbles)}/{len(cv_bubbles_per_page[p_idx])} bubbles (omitted={missing_ids}); re-translating single page"
+        )
+        try:
+            new_bubbles, new_summary, new_cv = await extract_and_translate_manga_bubbles(
+                raw_b,
+                fname,
+                target_lang_name,
+                series_context_hint=series_context_hint,
+                req_id=f"{req_id}-p{p_idx + 1}",
+            )
+            if len(new_bubbles) > len(old_bubbles):
+                _release_cv_page_masks(cv_bubbles_per_page[p_idx])
+                cv_bubbles_per_page[p_idx] = new_cv
+                batch_results[p_idx] = (new_bubbles, new_summary or old_summary)
+                recovered_pages += 1
+                api_log(
+                    f"MangaPageRecover [req={req_id}] -> Page {p_idx + 1} RECOVERED "
+                    f"({len(old_bubbles)} -> {len(new_bubbles)} bubbles)"
+                )
+            else:
+                _release_cv_page_masks(new_cv)
+        except Exception as e:
+            api_log(f"MangaPageRecover [req={req_id}] Page {p_idx + 1} note ({type(e).__name__})")
+
+    if recovered_pages:
+        api_log(f"MangaPageRecover [req={req_id}] -> recovered {recovered_pages} page(s) cleanly")
+    return batch_results, cv_bubbles_per_page
 
 
 async def _repair_wrong_language_batch_async(
@@ -789,9 +872,10 @@ async def _invoke_manga_batch_single_model(
                     1 for b_list, _ in batch_results for b in b_list
                     if b.get("bubble_id") is not None
                 )
+                per_page_llm = [len(b_list) for b_list, _ in batch_results]
                 api_log(
-                    f"{label_prefix} [req={req_id}] RESPONSE -> model={model_id} HTTP 200 OK "
-                    f"({elapsed:.2f}s{cache_note}, {total_b} bubbles: {matched_som} SoM-anchored, {total_anchored - matched_som} box_2d)"
+                    f"{label_prefix}/{MANGA_TRANSLATOR_VERSION} [req={req_id}] RESPONSE -> model={model_id} HTTP 200 OK "
+                    f"({elapsed:.2f}s{cache_note}, {total_b} bubbles: {matched_som} SoM-anchored, {total_anchored - matched_som} box_2d, per_page={per_page_llm})"
                 )
                 return batch_results, None
 
@@ -914,9 +998,10 @@ async def extract_and_translate_manga_pages_batch(
     total_cv = sum(len(c) for c in cv_bubbles_per_page)
     cv_elapsed = time.monotonic() - som_t0
     engine_tag = "cv2" if HAS_CV2 else "pil"
+    per_page_cv_counts = [len(c) for c in cv_bubbles_per_page]
     api_log(
-        f"MangaBatch({num_pages}p) [req={req_id}] CV_DETECT ({engine_tag}) -> found {total_cv} enclosed bubble(s) "
-        f"across {num_pages} page(s) in {cv_elapsed:.2f}s"
+        f"MangaBatch({num_pages}p/{MANGA_TRANSLATOR_VERSION}) [req={req_id}] CV_DETECT ({engine_tag}/{MANGA_CV_VER}) -> "
+        f"found {total_cv} enclosed bubble(s) across {num_pages} page(s) per_page={per_page_cv_counts} in {cv_elapsed:.2f}s"
     )
     await _notify(
         f"🌐 **2/3** เจอ `{total_cv}` ช่องคำพูด กำลังแปลอยู่นะคะ..."
@@ -1480,6 +1565,14 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
                     )
                     return
 
+                batch_results, cv_bubbles_per_page = await _recover_omitted_pages_async(
+                    pages_input,
+                    batch_results,
+                    cv_bubbles_per_page,
+                    target_lang_name,
+                    series_context_hint=series_context_hint,
+                    req_id=req_id,
+                )
                 batch_results = await _repair_wrong_language_batch_async(
                     batch_results, target_lang_name, req_id=req_id
                 )
@@ -1493,7 +1586,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
                 discord_files = []
                 render_t0 = time.monotonic()
                 api_log(
-                    f"MangaRender [req={req_id}] START ({'cv2' if HAS_CV2 else 'pil'}) -> rendering {num_pages} page(s)..."
+                    f"MangaRender [req={req_id}] START ({'cv2' if HAS_CV2 else 'pil'}/{MANGA_CV_VER}) -> rendering {num_pages} page(s)..."
                 )
                 await _update_progress(
                     f"🎨 **3/3** กำลังใส่คำแปลลงภาพ (`0/{num_pages}` หน้า)...",
