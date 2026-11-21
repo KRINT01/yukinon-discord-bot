@@ -56,6 +56,17 @@ _THAI_CLUSTER_SECOND = set("รลว")
 _THAI_HO_NAM_FOLLOW = set("งญนมยรลว")
 _THAI_PREFIX_LEAD = set("สปกตฉผถข")
 _THAI_PUNCT_ATTACH = set("ๆฯ?!.,:;'\"')]-~")
+_THAI_OPEN_ENDINGS = set("าำ\u0E31\u0E34\u0E35\u0E36\u0E37\u0E38\u0E39\u0E47\u0E48\u0E49\u0E4A\u0E4Bอว")
+_THAI_CAN_TAKE_CODA_VOWEL = set("เแโา\u0E31\u0E34\u0E35\u0E36\u0E37\u0E38\u0E39\u0E47อว")
+_THAI_CODA_CONSONANTS = set("กขคฆงจชซฎฏฐฑฒณดตถทธนบปพฟภมยรลวศษสฬ")
+
+# Strict font-safe whitelist (ASCII printable + Thai Unicode block + Latin-1 accented letters)
+# Guarantees ZERO missing-glyph `[]` tofu boxes in Garuda-Bold.ttf / NotoSans-Bold.ttf!
+_FONT_UNSAFE_CHARS_REGEX = re.compile(r"[^\x20-\x7E\u00C0-\u00FF\u0E00-\u0E5B]")
+# Stray single Latin letter glued onto Thai text (e.g. 'ทะ...Eเป็นยังไง' -> 'ทะ...เป็นยังไง')
+_STRAY_SINGLE_LATIN_IN_THAI_REGEX = re.compile(
+    r"(?:(?<=[\u0E00-\u0E5B.])|(?<=[\u0E00-\u0E5B] ))([A-Za-z])(?=[\u0E00-\u0E5B])"
+)
 
 # Pre-allocated reusable OpenCV morphological kernels
 _CV2_K3 = np.ones((3, 3), np.uint8) if HAS_CV2 else None
@@ -79,8 +90,9 @@ def _load_manga_font(size: int, is_thai: bool = False) -> ImageFont.FreeTypeFont
 
 def _sanitize_text_for_manga_font(text: str) -> str:
     """
-    Normalizes Unicode punctuation, strips stray CJK/emoji symbols, and cleans empty `()` / `[]`
-    so `Garuda-Bold.ttf` & `NotoSans-Bold.ttf` render every character cleanly with zero tofu boxes.
+    Normalizes Unicode punctuation, strips stray single Latin glitches inside Thai words,
+    and enforces a strict font-safe whitelist (`ASCII + Thai + Latin-1`) so `♥`, `♡`, `♪`,
+    Hangul, Arabic, CJK, and emojis NEVER render as missing-glyph `[]` tofu boxes!
     """
     if not text:
         return ""
@@ -104,11 +116,56 @@ def _sanitize_text_for_manga_font(text: str) -> str:
         .replace("』", "'")
         .replace("！", "!")
         .replace("？", "?")
+        .replace("（", "(")
+        .replace("）", ")")
+        .replace("，", ",")
+        .replace("。", ".")
     )
-    s = re.sub(r"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\U00010000-\U0010FFFF]", "", s)
+    # Remove any character outside Garuda-Bold / NotoSans-Bold glyph coverage (kills ♥/♡/♪/Hangul/Arabic/CJK/emoji tofu!)
+    s = _FONT_UNSAFE_CHARS_REGEX.sub("", s)
+    # Remove accidental single-letter Latin glitch glued directly before Thai (e.g. 'ทะ...Eเป็น' -> 'ทะ...เป็น')
+    if THAI_CHAR_REGEX.search(s):
+        s = _STRAY_SINGLE_LATIN_IN_THAI_REGEX.sub("", s)
     s = re.sub(r"\(\s*\)|\[\s*\]|'\s*'", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+def _prune_nested_child_bubbles(detected: list[dict], close_pil: bool = False) -> list[dict]:
+    """
+    Drops tiny inner white text-glow halos (from Pass A1) that sit >=70% inside a larger
+    enclosing speech bubble (from Pass A3 pastel detection), preventing overlapping SoM
+    badges and microscopic text crammed inside a single kanji column.
+    """
+    if len(detected) <= 1:
+        return detected
+    pruned: list[dict] = []
+    for i, a in enumerate(detected):
+        ay1, ax1, ay2, ax2 = a["bbox_norm"]
+        a_box_area = max(1, (ay2 - ay1) * (ax2 - ax1))
+        is_nested_child = False
+        for j, b in enumerate(detected):
+            if i == j:
+                continue
+            by1, bx1, by2, bx2 = b["bbox_norm"]
+            b_box_area = max(1, (by2 - by1) * (bx2 - bx1))
+            if b_box_area <= a_box_area * 1.15:
+                continue
+            ov_y = max(0, min(ay2, by2) - max(ay1, by1))
+            ov_x = max(0, min(ax2, bx2) - max(ax1, bx1))
+            if (ov_x * ov_y) / float(a_box_area) >= 0.70:
+                is_nested_child = True
+                break
+        if is_nested_child:
+            if close_pil and a.get("mask_small") is not None:
+                try:
+                    a["mask_small"].close()
+                except Exception:
+                    pass
+                a["mask_small"] = None
+            continue
+        pruned.append(a)
+    return pruned
 
 
 def _sort_bubbles_manga_reading_order(bubbles: list[dict]) -> list[dict]:
@@ -191,7 +248,11 @@ def _tokenize_thai_syllables(word: str) -> list[str]:
                     merged_vowels.append(tok + nxt)
                     i += 2
                     continue
-            if nxt in ("อ", "ว") and not any(c in _THAI_VOWEL_SIGNALS for c in tok) and any("\u0E01" <= c <= "\u0E2E" for c in tok):
+            # Merge bare 'อ' (including after '\u0E47' as in ช็อก/ล็อก) or 'ว' (สระอัวลดรูป like พวก/สวย)
+            tok_other_v = any(c in _THAI_VOWEL_SIGNALS and c != "\u0E47" for c in tok)
+            if (nxt == "อ" and not tok_other_v and any("\u0E01" <= c <= "\u0E2E" for c in tok)) or (
+                nxt == "ว" and not any(c in _THAI_VOWEL_SIGNALS for c in tok) and any("\u0E01" <= c <= "\u0E2E" for c in tok)
+            ):
                 merged_vowels.append(tok + nxt)
                 i += 2
                 continue
@@ -205,18 +266,16 @@ def _tokenize_thai_syllables(word: str) -> list[str]:
         tok = merged_vowels[i]
         nxt = merged_vowels[i + 1] if (i + 1) < k else ""
 
-        if (
-            nxt
-            and len(tok) == 1
-            and tok in _THAI_PREFIX_LEAD
-            and any(c in _THAI_VOWEL_SIGNALS for c in nxt)
-            and (not syllables or len(syllables[-1]) >= 3)
-        ):
-            syllables.append(tok + nxt)
-            i += 2
-            continue
-
         if not syllables:
+            if (
+                nxt
+                and len(tok) == 1
+                and tok in _THAI_PREFIX_LEAD
+                and any(c in _THAI_VOWEL_SIGNALS for c in nxt)
+            ):
+                syllables.append(tok + nxt)
+                i += 2
+                continue
             syllables.append(tok)
             i += 1
             continue
@@ -228,15 +287,34 @@ def _tokenize_thai_syllables(word: str) -> list[str]:
 
         is_bare_single = (len(tok) == 1 and "\u0E01" <= tok <= "\u0E2E")
         prev = syllables[-1]
-        # Recognize both 'อ' (สระออ) and 'ว' (สระอัวลดรูป e.g. พวก/สวย/ควร) as valid syllable nuclei for final consonants
-        prev_has_o_or_w_vowel = (len(prev) >= 2 and prev[-1] in ("อ", "ว"))
-        prev_has_nucleus = (
-            prev_has_o_or_w_vowel
-            or any(c in _THAI_VOWEL_SIGNALS or ("\u0E48" <= c <= "\u0E4B") for c in prev)
+        # Attach coda consonant to an open previous syllable BEFORE considering prefix merge
+        # (fixes 'ช็อก' -> ['ช็อก'], 'หรอก' -> ['หรอก'], 'พวก' -> ['พวก'])
+        prev_closed_vowel = prev.endswith(("ะ", "ำ")) or (prev[0] in ("ใ", "ไ"))
+        prev_open_for_coda = (
+            not prev_closed_vowel
+            and len(prev) <= 6
+            and (
+                (len(prev) >= 2 and prev[-1] in ("อ", "ว"))
+                or (
+                    any(c in _THAI_CAN_TAKE_CODA_VOWEL for c in prev)
+                    and (prev[-1] in _THAI_OPEN_ENDINGS or (len(prev) == 2 and prev[0] in ("เ", "แ", "โ")))
+                )
+            )
         )
-        if is_bare_single and prev_has_nucleus and len(prev) <= 6:
+        if is_bare_single and tok in _THAI_CODA_CONSONANTS and prev_open_for_coda:
             syllables[-1] += tok
             i += 1
+            continue
+
+        if (
+            nxt
+            and len(tok) == 1
+            and tok in _THAI_PREFIX_LEAD
+            and any(c in _THAI_VOWEL_SIGNALS for c in nxt)
+            and len(prev) >= 3
+        ):
+            syllables.append(tok + nxt)
+            i += 2
             continue
 
         syllables.append(tok)
@@ -521,19 +599,20 @@ def _collect_margin_labels_cv2(
     sw: int,
     sh: int,
     max_area_px: int,
+    edge_pad: int = 1,
 ) -> set[int]:
     """
-    Identifies ONLY true outer page-margin / gutter components (never single-edge-clipped
-    speech bubbles!): a border-probed label is treated as page margin only if its area
-    exceeds `max_area_px`, it touches >= 2 distinct borders, or it spans >75% of width/height.
+    Identifies ONLY true outer page-margin / gutter components (preserving corner speech
+    bubbles touching 2 adjacent edges!): a border-probed label is margin only if its area
+    exceeds `max_area_px`, it touches >= 3 edges, spans opposite edges, or spans >75% width/height.
     """
     margin_lbls: set[int] = {0}
     probes = []
-    for bx in (1, sw // 2, sw - 2):
-        for by in (1, sh - 2):
+    for bx in (edge_pad, sw // 2, sw - 1 - edge_pad):
+        for by in (edge_pad, sh - 1 - edge_pad):
             probes.append((bx, by))
     for by in (sh // 3, (2 * sh) // 3):
-        for bx in (1, sw - 2):
+        for bx in (edge_pad, sw - 1 - edge_pad):
             probes.append((bx, by))
 
     for bx, by in probes:
@@ -546,13 +625,13 @@ def _collect_margin_labels_cv2(
         ch = int(stats[lbl, cv2.CC_STAT_HEIGHT])
         area = int(stats[lbl, cv2.CC_STAT_AREA])
         cx2, cy2 = cx1 + cw, cy1 + ch
-        edge_touches = (
-            (1 if cx1 <= 1 else 0)
-            + (1 if cy1 <= 1 else 0)
-            + (1 if cx2 >= sw - 1 else 0)
-            + (1 if cy2 >= sh - 1 else 0)
-        )
-        if area > max_area_px or edge_touches >= 2 or cw > int(sw * 0.75) or ch > int(sh * 0.75):
+        t_l = cx1 <= edge_pad
+        t_t = cy1 <= edge_pad
+        t_r = cx2 >= sw - edge_pad
+        t_b = cy2 >= sh - edge_pad
+        et = int(t_l) + int(t_t) + int(t_r) + int(t_b)
+        spans_opposite = (t_l and t_r) or (t_t and t_b)
+        if area > max_area_px or et >= 3 or spans_opposite or cw > int(sw * 0.75) or ch > int(sh * 0.75):
             margin_lbls.add(lbl)
     return margin_lbls
 
@@ -577,21 +656,19 @@ def _extract_and_filter_white_components_cv2(
     """
     Vectorized `cv2.connectedComponentsWithStats` + NumPy bubble validator supporting BOTH
     classic white bubbles (Pass A1/A2) and colored/pastel light speech bubbles (Pass A3):
-    1) Eroded interior achromatic dark-ink check (`5x5` erode -> `inner_ink_px >= 4` / `>= 10` for pastel)
-    2) Concave panel-background rejection (`rect_fill < 0.50` / `< 0.56` for pastel)
-    3) Whisper halo rejection (`filled_area < min_area_px` or narrow low-solidity)
-    4) Pastel pass adds HSV saturation ceiling (`mean_s < 75`, `high_sat_ratio < 0.30`) and
-       smooth background check (`bg_std <= 32.0`) so faces/hair/clothes are NEVER detected.
+    - Allows corner speech bubbles (touching 2 adjacent edges); rejects >=3 edges or opposite spans.
+    - Allows Pass A3 pastel bubbles to supersede tiny Pass A1 white text-glow halos inside them
+      (`ov_px > filled_area * 0.65`), followed by `_prune_nested_child_bubbles()`.
     """
     found: list[dict] = []
     min_area_px = max(220, int(sw * sh * 0.0022))
+    edge_pad = 2 if is_pastel_pass else 1
 
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=4)
     if num_labels <= 1:
         return found
 
-    margin_lbls = _collect_margin_labels_cv2(labels, stats, sw, sh, max_area_px)
-    edge_pad = 2 if is_pastel_pass else 1
+    margin_lbls = _collect_margin_labels_cv2(labels, stats, sw, sh, max_area_px, edge_pad=edge_pad)
 
     for lbl in range(1, num_labels):
         if lbl in margin_lbls:
@@ -607,18 +684,17 @@ def _extract_and_filter_white_components_cv2(
         if comp_area > max_area_px or cw < min_w or ch < min_h or cw > max_w or ch > max_h:
             continue
 
-        edge_touches = (
-            (1 if cx1 <= edge_pad else 0)
-            + (1 if cy1 <= edge_pad else 0)
-            + (1 if cx2 >= sw - edge_pad else 0)
-            + (1 if cy2 >= sh - edge_pad else 0)
-        )
-        if edge_touches >= 2:
+        t_l = cx1 <= edge_pad
+        t_t = cy1 <= edge_pad
+        t_r = cx2 >= sw - edge_pad
+        t_b = cy2 >= sh - edge_pad
+        edge_touches = int(t_l) + int(t_t) + int(t_r) + int(t_b)
+        if edge_touches >= 3 or (t_l and t_r) or (t_t and t_b):
             continue
 
         comp_crop = np.where(labels[cy1:cy2, cx1:cx2] == lbl, np.uint8(255), np.uint8(0))
 
-        if is_secondary_pass or is_pastel_pass:
+        if is_secondary_pass and not is_pastel_pass:
             ov_px = int(np.count_nonzero(comp_crop & already_covered[cy1:cy2, cx1:cx2]))
             if ov_px > comp_area * 0.25:
                 continue
@@ -644,6 +720,11 @@ def _extract_and_filter_white_components_cv2(
             or (holes_area / float(filled_area)) > 0.78
         ):
             continue
+
+        if is_pastel_pass:
+            ov_px = int(np.count_nonzero(filled_crop & already_covered[cy1:cy2, cx1:cx2]))
+            if ov_px > filled_area * 0.65:
+                continue
 
         c_sub = small_chroma[cy1:cy2, cx1:cx2]
         g_sub = small_gray[cy1:cy2, cx1:cx2]
@@ -709,16 +790,14 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
 ) -> tuple[str, list[dict]]:
     """
     Fully vectorized OpenCV + NumPy Stage 1 detector & Set-of-Mark JPEG builder:
-    - Decodes via `cv2.imdecode`, builds crisp `vis_bgr` (<=1024px via `INTER_AREA`) and `small_bgr` (<=360px) in C.
-    - Pass A1 (`gray >= 232`): clean base white bubble pass.
-    - Pass A2 (`INTER_AREA` dark-outline preservation): recovers 1px thin-bordered ovals on white panels.
-    - Pass A3 (`gray >= 178 & sat < 95 & dark_box < 24`): detects enclosed pastel/colored light speech
-      bubbles (pale blue, pink, lavender, cream, mint, yellow) with 2px border trim so edge-clipped
-      colored bubbles don't bleed across outer margins.
-    - Pass B (`gray <= 95`): enclosed dark speech bubbles guarded by `already_covered` overlap rejection,
-      true HSV saturation (`mean_s < 22`, `sat_ratio < 0.16`), dark background uniformity (`std <= 24`),
-      and eroded interior bright-text check so dark colored panels are NEVER misclassified!
-    - Draws crisp red contours + compact top-right-rim red badges that NEVER cover vertical kanji.
+    - Pass A1 (`gray >= 232`): clean base white bubble pass (now corner-bubble safe!).
+    - Pass A2 (`INTER_AREA` dark-outline preservation): thin-bordered ovals on white panels.
+    - Pass A3 (`gray >= 178 & sat < 95 & dark_box < 24`): enclosed pastel/colored light speech
+      bubbles (pale blue, pink, lavender, green, cream, yellow) with 2px border trim + nested
+      white-halo deduplication.
+    - Pass B (`gray <= 95`): enclosed dark speech bubbles with strict anti-dark-panel guards.
+    - Draws crisp RED bubble contours + high-contrast BLACK/WHITE/YELLOW numbered badges so
+      badges stand out clearly even next to red SFX (`ガチャ`, `ぎゅっ`) or top edges!
     """
     arr = np.frombuffer(raw_bytes, dtype=np.uint8)
     img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -807,13 +886,12 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
         )
     )
 
-    # Pass A3: Enclosed pastel / colored light speech bubbles (pale blue, pink, lavender, mint, cream, yellow)
+    # Pass A3: Enclosed pastel / colored light speech bubbles (pale blue, pink, green, lavender, cream, yellow)
     pastel_bin = np.where(
         (small_gray >= 178) & (small_sat < 95) & (small_dark_box < 24),
         np.uint8(255),
         np.uint8(0),
     )
-    # Trim outermost 2px frame so edge-clipped bubbles don't bridge through a 1-2px page gutter
     pastel_bin[:2, :] = 0
     pastel_bin[-2:, :] = 0
     pastel_bin[:, :2] = 0
@@ -839,11 +917,14 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
     )
     del small_bgr
 
+    # Remove tiny Pass A1 white text-glow halos nested inside larger Pass A3 pastel bubbles!
+    detected = _prune_nested_child_bubbles(detected, close_pil=False)
+
     # Pass B: Enclosed dark speech bubbles / dark caption boxes (strict anti-dark-panel guards!)
     dark_bin = np.where(small_gray <= 95, np.uint8(255), np.uint8(0))
     num_d, d_labels, d_stats, _ = cv2.connectedComponentsWithStats(dark_bin, connectivity=4)
     if num_d > 1:
-        d_margin = _collect_margin_labels_cv2(d_labels, d_stats, sw, sh, max_area_px)
+        d_margin = _collect_margin_labels_cv2(d_labels, d_stats, sw, sh, max_area_px, edge_pad=1)
         max_dw, max_dh = int(sw * 0.50), int(sh * 0.50)
         for lbl in range(1, num_d):
             if lbl in d_margin:
@@ -856,13 +937,8 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
             cx2, cy2 = cx1 + cw, cy1 + ch
             if comp_area > max_area_px or cw < min_w_px or ch < min_h_px or cw > max_dw or ch > max_dh:
                 continue
-            edge_touches = (
-                (1 if cx1 <= 1 else 0)
-                + (1 if cy1 <= 1 else 0)
-                + (1 if cx2 >= sw - 1 else 0)
-                + (1 if cy2 >= sh - 1 else 0)
-            )
-            if edge_touches >= 2:
+            t_l, t_t, t_r, t_b = cx1 <= 1, cy1 <= 1, cx2 >= sw - 1, cy2 >= sh - 1
+            if (int(t_l) + int(t_t) + int(t_r) + int(t_b)) >= 3 or (t_l and t_r) or (t_t and t_b):
                 continue
 
             comp_crop = np.where(d_labels[cy1:cy2, cx1:cx2] == lbl, np.uint8(255), np.uint8(0))
@@ -933,9 +1009,10 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
     for idx, b_obj in enumerate(detected, 1):
         b_obj["bubble_id"] = idx
 
-    # Draw crisp red contours + compact top-right-rim badges (keeps top vertical kanji 100% visible!)
-    font_scale = max(0.45, vw / 1550.0)
-    thickness = 1 if vw < 1050 else 2
+    # Draw crisp RED contours + high-contrast BLACK/WHITE/YELLOW numbered badges
+    # (stands out unmistakably against white, pastel bubbles, AND bright red SFX like ガチャ!)
+    font_scale = max(0.50, vw / 1450.0)
+    thickness = 2
     for b_obj in detected:
         bid = b_obj["bubble_id"]
         ymin, xmin, ymax, xmax = b_obj["bbox_norm"]
@@ -952,21 +1029,25 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
 
         label = str(bid)
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-        pw = tw + 8
-        ph = th + 6
-        bx2 = min(vw - 1, vx2 + 4)
-        bx1 = max(0, bx2 - pw)
-        by2 = min(vh - 1, max(ph, vy1 + 4))
-        by1 = max(0, by2 - ph)
-        cv2.rectangle(vis_bgr, (bx1, by1), (bx2, by2), (15, 15, 225), -1)
-        cv2.rectangle(vis_bgr, (bx1, by1), (bx2, by2), (255, 255, 255), 1)
+        pw = tw + 10
+        ph = th + 8
+        bx2 = min(vw - 3, vx2 + 2)
+        bx1 = max(2, bx2 - pw)
+        if vy1 < ph:
+            by1 = min(vh - ph - 2, max(2, vy1 + 2))
+            by2 = by1 + ph
+        else:
+            by2 = min(vh - 2, max(ph + 2, vy1 + 6))
+            by1 = max(2, by2 - ph)
+        cv2.rectangle(vis_bgr, (bx1 - 1, by1 - 1), (bx2 + 1, by2 + 1), (255, 255, 255), -1)
+        cv2.rectangle(vis_bgr, (bx1, by1), (bx2, by2), (18, 18, 18), -1)
         cv2.putText(
             vis_bgr,
             label,
-            (bx1 + 4, by1 + ph - 4),
+            (bx1 + 5, by1 + ph - 4),
             cv2.FONT_HERSHEY_SIMPLEX,
             font_scale,
-            (255, 255, 255),
+            (0, 235, 255),  # Bright yellow in BGR
             thickness,
             cv2.LINE_AA,
         )
@@ -1063,7 +1144,7 @@ def _inpaint_pastel_bubble_region_cv2(
     """
     Erases dark Japanese ink + any white text glow/halo inside a pastel/colored light bubble
     and fills the erased region via fast half-res TELEA inpainting (~3-10ms/bubble) so the
-    bubble's pastel blue/pink/yellow/mint gradient stays completely seamless!
+    bubble's pastel blue/pink/green/yellow/mint gradient stays completely seamless!
     Returns `(erase_bool, median_bg_bgr)`.
     """
     bh, bw = sub_gray.shape
@@ -1338,13 +1419,8 @@ def _refine_cv_bubble_mask_locally_cv2(
     cy1, cy2 = int(ys.min()), int(ys.max()) + 1
     cw_s, ch_s = cx2 - cx1, cy2 - cy1
 
-    edge_touches = (
-        (1 if cx1 <= 1 else 0)
-        + (1 if cy1 <= 1 else 0)
-        + (1 if cx2 >= sw - 1 else 0)
-        + (1 if cy2 >= sh - 1 else 0)
-    )
-    if edge_touches >= 2 or (cx1 <= 1 and cx2 >= sw - 1) or (cy1 <= 1 and cy2 >= sh - 1):
+    t_l, t_t, t_r, t_b = cx1 <= 1, cy1 <= 1, cx2 >= sw - 1, cy2 >= sh - 1
+    if (int(t_l) + int(t_t) + int(t_r) + int(t_b)) >= 3 or (t_l and t_r) or (t_t and t_b):
         return _fallback_orig()
 
     filled_s = _fill_mask_holes_cv2(comp[cy1:cy2, cx1:cx2])
@@ -1457,8 +1533,6 @@ def _clean_exact_cv_bubble_and_build_render_slots_cv2(
     sub_bgr = img_bgr[ry1:ry2, rx1:rx2]
 
     if is_pastel:
-        # Pastel/colored bubble: preserve smooth gradient background via fast half-res inpainting
-        # without blocking the bubble's own pastel color with an absolute chroma shield!
         erase_bool, bg_bgr = _inpaint_pastel_bubble_region_cv2(sub_bgr, sub_gray, safe_core)
         fg_rgb = (15, 15, 15)
         stroke_rgb = (bg_bgr[2], bg_bgr[1], bg_bgr[0])
@@ -1584,7 +1658,7 @@ def _clean_unmarked_open_bubble_and_measure_box_cv2(
 
     is_pastel_open = (mean_chroma >= 18.0 or chroma_ratio >= 0.18)
 
-    # Case 2: Pastel / colored light bubble (`box_2d` fallback for edge-clipped or borderless pastel bubbles)
+    # Case 2: Pastel / colored light bubble (`box_2d` fallback for borderless pastel bubbles)
     if is_pastel_open:
         if median_lum < 170.0:
             return None
@@ -1610,7 +1684,6 @@ def _clean_unmarked_open_bubble_and_measure_box_cv2(
         s_bgr = img_bgr[wy1:wy2, wx1:wx2]
         s_sat = cv2.cvtColor(s_bgr, cv2.COLOR_BGR2HSV)[:, :, 1]
 
-        # Build safe pastel zone strictly around bright low-sat bubble pixels (protects vivid exterior art)
         p_seed = np.where((sg >= 175) & (s_sat < 95), np.uint8(255), np.uint8(0))
         p_zone = _fast_dilate_mask_cv2(p_seed, kernel_half=5)
         erase_bool, bg_bgr = _inpaint_pastel_bubble_region_cv2(s_bgr, sg, p_zone)

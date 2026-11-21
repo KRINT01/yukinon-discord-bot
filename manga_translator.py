@@ -5,6 +5,7 @@ import json
 import time
 import uuid
 import asyncio
+from urllib.parse import quote_plus
 
 import aiohttp
 import discord
@@ -47,9 +48,11 @@ MANGA_BATCH_HEDGE_DELAY_SMALL_SEC = 15.0
 MANGA_BATCH_HEDGE_DELAY_LARGE_SEC = 25.0
 
 _FLASH_LITE_EXCLUDED = ("2.5", "2.0", "1.5", "latest", "image", "tts", "audio", "live", "embedding")
+_HANGUL_REGEX = re.compile(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF]")
+_SOURCE_EAST_ASIAN_REGEX = re.compile(r"[\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]")
 
 # Set-of-Mark (SoM) JSON responseSchema with explicit `propertyOrdering`:
-# - Every red-numbered CV bubble `[k]` maps 1-to-1 via `"bubble_id": k` (zero coordinate drift!).
+# - Every numbered CV bubble `[k]` maps 1-to-1 via `"bubble_id": k` (zero coordinate drift!).
 # - Unmarked borderless/open bubbles use `"bubble_id": null` + `"box_2d"` emitted AFTER `"source_text"`.
 MANGA_BATCH_SOM_SCHEMA = {
     "type": "OBJECT",
@@ -220,7 +223,7 @@ async def _discover_manga_batch_models() -> list[tuple[str, bool]]:
 
 
 # ==============================================================================
-# STAGE 2: JSON NORMALIZATION & HEDGED BATCH VISION ORCHESTRATION
+# STAGE 2: JSON NORMALIZATION, WRONG-LANGUAGE AUTO-REPAIR & BATCH ORCHESTRATION
 # ==============================================================================
 def _extract_norm_box_2d(raw_box) -> list[float] | None:
     if raw_box is None:
@@ -267,6 +270,153 @@ def _extract_norm_box_2d(raw_box) -> list[float] | None:
     return coords
 
 
+def _needs_target_language_repair(tr_text: str, src_text: str, target_lang_name: str) -> bool:
+    """
+    Detects when a single bubble inside a multi-page batch drifted into the wrong language
+    (e.g., Korean Hangul `하하, 뭐 신경 쓰지 마.` when translating to Thai, or stripped to
+    punctuation after removing leaked foreign script).
+    """
+    raw_tr = str(tr_text or "").strip()
+    if _HANGUL_REGEX.search(raw_tr):
+        return True
+    cleaned = _sanitize_text_for_manga_font(raw_tr)
+    if target_lang_name.lower() == "thai":
+        if not THAI_CHAR_REGEX.search(cleaned):
+            if _SOURCE_EAST_ASIAN_REGEX.search(src_text or ""):
+                return True
+    elif target_lang_name.lower() == "english":
+        if not re.search(r"[A-Za-z]", cleaned):
+            if _SOURCE_EAST_ASIAN_REGEX.search(src_text or ""):
+                return True
+    return False
+
+
+async def _repair_wrong_language_batch_async(
+    batch_results: list[tuple[list[dict], str]],
+    target_lang_name: str,
+    req_id: str = "",
+) -> list[tuple[list[dict], str]]:
+    """
+    Fast (<1s) post-parse language safeguard:
+    1) Sanitizes every page `summary` (removes stray Arabic/Hangul/CJK/symbol glitches).
+    2) Finds any bubble whose `translated_text` drifted into Korean/wrong script or became
+       empty after font-safe sanitization, and batch-retranslates ONLY those defective bubbles
+       from `source_text` via Gemini Flash-Lite (with Google NMT fallback).
+    """
+    defective: list[tuple[int, int, dict]] = []
+    cleaned_batch: list[tuple[list[dict], str]] = []
+
+    for p_idx, (bubbles, summary) in enumerate(batch_results):
+        clean_sum = _sanitize_text_for_manga_font(summary or "")
+        for b_idx, b in enumerate(bubbles):
+            raw_tr = b.get("_raw_translated_text") or b.get("translated_text") or ""
+            src_txt = b.get("source_text") or ""
+            if _needs_target_language_repair(raw_tr, src_txt, target_lang_name):
+                defective.append((p_idx, b_idx, b))
+        cleaned_batch.append((bubbles, clean_sum))
+
+    if not defective:
+        return cleaned_batch
+
+    api_log(
+        f"MangaLangRepair [req={req_id}] -> detected {len(defective)} wrong-language bubble(s); "
+        f"retranslating to {target_lang_name}"
+    )
+    items_payload = [
+        {
+            "idx": i,
+            "speaker": b.get("speaker_or_note") or "",
+            "source_text": b.get("source_text") or "",
+            "wrong_translation": b.get("_raw_translated_text") or b.get("translated_text") or "",
+        }
+        for i, (_, _, b) in enumerate(defective)
+    ]
+    repaired_map: dict[int, str] = {}
+
+    if GEMINI_API_KEY:
+        repair_prompt = (
+            f"Translate EVERY item below from Japanese into natural, conversational {target_lang_name} manga dialogue.\n"
+            f"CRITICAL: Output STRICTLY in {target_lang_name} ONLY — NEVER output Korean (Hangul), Chinese, Arabic, "
+            "or heart/music symbols/emojis. Return ONLY a JSON object mapping string index to translated string, "
+            'e.g. {"0": "...", "1": "..."}.\n\n'
+            + json.dumps(items_payload, ensure_ascii=False)
+        )
+        payload = {
+            "contents": [{"parts": [{"text": repair_prompt}]}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 1024,
+                "responseMimeType": "application/json",
+                "thinkingConfig": {"thinkingLevel": "MINIMAL"},
+            },
+        }
+        try:
+            data = await call_gemini_generate_content_self_healing(
+                payload,
+                timeout_sec=10,
+                purpose=f"MangaLangRepair[{req_id}]",
+                max_models=2,
+                max_wall_sec=14.0,
+                preferred_models=["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
+            )
+            if data:
+                r_parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+                raw_out = "".join(
+                    p.get("text", "") for p in r_parts if p.get("text") and not p.get("thought", False)
+                ).strip()
+                m_obj = re.search(r"\{[\s\S]*\}", raw_out)
+                if m_obj:
+                    parsed_map = json.loads(m_obj.group(0))
+                    if isinstance(parsed_map, dict):
+                        for k_str, val in parsed_map.items():
+                            try:
+                                ki = int(k_str)
+                            except Exception:
+                                continue
+                            clean_val = _sanitize_text_for_manga_font(str(val or ""))
+                            if clean_val and not _HANGUL_REGEX.search(str(val or "")):
+                                repaired_map[ki] = clean_val
+        except Exception as e:
+            api_log(f"MangaLangRepair [req={req_id}] Gemini note ({type(e).__name__})")
+
+    # Tier 2 fast Google NMT fallback for any remaining defective bubble
+    tl_code = "th" if target_lang_name.lower() == "thai" else "en"
+    session = get_http_session()
+    for i, (_, _, b) in enumerate(defective):
+        if i in repaired_map:
+            continue
+        src_q = (b.get("source_text") or "").strip() or (b.get("_raw_translated_text") or "").strip()
+        if not src_q:
+            continue
+        try:
+            gtrans_host = "translate." + "googleapis.com"
+            gt_url = (
+                f"{HTTPS}{gtrans_host}/translate_a/single"
+                f"?client=gtx&sl=auto&tl={tl_code}&dt=t&q={quote_plus(src_q)}"
+            )
+            async with session.get(
+                gt_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=aiohttp.ClientTimeout(total=6)
+            ) as resp:
+                if resp.status == 200:
+                    gt_data = await resp.json(content_type=None)
+                    segs = [seg[0] for seg in (gt_data[0] or []) if seg and seg[0]]
+                    cand = _sanitize_text_for_manga_font("".join(segs))
+                    if cand:
+                        repaired_map[i] = cand
+        except Exception:
+            continue
+
+    repaired_cnt = 0
+    for i, (p_idx, b_idx, b) in enumerate(defective):
+        if i in repaired_map:
+            b["translated_text"] = repaired_map[i]
+            b.pop("_raw_translated_text", None)
+            repaired_cnt += 1
+
+    api_log(f"MangaLangRepair [req={req_id}] -> repaired {repaired_cnt}/{len(defective)} bubble(s)")
+    return cleaned_batch
+
+
 def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
     valid = []
     for idx, item in enumerate(raw_bubbles, 1):
@@ -298,7 +448,8 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
             or item.get("text")
             or ""
         )
-        tr_txt = _sanitize_text_for_manga_font(str(tr_txt))
+        raw_tr_before_sanitize = str(tr_txt).strip()
+        tr_txt = _sanitize_text_for_manga_font(raw_tr_before_sanitize)
         tr_txt = re.sub(
             r"-\s+(san|kun|chan|sama|sensei|senpai|dono|shi)\b",
             r"-\1",
@@ -306,7 +457,7 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
             flags=re.IGNORECASE,
         )
         src_txt = re.sub(r"\s+", " ", str(src_txt)).strip()
-        if not tr_txt:
+        if not tr_txt and not (_HANGUL_REGEX.search(raw_tr_before_sanitize) and src_txt):
             continue
 
         spk_lower = str(speaker).strip().lower()
@@ -331,14 +482,17 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
         )
         norm_box = None if is_sfx else _extract_norm_box_2d(raw_box)
 
-        valid.append({
+        entry = {
             "id": item.get("id", idx),
             "bubble_id": bubble_id,
             "speaker_or_note": str(speaker).strip(),
             "source_text": src_txt,
             "translated_text": tr_txt,
             "box_2d": norm_box,
-        })
+        }
+        if _HANGUL_REGEX.search(raw_tr_before_sanitize):
+            entry["_raw_translated_text"] = raw_tr_before_sanitize
+        valid.append(entry)
     return valid
 
 
@@ -400,14 +554,14 @@ def _parse_manga_pages_batch_json(
                 if not (0 <= p_idx < expected_pages):
                     p_idx = min(idx, expected_pages - 1)
                 bubbles = _normalize_and_validate_bubbles(p_obj.get("bubbles") or [])
-                summary = str(p_obj.get("summary") or "").strip()
+                summary = _sanitize_text_for_manga_font(str(p_obj.get("summary") or "").strip())
                 results[p_idx] = (bubbles, summary)
             if any(b or s for b, s in results):
                 return results
 
     if expected_pages == 1 and isinstance(parsed, dict) and "bubbles" in parsed:
         bubbles = _normalize_and_validate_bubbles(parsed.get("bubbles") or [])
-        summary = str(parsed.get("summary") or "").strip()
+        summary = _sanitize_text_for_manga_font(str(parsed.get("summary") or "").strip())
         return [(bubbles, summary)]
 
     if expected_pages == 1:
@@ -428,7 +582,7 @@ def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
     try:
         parsed = json.loads(target)
         bubbles = _normalize_and_validate_bubbles(parsed.get("bubbles") or [])
-        summary = str(parsed.get("summary") or "").strip()
+        summary = _sanitize_text_for_manga_font(str(parsed.get("summary") or "").strip())
         if bubbles:
             return bubbles, summary
     except Exception:
@@ -440,14 +594,14 @@ def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
         repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
         parsed = json.loads(repaired)
         bubbles = _normalize_and_validate_bubbles(parsed.get("bubbles") or [])
-        summary = str(parsed.get("summary") or "").strip()
+        summary = _sanitize_text_for_manga_font(str(parsed.get("summary") or "").strip())
         if bubbles:
             return bubbles, summary
     except Exception:
         pass
 
     summary_m = re.search(r'"summary"\s*:\s*"([^"\n]+)"', target)
-    summary = summary_m.group(1).strip() if summary_m else ""
+    summary = _sanitize_text_for_manga_font(summary_m.group(1).strip()) if summary_m else ""
 
     extracted_bubbles = []
     for idx, obj_m in enumerate(re.finditer(r"\{[^{}]*?\}", target), 1):
@@ -696,13 +850,12 @@ async def extract_and_translate_manga_pages_batch(
 ) -> tuple[list[tuple[list[dict], str]], list[list[dict]], bool]:
     """
     Set-of-Mark (SoM) CV-Anchored Multi-Page Manga Batch Pipeline:
-    1) Detects enclosed speech bubbles via vectorized OpenCV+NumPy (or lazy PIL fallback)
-       and stamps compact top-right-rim red badges `[1]`, `[2]`, ...
-    2) Calls `MangaBatch` strictly across:
+    1) Detects enclosed speech bubbles (white, pastel/colored, corner-clipped, and dark) via
+       vectorized OpenCV+NumPy (or lazy PIL fallback) and stamps high-contrast BLACK/YELLOW badges.
+    2) Calls `MangaBatch` across:
        `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> (newer >3.5 `flash-lite`)
        -> `gemma-4-31b-it` -> `gemma-4-26b-a4b-it`
-       using shared `llm.py` catalog/cooldowns AND dynamic parallel hedging
-       (15s for 2-4p batches, 25s for 5-12p batches) on `3.5-flash-lite`!
+       using shared `llm.py` catalog/cooldowns AND dynamic parallel hedging.
     3) Returns `(batch_results, cv_bubbles_per_page, is_service_unavailable)`.
     """
     num_pages = len(pages_input)
@@ -769,27 +922,28 @@ async def extract_and_translate_manga_pages_batch(
     manga_batch_instruction = f"""
 You are a professional Manga, Manhwa, and Comic Localizer.
 You are given {num_pages} sequential manga page image(s) (labeled PAGE 1 to PAGE {num_pages}).
-Every enclosed speech bubble and caption box has ALREADY been outlined in RED with a RED NUMBERED BADGE (`1`, `2`, `3`, ...) at its top-right rim!
+Every enclosed speech bubble and caption box has ALREADY been outlined in RED with a high-contrast BLACK/YELLOW NUMBERED BADGE (`1`, `2`, `3`, ...) at its top-right rim!
 {context_block}
 Analyze all {num_pages} page(s) in sequence so character names, titles/ranks, pronouns, and ongoing story stay consistent across every page,
 and translate EVERY SINGLE speech bubble and narration/caption box on EVERY page into natural, idiomatic {target_lang_name}.
 
-CRITICAL SET-OF-MARK (RED BADGE) & TRANSLATION RULES:
-1. MANDATORY 1-TO-1 RED BADGE CHECKLIST (`bubble_id`):
-   - Each page header lists the exact red badge IDs present on that page (`[1, 2, ..., K]`).
-   - You MUST inspect and output an entry for EVERY SINGLE red badge ID `1..K` on that page — NEVER skip a badge ID, NEVER merge two separate red badges into one entry, and NEVER put text from a DIFFERENT panel into another panel's red badge!
-   - If red badge `k` contains Japanese dialogue, monologue, or a caption box: set `"bubble_id": k`, `"is_dialogue": true`, `"box_2d": null`, transcribe ONLY the exact `"source_text"` visually INSIDE badge `k`, and write its natural {target_lang_name} `"translated_text"`.
-   - If red badge `k` is NOT dialogue (for example, a sound effect / SFX like ゲプ…, a non-speech diagram/icon, or a blank background/face/tile strip with no dialogue): set `"bubble_id": k`, `"is_dialogue": false`, `"source_text": ""`, `"translated_text": ""` so it is left untouched!
+CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
+1. MANDATORY 1-TO-1 NUMBERED BADGE CHECKLIST (`bubble_id`):
+   - Each page header lists the exact numbered badge IDs present on that page (`[1, 2, ..., K]`).
+   - You MUST inspect and output an entry for EVERY SINGLE badge ID `1..K` on that page — NEVER skip a badge ID, NEVER merge two separate badges into one entry, and NEVER put text from a DIFFERENT bubble into another bubble's badge ID!
+   - Double-check which exact BLACK/YELLOW badge number touches the bubble whose Japanese text you are reading before assigning `"bubble_id"`.
+   - If badge `k` contains Japanese dialogue, monologue, or a caption box: set `"bubble_id": k`, `"is_dialogue": true`, `"box_2d": null`, transcribe ONLY the exact `"source_text"` visually INSIDE badge `k`, and write its natural {target_lang_name} `"translated_text"`.
+   - If badge `k` is NOT dialogue (for example, a sound effect / SFX, a non-speech diagram/icon, or a blank background/face/clothing region with no dialogue): set `"bubble_id": k`, `"is_dialogue": false`, `"source_text": ""`, `"translated_text": ""` so it is left untouched!
 2. UNMARKED / BORDERLESS DIALOGUE (`bubble_id: null`):
-   - ALSO scan every panel for real spoken dialogue or monologue written directly on white/light areas WITHOUT a red badge around it (such as borderless vertical monologue lines in a panel with no red badge!).
+   - ALSO scan every panel for real spoken dialogue or monologue written WITHOUT a numbered badge around it.
    - For each unmarked dialogue line, add a SEPARATE entry with `"bubble_id": null`, `"is_dialogue": true`, transcribe `"source_text"`, and provide `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY that Japanese text in its OWN panel — NEVER over faces, hands, or artwork!).
-   - NEVER merge unbadged dialogue from another panel into an earlier panel's red badge!
-   - NEVER output floating handwritten SFX (e.g. ドーン, トスッ, ポスン, ムチッ, ぐっ, カチャッ, 脱, ぎゅ) as `box_2d`.
+   - NEVER merge unbadged dialogue from another panel into an earlier panel's badge!
+   - NEVER output floating handwritten SFX (e.g. ドーン, トスッ, ポスン, ムチッ, ぐっ, カチャッ, ガチャ, ぎゅっ, にま, べた, もじっ) as `box_2d`.
 3. Accurate Speaker Attribution, Names & Visual Gender:
    - Identify the actual character speaking each bubble visually (follow the tail; never copy one character's name onto every bubble).
    - Keep character names, titles/ranks, and faction names consistent across all pages using accurate Japanese phonetics.
    - Match pronouns and politeness particles strictly to each speaker's visual gender and setting: in Thai, visually female characters (including female subordinates, guards, and attendants) must use female/neutral endings (`ค่ะ`, `คะ`, `นะคะ`, `นะ`, `ล่ะ`, `สิ`) — NEVER use male `ครับ`/`ผม` unless the speaker is clearly drawn as male!
-   - Use standard ASCII punctuation (`...`, `~`, `-`, single quotes `'`).
+   - STRICT TARGET LANGUAGE & FONT-SAFE OUTPUT: Write EVERY `translated_text` and `summary` STRICTLY in {target_lang_name} ONLY — NEVER switch any bubble to Korean (Hangul), Chinese, or Arabic, NEVER glue stray random Latin letters inside Thai words, and NEVER include heart/music symbols (`♥`, `♡`, `♪`, `★`) or emojis (use standard ASCII punctuation `...`, `~`, `-`, `'`, `!`, `?` only).
    - When translating to English, preserve Japanese honorifics attached directly with a hyphen and NO space (`-san`, `-kun`, `-chan`, `-sama`, `-sensei`, `-senpai`).
 4. Return ONLY valid JSON matching this exact structure for all {num_pages} page(s) (write `summary` in {target_lang_name}):
 {{
@@ -820,9 +974,9 @@ CRITICAL SET-OF-MARK (RED BADGE) & TRANSLATION RULES:
         for idx, (b64_img, fname, cv_cnt) in enumerate(b64_pages, 1):
             if cv_cnt > 0:
                 badge_ids_str = ", ".join(str(i) for i in range(1, cv_cnt + 1))
-                badge_note = f"RED BADGES ON THIS PAGE: [{badge_ids_str}] (account for EVERY badge ID strictly inside its own red outline; add bubble_id=null for any unbadged dialogue in other panels)"
+                badge_note = f"NUMBERED BADGES ON THIS PAGE: [{badge_ids_str}] (account for EVERY badge ID strictly inside its own red outline; add bubble_id=null for any unbadged dialogue in other panels)"
             else:
-                badge_note = "no red badges (use bubble_id=null + box_2d for any dialogue)"
+                badge_note = "no numbered badges (use bubble_id=null + box_2d for any dialogue)"
             parts.append({"text": f"=== PAGE {idx} ({fname} | {badge_note}) ==="})
             parts.append({"inlineData": {"mimeType": mime_type, "data": b64_img}})
 
@@ -962,9 +1116,9 @@ async def extract_and_translate_manga_bubbles(
     )
     if cv_bubbles:
         badge_ids_str = ", ".join(str(i) for i in range(1, len(cv_bubbles) + 1))
-        badge_note = f"RED BADGES ON THIS PAGE: [{badge_ids_str}] (account for EVERY badge ID strictly inside its own red outline!)"
+        badge_note = f"NUMBERED BLACK/YELLOW BADGES ON THIS PAGE: [{badge_ids_str}] (account for EVERY badge ID strictly inside its own red outline!)"
     else:
-        badge_note = "no red badges (use bubble_id=null + box_2d)"
+        badge_note = "no numbered badges (use bubble_id=null + box_2d)"
 
     manga_system_instruction = f"""
 You are a professional Manga, Manhwa, and Comic Localizer.
@@ -972,16 +1126,16 @@ This page has {badge_note}.
 {context_block}
 Translate EVERY SINGLE speech bubble and narration/caption box on this page into natural, idiomatic {target_lang_name}.
 
-CRITICAL SET-OF-MARK (RED BADGE) & TRANSLATION RULES:
-1. MANDATORY 1-TO-1 RED BADGE CHECKLIST (`bubble_id`):
-   - Output an entry for EVERY SINGLE red badge ID listed above — NEVER skip a badge ID, NEVER merge two separate red badges, and NEVER put text from a different panel into another panel's red badge!
-   - If red badge `k` contains Japanese dialogue/narration: set `"bubble_id": k`, `"is_dialogue": true`, `"box_2d": null`, exact `"source_text"` inside ONLY badge `k`, and its natural {target_lang_name} `"translated_text"`.
-   - If red badge `k` is NOT dialogue (SFX, diagram, background object, face): set `"bubble_id": k`, `"is_dialogue": false`, `"source_text": ""`, `"translated_text": ""`.
+CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
+1. MANDATORY 1-TO-1 NUMBERED BADGE CHECKLIST (`bubble_id`):
+   - Output an entry for EVERY SINGLE badge ID listed above — NEVER skip a badge ID, NEVER merge two separate badges, and NEVER put text from a different bubble into another bubble's badge ID!
+   - If badge `k` contains Japanese dialogue/narration: set `"bubble_id": k`, `"is_dialogue": true`, `"box_2d": null`, exact `"source_text"` inside ONLY badge `k`, and its natural {target_lang_name} `"translated_text"`.
+   - If badge `k` is NOT dialogue (SFX, diagram, background object, face): set `"bubble_id": k`, `"is_dialogue": false`, `"source_text": ""`, `"translated_text": ""`.
 2. UNMARKED / BORDERLESS DIALOGUE (`bubble_id: null`):
-   - For real spoken dialogue/narration WITHOUT a red badge (e.g. vertical text on open white panels), output a SEPARATE entry with `"bubble_id": null`, `"is_dialogue": true`, `"source_text"`, and `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY the Japanese text in its own panel).
+   - For real spoken dialogue/narration WITHOUT a numbered badge (e.g. vertical text on open white panels), output a SEPARATE entry with `"bubble_id": null`, `"is_dialogue": true`, `"source_text"`, and `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY the Japanese text in its own panel).
 3. Accurate Speaker Attribution, Names & Visual Gender:
    - Identify the actual speaker visually; match Thai/English tone to visual gender (never use male Thai `ครับ`/`ผม` for female characters/guards).
-   - Use standard ASCII punctuation (`...`, `~`, `-`, single quotes `'`).
+   - STRICT TARGET LANGUAGE & FONT-SAFE OUTPUT: Write EVERY `translated_text` and `summary` STRICTLY in {target_lang_name} ONLY — NEVER switch any bubble to Korean (Hangul), Chinese, or Arabic, NEVER glue stray random Latin letters inside Thai words, and NEVER include heart/music symbols (`♥`, `♡`, `♪`, `★`) or emojis (use standard ASCII punctuation `...`, `~`, `-`, `'`, `!`, `?` only).
 4. Return ONLY valid JSON matching this exact structure (write `summary` in {target_lang_name}):
 {{
   "summary": "Brief 1-sentence scene context in {target_lang_name}",
@@ -1159,11 +1313,10 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
     Discord attachments, zero-RAM `/tmp` image cache (instant on In-Bubble follow-ups!), OR
     embedded links using:
     - `manga_semaphore` (`Semaphore(1)`) OOM guard with queue waiting notice
-    - Vectorized OpenCV + NumPy CV Set-of-Mark (SoM) detection & render masking (with lazy PIL fallback)
+    - Vectorized OpenCV + NumPy CV Set-of-Mark (SoM) detection (white, pastel, corner, dark) & render masking
     - Shared `llm.py` Google AI Studio catalog & cooldowns + dynamic `15s`/`25s` `3.5-flash-lite` -> `3.1-flash-lite` hedge
+    - Automatic post-parse wrong-language / foreign-script bubble auto-repair
     - Throttled live Discord progress messages (1/3 -> 2/3 -> 3/3 -> auto-delete)
-    - Border-safe local mask refinement, HSV dark-panel rejection, two-lobe figure-8 typesetting,
-      and syllable-aware Thai wrapping
     """
     from media_context import resolve_referenced_message, collect_embedded_images_and_metadata
     from image_engine import _send_or_reply, send_chunked_response
@@ -1317,6 +1470,10 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
                         replace_with="อ่านข้อความในภาพไม่ได้เลยค่ะ ลองเช็คดูหน่อยนะคะว่าภาพชัดพอไหม"
                     )
                     return
+
+                batch_results = await _repair_wrong_language_batch_async(
+                    batch_results, target_lang_name, req_id=req_id
+                )
 
                 header_title = (
                     f"**📖 คำแปลมังงะ {num_pages} หน้า ตามลำดับช่องอ่าน ขวาไปซ้าย ({target_lang_name}):**"

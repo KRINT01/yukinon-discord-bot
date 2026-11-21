@@ -9,6 +9,7 @@ from manga_cv_render import (
     MANGA_RENDER_JPEG_QUALITY,
     _load_manga_font,
     _sanitize_text_for_manga_font,
+    _prune_nested_child_bubbles,
     _sort_bubbles_manga_reading_order,
     _split_text_for_two_lobes,
     _resolve_box_collisions,
@@ -96,13 +97,11 @@ def _extract_components_bytearray_bfs_pil(
 
         cw = (max_x - min_x) + 1
         ch = (max_y - min_y) + 1
-        edge_touches = (
-            (1 if min_x <= edge_pad else 0)
-            + (1 if min_y <= edge_pad else 0)
-            + (1 if (max_x + 1) >= sw - edge_pad else 0)
-            + (1 if (max_y + 1) >= sh - edge_pad else 0)
-        )
-        is_margin = oversized or edge_touches >= 2 or cw > int(sw * 0.75) or ch > int(sh * 0.75)
+        t_l, t_t = min_x <= edge_pad, min_y <= edge_pad
+        t_r, t_b = (max_x + 1) >= sw - edge_pad, (max_y + 1) >= sh - edge_pad
+        edge_touches = int(t_l) + int(t_t) + int(t_r) + int(t_b)
+        spans_opposite = (t_l and t_r) or (t_t and t_b)
+        is_margin = oversized or edge_touches >= 3 or spans_opposite or cw > int(sw * 0.75) or ch > int(sh * 0.75)
         if not is_margin:
             # Restore single-edge speech bubble pixels so main BFS extracts it
             for idx_p in visited:
@@ -183,13 +182,10 @@ def _extract_components_bytearray_bfs_pil(
 
             cx1, cy1, cx2, cy2 = min_x, min_y, max_x + 1, max_y + 1
             cw, ch = cx2 - cx1, cy2 - cy1
-            edge_touches = (
-                (1 if cx1 <= edge_pad else 0)
-                + (1 if cy1 <= edge_pad else 0)
-                + (1 if cx2 >= sw - edge_pad else 0)
-                + (1 if cy2 >= sh - edge_pad else 0)
-            )
-            if edge_touches >= 2 or cw < min_w or ch < min_h or cw > max_w or ch > max_h:
+            t_l, t_t = cx1 <= edge_pad, cy1 <= edge_pad
+            t_r, t_b = cx2 >= sw - edge_pad, cy2 >= sh - edge_pad
+            edge_touches = int(t_l) + int(t_t) + int(t_r) + int(t_b)
+            if edge_touches >= 3 or (t_l and t_r) or (t_t and t_b) or cw < min_w or ch < min_h or cw > max_w or ch > max_h:
                 continue
 
             crop_buf = bytearray(cw * ch)
@@ -220,7 +216,7 @@ def _filter_white_components_pil(
     for (cx1, cy1, cx2, cy2), comp_crop in raw_comps:
         cw, ch = cx2 - cx1, cy2 - cy1
 
-        if is_secondary_pass or is_pastel_pass:
+        if is_secondary_pass and not is_pastel_pass:
             cov_crop = already_covered.crop((cx1, cy1, cx2, cy2))
             ov_px = ImageChops.darker(comp_crop, cov_crop).histogram()[255]
             cov_crop.close()
@@ -262,6 +258,14 @@ def _filter_white_components_pil(
         ):
             filled_crop.close()
             continue
+
+        if is_pastel_pass:
+            cov_crop = already_covered.crop((cx1, cy1, cx2, cy2))
+            ov_px = ImageChops.darker(filled_crop, cov_crop).histogram()[255]
+            cov_crop.close()
+            if ov_px > filled_area * 0.65:
+                filled_crop.close()
+                continue
 
         ch_crop = small_chroma.crop((cx1, cy1, cx2, cy2))
         gray_crop = small_gray.crop((cx1, cy1, cx2, cy2))
@@ -438,6 +442,8 @@ def _detect_page_bubbles_and_build_som_b64_pil_sync(
         )
         small_rgb.close()
 
+        detected = _prune_nested_child_bubbles(detected, close_pil=True)
+
         # Pass B: Dark bubbles
         dark_bin = small_gray.point(lambda p: 255 if p <= 95 else 0)
         raw_dark = _extract_components_bytearray_bfs_pil(
@@ -581,16 +587,21 @@ def _detect_page_bubbles_and_build_som_b64_pil_sync(
             th = tb[3] - tb[1]
             pw = tw + 8
             ph = th + 6
-            bx2 = min(vw - 1, vx2 + 4)
-            bx1 = max(0, bx2 - pw)
-            by2 = min(vh - 1, max(ph, vy1 + 4))
-            by1 = max(0, by2 - ph)
-            vdraw.rectangle([bx1, by1, bx2, by2], fill=(225, 15, 15), outline=(255, 255, 255), width=1)
+            bx2 = min(vw - 3, vx2 + 2)
+            bx1 = max(2, bx2 - pw)
+            if vy1 < ph:
+                by1 = min(vh - ph - 2, max(2, vy1 + 2))
+                by2 = by1 + ph
+            else:
+                by2 = min(vh - 2, max(ph + 2, vy1 + 6))
+                by1 = max(2, by2 - ph)
+            vdraw.rectangle([bx1 - 1, by1 - 1, bx2 + 1, by2 + 1], fill=(255, 255, 255))
+            vdraw.rectangle([bx1, by1, bx2, by2], fill=(18, 18, 18))
             vdraw.text(
                 (bx1 + 4 - tb[0], by1 + 3 - tb[1]),
                 label,
                 font=badge_font,
-                fill=(255, 255, 255),
+                fill=(255, 235, 0),
             )
 
         buf = io.BytesIO()
