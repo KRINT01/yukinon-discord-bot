@@ -512,7 +512,7 @@ async def call_gemini_hydrogen_generate(
             async def _hydrogen_slow_tick():
                 try:
                     await asyncio.sleep(16.0)
-                    await on_heavy_status("❄️ กำลังวิเคราะห์เชิงลึกอย่างละเอียด (ใช้เวลาสักครู่ รออีกนิดนะคะ)...")
+                    await on_heavy_status("❄️ เนื้อหาค่อนข้างละเอียด รออีกนิดนะคะ...")
                 except asyncio.CancelledError:
                     return
                 except Exception:
@@ -650,8 +650,8 @@ async def call_gemini_hydrogen_chat(
 #          guardrails, tone cues, and passive durable-fact memory trigger).
 # Phase 2: Multimodal pre-OCR triage for images (`image` block) & scanned PDFs
 #          (`document` block) + native Gemini PDF extraction fallback.
-#          Bundle 2: Merges `_IMAGE_TRIAGE_DECISION_QUESTIONS` directly into `PreRoute`
-#          when an inline thumbnail is already attached (eliminates duplicate Decision-1 call!).
+# Bundle 2: Merges `_IMAGE_TRIAGE_DECISION_QUESTIONS` directly into `PreRoute`
+#           when an inline thumbnail is already attached (eliminates duplicate Decision-1 call!).
 # Phase 3: Multi-speaker voice room awareness (`addressed_to_bot`, `voice_action`,
 #          natural `start_scribe` / `stop_scribe` detection).
 # Phase 4: Search snippet relevance/clickbait denoising, Fact-Check Arbitrator
@@ -3117,20 +3117,20 @@ async def query_local_ollama_chat(
         raw_history = []
         if channel_id is not None:
             raw_history = list(channel_memory[channel_id])
-        if is_user_correction or did_search:
-            sanitized_history = []
-            for m in raw_history[-6:]:
-                if m.get("role") == "assistant":
-                    short_prev = m.get("content", "")[:200].replace("\n", " ")
-                    sanitized_history.append({
-                        "role": "assistant",
-                        "content": f"[สรุปคำตอบก่อนหน้า: {short_prev}...]",
-                    })
-                else:
-                    sanitized_history.append(m)
-            messages.extend(sanitized_history)
-        else:
-            messages.extend(raw_history)
+            if is_user_correction or did_search:
+                sanitized_history = []
+                for m in raw_history[-6:]:
+                    if m.get("role") == "assistant":
+                        short_prev = m.get("content", "")[:200].replace("\n", " ")
+                        sanitized_history.append({
+                            "role": "assistant",
+                            "content": f"[สรุปคำตอบก่อนหน้า: {short_prev}...]",
+                        })
+                    else:
+                        sanitized_history.append(m)
+                messages.extend(sanitized_history)
+            else:
+                messages.extend(raw_history)
 
         messages.append({"role": "user", "content": user_content})
 
@@ -3141,7 +3141,7 @@ async def query_local_ollama_chat(
                 or (complexity_score is not None and complexity_score >= 2.35 and complexity_conf >= 0.60)
             )
             if use_hydrogen_code and _can_use_gemini_hydrogen():
-                await _notify_heavy("❄️ กำลังวิเคราะห์โค้ดและโครงสร้างเชิงลึก รอสักครู่นะคะ...")
+                await _notify_heavy("❄️ ขอเวลาไล่ดูโค้ดละเอียดสักครู่นะคะ...")
                 ans = await call_gemini_hydrogen_chat(
                     messages,
                     thinking_level="MEDIUM",
@@ -3202,7 +3202,7 @@ async def query_local_ollama_chat(
             )
         )
         if use_hydrogen_heavy and _can_use_gemini_hydrogen():
-            await _notify_heavy("❄️ กำลังวิเคราะห์เอกสารและข้อมูลเชิงลึก รอสักครู่นะคะ...")
+            await _notify_heavy("❄️ ขอเวลาอ่านรายละเอียดสักครู่นะคะ...")
             ans = await call_gemini_hydrogen_chat(
                 messages,
                 thinking_level="LOW",
@@ -3338,7 +3338,7 @@ async def query_local_ollama_chat(
         except Exception as e:
             print(f"Modal GPU chat error: {e}")
 
-        return "ระบบประมวลผลไม่สามารถเชื่อมต่อได้ชั่วคราวค่ะ กรุณาลองใหม่อีกครั้งนะคะ"
+        return "ตอนนี้ระบบขัดข้องชั่วคราวค่ะ ลองส่งมาใหม่อีกสักครู่นะคะ"
 
     raw_answer = await _run_inference_pass(working_prompt)
 

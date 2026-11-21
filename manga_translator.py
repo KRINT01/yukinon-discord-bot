@@ -183,11 +183,11 @@ async def _discover_manga_batch_models() -> list[tuple[str, bool]]:
     """
     Returns the ordered model chain for multi-page `MangaBatch` using `llm.py`'s shared
     1-hour Google AI Studio catalog cache:
-    1. `gemini-3.5-flash-lite`
-    2. `gemini-3.1-flash-lite`
-    3. Any strictly newer (>3.5) `flash-lite` model discovered via shared catalog
-    4. `gemma-4-31b-it`
-    5. `gemma-4-26b-a4b-it`
+      1. `gemini-3.5-flash-lite`
+      2. `gemini-3.1-flash-lite`
+      3. Any strictly newer (>3.5) `flash-lite` model discovered via shared catalog
+      4. `gemma-4-31b-it`
+      5. `gemma-4-26b-a4b-it`
     Each entry is `(model_id, is_gemma)`.
     """
     newer_flash_lites: list[str] = []
@@ -405,10 +405,10 @@ def _parse_manga_pages_batch_json(
             if any(b or s for b, s in results):
                 return results
 
-    if expected_pages == 1 and isinstance(parsed, dict) and "bubbles" in parsed:
-        bubbles = _normalize_and_validate_bubbles(parsed.get("bubbles") or [])
-        summary = str(parsed.get("summary") or "").strip()
-        return [(bubbles, summary)]
+        if expected_pages == 1 and isinstance(parsed, dict) and "bubbles" in parsed:
+            bubbles = _normalize_and_validate_bubbles(parsed.get("bubbles") or [])
+            summary = str(parsed.get("summary") or "").strip()
+            return [(bubbles, summary)]
 
     if expected_pages == 1:
         b, s = _parse_manga_bubbles_json(raw_text)
@@ -562,7 +562,7 @@ async def _invoke_manga_batch_single_model(
         async def _on_hb_tick(m_id: str, el: float):
             if notify_fn is not None:
                 await notify_fn(
-                    f"🌐 **ขั้นตอน 2/3:** กำลังแปล `{total_cv}` ช่องคำพูดด้วย `{m_id}` (`{el:.0f}s`)..."
+                    f"🌐 **2/3** กำลังแปล `{total_cv}` ช่องคำพูดอยู่ค่ะ (`{el:.0f}s`)..."
                 )
 
         hb_task = asyncio.create_task(
@@ -699,8 +699,8 @@ async def extract_and_translate_manga_pages_batch(
     1) Detects enclosed speech bubbles via vectorized OpenCV+NumPy (or lazy PIL fallback)
        and stamps compact top-right-rim red badges `[1]`, `[2]`, ...
     2) Calls `MangaBatch` strictly across:
-       `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> (newer >3.5 `flash-lite`)
-       -> `gemma-4-31b-it` -> `gemma-4-26b-a4b-it`
+         `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> (newer >3.5 `flash-lite`)
+         -> `gemma-4-31b-it` -> `gemma-4-26b-a4b-it`
        using shared `llm.py` catalog/cooldowns AND dynamic parallel hedging
        (15s for 2-4p batches, 25s for 5-12p batches) on `3.5-flash-lite`!
     3) Returns `(batch_results, cv_bubbles_per_page, is_service_unavailable)`.
@@ -757,7 +757,7 @@ async def extract_and_translate_manga_pages_batch(
         f"across {num_pages} page(s) in {cv_elapsed:.2f}s"
     )
     await _notify(
-        f"🌐 **ขั้นตอน 2/3:** พบ `{total_cv}` ช่องคำพูด (`{cv_elapsed:.1f}s`) — กำลังแปลบทสนทนาทั้งหมด..."
+        f"🌐 **2/3** เจอ `{total_cv}` ช่องคำพูด กำลังแปลอยู่นะคะ..."
     )
 
     mime_type = "image/jpeg"
@@ -873,9 +873,7 @@ CRITICAL SET-OF-MARK (RED BADGE) & TRANSLATION RULES:
                     f"{label_prefix} [req={req_id}] HEDGE -> model={m1_id} >{hedge_delay_sec:.0f}s; "
                     f"racing {m2_id} in parallel"
                 )
-                await _notify(
-                    f"🌐 **ขั้นตอน 2/3:** `{m1_id}` ตอบช้า — กำลังเร่งแปลคู่ขนานด้วย `{m2_id}`..."
-                )
+                await _notify("🌐 **2/3** ตอบช้าไปหน่อย กำลังเร่งแปลให้อีกทางนะคะ...")
                 t2 = asyncio.create_task(
                     _invoke_manga_batch_single_model(
                         m2_id, m2_gemma, parts, req_id, num_pages, batch_dim,
@@ -915,7 +913,7 @@ CRITICAL SET-OF-MARK (RED BADGE) & TRANSLATION RULES:
             if (max_wall_budget - (time.monotonic() - wall_start)) <= 10.0:
                 break
             if start_idx > 0 or offset_i > 0:
-                await _notify(f"🌐 **ขั้นตอน 2/3:** กำลังสลับไปแปลด้วย `{model_id}`...")
+                await _notify("🌐 **2/3** กำลังลองเปลี่ยนฝั่งแปลให้ใหม่นะคะ...")
             res_m, fb_m = await _invoke_manga_batch_single_model(
                 model_id, is_gemma, parts, req_id, num_pages, batch_dim,
                 per_call_timeout, wall_start, max_wall_budget,
@@ -952,7 +950,7 @@ async def extract_and_translate_manga_bubbles(
     if progress_cb is not None:
         try:
             await progress_cb(
-                f"🌐 **ขั้นตอน 2/3:** พบ `{len(cv_bubbles)}` ช่องคำพูด (`{cv_el:.1f}s`) — กำลังแปลบทสนทนา..."
+                f"🌐 **2/3** เจอ `{len(cv_bubbles)}` ช่องคำพูด กำลังแปลอยู่นะคะ..."
             )
         except Exception:
             pass
@@ -1163,7 +1161,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
     - `manga_semaphore` (`Semaphore(1)`) OOM guard with queue waiting notice
     - Vectorized OpenCV + NumPy CV Set-of-Mark (SoM) detection & render masking (with lazy PIL fallback)
     - Shared `llm.py` Google AI Studio catalog & cooldowns + dynamic `15s`/`25s` `3.5-flash-lite` -> `3.1-flash-lite` hedge
-    - Throttled live Discord progress messages (1/3 CV -> 2/3 AI -> 3/3 Render -> auto-delete)
+    - Throttled live Discord progress messages (1/3 -> 2/3 -> 3/3 -> auto-delete)
     - Border-safe local mask refinement, HSV dark-panel rejection, two-lobe figure-8 typesetting,
       and syllable-aware Thai wrapping
     """
@@ -1215,8 +1213,8 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
 
     if not pages_input:
         await channel.send(
-            "กรุณาแนบรูปภาพหน้ามังงะ หรือวางลิงก์ที่มีรูปภาพ (เช่น X/Twitter, Pixiv/phixiv หรือลิงก์รูปภาพ) มาด้วยนะคะ "
-            "(สามารถแนบหรือวางลิงก์ที่มีหลายหน้าพร้อมกันได้เลยค่ะ เช่น พิมพ์ `!manga en` หรือ `!manga th`)"
+            "แนบรูปหน้ามังงะหรือวางลิงก์ (X/Twitter, Pixiv/phixiv หรือลิงก์รูปภาพ) มาด้วยสิคะ "
+            "แนบหลายหน้าพร้อมกันได้เลย เช่น พิมพ์ `!manga en` หรือ `!manga th` ค่ะ"
         )
         return
 
@@ -1245,7 +1243,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
             queue_notice_msg = await _send_or_reply(
                 channel,
                 msg,
-                content="-# ⏳ มีคิวแปลมังงะกำลังทำงานอยู่ค่ะ เดี๋ยวฉันเริ่มแปลหน้านี้ให้ทันทีที่คิวก่อนหน้าเสร็จนะคะ...",
+                content="-# ⏳ ตอนนี้ฉันติดแปลอีกชุดอยู่นะคะ เสร็จแล้วจะรีบจัดการหน้านี้ให้ต่อเลยค่ะ",
             )
         except Exception:
             queue_notice_msg = None
@@ -1295,9 +1293,8 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
 
         async with channel.typing():
             try:
-                engine_label = "OpenCV" if HAS_CV2 else "PIL"
                 await _update_progress(
-                    f"🔍 **ขั้นตอน 1/3:** กำลังตรวจจับช่องคำพูด ({engine_label})...",
+                    "🔍 **1/3** กำลังหาช่องคำพูด...",
                     force=True,
                 )
 
@@ -1311,16 +1308,13 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
 
                 if is_unavailable:
                     await _cleanup_status(
-                        replace_with=(
-                            "ขณะนี้ระบบแปลมังงะแบบหลายหน้าไม่พร้อมใช้งานชั่วคราว "
-                            "(API ต้นทางขัดข้องหรือหมดเวลาเชื่อมต่อ) กรุณาลองใหม่อีกครั้งในอีกสักครู่นะคะ"
-                        )
+                        replace_with="ตอนนี้ฝั่งแปลหลายหน้าขัดข้องชั่วคราวค่ะ ลองใหม่อีกสักครู่นะคะ"
                     )
                     return
 
                 if not any(bubbles or summary for bubbles, summary in batch_results):
                     await _cleanup_status(
-                        replace_with="ไม่สามารถตรวจจับข้อความในภาพที่แนบมาหรือจากลิงก์ได้ค่ะ กรุณาตรวจสอบว่าภาพมีความคมชัดนะคะ"
+                        replace_with="อ่านข้อความในภาพไม่ได้เลยค่ะ ลองเช็คดูหน่อยนะคะว่าภาพชัดพอไหม"
                     )
                     return
 
@@ -1336,7 +1330,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
                     f"MangaRender [req={req_id}] START ({'cv2' if HAS_CV2 else 'pil'}) -> rendering {num_pages} page(s)..."
                 )
                 await _update_progress(
-                    f"🎨 **ขั้นตอน 3/3:** กำลังฝังคำแปลลงภาพความละเอียดเต็ม (`0/{num_pages}` หน้า)...",
+                    f"🎨 **3/3** กำลังใส่คำแปลลงภาพ (`0/{num_pages}` หน้า)...",
                     force=True,
                 )
 
@@ -1386,10 +1380,10 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
 
                     if num_pages > 1 and page_idx < num_pages:
                         await _update_progress(
-                            f"🎨 **ขั้นตอน 3/3:** กำลังฝังคำแปลลงภาพความละเอียดเต็ม (`{page_idx}/{num_pages}` หน้า)...",
+                            f"🎨 **3/3** กำลังใส่คำแปลลงภาพ (`{page_idx}/{num_pages}` หน้า)...",
                             force=False,
                         )
-                    await asyncio.sleep(0.05)
+                        await asyncio.sleep(0.05)
 
                 render_elapsed = time.monotonic() - render_t0
                 api_log(

@@ -646,9 +646,9 @@ def _master_tts_audio_sync(
 ) -> bytes:
     """
     Audio mastering chain tuned for Yukino's calm, cool kuudere voice:
-      - `silenceremove`: tightens dead gaps >160ms (including chunk seams) down to a natural 70ms breath
-      - `adelay=220:all=1`: prevents Discord Opus from clipping opening syllables
-      - Subtle warmth (+1.5dB @ 240Hz) + de-harshing (-3.0dB @ 3.2kHz) + gentle compression
+    - `silenceremove`: tightens dead gaps >160ms (including chunk seams) down to a natural 70ms breath
+    - `adelay=220:all=1`: prevents Discord Opus from clipping opening syllables
+    - Subtle warmth (+1.5dB @ 240Hz) + de-harshing (-3.0dB @ 3.2kHz) + gentle compression
     """
     stages = []
     if extra_af:
@@ -755,9 +755,9 @@ async def _edge_tts_with_mastering(spoken_text: str, is_thai: bool) -> bytes:
 async def synthesize_tts_mp3_bytes(text: str) -> bytes:
     """
     Consistent voice synthesis:
-      - Default (`TTS_PRIMARY_ENGINE=google`): Google TTS + tuned cool Yukino filter for every turn
-        (including join greeting), falling back to Edge-TTS only if Google TTS fails.
-      - Optional (`TTS_PRIMARY_ENGINE=edge`): Edge-TTS primary with Google TTS fallback.
+    - Default (`TTS_PRIMARY_ENGINE=google`): Google TTS + tuned cool Yukino filter for every turn
+      (including join greeting), falling back to Edge-TTS only if Google TTS fails.
+    - Optional (`TTS_PRIMARY_ENGINE=edge`): Edge-TTS primary with Google TTS fallback.
     """
     spoken_text = clean_text_for_speech(text)
     if not spoken_text:
@@ -907,8 +907,8 @@ async def start_voice_scribe_session(
         cnt = len(existing.get("entries") or [])
         if text_channel:
             await text_channel.send(
-                f"📝 ตอนนี้ฉันกำลังจดบันทึกการสนทนาอยู่แล้วค่ะ (บันทึกไปแล้ว `{cnt}` ประโยค) "
-                "หากต้องการให้สรุป พิมพ์ `!stopscribe` หรือพูดว่า `ยูกิโนะ หยุดจด` ได้เลยนะคะ"
+                f"📝 ตอนนี้ฉันกำลังจดให้ห้องนี้อยู่แล้วค่ะ (จดไปแล้ว `{cnt}` ประโยค) "
+                "ถ้าจะให้สรุป พิมพ์ `!stopscribe` หรือพูดว่า `ยูกิโนะ หยุดจด` ได้เลยนะคะ"
             )
         return False
 
@@ -936,15 +936,15 @@ async def start_voice_scribe_session(
     api_log(f"Voice Scribe STARTED -> guild={gid}, channel='{vc_name}', topic='{clean_topic}'")
     if text_channel:
         await text_channel.send(
-            f"📝 **[เริ่มโหมดจดบันทึกและสรุปการสนทนา (Voice Scribe)]**\n"
+            f"📝 **[เริ่มโหมดจดบันทึกการสนทนา (Voice Scribe)]**\n"
             f"- **ห้องเสียง:** `{vc_name}` | **เริ่มเวลา:** `{now_th.strftime('%H:%M')} น.`{topic_line}\n"
-            f"- ระหว่างนี้ฉันจะตั้งใจฟังและจดบันทึกทุกคนแบบเงียบๆ โดยไม่พิมพ์รบกวนในแชทและไม่พูดแทรกค่ะ\n"
-            f"- เมื่อคุยเสร็จแล้ว พิมพ์ `!stopscribe` / `!หยุดจด` / `!leave` หรือพูดว่า **\"ยูกิโนะ หยุดจด\"** / **\"สรุปการประชุม\"** ได้เลยนะคะ"
+            f"- ระหว่างนี้ฉันจะตั้งใจฟังและจดให้เงียบๆ โดยไม่พิมพ์รบกวนในแชทและไม่พูดแทรกนะคะ\n"
+            f"- คุยเสร็จแล้วพิมพ์ `!stopscribe` / `!หยุดจด` / `!leave` หรือพูดว่า **\"ยูกิโนะ หยุดจด\"** / **\"สรุปการประชุม\"** ได้เลยค่ะ"
         )
     if speak_ack and vc and vc.is_connected():
         await speak_in_voice_channel(
             guild,
-            "รับทราบค่ะ ฉันจะตั้งใจฟังและจดบันทึกให้เงียบๆ โดยไม่พูดแทรกนะคะ เมื่อคุยเสร็จแล้วสั่งหยุดหรือให้สรุปได้เลยค่ะ",
+            "เข้าใจแล้วค่ะ ฉันจะตั้งใจฟังและจดให้เงียบๆ โดยไม่พูดแทรกนะคะ คุยเสร็จแล้วบอกให้หยุดหรือสรุปได้เลยค่ะ",
             fallback_channel=None,
         )
     return True
@@ -1044,11 +1044,11 @@ async def stop_voice_scribe_session(
             if target_channel:
                 reason_note = f" ({reason})" if reason else ""
                 await target_channel.send(
-                    f"📝 หยุดโหมดจดบันทึกในห้อง `{vc_name}` แล้วค่ะ{reason_note} — "
-                    f"ตลอดช่วง `{duration_str}` ที่ผ่านมาไม่พบเสียงสนทนาที่ชัดเจน จึงไม่มีข้อมูลให้สรุปค่ะ"
+                    f"📝 หยุดจดให้ห้อง `{vc_name}` แล้วค่ะ{reason_note} — "
+                    f"ช่วง `{duration_str}` ที่ผ่านมาไม่ได้ยินเสียงคุยกันเลย ไม่มีอะไรให้สรุปนะคะ"
                 )
             if speak_ack and guild.voice_client and guild.voice_client.is_connected():
-                await speak_in_voice_channel(guild, "หยุดจดบันทึกแล้วค่ะ แต่ไม่พบเสียงสนทนาให้สรุปนะคะ")
+                await speak_in_voice_channel(guild, "หยุดจดแล้วค่ะ แต่เมื่อกี้ไม่ได้ยินเสียงคุยกันเลย ไม่มีอะไรให้สรุปนะคะ")
             return True
 
         speakers_ordered: list[str] = []
@@ -1069,8 +1069,8 @@ async def stop_voice_scribe_session(
 
         if target_channel:
             await target_channel.send(
-                f"📝 หยุดจดบันทึกห้อง `{vc_name}` แล้วค่ะ (`{len(transcript_lines)}` ประโยค | `{len(speakers_ordered)}` ผู้พูด | `{duration_str}`) "
-                "กำลังเรียบเรียงสรุปประเด็นทั้งหมดให้ รอสักครู่นะคะ..."
+                f"📝 หยุดจดให้ห้อง `{vc_name}` แล้วค่ะ (`{len(transcript_lines)}` ประโยค | `{len(speakers_ordered)}` ผู้พูด | `{duration_str}`) "
+                "กำลังสรุปเรื่องที่คุยกันให้ รอสักครู่นะคะ..."
             )
 
         topic_ctx = f"หัวข้อที่ระบุไว้ตอนเริ่ม: {topic_hint}\n" if topic_hint else ""
@@ -1155,7 +1155,7 @@ async def stop_voice_scribe_session(
         if speak_ack and guild.voice_client and guild.voice_client.is_connected():
             await speak_in_voice_channel(
                 guild,
-                "สรุปการสนทนาและส่งบันทึกทั้งหมดลงในแชทให้เรียบร้อยแล้วค่ะ",
+                "สรุปเรื่องที่คุยกันส่งไว้ในแชทให้เรียบร้อยแล้วค่ะ",
                 fallback_channel=None,
             )
 
@@ -1233,10 +1233,10 @@ async def transcribe_wav_bytes_gemini_live(wav_bytes: bytes) -> str:
     """
     Tier 1 Primary STT: Streams 16kHz mono PCM audio to `gemini-3.5-transcribe-live`
     over Google AI Studio's Multimodal Live WebSocket (`BidiGenerateContent`):
-      - Parses BOTH `BINARY` and `TEXT` JSON frames.
-      - Uses official `inputAudioTranscription` (`languageCodes`, `customVocabulary`, `mode="SMART"`)
-        with manual VAD (`activityStart` / `activityEnd`) for instant utterance finalization.
-      - Reads `serverContent.inputTranscription` (and `interimInputTranscription` fallback).
+    - Parses BOTH `BINARY` and `TEXT` JSON frames.
+    - Uses official `inputAudioTranscription` (`languageCodes`, `customVocabulary`, `mode="SMART"`)
+      with manual VAD (`activityStart` / `activityEnd`) for instant utterance finalization.
+    - Reads `serverContent.inputTranscription` (and `interimInputTranscription` fallback).
     """
     if not GEMINI_API_KEY or not GEMINI_TRANSCRIBE_LIVE_MODEL:
         return ""
@@ -1444,9 +1444,9 @@ async def transcribe_wav_bytes_gemini_live(wav_bytes: bytes) -> str:
 async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
     """
     3-Tier Hybrid Speech-to-Text Pipeline:
-      - Tier 1: `gemini-3.5-transcribe-live` (Real-time Live API WebSocket, custom Thai/EN/JP vocab)
-      - Tier 2: Groq `whisper-large-v3` (with segment logprob / no_speech_prob VAD filter)
-      - Tier 3: Google SpeechRecognition (`th-TH` / `en-US` cross-check)
+    - Tier 1: `gemini-3.5-transcribe-live` (Real-time Live API WebSocket, custom Thai/EN/JP vocab)
+    - Tier 2: Groq `whisper-large-v3` (with segment logprob / no_speech_prob VAD filter)
+    - Tier 3: Google SpeechRecognition (`th-TH` / `en-US` cross-check)
     """
     live_txt = await transcribe_wav_bytes_gemini_live(wav_bytes)
     if live_txt:
@@ -1641,7 +1641,7 @@ async def handle_spoken_voice_command(
                     speak_ack=True,
                     reason="ถึงขีดจำกัดระยะเวลาหรือจำนวนข้อความสูงสุดอัตโนมัติ",
                 )
-        return
+            return
 
     human_count_in_vc = _count_humans_in_voice_channel(guild)
     explicit_wake = _has_wake_word_prefix_or_near_start(cleaned)
@@ -1847,12 +1847,12 @@ async def handle_spoken_voice_command(
 class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
     """
     Adaptive Noise-Floor Multi-Speaker VAD Sink tuned for rooms with steady fan noise:
-      - Python 3.13+ safe NumPy int16->float64 RMS calculation (zero `audioop` dependency).
-      - Mode-aware silence flush: snappier `0.85s` in interactive voice chat, patient `1.20s` in Voice Scribe Mode.
-      - Tracks a slow per-speaker ambient noise floor EMA so steady fan hum (rms 30-65) never triggers STT.
-      - Preserves per-speaker utterance start timestamps so overlapping multi-speaker conversations
-        sort in exact chronological order during Voice Scribe Mode.
-      - Caps concurrent FFmpeg/STT tasks via `voice_stt_semaphore` (`Semaphore(2)`).
+    - Python 3.13+ safe NumPy int16->float64 RMS calculation (zero `audioop` dependency).
+    - Mode-aware silence flush: snappier `0.85s` in interactive voice chat, patient `1.20s` in Voice Scribe Mode.
+    - Tracks a slow per-speaker ambient noise floor EMA so steady fan hum (rms 30-65) never triggers STT.
+    - Preserves per-speaker utterance start timestamps so overlapping multi-speaker conversations
+      sort in exact chronological order during Voice Scribe Mode.
+    - Caps concurrent FFmpeg/STT tasks via `voice_stt_semaphore` (`Semaphore(2)`).
     """
 
     BASE_SPEECH_RMS_MIN = 110.0
@@ -2072,4 +2072,4 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
                 else:
                     print(f"[Voice STT] Audio captured from {user.display_name}, but STT returned empty text.", flush=True)
         except Exception as e:
-            print(f"Voice PCM processing error: {type(e).__name__}: {e}", flush=True)
+            print(f"Voice PCM processing error ({getattr(user, 'display_name', '?')}): {type(e).__name__}: {e}", flush=True)

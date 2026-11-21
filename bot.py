@@ -13,7 +13,10 @@ import psutil
 from aiohttp import web
 import discord
 from discord.ext import commands, tasks
+import simpleeval
 from simpleeval import SimpleEval
+
+simpleeval.MAX_POWER = 1000
 
 import config
 from config import (
@@ -531,8 +534,27 @@ state.bot = bot
 async def verify_allowed_guild(ctx):
     if not ALLOWED_GUILD_IDS or ctx.guild is None or ctx.guild.id in ALLOWED_GUILD_IDS:
         return True
-    await ctx.send("This Discord server is not on the bot's authorized allowlist.")
+    await ctx.send("เซิร์ฟเวอร์นี้ยังไม่ได้เปิดสิทธิ์ให้ฉันใช้งานนะคะ")
     return False
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, (commands.CommandNotFound, commands.CheckFailure)):
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"ยังพิมพ์ข้อมูลไม่ครบนะคะ (ขาด `{error.param.name}`)")
+        return
+    if isinstance(error, commands.BadArgument):
+        await ctx.send(f"รูปแบบข้อมูลไม่ถูกต้องนะคะ (`{error}`)")
+        return
+    orig = getattr(error, "original", error)
+    cmd_name = getattr(getattr(ctx, "command", None), "name", "unknown")
+    api_log(f"PrefixCommand Error (!{cmd_name}) -> {type(orig).__name__}: {str(orig)[:180]}")
+    try:
+        await ctx.send(f"คำสั่ง `!{cmd_name}` ติดขัดนิดหน่อยค่ะ (`{type(orig).__name__}`) ลองใหม่อีกทีนะคะ")
+    except Exception:
+        pass
 
 
 @bot.event
@@ -633,7 +655,7 @@ async def _send_response_with_interactive_view(
 
     await send_chunked_response(channel, answer, reply_to=reply_to)
     if view is not None:
-        footer_msg = await channel.send("-# ตัวเลือกดำเนินการเพิ่มเติม:", view=view)
+        footer_msg = await channel.send("-# ตัวเลือกเพิ่มเติม:", view=view)
         if hasattr(view, "message"):
             view.message = footer_msg
             view.delete_message_on_timeout = True
@@ -692,16 +714,16 @@ async def process_yukipedia_request(ctx_or_message, raw_prompt: str = ""):
 
         if extracted_ctx and not effective_query:
             effective_query = (
-                "สกัดข้อความ แปล และวิเคราะห์รายละเอียดทั้งหมดในฐานะ Yukipedia "
-                "พร้อมตรวจสอบคำผิดหรือจุดบกพร่องในต้นฉบับให้ด้วย"
+                "อ่านข้อความ แปล และวิเคราะห์รายละเอียดทั้งหมดในฐานะ Yukipedia "
+                "พร้อมช่วยดูคำผิดหรือจุดบกพร่องในต้นฉบับให้ด้วย"
             )
         elif not effective_query and not extracted_ctx:
             await _send_or_reply(
                 channel,
                 msg,
                 content=(
-                    "หากจะพึ่งพาคลังความรู้ **Yukipedia** ของฉัน ก็ช่วยระบุหัวข้อที่ต้องการค้นหา "
-                    "หรือแนบภาพ/เอกสารที่ต้องการให้ฉันสกัดข้อความ (OCR) และแปลภาษาเข้ามาด้วยสิคะ "
+                    "หากจะพึ่งพาคลังความรู้ **Yukipedia** ของฉัน ก็บอกหัวข้อที่จะให้ค้นหา "
+                    "หรือแนบรูป/เอกสารที่อยากให้ช่วยอ่านและแปลเข้ามาด้วยสิคะ "
                     "(เช่น `!yukipedia สรุปข่าว...` หรือแนบรูปพร้อมพิมพ์ `!yukipedia แปลและตรวจคำผิด` ค่ะ)"
                 ),
             )
@@ -954,6 +976,7 @@ async def on_message(message: discord.Message):
         preloaded_att_bytes.clear()
 
         if is_compound_prompt:
+            # Still run Decision-1 once for complexity, tone, guardrails, and passive memory (forcing compound route)
             decision_plan = await orchestrate_message_with_decision_1(
                 clean_prompt or spoken_clip_text,
                 extracted_ctx=extracted_ctx,
@@ -1104,7 +1127,7 @@ async def on_message(message: discord.Message):
 @bot.command(name="sync")
 async def sync_app_commands(ctx, scope: str = "guild"):
     if not is_owner_user(ctx.author):
-        await ctx.send("คำสั่งนี้สงวนไว้สำหรับเจ้าของบอทเท่านั้นนะคะ")
+        await ctx.send("คำสั่งนี้ให้เฉพาะเจ้าของบอทใช้เท่านั้นนะคะ")
         return
     try:
         if scope.strip().lower() == "global":
@@ -1118,7 +1141,7 @@ async def sync_app_commands(ctx, scope: str = "guild"):
             synced = await bot.tree.sync()
             await ctx.send(f"❄️ ซิงค์ Global Commands เรียบร้อยแล้วค่ะ (`{len(synced)}` รายการ)")
     except Exception as e:
-        await ctx.send(f"เกิดข้อผิดพลาดระหว่างซิงค์คำสั่งค่ะ (`{type(e).__name__}: {e}`)")
+        await ctx.send(f"ซิงค์คำสั่งติดขัดนิดหน่อยค่ะ (`{type(e).__name__}: {e}`)")
 
 
 async def _connect_bot_to_voice_channel(ctx, target_channel, greet: bool = True):
@@ -1193,8 +1216,8 @@ async def join_voice(ctx):
     except Exception as e:
         print(f"[Voice Join Error] {type(e).__name__}: {e}", flush=True)
         await ctx.send(
-            f"เกิดข้อผิดพลาดขณะเชื่อมต่อห้องเสียงค่ะ (`{type(e).__name__}: {e}`) "
-            "แต่ยังส่งไฟล์เสียงเข้าแชทเพื่อให้ฉันตอบกลับเป็นเสียงพูดได้ตามปกตินะคะ"
+            f"เข้าห้องเสียงไม่ได้ชั่วคราวค่ะ (`{type(e).__name__}: {e}`) "
+            "แต่ยังส่งไฟล์เสียงในแชทให้ฉันตอบกลับได้ตามปกตินะคะ"
         )
 
 
@@ -1224,12 +1247,12 @@ async def scribe_command(ctx, *, args: str = ""):
     vc = ctx.guild.voice_client
     if not vc or not vc.is_connected():
         if not getattr(ctx.author, "voice", None) or not ctx.author.voice.channel:
-            await ctx.send("กรุณาเข้าไปในห้องเสียงก่อนนะคะ แล้วค่อยพิมพ์ `!scribe` หรือ `!join` ค่ะ")
+            await ctx.send("เข้าไปในห้องเสียงก่อนนะคะ แล้วค่อยพิมพ์ `!scribe` หรือ `!join` ค่ะ")
             return
         try:
             await _connect_bot_to_voice_channel(ctx, ctx.author.voice.channel, greet=False)
         except Exception as e:
-            await ctx.send(f"ไม่สามารถเข้าห้องเสียงเพื่อเริ่มจดบันทึกได้ค่ะ (`{type(e).__name__}: {e}`)")
+            await ctx.send(f"เข้าห้องเสียงเพื่อเริ่มจดให้ไม่ได้ชั่วคราวค่ะ (`{type(e).__name__}: {e}`)")
             return
 
     await start_voice_scribe_session(
@@ -1257,7 +1280,10 @@ async def stop_scribe_command(ctx):
 
 @bot.command(name="leave")
 async def leave_voice(ctx):
-    if ctx.guild and is_voice_scribe_active(ctx.guild.id):
+    if not ctx.guild:
+        await ctx.send("คำสั่งนี้ใช้ได้เฉพาะในเซิร์ฟเวอร์ที่มีห้องเสียงค่ะ")
+        return
+    if is_voice_scribe_active(ctx.guild.id):
         await stop_voice_scribe_session(
             ctx.guild,
             fallback_text_channel=ctx.channel,
@@ -1265,27 +1291,31 @@ async def leave_voice(ctx):
             speak_ack=False,
             reason="ออกจากห้องเสียง (!leave)",
         )
-    elif ctx.guild:
+    else:
         clear_voice_scribe_session(ctx.guild.id)
 
-    vc = ctx.guild.voice_client if ctx.guild else None
+    vc = ctx.guild.voice_client
     if vc:
         if hasattr(vc, "stop_listening"):
             try:
                 vc.stop_listening()
             except Exception:
                 pass
-        if ctx.guild:
-            unregister_voice_sink(ctx.guild.id)
+        unregister_voice_sink(ctx.guild.id)
         await speak_in_voice_channel(
             ctx.guild, "ถ้าหมดธุระแล้ว ฉันขอตัวกลับไปอ่านหนังสือต่อนะคะ ลาก่อนค่ะ"
         )
         await vc.disconnect(force=True)
+    else:
+        await ctx.send("ตอนนี้ฉันไม่ได้อยู่ในห้องเสียงค่ะ")
 
 
 @bot.command(name="wakeword")
 async def toggle_wakeword(ctx, mode: str = ""):
-    gid = ctx.guild.id if ctx.guild else 0
+    if not ctx.guild:
+        await ctx.send("คำสั่งนี้ใช้ได้เฉพาะในเซิร์ฟเวอร์ที่มีห้องเสียงค่ะ")
+        return
+    gid = ctx.guild.id
     m = mode.strip().lower()
     if m in ("on", "true", "1", "เปิด"):
         voice_wake_word_enabled[gid] = True
@@ -1299,12 +1329,15 @@ async def toggle_wakeword(ctx, mode: str = ""):
         if voice_wake_word_enabled[gid]
         else "ปิดใช้งาน (พูดคุยได้ทันทีโดยไม่ต้องเรียกชื่อนำหน้า)"
     )
-    await ctx.send(f"🎙️ โหมดคำเรียกขานในห้องเสียงตอนนี้: **{state_th}** ค่ะ")
+    await ctx.send(f"🎙️ โหมดเรียกชื่อก่อนพูดในห้องเสียงตอนนี้: **{state_th}** ค่ะ")
 
 
 @bot.command(name="vstatus")
 async def voice_status_command(ctx):
-    vc = ctx.guild.voice_client if ctx.guild else None
+    if not ctx.guild:
+        await ctx.send("คำสั่งนี้ใช้ได้เฉพาะในเซิร์ฟเวอร์ที่มีห้องเสียงค่ะ")
+        return
+    vc = ctx.guild.voice_client
     if not vc or not vc.is_connected():
         await ctx.send("ตอนนี้ฉันไม่ได้อยู่ในห้องเสียงค่ะ")
         return
@@ -1333,7 +1366,7 @@ async def voice_status_command(ctx):
 @bot.command(name="imagine", aliases=["img", "draw"])
 async def imagine_command(ctx, *, prompt: str = ""):
     if not prompt.strip():
-        await ctx.send("กรุณาระบุสิ่งที่ต้องการให้วาดด้วยนะคะ เช่น `!imagine แมวส้มนั่งใช้คอมพิวเตอร์ในห้อง` ค่ะ")
+        await ctx.send("บอกด้วยสิคะว่าจะให้วาดอะไร เช่น `!imagine แมวส้มนั่งใช้คอมพิวเตอร์ในห้อง` ค่ะ")
         return
     async with ctx.typing():
         await send_generated_image_to_channel(ctx.channel, prompt, reply_to=ctx.message)
@@ -1458,8 +1491,8 @@ async def source_command(ctx, *, question: str = ""):
         ctx_text, _ = await extract_all_context(ctx.message)
         if not ctx_text:
             await ctx.send(
-                "กรุณาแนบรูปภาพ วางลิงก์ (เช่น X/Twitter, Pixiv/phixiv หรือลิงก์รูปภาพ) "
-                "หรือกด Reply ที่ข้อความที่มีรูป/ลิงก์ที่ต้องการให้ฉันช่วยตรวจสอบที่มาด้วยนะคะ"
+                "แนบรูป วางลิงก์ (X/Twitter, Pixiv/phixiv หรือลิงก์รูปภาพ) "
+                "หรือกด Reply ข้อความที่มีรูปมาด้วยสิคะ เดี๋ยวฉันเช็คที่มาให้ค่ะ"
             )
             return
         dec_plan = await orchestrate_message_with_decision_1(
@@ -1571,28 +1604,27 @@ async def clear_memory(ctx, scope: str = ""):
         else f"RAM ปัจจุบัน: `{after_mb} MB / 512 MB`"
     )
     await ctx.send(
-        f"🧹 ล้างประวัติการสนทนา ไฟล์แนบ และคืนค่าหน่วยความจำของ**{scope_label}**เรียบร้อยแล้วค่ะ ({ram_note})"
+        f"🧹 ล้างประวัติคุยกับไฟล์แนบของ**{scope_label}**ให้เรียบร้อยแล้วค่ะ ({ram_note})"
     )
 
 
 @bot.command(name="calc")
 async def calc_exp(ctx, *, expr: str = ""):
-    cleaned = expr.strip()
-    if not cleaned:
-        await ctx.send("กรุณาระบุนิพจน์ที่ต้องการคำนวณด้วยนะคะ เช่น `!calc (1250 * 1.07) / 3` ค่ะ")
+    clean_expr = (expr or "").strip()
+    if not clean_expr:
+        await ctx.send("พิมพ์โจทย์ที่จะให้คิดมาด้วยสิคะ เช่น `!calc (1250 * 1.07) / 3` ค่ะ")
         return
-    if len(cleaned) > 200 or cleaned.count("**") > 2:
-        await ctx.send("นิพจน์ยาวหรือซับซ้อนเกินไปค่ะ กรุณาพิมพ์ให้กระชับขึ้นนะคะ")
+    if len(clean_expr) > 200:
+        await ctx.send("โจทย์ยาวเกินไปค่ะ (ไม่เกิน 200 ตัวอักษรนะคะ)")
         return
     try:
-        ev = SimpleEval()
-        ev.MAX_POWER = 1000
-        res_str = str(ev.eval(cleaned))
-        if len(res_str) > 1800:
-            res_str = res_str[:1800] + "... (truncated)"
-        await ctx.send(f"Result: `{res_str}`")
+        res = SimpleEval().eval(clean_expr)
+        res_str = str(res)
+        if len(res_str) > 1500:
+            res_str = res_str[:1500] + "... (truncated)"
+        await ctx.send(f"ได้ `{res_str}` ค่ะ")
     except Exception as e:
-        await ctx.send(f"Error: `{e}`")
+        await ctx.send(f"คิดเลขไม่ได้ค่ะ (`{e}`)")
 
 
 @bot.command(name="ot")
@@ -1616,21 +1648,6 @@ async def memory_command(ctx, *, args: str = ""):
     reply, target_uid = await process_memory_request(ctx.message, query)
     mem_view = MemoryActionView(requester_id=ctx.author.id, target_uid=target_uid)
     await _send_response_with_interactive_view(ctx.channel, reply, mem_view, reply_to=ctx.message)
-
-
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, (commands.CommandNotFound, commands.CheckFailure)):
-        return
-    if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"ยังระบุพารามิเตอร์ไม่ครบนะคะ (`{error.param.name}`)")
-        return
-    orig = getattr(error, "original", error)
-    api_log(f"Prefix Command Error (!{getattr(ctx.command, 'name', 'unknown')}) -> {type(orig).__name__}: {str(orig)[:140]}")
-    try:
-        await ctx.send(f"เกิดข้อผิดพลาดระหว่างรันคำสั่งค่ะ (`{type(orig).__name__}`)")
-    except Exception:
-        pass
 
 
 if __name__ == "__main__":

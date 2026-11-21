@@ -205,7 +205,7 @@ async def send_chunked_response(
             await _send_or_reply(
                 target_channel,
                 reply_to,
-                content="**เนื้อหาและโค้ดมีความยาวมาก ฉันแยกไฟล์ซอร์สโค้ดพร้อมฉบับเต็มแนบไว้ให้ด้านล่างนะคะ:**",
+                content="**ข้อความกับโค้ดยาวเกินไป ฉันแยกเป็นไฟล์แนบไว้ให้ด้านล่างแทนนะคะ:**",
                 files=code_files[:10],
             )
             return
@@ -213,7 +213,7 @@ async def send_chunked_response(
         await _send_or_reply(
             target_channel,
             reply_to,
-            content="**เนื้อหายาวเกิน 7,500 ตัวอักษร ฉันแนบเป็นไฟล์ไว้ให้ด้านล่างนะคะ:**",
+            content="**เนื้อหายาวเกินไป ฉันแนบเป็นไฟล์ไว้ให้ด้านล่างนะคะ:**",
             file=discord.File(io.StringIO(text), filename=filename_fallback),
         )
         return
@@ -411,7 +411,7 @@ def build_yukino_image_caption(subject_text: str, formatted_en_prompt: str) -> s
             f"-# Prompt: *{formatted_en_prompt[:500]}*"
         )
     return (
-        f"ฉันสร้างภาพ `{subject_text}` ออกมาให้ตามที่นายต้องการแล้วค่ะ ลองตรวจสอบดูสิคะ\n"
+        f"ฉันวาด `{subject_text}` ให้ตามที่นายขอแล้วค่ะ ลองดูสิคะ\n"
         f"-# Prompt: *{formatted_en_prompt[:500]}*"
     )
 
@@ -427,7 +427,7 @@ async def send_generated_image_to_channel(channel, prompt_text: str, reply_to: d
             file=discord.File(io.BytesIO(img_bytes), filename="yukinon_flux.png"),
         )
     except Exception as e:
-        await _send_or_reply(channel, reply_to, content=f"ไม่สามารถสร้างรูปภาพได้ในขณะนี้ค่ะ (`{e}`)")
+        await _send_or_reply(channel, reply_to, content=f"ตอนนี้วาดรูปให้ไม่ได้ชั่วคราวค่ะ (`{e}`)")
 
 
 # ==============================================================================

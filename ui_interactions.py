@@ -63,7 +63,7 @@ _FAILURE_OR_REFUSAL_REPLY_REGEX = re.compile(
     r"(ไม่สามารถเข้าถึง|ไม่สามารถดึง|ไม่สามารถอ่าน|ไม่สามารถตรวจสอบ|ไม่สามารถเชื่อมต่อได้ชั่วคราว|"
     r"ไม่สามารถสร้างรูปภาพได้|ไม่สามารถตรวจจับข้อความ|ไม่พบรายการ|ไม่พบข้อมูล(?:ที่|ใน|เพียงพอ)|"
     r"ไม่มีข้อมูลเพียงพอ|ไฟล์มีขนาดใหญ่เกิน|ไม่มีข้อความที่สามารถอ่านได้|สแกนหรือเป็นรูปภาพ|"
-    r"ส่งไฟล์.*มาใหม่|แนบไฟล์.*มาใหม่|ลืมคำสั่งก่อนหน้า|"
+    r"ส่งไฟล์.*มาใหม่|แนบไฟล์.*มาใหม่|ลืมคำสั่งก่อนหน้า|ตอนนี้ระบบขัดข้องชั่วคราว|ตอนนี้วาดรูปให้ไม่ได้ชั่วคราว|"
     r"\b(?:unable to access|cannot read|could not extract|no readable (?:article )?text|shallow, transparent attempt)\b)",
     re.IGNORECASE,
 )
@@ -237,7 +237,7 @@ class AutoDisappearingView(discord.ui.View):
         )
         await _safe_send_ephemeral_error(
             interaction,
-            f"เกิดข้อผิดพลาดระหว่างดำเนินการค่ะ (`{type(error).__name__}`) กรุณาลองใหม่อีกครั้งนะคะ",
+            f"ติดขัดนิดหน่อยค่ะ (`{type(error).__name__}`) ลองใหม่อีกทีนะคะ",
         )
 
 
@@ -272,7 +272,7 @@ async def _deliver_button_followup_cleanly(interaction: discord.Interaction, ans
 
     try:
         await interaction.followup.send(
-            content="**คำตอบมีความยาวมาก ฉันแนบเป็นไฟล์ไว้ให้ด้านล่างนะคะ:**",
+            content="**คำตอบยาวเกินไป ฉันแนบเป็นไฟล์ไว้ให้ด้านล่างนะคะ:**",
             file=discord.File(io.StringIO(answer), filename="output.md"),
         )
     except Exception:
@@ -283,13 +283,13 @@ async def _send_interaction_with_auto_view(
     interaction: discord.Interaction,
     answer: str,
     view: AutoDisappearingView | None,
-    chunked_header: str = "❄️ ดำเนินการเรียบร้อยแล้วค่ะ:",
+    chunked_header: str = "❄️ เรียบร้อยแล้วค่ะ:",
     allow_view_on_error: bool = False,
 ):
     """
-    Resolves a deferred interaction with optional AutoDisappearingView.
-    Falls back cleanly to `interaction.channel.send(...)` if the deferred placeholder
-    was manually deleted or expired (`discord.NotFound` 10008).
+    Delivers a deferred slash/modal response with an auto-expiring View.
+    Includes a `discord.NotFound` fallback to `interaction.channel.send(...)` in case
+    the original thinking placeholder message was manually deleted before completion.
     """
     if not answer or not answer.strip():
         return
@@ -304,7 +304,7 @@ async def _send_interaction_with_auto_view(
             else:
                 await interaction.followup.send(answer)
             return
-        except (discord.NotFound, discord.HTTPException):
+        except discord.NotFound:
             if interaction.channel is not None:
                 sent_msg = await interaction.channel.send(answer, view=effective_view)
                 if effective_view is not None:
@@ -316,11 +316,11 @@ async def _send_interaction_with_auto_view(
     if interaction.channel is not None:
         try:
             await interaction.followup.send(chunked_header)
-        except Exception:
+        except discord.NotFound:
             pass
         await send_chunked_response(interaction.channel, answer)
         if effective_view is not None:
-            footer_msg = await interaction.channel.send("-# ตัวเลือกดำเนินการเพิ่มเติม:", view=effective_view)
+            footer_msg = await interaction.channel.send("-# ตัวเลือกเพิ่มเติม:", view=effective_view)
             effective_view.message = footer_msg
             effective_view.delete_message_on_timeout = True
     else:
@@ -340,11 +340,10 @@ async def _safe_edit_or_followup_after_defer(
     interaction: discord.Interaction,
     content: str,
     view: AutoDisappearingView | None,
-    allow_view_on_error: bool = False,
 ) -> None:
     """
     Safely updates the original message after `interaction.response.defer()`.
-    Handles >1950-char cards cleanly and falls back to `followup.send` or `channel.send`
+    Handles >1950-char cards cleanly and falls back to `followup.send` / `channel.send`
     if the original message was deleted (`404 Unknown Message`).
     """
     if len(content) <= 1950:
@@ -356,9 +355,7 @@ async def _safe_edit_or_followup_after_defer(
             return
         except Exception:
             pass
-    await _send_interaction_with_auto_view(
-        interaction, content, view, allow_view_on_error=allow_view_on_error
-    )
+    await _send_interaction_with_auto_view(interaction, content, view, allow_view_on_error=True)
 
 
 # ==============================================================================
@@ -464,9 +461,9 @@ FOLLOWUP_ACTION_REGISTRY: dict[str, tuple[str, str, str, bool]] = {
         False,
     ),
     "action_checklist": (
-        "สกัด Action Items / Checklist",
+        "สรุปสิ่งที่ต้องทำ",
         "📋",
-        "ช่วยสกัดขั้นตอนที่ต้องทำ (Action Items), เงื่อนไขสำคัญ หรือ Checklist ที่นำไปใช้งานต่อได้ทันทีจากเนื้อหาข้างต้นค่ะ",
+        "ช่วยสรุปขั้นตอนที่ต้องทำ เงื่อนไขสำคัญ หรือรายการเช็กลิสต์ที่เอาไปใช้ต่อได้ทันทีจากเนื้อหาข้างต้นค่ะ",
         False,
     ),
     "deep_dive_details": (
@@ -618,7 +615,7 @@ class GeneralAssistantActionView(AutoDisappearingView):
     def _make_in_bubble_manga_callback(self):
         async def _callback(interaction: discord.Interaction):
             await interaction.response.send_message(
-                "รับทราบค่ะ เดี๋ยวฉันจัดการแปลบทสนทนาในภาพเป็นภาษาไทยให้ รอสักครู่นะคะ",
+                "เข้าใจแล้วค่ะ เดี๋ยวฉันแปลภาพนี้เป็นภาษาไทยให้ รอสักครู่นะคะ",
                 ephemeral=True,
             )
             target_msg = self.source_message
@@ -827,10 +824,10 @@ def build_contextual_suggestion_view(
                 False,
             ),
             (
-                "สกัด Action Items / Checklist",
+                "สรุปสิ่งที่ต้องทำ",
                 "📋",
                 discord.ButtonStyle.secondary,
-                "ช่วยสกัดขั้นตอนที่ต้องทำ (Action Items), เงื่อนไขสำคัญ หรือ Checklist ที่นำไปใช้งานต่อได้ทันทีจากเอกสาร/เนื้อหานี้ค่ะ",
+                "ช่วยสรุปขั้นตอนที่ต้องทำ เงื่อนไขสำคัญ หรือรายการเช็กลิสต์ที่เอาไปใช้ต่อได้ทันทีจากเอกสาร/เนื้อหานี้ค่ะ",
                 False,
             ),
             (
@@ -868,10 +865,10 @@ def build_contextual_suggestion_view(
         else:
             specs.append(
                 (
-                    "วิเคราะห์องค์ประกอบ & บรรยากาศ",
+                    "ดูรายละเอียดภาพเพิ่ม",
                     "📌",
                     discord.ButtonStyle.primary,
-                    "ช่วยวิเคราะห์องค์ประกอบภาพ อารมณ์สีหน้า และรายละเอียดที่น่าสนใจในภาพนี้เพิ่มเติมจากที่เล่าไปเมื่อครู่ค่ะ",
+                    "ช่วยเล่าจุดน่าสนใจ อารมณ์สีหน้า และรายละเอียดเล็กๆ ในภาพนี้เพิ่มเติมจากที่เล่าไปเมื่อครู่ค่ะ",
                     False,
                 )
             )
@@ -930,10 +927,10 @@ def build_contextual_suggestion_view(
                 False,
             ),
             (
-                "ตรวจสอบบริบทเพิ่มเติม",
+                "เช็คข้อมูลเพิ่มเติม",
                 "🔍",
                 discord.ButtonStyle.secondary,
-                "ช่วยค้นหาข้อมูลเบื้องหลังและตรวจสอบข้อเท็จจริงเพิ่มเติมของประเด็นนี้ให้หน่อยค่ะ",
+                "ช่วยค้นหาข้อมูลเบื้องหลังและเช็คข้อเท็จจริงเพิ่มเติมของประเด็นนี้ให้หน่อยค่ะ",
                 True,
             ),
         ]
@@ -993,7 +990,7 @@ class MemoryEditModal(discord.ui.Modal, title="แก้ไขความจำ
     custom_notes_input = discord.ui.TextInput(
         label="บันทึกระยะสั้น (แยกบรรทัดหรือ ;)",
         style=discord.TextStyle.paragraph,
-        placeholder="Rolling Notes: พิมพ์บันทึกระยะสั้นทีละบรรทัด หรือคั่นด้วย ;",
+        placeholder="พิมพ์บันทึกระยะสั้นทีละบรรทัด หรือคั่นด้วย ;",
         required=False,
         max_length=800,
     )
@@ -1017,7 +1014,7 @@ class MemoryEditModal(discord.ui.Modal, title="แก้ไขความจำ
         self.recent_topics_input.default = "\n".join(prof.get("recent_topics") or [])[:500]
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Explicit thinking=True ensures followup.send() works identically from both Slash and Button modals
+        # Defer immediately BEFORE Discord cloud backup so slow network never hits the 3-second limit!
         await interaction.response.defer(thinking=True)
         new_disp = self.display_name_input.value.strip()
         raw_pinned = self.pinned_facts_input.value.strip()
@@ -1048,7 +1045,7 @@ class MemoryEditModal(discord.ui.Modal, title="แก้ไขความจำ
             interaction,
             card_text,
             view,
-            chunked_header="❄️ บันทึกการแก้ไขความจำถาวรเรียบร้อยแล้วค่ะ:",
+            chunked_header="❄️ บันทึกการแก้ไขความจำเรียบร้อยแล้วค่ะ:",
             allow_view_on_error=True,
         )
 
@@ -1056,7 +1053,7 @@ class MemoryEditModal(discord.ui.Modal, title="แก้ไขความจำ
         api_log(f"MemoryEditModal Error -> {type(error).__name__}: {str(error)[:160]}")
         await _safe_send_ephemeral_error(
             interaction,
-            f"เกิดข้อผิดพลาดระหว่างบันทึกความจำค่ะ (`{type(error).__name__}`) กรุณาลองใหม่อีกครั้งนะคะ",
+            f"บันทึกความจำติดขัดนิดหน่อยค่ะ (`{type(error).__name__}`) ลองใหม่อีกทีนะคะ",
         )
 
 
@@ -1069,7 +1066,7 @@ class MemoryActionView(AutoDisappearingView):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.requester_id and not is_owner_user(interaction.user):
             await interaction.response.send_message(
-                "ปุ่มแก้ไขความจำนี้สงวนไว้สำหรับเจ้าของข้อมูลเท่านั้นนะคะ", ephemeral=True
+                "ปุ่มนี้ให้เฉพาะเจ้าของข้อมูลกดเท่านั้นนะคะ", ephemeral=True
             )
             return False
         return True
@@ -1085,9 +1082,7 @@ class MemoryActionView(AutoDisappearingView):
         card_text = format_user_memory_card(
             self.target_uid, header_title="ล้างรายการเรื่องที่คุยล่าสุดเรียบร้อยแล้วค่ะ"
         )
-        await _safe_edit_or_followup_after_defer(
-            interaction, card_text, self, allow_view_on_error=True
-        )
+        await _safe_edit_or_followup_after_defer(interaction, card_text, self)
 
     @discord.ui.button(label="รีเซ็ตความจำ", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def btn_reset_memory(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1102,9 +1097,7 @@ class MemoryActionView(AutoDisappearingView):
         card_text = format_user_memory_card(
             self.target_uid, header_title="รีเซ็ตความจำถาวรเรียบร้อยแล้วค่ะ (คงข้อมูล OT ไว้ให้ครบ)"
         )
-        await _safe_edit_or_followup_after_defer(
-            interaction, card_text, self, allow_view_on_error=True
-        )
+        await _safe_edit_or_followup_after_defer(interaction, card_text, self)
 
 
 def parse_memory_record_metadata(mem_reply_text: str) -> str:
@@ -1171,14 +1164,14 @@ class OTEditModal(discord.ui.Modal, title="แก้ไขรายการบ�
             interaction,
             reply,
             view,
-            chunked_header="❄️ อัปเดตบันทึกเวลา OT เรียบร้อยแล้วค่ะ:",
+            chunked_header="❄️ อัปเดตเวลา OT เรียบร้อยแล้วค่ะ:",
         )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
         api_log(f"OTEditModal Error -> {type(error).__name__}: {str(error)[:160]}")
         await _safe_send_ephemeral_error(
             interaction,
-            f"เกิดข้อผิดพลาดระหว่างบันทึกรายการ OT ค่ะ (`{type(error).__name__}`) กรุณาลองใหม่อีกครั้งนะคะ",
+            f"บันทึกรายการ OT ติดขัดนิดหน่อยค่ะ (`{type(error).__name__}`) ลองใหม่อีกทีนะคะ",
         )
 
 
@@ -1192,7 +1185,7 @@ class OTActionView(AutoDisappearingView):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("ปุ่มจัดการ OT นี้เป็นของเจ้าของรายการเท่านั้นนะคะ", ephemeral=True)
+            await interaction.response.send_message("ปุ่มนี้ให้เฉพาะเจ้าของรายการ OT กดเท่านั้นนะคะ", ephemeral=True)
             return False
         return True
 
@@ -1275,7 +1268,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
         if not ALLOWED_GUILD_IDS or interaction.guild is None or interaction.guild.id in ALLOWED_GUILD_IDS:
             return True
         await _safe_send_ephemeral_error(
-            interaction, "This Discord server is not on the bot's authorized allowlist."
+            interaction, "เซิร์ฟเวอร์นี้ยังไม่ได้เปิดสิทธิ์ให้ฉันใช้งานนะคะ"
         )
         return False
 
@@ -1290,7 +1283,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
         api_log(f"AppCommand Error (/{cmd_name}) -> {type(orig).__name__}: {str(orig)[:180]}")
         await _safe_send_ephemeral_error(
             interaction,
-            f"เกิดข้อผิดพลาดระหว่างรันคำสั่ง `/{cmd_name}` ค่ะ (`{type(orig).__name__}`) กรุณาลองใหม่อีกครั้งนะคะ",
+            f"คำสั่ง `/{cmd_name}` ติดขัดนิดหน่อยค่ะ (`{type(orig).__name__}`) ลองใหม่อีกทีนะคะ",
         )
 
     @bot.tree.command(name="memory", description="ดู แก้ไข ปักหมุด หรือรีเซ็ตข้อมูลความจำถาวร (user_profiles.json)")
@@ -1357,7 +1350,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             interaction,
             reply,
             view,
-            chunked_header="❄️ ข้อมูลความจำถาวรพร้อมแล้วค่ะ:",
+            chunked_header="❄️ ข้อมูลความจำพร้อมแล้วค่ะ:",
             allow_view_on_error=True,
         )
 
@@ -1396,7 +1389,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             if attachment.size > 25 * 1024 * 1024:
                 size_mb = round(attachment.size / (1024 * 1024), 2)
                 await interaction.followup.send(
-                    f"ไฟล์ `{attachment.filename}` มีขนาด `{size_mb} MB` เกินขีดจำกัด `25 MB` ค่ะ กรุณาแบ่งไฟล์หรือตัดเฉพาะส่วนที่เกี่ยวข้องส่งมานะคะ",
+                    f"ไฟล์ `{attachment.filename}` ใหญ่เกิน 25 MB ค่ะ (`{size_mb} MB`) ลองตัดแบ่งไฟล์หรือส่งเฉพาะส่วนที่เกี่ยวข้องมานะคะ",
                     ephemeral=True,
                 )
                 return
@@ -1445,7 +1438,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             else None
         )
         await _send_interaction_with_auto_view(
-            interaction, answer, view, chunked_header="❄️ ผลการวิเคราะห์เสร็จสมบูรณ์แล้วค่ะ:"
+            interaction, answer, view, chunked_header="❄️ ดูให้เรียบร้อยแล้วค่ะ:"
         )
 
     @bot.tree.command(name="ot", description="บันทึกเวลาทำ OT, แก้ไข, ลบ หรือดูตารางสรุปรายเดือน")
@@ -1500,10 +1493,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             else None
         )
         await _send_interaction_with_auto_view(
-            interaction,
-            reply,
-            view,
-            chunked_header="❄️ ข้อมูลสรุปเวลา OT พร้อมแล้วค่ะ:",
+            interaction, reply, view, chunked_header="❄️ สรุปเวลา OT พร้อมแล้วค่ะ:"
         )
 
     @bot.tree.command(name="yukipedia", description="ค้นหาข้อมูลเรียลไทม์ วิเคราะห์ข่าว เกม อนิเมะ หรือสรุปหัวข้อพร้อมปุ่มแนะนำ")
@@ -1557,7 +1547,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
     ):
         if not link.strip() and attachment is None:
             await interaction.response.send_message(
-                "กรุณาแนบรูปภาพ หรือวางลิงก์ (เช่น X/Twitter, Pixiv/phixiv หรือลิงก์รูปภาพ) มาด้วยนะคะ",
+                "แนบรูปหรือวางลิงก์ (X/Twitter, Pixiv/phixiv หรือลิงก์รูปภาพ) มาด้วยสิคะ",
                 ephemeral=True,
             )
             return
@@ -1625,10 +1615,10 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             else None
         )
         await _send_interaction_with_auto_view(
-            interaction, answer, view, chunked_header="❄️ ตรวจสอบที่มาเรียบร้อยแล้วค่ะ:"
+            interaction, answer, view, chunked_header="❄️ เช็คที่มาให้แล้วค่ะ:"
         )
 
-    @bot.tree.command(name="manga", description="แปลหน้ามังงะในช่องคำพูดพร้อมฝังคำแปลลงในภาพ (รองรับไฟล์แนบและลิงก์ X/Pixiv)")
+    @bot.tree.command(name="manga", description="แปลหน้ามังงะในช่องคำพูดพร้อมใส่คำแปลลงในภาพ (รองรับไฟล์แนบและลิงก์ X/Pixiv)")
     @app_commands.describe(
         language="ภาษาปลายทางที่ต้องการแปล",
         link="วางลิงก์ X (Twitter), Pixiv/phixiv หรือลิงก์รูปมังงะ (รองรับหลายหน้าในโพสต์เดียว)",
@@ -1648,14 +1638,14 @@ def register_app_commands(bot: discord.ext.commands.Bot):
     ):
         if not link.strip() and attachment is None:
             await interaction.response.send_message(
-                "กรุณาแนบไฟล์รูปมังงะ หรือวางลิงก์ X (Twitter) / Pixiv / phixiv ที่มีรูปมังงะนะคะ",
+                "แนบรูปมังงะหรือวางลิงก์ X (Twitter) / Pixiv / phixiv มาด้วยสิคะ",
                 ephemeral=True,
             )
             return
 
         lang_label = "ภาษาไทย" if language.lower() == "thai" else "ภาษาอังกฤษ"
         await interaction.response.send_message(
-            f"รับทราบค่ะ เดี๋ยวฉันจัดการแปลหน้านี้เป็น**{lang_label}**ให้ รอสักครู่นะคะ",
+            f"เข้าใจแล้วค่ะ เดี๋ยวฉันแปลหน้านี้เป็น**{lang_label}**ให้ รอสักครู่นะคะ",
             ephemeral=True,
         )
 
@@ -1714,7 +1704,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             else None
         )
         await _send_interaction_with_auto_view(
-            interaction, answer, view, chunked_header="❄️ วิเคราะห์โค้ด/Stack Trace เรียบร้อยแล้วค่ะ:"
+            interaction, answer, view, chunked_header="❄️ ดูโค้ดให้เรียบร้อยแล้วค่ะ:"
         )
 
     @bot.tree.context_menu(name="Yukipedia Fact-Check / Summary")
@@ -1765,7 +1755,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             else None
         )
         await _send_interaction_with_auto_view(
-            interaction, answer, view, chunked_header="❄️ ตรวจสอบและสรุปข้อมูลเรียบร้อยแล้วค่ะ:"
+            interaction, answer, view, chunked_header="❄️ สรุปข้อมูลให้เรียบร้อยแล้วค่ะ:"
         )
 
     @bot.tree.context_menu(name="Find Image / Link Source")
@@ -1774,7 +1764,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
         extracted_ctx, _ = await extract_all_context(message)
         if not has_valid_extracted_context(extracted_ctx):
             await interaction.followup.send(
-                "ไม่พบรูปภาพหรือลิงก์ที่สามารถตรวจสอบที่มาได้ในข้อความนี้ค่ะ",
+                "ข้อความนี้ไม่มีรูปหรือลิงก์ให้เช็คที่มาเลยค่ะ",
                 ephemeral=True,
             )
             return
@@ -1824,7 +1814,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             else None
         )
         await _send_interaction_with_auto_view(
-            interaction, answer, view, chunked_header="❄️ ตรวจสอบที่มาเรียบร้อยแล้วค่ะ:"
+            interaction, answer, view, chunked_header="❄️ เช็คที่มาให้แล้วค่ะ:"
         )
 
     @bot.tree.context_menu(name="Translate Manga Page (TH)")
@@ -1833,12 +1823,12 @@ def register_app_commands(bot: discord.ext.commands.Bot):
         has_embeds_or_links = bool(message.embeds) or bool(URL_REGEX.search(message.content or ""))
         if not has_imgs and not has_embeds_or_links:
             await interaction.response.send_message(
-                "ข้อความที่เลือกไม่มีไฟล์รูปภาพหรือลิงก์ที่มีรูปภาพแนบอยู่ค่ะ กรุณาคลิกขวาที่ข้อความที่มีรูปมังงะหรือลิงก์ X/Pixiv นะคะ",
+                "ข้อความนี้ไม่มีรูปหรือลิงก์ภาพแนบอยู่ค่ะ คลิกขวาที่ข้อความที่มีรูปมังงะหรือลิงก์ X/Pixiv นะคะ",
                 ephemeral=True,
             )
             return
         await interaction.response.send_message(
-            "รับทราบค่ะ เดี๋ยวฉันจัดการแปลหน้านี้เป็นภาษาไทยให้ รอสักครู่นะคะ",
+            "เข้าใจแล้วค่ะ เดี๋ยวฉันแปลหน้านี้เป็นภาษาไทยให้ รอสักครู่นะคะ",
             ephemeral=True,
         )
         await process_manga_translation_request(message, "แปลมังงะเป็นภาษาไทย")
@@ -1849,12 +1839,12 @@ def register_app_commands(bot: discord.ext.commands.Bot):
         has_embeds_or_links = bool(message.embeds) or bool(URL_REGEX.search(message.content or ""))
         if not has_imgs and not has_embeds_or_links:
             await interaction.response.send_message(
-                "ข้อความที่เลือกไม่มีไฟล์รูปภาพหรือลิงก์ที่มีรูปภาพแนบอยู่ค่ะ กรุณาคลิกขวาที่ข้อความที่มีรูปมังงะหรือลิงก์ X/Pixiv นะคะ",
+                "ข้อความนี้ไม่มีรูปหรือลิงก์ภาพแนบอยู่ค่ะ คลิกขวาที่ข้อความที่มีรูปมังงะหรือลิงก์ X/Pixiv นะคะ",
                 ephemeral=True,
             )
             return
         await interaction.response.send_message(
-            "รับทราบค่ะ เดี๋ยวฉันจัดการแปลหน้านี้เป็นภาษาอังกฤษให้ รอสักครู่นะคะ",
+            "เข้าใจแล้วค่ะ เดี๋ยวฉันแปลหน้านี้เป็นภาษาอังกฤษให้ รอสักครู่นะคะ",
             ephemeral=True,
         )
         await process_manga_translation_request(message, "แปลมังงะเป็นภาษาอังกฤษ")

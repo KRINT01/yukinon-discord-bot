@@ -161,7 +161,7 @@ async def restore_user_profiles_from_discord(bot: discord.Client):
     if ch:
         try:
             restored = False
-            async for msg in ch.history(limit=30):
+            async for msg in ch.history(limit=15):
                 if msg.author.id == bot.user.id and msg.attachments:
                     for att in msg.attachments:
                         if att.filename == "user_profiles.json":
@@ -198,9 +198,9 @@ async def restore_user_profiles_from_discord(bot: discord.Client):
 async def backup_user_profiles_to_discord(force: bool = False):
     """
     Serialized cloud backup of user_profiles.json to #yukinon-memory (throttled to every 3 mins unless force=True).
-    Protected by `_CLOUD_BACKUP_LOCK` so concurrent edits never delete each other's latest backup.
-    Deletes ONLY older `user_profiles.json` backup messages so `/memory` cards and deferred thinking
-    placeholders posted inside `#yukinon-memory` are never deleted (prevents 404 Unknown Message).
+    Protected by `_CLOUD_BACKUP_LOCK` so concurrent edits never delete each other's latest backup!
+    Only deletes previous `user_profiles.json` backup messages — NEVER normal bot replies,
+    `/memory` cards, or deferred thinking placeholders in `#yukinon-memory`.
     """
     global _DIRTY_SINCE_LAST_BACKUP, _LAST_CLOUD_BACKUP_TS
     if not _DIRTY_SINCE_LAST_BACKUP and not force:
@@ -224,17 +224,14 @@ async def backup_user_profiles_to_discord(force: bool = False):
             _DIRTY_SINCE_LAST_BACKUP = False
             payload_bytes = json.dumps(user_profiles, ensure_ascii=False, indent=2).encode("utf-8")
 
-            # Upload new backup FIRST, then delete older `user_profiles.json` backup messages only
+            # Upload new backup FIRST, then delete older `user_profiles.json` backup messages ONLY
             new_msg = await ch.send(
                 content=f"💾 **[Yukinon Persistent User Memory Backup]** (`{len(user_profiles)}` users | `{get_current_thai_datetime_str()}`)",
                 file=discord.File(io.BytesIO(payload_bytes), filename="user_profiles.json"),
             )
 
-            async for old_msg in ch.history(limit=25):
-                is_backup_msg = any(
-                    getattr(att, "filename", "") == "user_profiles.json"
-                    for att in (getattr(old_msg, "attachments", None) or [])
-                )
+            async for old_msg in ch.history(limit=20):
+                is_backup_msg = any(a.filename == "user_profiles.json" for a in (old_msg.attachments or []))
                 if old_msg.author.id == bot.user.id and old_msg.id != new_msg.id and is_backup_msg:
                     try:
                         await old_msg.delete()
@@ -671,7 +668,7 @@ async def update_user_memory_fields(
     return prof
 
 
-def format_user_memory_card(target_uid: str, header_title: str = "แฟ้มความจำผู้ใช้ (Persistent User Memory)") -> str:
+def format_user_memory_card(target_uid: str, header_title: str = "ข้อมูลความจำ (User Memory)") -> str:
     prof = ensure_user_profile_exists(target_uid)
     disp = prof.get("display_name") or f"User_{target_uid[-4:]}"
     cnt = int(prof.get("interaction_count") or 1)
@@ -855,7 +852,7 @@ async def process_memory_request(message, raw_text: str) -> tuple[str, str]:
         notes.append(new_note)
         await update_user_memory_fields(target_uid, custom_notes=notes)
         return (
-            format_user_memory_card(target_uid, header_title="เพิ่มบันทึกระยะสั้นลงในระบบเรียบร้อยแล้วค่ะ"),
+            format_user_memory_card(target_uid, header_title="เพิ่มบันทึกระยะสั้นให้เรียบร้อยแล้วค่ะ"),
             target_uid,
         )
 
@@ -1526,7 +1523,7 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
             extra_detail = (tm_match.group(5) or "").strip(" -:")
 
             if not (0 <= sh <= 23 and 0 <= sm <= 59):
-                return "รูปแบบเวลาไม่ถูกต้องค่ะ กรุณาระบุเวลาเป็น `HH.MM` หรือ `HH:MM` เช่น `09.00` หรือ `18.00 - 20.00` นะคะ"
+                return "เวลาที่พิมพ์มาไม่ถูกต้องนะคะ ใส่เป็น `HH.MM` หรือ `HH:MM` เช่น `09.00` หรือ `18.00 - 20.00` ค่ะ"
 
             start_dt = saved_work_dt.replace(hour=sh, minute=sm, second=0, microsecond=0)
             if eh_str is not None:
@@ -1547,12 +1544,12 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
                 pending_weekend_ot[pending_key] = pending_data
                 return (
                     f"เนื่องจากเวลาปัจจุบันคือ `{_format_time_dot(saved_end_dt)} น.` ซึ่งไม่ได้อยู่หลังเวลาเริ่ม `{sh:02d}.{sm:02d} น.` "
-                    f"กรุณาระบุเป็น**ช่วงเวลาเริ่ม-เลิก**แทนนะคะ เช่น `{sh:02d}.{sm:02d} - 21.00` ค่ะ"
+                    f"ใส่เป็น**ช่วงเวลาเริ่ม-เลิก**แทนนะคะ เช่น `{sh:02d}.{sm:02d} - 21.00` ค่ะ"
                 )
 
             ot_hours = round(diff_mins / 60.0, 2)
-            default_label = "ปฏิบัติงานล่วงเวลาย้อนหลัง" if is_backdated_pending else "ปฏิบัติงานล่วงเวลาวันหยุด"
-            final_detail = extra_detail or saved_detail or f"{default_label} (ไม่ระบุรายละเอียด)"
+            default_label = "ทำ OT ย้อนหลัง" if is_backdated_pending else "ทำ OT วันหยุด"
+            final_detail = extra_detail or saved_detail or f"{default_label} (ไม่ได้ระบุรายละเอียด)"
             note_label = "*(บันทึกย้อนหลัง)*" if is_backdated_pending else "*(เวลาทำ OT วันหยุดตามจริง)*"
             return await _save_and_format_ot_entry(
                 prof,
@@ -1650,7 +1647,7 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
             end_dt += timedelta(days=1)
         diff_mins = max(15, int(round((end_dt - start_dt).total_seconds() / 60.0)))
         ot_hours = round(diff_mins / 60.0, 2)
-        clean_detail = rem_detail or "ปฏิบัติงานล่วงเวลา (ไม่ระบุรายละเอียด)"
+        clean_detail = rem_detail or "ทำ OT (ไม่ได้ระบุรายละเอียด)"
         note_str = "*(บันทึกย้อนหลัง)*" if is_custom_date else "*(ระบุช่วงเวลาโดยตรง)*"
         return await _save_and_format_ot_entry(
             prof,
@@ -1702,12 +1699,12 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
                 if diff_mins <= 0:
                     return (
                         f"เวลาเริ่ม (`{sh:02d}.{sm:02d} น.`) ต้องมาก่อนเวลาสิ้นสุด (`{_format_time_dot(end_dt)} น.`) นะคะ "
-                        f"สำหรับการจดย้อนหลัง กรุณาระบุเป็นช่วงเวลา เช่น `จด OT {target_date_th} {sh:02d}.{sm:02d} - 21.00` ค่ะ"
+                        f"ถ้าจดย้อนหลัง ใส่เป็นช่วงเวลาแทนนะคะ เช่น `จด OT {target_date_th} {sh:02d}.{sm:02d} - 21.00` ค่ะ"
                     )
                 ot_hours = round(diff_mins / 60.0, 2)
 
-            default_label = "ปฏิบัติงานล่วงเวลาย้อนหลัง" if is_custom_date else "ปฏิบัติงานล่วงเวลาวันหยุด"
-            clean_detail = rem_detail or f"{default_label} (ไม่ระบุรายละเอียด)"
+            default_label = "ทำ OT ย้อนหลัง" if is_custom_date else "ทำ OT วันหยุด"
+            clean_detail = rem_detail or f"{default_label} (ไม่ได้ระบุรายละเอียด)"
             note_str = "*(บันทึกย้อนหลัง)*" if is_custom_date else "*(เวลาทำ OT วันหยุดตามจริง)*"
             return await _save_and_format_ot_entry(
                 prof,
@@ -1788,7 +1785,7 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
         noted_end_str = _format_time_dot(noted_end_dt)
         actual_finish_str = _format_time_dot(now_th)
 
-    clean_detail = detail_str.strip(" -:") or "ปฏิบัติงานล่วงเวลา (ไม่ระบุรายละเอียด)"
+    clean_detail = detail_str.strip(" -:") or "ทำ OT (ไม่ได้ระบุรายละเอียด)"
     return await _save_and_format_ot_entry(
         prof,
         ot_logs,
