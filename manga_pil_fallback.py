@@ -41,40 +41,83 @@ def _extract_components_bytearray_bfs_pil(
     max_area: int,
     step: int = 2,
     core_radius: int = 1,
+    edge_pad: int = 1,
 ) -> list[tuple[tuple[int, int, int, int], Image.Image]]:
     sw, sh = bin_img.size
     buf = bytearray(bin_img.tobytes())
     total_len = sw * sh
 
-    def _clear_component(start_idx: int) -> None:
-        buf[start_idx] = 0
+    def _clear_true_margin_component(start_idx: int) -> None:
+        # Probe-only BFS: only clear component if it is a genuine page margin
+        # (area > max_area, >=2 edges touched, or >75% span) — preserves single-edge bubbles!
+        visited = [start_idx]
         stk = [start_idx]
+        buf[start_idx] = 0
+        min_x = max_x = start_idx % sw
+        min_y = max_y = start_idx // sw
+        oversized = False
+        area_cnt = 0
         while stk:
             p = stk.pop()
+            area_cnt += 1
             x = p % sw
+            y = p // sw
+            if x < min_x:
+                min_x = x
+            elif x > max_x:
+                max_x = x
+            if y < min_y:
+                min_y = y
+            elif y > max_y:
+                max_y = y
+            if not oversized and area_cnt > max_area:
+                oversized = True
+                visited.clear()
             if x > 0 and buf[p - 1]:
                 buf[p - 1] = 0
                 stk.append(p - 1)
+                if not oversized:
+                    visited.append(p - 1)
             if x + 1 < sw and buf[p + 1]:
                 buf[p + 1] = 0
                 stk.append(p + 1)
+                if not oversized:
+                    visited.append(p + 1)
             if p >= sw and buf[p - sw]:
                 buf[p - sw] = 0
                 stk.append(p - sw)
+                if not oversized:
+                    visited.append(p - sw)
             if p + sw < total_len and buf[p + sw]:
                 buf[p + sw] = 0
                 stk.append(p + sw)
+                if not oversized:
+                    visited.append(p + sw)
+
+        cw = (max_x - min_x) + 1
+        ch = (max_y - min_y) + 1
+        edge_touches = (
+            (1 if min_x <= edge_pad else 0)
+            + (1 if min_y <= edge_pad else 0)
+            + (1 if (max_x + 1) >= sw - edge_pad else 0)
+            + (1 if (max_y + 1) >= sh - edge_pad else 0)
+        )
+        is_margin = oversized or edge_touches >= 2 or cw > int(sw * 0.75) or ch > int(sh * 0.75)
+        if not is_margin:
+            # Restore single-edge speech bubble pixels so main BFS extracts it
+            for idx_p in visited:
+                buf[idx_p] = 255
 
     for bx in (1, sw // 2, sw - 2):
         for by in (1, sh - 2):
             pos = by * sw + bx
             if buf[pos]:
-                _clear_component(pos)
+                _clear_true_margin_component(pos)
     for by in (sh // 3, (2 * sh) // 3):
         for bx in (1, sw - 2):
             pos = by * sw + bx
             if buf[pos]:
-                _clear_component(pos)
+                _clear_true_margin_component(pos)
 
     results: list[tuple[tuple[int, int, int, int], Image.Image]] = []
     margin = max(2, core_radius + 1)
@@ -141,10 +184,10 @@ def _extract_components_bytearray_bfs_pil(
             cx1, cy1, cx2, cy2 = min_x, min_y, max_x + 1, max_y + 1
             cw, ch = cx2 - cx1, cy2 - cy1
             edge_touches = (
-                (1 if cx1 <= 1 else 0)
-                + (1 if cy1 <= 1 else 0)
-                + (1 if cx2 >= sw - 1 else 0)
-                + (1 if cy2 >= sh - 1 else 0)
+                (1 if cx1 <= edge_pad else 0)
+                + (1 if cy1 <= edge_pad else 0)
+                + (1 if cx2 >= sw - edge_pad else 0)
+                + (1 if cy2 >= sh - edge_pad else 0)
             )
             if edge_touches >= 2 or cw < min_w or ch < min_h or cw > max_w or ch > max_h:
                 continue
@@ -160,12 +203,15 @@ def _extract_components_bytearray_bfs_pil(
 
 def _filter_white_components_pil(
     raw_comps: list[tuple[tuple[int, int, int, int], Image.Image]],
+    small_rgb: Image.Image,
     small_gray: Image.Image,
     small_chroma: Image.Image,
+    small_sat: Image.Image,
     sw: int,
     sh: int,
     already_covered: Image.Image,
     is_secondary_pass: bool = False,
+    is_pastel_pass: bool = False,
 ) -> list[dict]:
     found: list[dict] = []
     max_area_px = int(sw * sh * 0.24)
@@ -174,7 +220,7 @@ def _filter_white_components_pil(
     for (cx1, cy1, cx2, cy2), comp_crop in raw_comps:
         cw, ch = cx2 - cx1, cy2 - cy1
 
-        if is_secondary_pass:
+        if is_secondary_pass or is_pastel_pass:
             cov_crop = already_covered.crop((cx1, cy1, cx2, cy2))
             ov_px = ImageChops.darker(comp_crop, cov_crop).histogram()[255]
             cov_crop.close()
@@ -201,14 +247,16 @@ def _filter_white_components_pil(
         if filled_area < min_area_px or filled_area > max_area_px:
             filled_crop.close()
             continue
-        if rect_fill < 0.50 or (cw > sw * 0.42 and rect_fill < 0.62):
+        min_rf = 0.56 if is_pastel_pass else 0.50
+        if rect_fill < min_rf or (cw > sw * 0.42 and rect_fill < 0.62):
             filled_crop.close()
             continue
         if (aspect > 4.2 and rect_fill < 0.65) or (min(cw, ch) < 14 and rect_fill < 0.62):
             filled_crop.close()
             continue
+        min_holes = 6 if is_pastel_pass else 3
         if (
-            holes_area < 3
+            holes_area < min_holes
             or (comp_area / float(filled_area)) < 0.18
             or (holes_area / float(filled_area)) > 0.78
         ):
@@ -217,24 +265,61 @@ def _filter_white_components_pil(
 
         ch_crop = small_chroma.crop((cx1, cy1, cx2, cy2))
         gray_crop = small_gray.crop((cx1, cy1, cx2, cy2))
-        ch_hist = ch_crop.histogram(mask=filled_crop)
-        total_m_px = max(1, sum(ch_hist))
-        chroma_ratio = sum(ch_hist[28:]) / float(total_m_px)
-        mean_chroma = ImageStat.Stat(ch_crop, mask=filled_crop).mean[0]
 
-        if chroma_ratio >= 0.20 or mean_chroma >= 18.0:
-            ch_crop.close()
-            gray_crop.close()
-            filled_crop.close()
-            continue
+        if not is_pastel_pass:
+            ch_hist = ch_crop.histogram(mask=filled_crop)
+            total_m_px = max(1, sum(ch_hist))
+            chroma_ratio = sum(ch_hist[28:]) / float(total_m_px)
+            mean_chroma = ImageStat.Stat(ch_crop, mask=filled_crop).mean[0]
+            if chroma_ratio >= 0.20 or mean_chroma >= 18.0:
+                ch_crop.close()
+                gray_crop.close()
+                filled_crop.close()
+                continue
+        else:
+            sat_crop = small_sat.crop((cx1, cy1, cx2, cy2))
+            s_hist = sat_crop.histogram(mask=filled_crop)
+            mean_s = ImageStat.Stat(sat_crop, mask=filled_crop).mean[0]
+            high_sat_ratio = sum(s_hist[95:]) / float(max(1, sum(s_hist)))
+            sat_crop.close()
+            if mean_s >= 75.0 or high_sat_ratio >= 0.30:
+                ch_crop.close()
+                gray_crop.close()
+                filled_crop.close()
+                continue
+
+            bg_mask = ImageChops.darker(gray_crop.point(lambda p: 255 if p >= 170 else 0), filled_crop)
+            bg_cnt = bg_mask.histogram()[255]
+            if bg_cnt < int(filled_area * 0.45):
+                bg_mask.close()
+                ch_crop.close()
+                gray_crop.close()
+                filled_crop.close()
+                continue
+            rgb_crop = small_rgb.crop((cx1, cy1, cx2, cy2))
+            bg_std = sum(ImageStat.Stat(rgb_crop, mask=bg_mask).stddev[:3]) / 3.0
+            rgb_crop.close()
+            bg_mask.close()
+            if bg_std > 32.0:
+                ch_crop.close()
+                gray_crop.close()
+                filled_crop.close()
+                continue
 
         inner_core = filled_crop.filter(ImageFilter.MinFilter(5))
         if not inner_core.getbbox():
             inner_core.close()
             inner_core = filled_crop.filter(ImageFilter.MinFilter(3))
 
-        dark_ink_bin = gray_crop.point(lambda p: 255 if p < 175 else 0)
-        achrom_bin = ch_crop.point(lambda p: 255 if p < 26 else 0)
+        if is_pastel_pass:
+            dark_ink_bin = gray_crop.point(lambda p: 255 if p < 160 else 0)
+            achrom_bin = ch_crop.point(lambda p: 255 if p < 32 else 0)
+            min_inner_ink = 10
+        else:
+            dark_ink_bin = gray_crop.point(lambda p: 255 if p < 175 else 0)
+            achrom_bin = ch_crop.point(lambda p: 255 if p < 26 else 0)
+            min_inner_ink = 4
+
         inner_ink = ImageChops.darker(ImageChops.darker(dark_ink_bin, achrom_bin), inner_core)
         inner_ink_px = inner_ink.histogram()[255]
 
@@ -245,7 +330,7 @@ def _filter_white_components_pil(
         ch_crop.close()
         gray_crop.close()
 
-        if inner_ink_px < 4:
+        if inner_ink_px < min_inner_ink:
             filled_crop.close()
             continue
 
@@ -261,6 +346,7 @@ def _filter_white_components_pil(
             "mask_small": filled_crop,
             "rect_fill": rect_fill,
             "is_dark": False,
+            "is_pastel": bool(is_pastel_pass),
         })
 
     return found
@@ -285,7 +371,6 @@ def _detect_page_bubbles_and_build_som_b64_pil_sync(
         small_gray = small_rgb.convert("L")
         small_chroma = _compute_rgb_chroma_band_pil(small_rgb)
         small_sat = small_rgb.convert("HSV").getchannel("S")
-        small_rgb.close()
 
         vis_gray = vis_img.convert("L")
         vis_dark_strokes = vis_gray.point(lambda p: 255 if p < 185 else 0)
@@ -301,19 +386,21 @@ def _detect_page_bubbles_and_build_som_b64_pil_sync(
 
         already_covered = Image.new("L", (sw, sh), 0)
 
+        # Pass A1: White bubbles
         white_bin_base = small_gray.point(lambda p: 255 if p >= 232 else 0)
         raw_a1 = _extract_components_bytearray_bfs_pil(
             white_bin_base, min_w_px, min_h_px, max_w_px, max_h_px, max_area_px, step=2, core_radius=1
         )
         detected = _filter_white_components_pil(
-            raw_a1, small_gray, small_chroma, sw, sh, already_covered, is_secondary_pass=False
+            raw_a1, small_rgb, small_gray, small_chroma, small_sat, sw, sh, already_covered,
+            is_secondary_pass=False, is_pastel_pass=False,
         )
 
+        # Pass A2: Thin-outline white bubbles
         non_outline = small_dark_box.point(lambda p: 0 if p >= 24 else 255)
         small_dark_box.close()
         white_bin_outline = ImageChops.darker(white_bin_base, non_outline)
         white_bin_base.close()
-        non_outline.close()
 
         raw_a2 = _extract_components_bytearray_bfs_pil(
             white_bin_outline, min_w_px, min_h_px, max_w_px, max_h_px, max_area_px, step=2, core_radius=1
@@ -321,10 +408,37 @@ def _detect_page_bubbles_and_build_som_b64_pil_sync(
         white_bin_outline.close()
         detected.extend(
             _filter_white_components_pil(
-                raw_a2, small_gray, small_chroma, sw, sh, already_covered, is_secondary_pass=True
+                raw_a2, small_rgb, small_gray, small_chroma, small_sat, sw, sh, already_covered,
+                is_secondary_pass=True, is_pastel_pass=False,
             )
         )
 
+        # Pass A3: Pastel / colored light bubbles
+        g_pastel = small_gray.point(lambda p: 255 if p >= 178 else 0)
+        s_pastel = small_sat.point(lambda p: 255 if p < 95 else 0)
+        pastel_bin = ImageChops.darker(ImageChops.darker(g_pastel, s_pastel), non_outline)
+        g_pastel.close()
+        s_pastel.close()
+        non_outline.close()
+        pdraw = ImageDraw.Draw(pastel_bin)
+        pdraw.rectangle([0, 0, sw - 1, 1], fill=0)
+        pdraw.rectangle([0, sh - 2, sw - 1, sh - 1], fill=0)
+        pdraw.rectangle([0, 0, 1, sh - 1], fill=0)
+        pdraw.rectangle([sw - 2, 0, sw - 1, sh - 1], fill=0)
+
+        raw_a3 = _extract_components_bytearray_bfs_pil(
+            pastel_bin, min_w_px, min_h_px, max_w_px, max_h_px, max_area_px, step=2, core_radius=1, edge_pad=2
+        )
+        pastel_bin.close()
+        detected.extend(
+            _filter_white_components_pil(
+                raw_a3, small_rgb, small_gray, small_chroma, small_sat, sw, sh, already_covered,
+                is_secondary_pass=True, is_pastel_pass=True,
+            )
+        )
+        small_rgb.close()
+
+        # Pass B: Dark bubbles
         dark_bin = small_gray.point(lambda p: 255 if p <= 95 else 0)
         raw_dark = _extract_components_bytearray_bfs_pil(
             dark_bin, min_w_px, min_h_px, int(sw * 0.50), int(sh * 0.50), max_area_px, step=3, core_radius=1
@@ -350,7 +464,6 @@ def _detect_page_bubbles_and_build_som_b64_pil_sync(
                 filled_crop.close()
                 continue
 
-            # Guard 1: Reject dark panels overlapping already-detected white speech bubbles
             cov_crop = already_covered.crop((cx1, cy1, cx2, cy2))
             ov_px = ImageChops.darker(filled_crop, cov_crop).histogram()[255]
             cov_crop.close()
@@ -364,14 +477,12 @@ def _detect_page_bubbles_and_build_som_b64_pil_sync(
             mean_s = ImageStat.Stat(s_crop, mask=filled_crop).mean[0]
             sat_ratio = sum(s_hist[28:]) / float(max(1, sum(s_hist)))
 
-            # Guard 2: True HSV saturation rejects dark colored panels
             if mean_s >= 22.0 or sat_ratio >= 0.16:
                 g_crop.close()
                 s_crop.close()
                 filled_crop.close()
                 continue
 
-            # Guard 3: Uniform dark background check
             dark_bg_mask = ImageChops.darker(g_crop.point(lambda p: 255 if p <= 135 else 0), filled_crop)
             dark_bg_px = dark_bg_mask.histogram()[255]
             dark_std = ImageStat.Stat(g_crop, mask=dark_bg_mask).stddev[0] if dark_bg_px > 0 else 99.0
@@ -382,7 +493,6 @@ def _detect_page_bubbles_and_build_som_b64_pil_sync(
                 filled_crop.close()
                 continue
 
-            # Guard 4: Eroded interior bright text check
             inner_core = filled_crop.filter(ImageFilter.MinFilter(5))
             if not inner_core.getbbox():
                 inner_core.close()
@@ -414,6 +524,7 @@ def _detect_page_bubbles_and_build_som_b64_pil_sync(
                     "mask_small": filled_crop,
                     "rect_fill": rect_fill,
                     "is_dark": True,
+                    "is_pastel": False,
                 })
             else:
                 filled_crop.close()
@@ -729,7 +840,7 @@ def _refine_cv_bubble_mask_locally_pil(
         )
         return x1, y1, x2, y2, m_full, orig_fill
 
-    if bool(cv_obj.get("is_dark")) or bw < 16 or bh < 14:
+    if bool(cv_obj.get("is_dark")) or bool(cv_obj.get("is_pastel")) or bw < 16 or bh < 14:
         return _fallback_orig()
 
     pad_x = min(int(width * 0.12), max(24, int(bw * 0.35)))
@@ -889,23 +1000,20 @@ def _sample_light_bg_rgb_pil(
 ) -> tuple[int, int, int]:
     crop_rgb = img.crop((x1, y1, x2, y2))
     crop_gray = base_gray.crop((x1, y1, x2, y2))
-    light_mask = crop_gray.point(lambda p: 255 if p >= 200 else 0)
+    light_mask = crop_gray.point(lambda p: 255 if p >= 175 else 0)
     if not light_mask.getbbox():
         light_mask.close()
         crop_rgb.close()
         crop_gray.close()
         return (255, 255, 255)
     stat_g = ImageStat.Stat(crop_gray, mask=light_mask)
-    if stat_g.median[0] >= 244:
-        light_mask.close()
-        crop_rgb.close()
-        crop_gray.close()
-        return (255, 255, 255)
     stat_rgb = ImageStat.Stat(crop_rgb, mask=light_mask)
     bg_rgb = tuple(int(v) for v in stat_rgb.median[:3])
     light_mask.close()
     crop_rgb.close()
     crop_gray.close()
+    if stat_g.median[0] >= 244 and (max(bg_rgb) - min(bg_rgb)) <= 8:
+        return (255, 255, 255)
     return bg_rgb
 
 
@@ -927,6 +1035,7 @@ def _clean_exact_cv_bubble_and_build_render_slots_pil(
         return []
 
     is_dark = bool(cv_obj.get("is_dark"))
+    is_pastel = bool(cv_obj.get("is_pastel"))
     rx1, ry1, rx2, ry2, mask_full, rect_fill = _refine_cv_bubble_mask_locally_pil(
         img, cv_obj, x1, y1, x2, y2, other_cv_boxes=other_cv_boxes
     )
@@ -956,11 +1065,31 @@ def _clean_exact_cv_bubble_and_build_render_slots_pil(
 
     sub_gray = base_gray.crop((rx1, ry1, rx2, ry2))
     sub_rgb = img.crop((rx1, ry1, rx2, ry2))
-    non_chroma = _build_true_chroma_art_shield_pil(sub_rgb, chroma_thresh=34, is_dark=is_dark)
+    non_chroma = (
+        Image.new("L", (bw, bh), 255)
+        if is_pastel
+        else _build_true_chroma_art_shield_pil(sub_rgb, chroma_thresh=34, is_dark=is_dark)
+    )
     sub_rgb.close()
 
     try:
-        if is_dark:
+        if is_pastel:
+            bg_rgb = _sample_light_bg_rgb_pil(img, base_gray, rx1, ry1, rx2, ry2)
+            bg_lum = int(0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2])
+            ink_t = min(195, max(145, bg_lum - 24))
+            ink_mask = sub_gray.point(lambda p: 255 if p < ink_t else 0)
+            ink_dil = _fast_dilate_mask_half_res_pil(ink_mask, kernel_half=5)
+            ink_mask.close()
+            ink_dil2 = ink_dil.filter(ImageFilter.MaxFilter(5))
+            ink_dil.close()
+            erase_mask = ImageChops.darker(ink_dil2, safe_core)
+            ink_dil2.close()
+            fill_patch = Image.new("RGB", (bw, bh), bg_rgb)
+            img.paste(fill_patch, (rx1, ry1), mask=erase_mask)
+            fill_patch.close()
+            fg_rgb = (15, 15, 15)
+            stroke_rgb = bg_rgb
+        elif is_dark:
             dark_rgb, bg_lum, _ = _sample_dark_bg_rgb_and_lum_pil(img, base_gray, rx1, ry1, rx2, ry2)
             diff_ink = sub_gray.point(lambda p: 255 if abs(int(p) - bg_lum) > 18 else 0)
             ink_dil = _fast_dilate_mask_half_res_pil(diff_ink, kernel_half=3)
@@ -1062,21 +1191,20 @@ def _clean_unmarked_open_bubble_and_measure_box_pil(
     sub_g = base_gray.crop((raw_x1, raw_y1, raw_x2, raw_y2))
     median_lum = ImageStat.Stat(sub_g).median[0]
     box_hist = sub_g.histogram()
-    sub_g.close()
     total_px = max(1, sum(box_hist))
 
     sub_rgb_check = img.crop((raw_x1, raw_y1, raw_x2, raw_y2))
     ch_band = _compute_rgb_chroma_band_pil(sub_rgb_check)
     ch_hist = ch_band.histogram()
     mean_chroma = ImageStat.Stat(ch_band).mean[0]
-    ch_band.close()
     chroma_ratio = sum(ch_hist[28:]) / float(max(1, sum(ch_hist)))
 
-    if mean_chroma >= 18.0 or chroma_ratio >= 0.18:
-        sub_rgb_check.close()
-        return None
-
     if median_lum < 125:
+        ch_band.close()
+        sub_g.close()
+        if mean_chroma >= 18.0 or chroma_ratio >= 0.18:
+            sub_rgb_check.close()
+            return None
         s_band = sub_rgb_check.convert("HSV").getchannel("S")
         sub_rgb_check.close()
         s_hist = s_band.histogram()
@@ -1112,6 +1240,79 @@ def _clean_unmarked_open_bubble_and_measure_box_pil(
         stroke_c = (max(0, bg_lum - 20), max(0, bg_lum - 20), max(0, bg_lum - 20))
         return raw_x1, raw_y1, raw_x2, raw_y2, (250, 250, 250), stroke_c, (raw_x1, raw_y1, raw_x2, raw_y2)
 
+    is_pastel_open = (mean_chroma >= 18.0 or chroma_ratio >= 0.18)
+
+    if is_pastel_open:
+        if median_lum < 170:
+            ch_band.close()
+            sub_g.close()
+            sub_rgb_check.close()
+            return None
+        s_band = sub_rgb_check.convert("HSV").getchannel("S")
+        s_hist = s_band.histogram()
+        mean_s = ImageStat.Stat(s_band).mean[0]
+        high_sat_ratio = sum(s_hist[100:]) / float(max(1, sum(s_hist)))
+        s_band.close()
+        if mean_s >= 85.0 or high_sat_ratio >= 0.30:
+            ch_band.close()
+            sub_g.close()
+            sub_rgb_check.close()
+            return None
+
+        light_ratio = sum(box_hist[170:]) / float(total_px)
+        ink_mask_chk = ImageChops.darker(
+            sub_g.point(lambda p: 255 if p < 155 else 0),
+            ch_band.point(lambda p: 255 if p < 36 else 0),
+        )
+        ink_ratio = ink_mask_chk.histogram()[255] / float(total_px)
+        ink_mask_chk.close()
+        ch_band.close()
+        if light_ratio < 0.42 or ink_ratio < 0.010:
+            sub_g.close()
+            sub_rgb_check.close()
+            return None
+
+        bg_m = sub_g.point(lambda p: 255 if p >= 170 else 0)
+        bg_std = sum(ImageStat.Stat(sub_rgb_check, mask=bg_m).stddev[:3]) / 3.0 if bg_m.getbbox() else 99.0
+        bg_m.close()
+        sub_g.close()
+        sub_rgb_check.close()
+        if bg_std > 32.0:
+            return None
+
+        pad_x, pad_y = 6, 8
+        wx1, wy1 = max(0, raw_x1 - pad_x), max(0, raw_y1 - pad_y)
+        wx2, wy2 = min(width, raw_x2 + pad_x), min(height, raw_y2 + pad_y)
+        ww, wh = wx2 - wx1, wy2 - wy1
+        bg_rgb = _sample_light_bg_rgb_pil(img, base_gray, raw_x1, raw_y1, raw_x2, raw_y2)
+        bg_lum = int(0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2])
+        sg = base_gray.crop((wx1, wy1, wx2, wy2))
+        srgb = img.crop((wx1, wy1, wx2, wy2))
+        ssat = srgb.convert("HSV").getchannel("S")
+        srgb.close()
+        p_seed = ImageChops.darker(sg.point(lambda p: 255 if p >= 175 else 0), ssat.point(lambda p: 255 if p < 95 else 0))
+        ssat.close()
+        p_zone = _fast_dilate_mask_half_res_pil(p_seed, kernel_half=5)
+        p_seed.close()
+        ink_t = min(195, max(145, bg_lum - 24))
+        ink_m = sg.point(lambda p: 255 if p < ink_t else 0)
+        sg.close()
+        ink_dil = _fast_dilate_mask_half_res_pil(ink_m, kernel_half=5)
+        ink_m.close()
+        erase_c = ImageChops.darker(ink_dil, p_zone)
+        ink_dil.close()
+        p_zone.close()
+        if not erase_c.getbbox():
+            erase_c.close()
+            return None
+        patch = Image.new("RGB", (ww, wh), bg_rgb)
+        img.paste(patch, (wx1, wy1), mask=erase_c)
+        patch.close()
+        erase_c.close()
+        return raw_x1, raw_y1, raw_x2, raw_y2, (15, 15, 15), bg_rgb, (raw_x1, raw_y1, raw_x2, raw_y2)
+
+    ch_band.close()
+    sub_g.close()
     sub_rgb_check.close()
     white_ratio = sum(box_hist[220:]) / float(total_px)
     ink_ratio = sum(box_hist[:155]) / float(total_px)

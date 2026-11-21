@@ -55,7 +55,7 @@ _THAI_CLUSTER_FIRST = set("กขคจตทบปผพฟสศษ")
 _THAI_CLUSTER_SECOND = set("รลว")
 _THAI_HO_NAM_FOLLOW = set("งญนมยรลว")
 _THAI_PREFIX_LEAD = set("สปกตฉผถข")
-_THAI_PUNCT_ATTACH = set("ๆฯ?!.,:;'\")]-~")
+_THAI_PUNCT_ATTACH = set("ๆฯ?!.,:;'\"')]-~")
 
 # Pre-allocated reusable OpenCV morphological kernels
 _CV2_K3 = np.ones((3, 3), np.uint8) if HAS_CV2 else None
@@ -191,7 +191,7 @@ def _tokenize_thai_syllables(word: str) -> list[str]:
                     merged_vowels.append(tok + nxt)
                     i += 2
                     continue
-            if nxt == "อ" and not any(c in _THAI_VOWEL_SIGNALS for c in tok) and any("\u0E01" <= c <= "\u0E2E" for c in tok):
+            if nxt in ("อ", "ว") and not any(c in _THAI_VOWEL_SIGNALS for c in tok) and any("\u0E01" <= c <= "\u0E2E" for c in tok):
                 merged_vowels.append(tok + nxt)
                 i += 2
                 continue
@@ -228,9 +228,10 @@ def _tokenize_thai_syllables(word: str) -> list[str]:
 
         is_bare_single = (len(tok) == 1 and "\u0E01" <= tok <= "\u0E2E")
         prev = syllables[-1]
-        prev_has_o_vowel = (len(prev) >= 2 and prev.endswith("อ"))
+        # Recognize both 'อ' (สระออ) and 'ว' (สระอัวลดรูป e.g. พวก/สวย/ควร) as valid syllable nuclei for final consonants
+        prev_has_o_or_w_vowel = (len(prev) >= 2 and prev[-1] in ("อ", "ว"))
         prev_has_nucleus = (
-            prev_has_o_vowel
+            prev_has_o_or_w_vowel
             or any(c in _THAI_VOWEL_SIGNALS or ("\u0E48" <= c <= "\u0E4B") for c in prev)
         )
         if is_bare_single and prev_has_nucleus and len(prev) <= 6:
@@ -514,22 +515,54 @@ def _fill_mask_holes_cv2(comp_crop: "np.ndarray") -> "np.ndarray":
     return np.where(padded[1:-1, 1:-1] == 128, np.uint8(0), np.uint8(255))
 
 
-def _collect_margin_labels_cv2(labels: "np.ndarray", sw: int, sh: int) -> set[int]:
-    """Identifies background component labels touching outer page-margin probe points."""
+def _collect_margin_labels_cv2(
+    labels: "np.ndarray",
+    stats: "np.ndarray",
+    sw: int,
+    sh: int,
+    max_area_px: int,
+) -> set[int]:
+    """
+    Identifies ONLY true outer page-margin / gutter components (never single-edge-clipped
+    speech bubbles!): a border-probed label is treated as page margin only if its area
+    exceeds `max_area_px`, it touches >= 2 distinct borders, or it spans >75% of width/height.
+    """
     margin_lbls: set[int] = {0}
+    probes = []
     for bx in (1, sw // 2, sw - 2):
         for by in (1, sh - 2):
-            margin_lbls.add(int(labels[by, bx]))
+            probes.append((bx, by))
     for by in (sh // 3, (2 * sh) // 3):
         for bx in (1, sw - 2):
-            margin_lbls.add(int(labels[by, bx]))
+            probes.append((bx, by))
+
+    for bx, by in probes:
+        lbl = int(labels[by, bx])
+        if lbl <= 0 or lbl in margin_lbls:
+            continue
+        cx1 = int(stats[lbl, cv2.CC_STAT_LEFT])
+        cy1 = int(stats[lbl, cv2.CC_STAT_TOP])
+        cw = int(stats[lbl, cv2.CC_STAT_WIDTH])
+        ch = int(stats[lbl, cv2.CC_STAT_HEIGHT])
+        area = int(stats[lbl, cv2.CC_STAT_AREA])
+        cx2, cy2 = cx1 + cw, cy1 + ch
+        edge_touches = (
+            (1 if cx1 <= 1 else 0)
+            + (1 if cy1 <= 1 else 0)
+            + (1 if cx2 >= sw - 1 else 0)
+            + (1 if cy2 >= sh - 1 else 0)
+        )
+        if area > max_area_px or edge_touches >= 2 or cw > int(sw * 0.75) or ch > int(sh * 0.75):
+            margin_lbls.add(lbl)
     return margin_lbls
 
 
 def _extract_and_filter_white_components_cv2(
     bin_mask: "np.ndarray",
+    small_bgr: "np.ndarray",
     small_gray: "np.ndarray",
     small_chroma: "np.ndarray",
+    small_sat: "np.ndarray",
     sw: int,
     sh: int,
     already_covered: "np.ndarray",
@@ -539,13 +572,16 @@ def _extract_and_filter_white_components_cv2(
     max_h: int,
     max_area_px: int,
     is_secondary_pass: bool = False,
+    is_pastel_pass: bool = False,
 ) -> list[dict]:
     """
-    Vectorized `cv2.connectedComponentsWithStats` + NumPy bubble validator implementing
-    all 3 battle-tested anti-background guards:
-    1) Eroded interior ink check (`5x5` erode -> `inner_ink_px >= 4`)
-    2) Concave panel-background rejection (`rect_fill < 0.50` or wide low-solidity)
+    Vectorized `cv2.connectedComponentsWithStats` + NumPy bubble validator supporting BOTH
+    classic white bubbles (Pass A1/A2) and colored/pastel light speech bubbles (Pass A3):
+    1) Eroded interior achromatic dark-ink check (`5x5` erode -> `inner_ink_px >= 4` / `>= 10` for pastel)
+    2) Concave panel-background rejection (`rect_fill < 0.50` / `< 0.56` for pastel)
     3) Whisper halo rejection (`filled_area < min_area_px` or narrow low-solidity)
+    4) Pastel pass adds HSV saturation ceiling (`mean_s < 75`, `high_sat_ratio < 0.30`) and
+       smooth background check (`bg_std <= 32.0`) so faces/hair/clothes are NEVER detected.
     """
     found: list[dict] = []
     min_area_px = max(220, int(sw * sh * 0.0022))
@@ -554,7 +590,8 @@ def _extract_and_filter_white_components_cv2(
     if num_labels <= 1:
         return found
 
-    margin_lbls = _collect_margin_labels_cv2(labels, sw, sh)
+    margin_lbls = _collect_margin_labels_cv2(labels, stats, sw, sh, max_area_px)
+    edge_pad = 2 if is_pastel_pass else 1
 
     for lbl in range(1, num_labels):
         if lbl in margin_lbls:
@@ -571,17 +608,17 @@ def _extract_and_filter_white_components_cv2(
             continue
 
         edge_touches = (
-            (1 if cx1 <= 1 else 0)
-            + (1 if cy1 <= 1 else 0)
-            + (1 if cx2 >= sw - 1 else 0)
-            + (1 if cy2 >= sh - 1 else 0)
+            (1 if cx1 <= edge_pad else 0)
+            + (1 if cy1 <= edge_pad else 0)
+            + (1 if cx2 >= sw - edge_pad else 0)
+            + (1 if cy2 >= sh - edge_pad else 0)
         )
         if edge_touches >= 2:
             continue
 
         comp_crop = np.where(labels[cy1:cy2, cx1:cx2] == lbl, np.uint8(255), np.uint8(0))
 
-        if is_secondary_pass:
+        if is_secondary_pass or is_pastel_pass:
             ov_px = int(np.count_nonzero(comp_crop & already_covered[cy1:cy2, cx1:cx2]))
             if ov_px > comp_area * 0.25:
                 continue
@@ -595,12 +632,14 @@ def _extract_and_filter_white_components_cv2(
 
         if filled_area < min_area_px or filled_area > max_area_px:
             continue
-        if rect_fill < 0.50 or (cw > sw * 0.42 and rect_fill < 0.62):
+        min_rf = 0.56 if is_pastel_pass else 0.50
+        if rect_fill < min_rf or (cw > sw * 0.42 and rect_fill < 0.62):
             continue
         if (aspect > 4.2 and rect_fill < 0.65) or (min(cw, ch) < 14 and rect_fill < 0.62):
             continue
+        min_holes = 6 if is_pastel_pass else 3
         if (
-            holes_area < 3
+            holes_area < min_holes
             or (comp_area / float(filled_area)) < 0.18
             or (holes_area / float(filled_area)) > 0.78
         ):
@@ -609,18 +648,41 @@ def _extract_and_filter_white_components_cv2(
         c_sub = small_chroma[cy1:cy2, cx1:cx2]
         g_sub = small_gray[cy1:cy2, cx1:cx2]
         mask_bool = filled_crop > 0
-        c_vals = c_sub[mask_bool]
-        chroma_ratio = float(np.count_nonzero(c_vals >= 28)) / float(max(1, c_vals.size))
-        mean_chroma = float(c_vals.mean()) if c_vals.size else 255.0
-        if chroma_ratio >= 0.20 or mean_chroma >= 18.0:
-            continue
+
+        if not is_pastel_pass:
+            c_vals = c_sub[mask_bool]
+            chroma_ratio = float(np.count_nonzero(c_vals >= 28)) / float(max(1, c_vals.size))
+            mean_chroma = float(c_vals.mean()) if c_vals.size else 255.0
+            if chroma_ratio >= 0.20 or mean_chroma >= 18.0:
+                continue
+        else:
+            s_sub = small_sat[cy1:cy2, cx1:cx2]
+            s_vals = s_sub[mask_bool]
+            mean_s = float(s_vals.mean()) if s_vals.size else 255.0
+            high_sat_ratio = float(np.count_nonzero(s_vals >= 95)) / float(max(1, s_vals.size))
+            if mean_s >= 75.0 or high_sat_ratio >= 0.30:
+                continue
+
+            bgr_sub = small_bgr[cy1:cy2, cx1:cx2]
+            bg_mask = mask_bool & (g_sub >= 170)
+            if int(np.count_nonzero(bg_mask)) < int(filled_area * 0.45):
+                continue
+            bg_std = float(np.std(bgr_sub[bg_mask], axis=0).mean())
+            if bg_std > 32.0:
+                continue
 
         inner_core = cv2.erode(filled_crop, _CV2_K5, iterations=1)
         if not np.any(inner_core):
             inner_core = cv2.erode(filled_crop, _CV2_K3, iterations=1)
-        inner_ink_px = int(np.count_nonzero((inner_core > 0) & (g_sub < 175) & (c_sub < 26)))
-        if inner_ink_px < 4:
-            continue
+
+        if is_pastel_pass:
+            inner_ink_px = int(np.count_nonzero((inner_core > 0) & (g_sub < 160) & (c_sub < 32)))
+            if inner_ink_px < 10:
+                continue
+        else:
+            inner_ink_px = int(np.count_nonzero((inner_core > 0) & (g_sub < 175) & (c_sub < 26)))
+            if inner_ink_px < 4:
+                continue
 
         already_covered[cy1:cy2, cx1:cx2] |= filled_crop
         bbox_norm = [
@@ -634,6 +696,7 @@ def _extract_and_filter_white_components_cv2(
             "mask_np": filled_crop,
             "rect_fill": rect_fill,
             "is_dark": False,
+            "is_pastel": bool(is_pastel_pass),
         })
 
     return found
@@ -649,6 +712,9 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
     - Decodes via `cv2.imdecode`, builds crisp `vis_bgr` (<=1024px via `INTER_AREA`) and `small_bgr` (<=360px) in C.
     - Pass A1 (`gray >= 232`): clean base white bubble pass.
     - Pass A2 (`INTER_AREA` dark-outline preservation): recovers 1px thin-bordered ovals on white panels.
+    - Pass A3 (`gray >= 178 & sat < 95 & dark_box < 24`): detects enclosed pastel/colored light speech
+      bubbles (pale blue, pink, lavender, cream, mint, yellow) with 2px border trim so edge-clipped
+      colored bubbles don't bleed across outer margins.
     - Pass B (`gray <= 95`): enclosed dark speech bubbles guarded by `already_covered` overlap rejection,
       true HSV saturation (`mean_s < 22`, `sat_ratio < 0.16`), dark background uniformity (`std <= 24`),
       and eroded interior bright-text check so dark colored panels are NEVER misclassified!
@@ -680,7 +746,7 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
     small_chroma = small_bgr.max(axis=2) - small_bgr.min(axis=2)
     small_hsv = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2HSV)
     small_sat = small_hsv[:, :, 1]
-    del small_hsv, small_bgr
+    del small_hsv
 
     # Zero-thickening dark-outline preservation via C box-area downscale
     vis_gray = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2GRAY)
@@ -701,8 +767,10 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
     white_bin_base = np.where(small_gray >= 232, np.uint8(255), np.uint8(0))
     detected = _extract_and_filter_white_components_cv2(
         white_bin_base,
+        small_bgr,
         small_gray,
         small_chroma,
+        small_sat,
         sw,
         sh,
         already_covered,
@@ -712,6 +780,7 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
         max_h_px,
         max_area_px,
         is_secondary_pass=False,
+        is_pastel_pass=False,
     )
 
     # Pass A2: Dark-outline-preserved pass (thin-outline ovals on white panels)
@@ -721,8 +790,10 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
     detected.extend(
         _extract_and_filter_white_components_cv2(
             white_bin_outline,
+            small_bgr,
             small_gray,
             small_chroma,
+            small_sat,
             sw,
             sh,
             already_covered,
@@ -732,14 +803,47 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
             max_h_px,
             max_area_px,
             is_secondary_pass=True,
+            is_pastel_pass=False,
         )
     )
+
+    # Pass A3: Enclosed pastel / colored light speech bubbles (pale blue, pink, lavender, mint, cream, yellow)
+    pastel_bin = np.where(
+        (small_gray >= 178) & (small_sat < 95) & (small_dark_box < 24),
+        np.uint8(255),
+        np.uint8(0),
+    )
+    # Trim outermost 2px frame so edge-clipped bubbles don't bridge through a 1-2px page gutter
+    pastel_bin[:2, :] = 0
+    pastel_bin[-2:, :] = 0
+    pastel_bin[:, :2] = 0
+    pastel_bin[:, -2:] = 0
+    detected.extend(
+        _extract_and_filter_white_components_cv2(
+            pastel_bin,
+            small_bgr,
+            small_gray,
+            small_chroma,
+            small_sat,
+            sw,
+            sh,
+            already_covered,
+            min_w_px,
+            min_h_px,
+            max_w_px,
+            max_h_px,
+            max_area_px,
+            is_secondary_pass=True,
+            is_pastel_pass=True,
+        )
+    )
+    del small_bgr
 
     # Pass B: Enclosed dark speech bubbles / dark caption boxes (strict anti-dark-panel guards!)
     dark_bin = np.where(small_gray <= 95, np.uint8(255), np.uint8(0))
     num_d, d_labels, d_stats, _ = cv2.connectedComponentsWithStats(dark_bin, connectivity=4)
     if num_d > 1:
-        d_margin = _collect_margin_labels_cv2(d_labels, sw, sh)
+        d_margin = _collect_margin_labels_cv2(d_labels, d_stats, sw, sh, max_area_px)
         max_dw, max_dh = int(sw * 0.50), int(sh * 0.50)
         for lbl in range(1, num_d):
             if lbl in d_margin:
@@ -769,7 +873,7 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
             if filled_area > max_area_px or holes_area < 5 or rect_fill < 0.65:
                 continue
 
-            # Guard 1: Reject dark panels that enclose/overlap already-detected white speech bubbles!
+            # Guard 1: Reject dark panels that enclose/overlap already-detected light/pastel speech bubbles!
             ov_px = int(np.count_nonzero(filled_crop & already_covered[cy1:cy2, cx1:cx2]))
             if ov_px > 20 or ov_px > filled_area * 0.04:
                 continue
@@ -810,6 +914,7 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
                     "mask_np": filled_crop,
                     "rect_fill": rect_fill,
                     "is_dark": True,
+                    "is_pastel": False,
                 })
 
     # On dense B&W pages, cap to top 24 highest-solidity/largest candidates
@@ -950,6 +1055,72 @@ def _build_true_chroma_art_shield_cv2(
     return np.where(shield > 0, np.uint8(0), np.uint8(255))
 
 
+def _inpaint_pastel_bubble_region_cv2(
+    sub_bgr: "np.ndarray",
+    sub_gray: "np.ndarray",
+    safe_core: "np.ndarray",
+) -> tuple["np.ndarray", tuple[int, int, int]]:
+    """
+    Erases dark Japanese ink + any white text glow/halo inside a pastel/colored light bubble
+    and fills the erased region via fast half-res TELEA inpainting (~3-10ms/bubble) so the
+    bubble's pastel blue/pink/yellow/mint gradient stays completely seamless!
+    Returns `(erase_bool, median_bg_bgr)`.
+    """
+    bh, bw = sub_gray.shape
+    core_bool = safe_core > 0
+    sub_chroma = sub_bgr.max(axis=2) - sub_bgr.min(axis=2)
+
+    non_dark = core_bool & (sub_gray >= 165)
+    if np.count_nonzero(non_dark) < 16:
+        non_dark = core_bool
+    bg_lum = int(np.median(sub_gray[non_dark]))
+    med_bgr = np.median(sub_bgr[non_dark], axis=0)
+    bg_bgr = (int(med_bgr[0]), int(med_bgr[1]), int(med_bgr[2]))
+    bg_chroma = int(max(bg_bgr) - min(bg_bgr))
+
+    ink_thresh = min(195, max(145, bg_lum - 24))
+    dark_ink = np.where(
+        core_bool & (sub_gray < ink_thresh) & (sub_chroma < max(42, bg_chroma + 22)),
+        np.uint8(255),
+        np.uint8(0),
+    )
+
+    # Dilate dark ink to cover anti-aliased strokes + surrounding white outline halos on colored bubbles
+    ink_halo = _fast_dilate_mask_cv2(dark_ink, kernel_half=5)
+    ink_halo = cv2.dilate(ink_halo, _CV2_K5, iterations=1)
+    if bg_lum < 242 or bg_chroma >= 10:
+        near_ink = cv2.dilate(ink_halo, _CV2_K5, iterations=1)
+        white_halo = (
+            (near_ink > 0)
+            & core_bool
+            & (sub_gray >= max(240, bg_lum + 8))
+            & (sub_chroma <= max(10, bg_chroma // 2))
+        )
+        erase_bool = ((ink_halo > 0) | white_halo) & core_bool
+    else:
+        erase_bool = (ink_halo > 0) & core_bool
+
+    if not np.any(erase_bool):
+        return erase_bool, bg_bgr
+
+    erase_u8 = np.where(erase_bool, np.uint8(255), np.uint8(0))
+    inp_scale = min(0.5, 180.0 / float(max(bw, bh)))
+    if bw >= 32 and bh >= 32 and inp_scale < 1.0:
+        iw = max(12, int(round(bw * inp_scale)))
+        ih = max(12, int(round(bh * inp_scale)))
+        sm_bgr = cv2.resize(sub_bgr, (iw, ih), interpolation=cv2.INTER_AREA)
+        sm_mask = cv2.resize(erase_u8, (iw, ih), interpolation=cv2.INTER_LINEAR)
+        sm_mask = np.where(sm_mask >= 32, np.uint8(255), np.uint8(0))
+        sm_inp = cv2.inpaint(sm_bgr, sm_mask, 3, cv2.INPAINT_TELEA)
+        full_inp = cv2.resize(sm_inp, (bw, bh), interpolation=cv2.INTER_LINEAR)
+        sub_bgr[erase_bool] = full_inp[erase_bool]
+    else:
+        full_inp = cv2.inpaint(sub_bgr, erase_u8, 3, cv2.INPAINT_TELEA)
+        sub_bgr[erase_bool] = full_inp[erase_bool]
+
+    return erase_bool, bg_bgr
+
+
 def _largest_inscribed_rect_in_mask_cv2(mask_u8: "np.ndarray") -> tuple[int, int, int, int] | None:
     mh, mw = mask_u8.shape
     if mw < 4 or mh < 4:
@@ -1085,8 +1256,9 @@ def _refine_cv_bubble_mask_locally_cv2(
     other_cv_boxes: list[tuple[int, int, int, int]] | None = None,
 ) -> tuple[int, int, int, int, "np.ndarray", float]:
     """
-    Locally refines a light CV bubble with strict anti-leak guards:
+    Locally refines a light white CV bubble with strict anti-leak guards:
     - Preserves thin 1px dark borders via `INTER_AREA` downscale of `gray < 185`.
+    - Skips white-only chroma refinement on dark or pastel bubbles (which already have exact Pass A3/B masks).
     - Caps area growth at `1.75x`, enforces solidity retention (`>= 0.78x`),
       and rejects any expansion that spills into a neighboring CV bubble.
     """
@@ -1105,7 +1277,7 @@ def _refine_cv_bubble_mask_locally_cv2(
         )
         return x1, y1, x2, y2, m_full, orig_fill
 
-    if bool(cv_obj.get("is_dark")) or bw < 16 or bh < 14 or orig_mask_np is None:
+    if bool(cv_obj.get("is_dark")) or bool(cv_obj.get("is_pastel")) or bw < 16 or bh < 14 or orig_mask_np is None:
         return _fallback_orig()
 
     pad_x = min(int(width * 0.12), max(24, int(bw * 0.35)))
@@ -1235,13 +1407,14 @@ def _sample_light_bg_bgr_cv2(
 ) -> tuple[int, int, int]:
     sub_bgr = img_bgr[y1:y2, x1:x2]
     sub_g = base_gray[y1:y2, x1:x2]
-    light_bool = sub_g >= 200
+    light_bool = sub_g >= 175
     if not np.any(light_bool):
         return (255, 255, 255)
-    if float(np.median(sub_g[light_bool])) >= 244.0:
-        return (255, 255, 255)
     med_bgr = np.median(sub_bgr[light_bool], axis=0)
-    return (int(med_bgr[0]), int(med_bgr[1]), int(med_bgr[2]))
+    bg_bgr = (int(med_bgr[0]), int(med_bgr[1]), int(med_bgr[2]))
+    if float(np.median(sub_g[light_bool])) >= 244.0 and (max(bg_bgr) - min(bg_bgr)) <= 8:
+        return (255, 255, 255)
+    return bg_bgr
 
 
 def _clean_exact_cv_bubble_and_build_render_slots_cv2(
@@ -1262,6 +1435,7 @@ def _clean_exact_cv_bubble_and_build_render_slots_cv2(
         return []
 
     is_dark = bool(cv_obj.get("is_dark"))
+    is_pastel = bool(cv_obj.get("is_pastel"))
     rx1, ry1, rx2, ry2, mask_full, rect_fill = _refine_cv_bubble_mask_locally_cv2(
         img_bgr, cv_obj, x1, y1, x2, y2, other_cv_boxes=other_cv_boxes
     )
@@ -1273,7 +1447,7 @@ def _clean_exact_cv_bubble_and_build_render_slots_cv2(
     if not np.any(safe_core):
         safe_core = mask_full
 
-    # Never let a dark bubble erase or overwrite an enclosed white speech bubble
+    # Never let a dark bubble erase or overwrite an enclosed white/pastel speech bubble
     if is_dark and white_exclusion_mask is not None:
         safe_core = np.where(white_exclusion_mask[ry1:ry2, rx1:rx2] > 0, np.uint8(0), safe_core)
         if not np.any(safe_core):
@@ -1281,31 +1455,39 @@ def _clean_exact_cv_bubble_and_build_render_slots_cv2(
 
     sub_gray = base_gray[ry1:ry2, rx1:rx2]
     sub_bgr = img_bgr[ry1:ry2, rx1:rx2]
-    non_chroma = _build_true_chroma_art_shield_cv2(sub_bgr, chroma_thresh=34, is_dark=is_dark)
 
-    if is_dark:
-        dark_bgr, bg_lum, _ = _sample_dark_bg_bgr_and_lum_cv2(img_bgr, base_gray, rx1, ry1, rx2, ry2)
-        diff_ink = np.where(np.abs(sub_gray.astype(np.int16) - bg_lum) > 18, np.uint8(255), np.uint8(0))
-        ink_dil = _fast_dilate_mask_cv2(diff_ink, kernel_half=3)
-        erase_bool = (ink_dil > 0) & (safe_core > 0) & (non_chroma > 0)
-        sub_bgr[erase_bool] = dark_bgr
-        fg_rgb = (250, 250, 250)
-        sc_val = max(0, bg_lum - 20)
-        stroke_rgb = (sc_val, sc_val, sc_val)
-    else:
-        ink_mask = np.where(sub_gray < 246, np.uint8(255), np.uint8(0))
-        ink_dil = _fast_dilate_mask_cv2(ink_mask, kernel_half=3)
-        erase_bool = (ink_dil > 0) & (safe_core > 0) & (non_chroma > 0)
-        sub_bgr[erase_bool] = (255, 255, 255)
+    if is_pastel:
+        # Pastel/colored bubble: preserve smooth gradient background via fast half-res inpainting
+        # without blocking the bubble's own pastel color with an absolute chroma shield!
+        erase_bool, bg_bgr = _inpaint_pastel_bubble_region_cv2(sub_bgr, sub_gray, safe_core)
         fg_rgb = (15, 15, 15)
-        stroke_rgb = (255, 255, 255)
+        stroke_rgb = (bg_bgr[2], bg_bgr[1], bg_bgr[0])
+        place_mask = safe_core
+    else:
+        non_chroma = _build_true_chroma_art_shield_cv2(sub_bgr, chroma_thresh=34, is_dark=is_dark)
+        if is_dark:
+            dark_bgr, bg_lum, _ = _sample_dark_bg_bgr_and_lum_cv2(img_bgr, base_gray, rx1, ry1, rx2, ry2)
+            diff_ink = np.where(np.abs(sub_gray.astype(np.int16) - bg_lum) > 18, np.uint8(255), np.uint8(0))
+            ink_dil = _fast_dilate_mask_cv2(diff_ink, kernel_half=3)
+            erase_bool = (ink_dil > 0) & (safe_core > 0) & (non_chroma > 0)
+            sub_bgr[erase_bool] = dark_bgr
+            fg_rgb = (250, 250, 250)
+            sc_val = max(0, bg_lum - 20)
+            stroke_rgb = (sc_val, sc_val, sc_val)
+        else:
+            ink_mask = np.where(sub_gray < 246, np.uint8(255), np.uint8(0))
+            ink_dil = _fast_dilate_mask_cv2(ink_mask, kernel_half=3)
+            erase_bool = (ink_dil > 0) & (safe_core > 0) & (non_chroma > 0)
+            sub_bgr[erase_bool] = (255, 255, 255)
+            fg_rgb = (15, 15, 15)
+            stroke_rgb = (255, 255, 255)
+
+        place_mask = np.where((safe_core > 0) & (non_chroma > 0), np.uint8(255), np.uint8(0))
+        if not np.any(place_mask):
+            place_mask = safe_core
 
     eys, exs = np.nonzero(erase_bool)
     erased_bb = (int(exs.min()), int(eys.min()), int(exs.max()) + 1, int(eys.max()) + 1) if eys.size else None
-
-    place_mask = np.where((safe_core > 0) & (non_chroma > 0), np.uint8(255), np.uint8(0))
-    if not np.any(place_mask):
-        place_mask = safe_core
 
     # 1. Connected figure-8 double bubble -> flow text cleanly across BOTH lobes!
     if not is_dark and len(trans_text) >= 28:
@@ -1375,10 +1557,11 @@ def _clean_unmarked_open_bubble_and_measure_box_cv2(
     ch_band = sub_bgr_chk.max(axis=2) - sub_bgr_chk.min(axis=2)
     mean_chroma = float(ch_band.mean())
     chroma_ratio = float(np.count_nonzero(ch_band >= 28)) / float(total_px)
-    if mean_chroma >= 18.0 or chroma_ratio >= 0.18:
-        return None
 
+    # Case 1: Dark speech bubble (strictly achromatic uniform dark background + bright text)
     if median_lum < 125.0:
+        if mean_chroma >= 18.0 or chroma_ratio >= 0.18:
+            return None
         s_band = cv2.cvtColor(sub_bgr_chk, cv2.COLOR_BGR2HSV)[:, :, 1]
         if float(s_band.mean()) >= 22.0 or (float(np.count_nonzero(s_band >= 28)) / float(total_px)) >= 0.16:
             return None
@@ -1399,6 +1582,44 @@ def _clean_unmarked_open_bubble_and_measure_box_cv2(
         sc_val = max(0, bg_lum - 20)
         return raw_x1, raw_y1, raw_x2, raw_y2, (250, 250, 250), (sc_val, sc_val, sc_val), (raw_x1, raw_y1, raw_x2, raw_y2)
 
+    is_pastel_open = (mean_chroma >= 18.0 or chroma_ratio >= 0.18)
+
+    # Case 2: Pastel / colored light bubble (`box_2d` fallback for edge-clipped or borderless pastel bubbles)
+    if is_pastel_open:
+        if median_lum < 170.0:
+            return None
+        s_band = cv2.cvtColor(sub_bgr_chk, cv2.COLOR_BGR2HSV)[:, :, 1]
+        mean_s = float(s_band.mean())
+        high_sat_ratio = float(np.count_nonzero(s_band >= 100)) / float(total_px)
+        if mean_s >= 85.0 or high_sat_ratio >= 0.30:
+            return None
+
+        light_bool = sub_g >= 170
+        light_ratio = float(np.count_nonzero(light_bool)) / float(total_px)
+        ink_ratio = float(np.count_nonzero((sub_g < 155) & (ch_band < 36))) / float(total_px)
+        if light_ratio < 0.42 or ink_ratio < 0.010:
+            return None
+        bg_std = float(np.std(sub_bgr_chk[light_bool], axis=0).mean())
+        if bg_std > 32.0:
+            return None
+
+        pad_x, pad_y = 6, 8
+        wx1, wy1 = max(0, raw_x1 - pad_x), max(0, raw_y1 - pad_y)
+        wx2, wy2 = min(width, raw_x2 + pad_x), min(height, raw_y2 + pad_y)
+        sg = base_gray[wy1:wy2, wx1:wx2]
+        s_bgr = img_bgr[wy1:wy2, wx1:wx2]
+        s_sat = cv2.cvtColor(s_bgr, cv2.COLOR_BGR2HSV)[:, :, 1]
+
+        # Build safe pastel zone strictly around bright low-sat bubble pixels (protects vivid exterior art)
+        p_seed = np.where((sg >= 175) & (s_sat < 95), np.uint8(255), np.uint8(0))
+        p_zone = _fast_dilate_mask_cv2(p_seed, kernel_half=5)
+        erase_bool, bg_bgr = _inpaint_pastel_bubble_region_cv2(s_bgr, sg, p_zone)
+        if not np.any(erase_bool):
+            return None
+        stroke_rgb = (bg_bgr[2], bg_bgr[1], bg_bgr[0])
+        return raw_x1, raw_y1, raw_x2, raw_y2, (15, 15, 15), stroke_rgb, (raw_x1, raw_y1, raw_x2, raw_y2)
+
+    # Case 3: Classic white / light achromatic open bubble
     white_ratio = float(np.count_nonzero(sub_g >= 220)) / float(total_px)
     ink_ratio = float(np.count_nonzero(sub_g < 155)) / float(total_px)
     if white_ratio < 0.38 or ink_ratio < 0.010:
