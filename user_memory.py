@@ -161,7 +161,7 @@ async def restore_user_profiles_from_discord(bot: discord.Client):
     if ch:
         try:
             restored = False
-            async for msg in ch.history(limit=15):
+            async for msg in ch.history(limit=30):
                 if msg.author.id == bot.user.id and msg.attachments:
                     for att in msg.attachments:
                         if att.filename == "user_profiles.json":
@@ -198,7 +198,9 @@ async def restore_user_profiles_from_discord(bot: discord.Client):
 async def backup_user_profiles_to_discord(force: bool = False):
     """
     Serialized cloud backup of user_profiles.json to #yukinon-memory (throttled to every 3 mins unless force=True).
-    Protected by `_CLOUD_BACKUP_LOCK` so concurrent edits never delete each other's latest backup!
+    Protected by `_CLOUD_BACKUP_LOCK` so concurrent edits never delete each other's latest backup.
+    Deletes ONLY older `user_profiles.json` backup messages so `/memory` cards and deferred thinking
+    placeholders posted inside `#yukinon-memory` are never deleted (prevents 404 Unknown Message).
     """
     global _DIRTY_SINCE_LAST_BACKUP, _LAST_CLOUD_BACKUP_TS
     if not _DIRTY_SINCE_LAST_BACKUP and not force:
@@ -222,14 +224,18 @@ async def backup_user_profiles_to_discord(force: bool = False):
             _DIRTY_SINCE_LAST_BACKUP = False
             payload_bytes = json.dumps(user_profiles, ensure_ascii=False, indent=2).encode("utf-8")
 
-            # Upload new backup FIRST, then delete older bot backups so memory is never momentarily missing
+            # Upload new backup FIRST, then delete older `user_profiles.json` backup messages only
             new_msg = await ch.send(
                 content=f"💾 **[Yukinon Persistent User Memory Backup]** (`{len(user_profiles)}` users | `{get_current_thai_datetime_str()}`)",
                 file=discord.File(io.BytesIO(payload_bytes), filename="user_profiles.json"),
             )
 
-            async for old_msg in ch.history(limit=12):
-                if old_msg.author.id == bot.user.id and old_msg.id != new_msg.id:
+            async for old_msg in ch.history(limit=25):
+                is_backup_msg = any(
+                    getattr(att, "filename", "") == "user_profiles.json"
+                    for att in (getattr(old_msg, "attachments", None) or [])
+                )
+                if old_msg.author.id == bot.user.id and old_msg.id != new_msg.id and is_backup_msg:
                     try:
                         await old_msg.delete()
                     except Exception:

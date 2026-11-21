@@ -1,4 +1,6 @@
+import io
 import re
+import asyncio
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -6,6 +8,7 @@ import discord
 from discord import app_commands
 
 from config import (
+    ALLOWED_GUILD_IDS,
     ACTIVE_FAST_MODEL,
     ACTIVE_CODE_MODEL,
     IMAGE_EXTENSIONS,
@@ -29,6 +32,9 @@ from media_context import (
     extract_all_context,
     format_code_or_log_attachment,
     extract_image_via_transient_ocr,
+    extract_pdf_context_async,
+    parse_docx_bytes,
+    parse_xlsx_bytes_to_markdown,
 )
 from image_engine import (
     send_chunked_response,
@@ -183,11 +189,23 @@ def get_previous_month_info(now_th: datetime) -> tuple[int, int, str]:
     return y_ce, m_num, f"{THAI_MONTHS[m_num]} พ.ศ. {y_ce + 543}"
 
 
+async def _safe_send_ephemeral_error(interaction: discord.Interaction, err_msg: str) -> None:
+    """Safely delivers an ephemeral Thai error notice regardless of whether the interaction was deferred."""
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(err_msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(err_msg, ephemeral=True)
+    except Exception:
+        pass
+
+
 class AutoDisappearingView(discord.ui.View):
     """
     Base View that automatically removes its buttons from the Discord message
     (or deletes the standalone button footer message) when `timeout` expires,
-    and releases its message references to keep Render 512MB RAM clean.
+    handles unexpected button callback exceptions cleanly, and releases its
+    message references to keep Render 512MB RAM clean.
     """
 
     def __init__(self, timeout: float = 300.0):
@@ -210,25 +228,25 @@ class AutoDisappearingView(discord.ui.View):
         except Exception:
             pass
 
-
-async def _send_safe_interaction_error(interaction: discord.Interaction, err: Exception, context_label: str = ""):
-    """Prevents stuck 'Yukinon is thinking...' states when a deferred interaction raises an error."""
-    api_log(f"Interaction Error ({context_label or 'UI'}) -> {type(err).__name__}: {str(err)[:160]}")
-    err_msg = f"เกิดข้อผิดพลาดระหว่างประมวลผลค่ะ (`{type(err).__name__}`) กรุณาลองใหม่อีกครั้งนะคะ"
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(err_msg, ephemeral=True)
-        else:
-            await interaction.response.send_message(err_msg, ephemeral=True)
-    except Exception:
-        pass
+    async def on_error(
+        self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item
+    ) -> None:
+        api_log(
+            f"UI View Error ({type(self).__name__} / {getattr(item, 'label', type(item).__name__)}) -> "
+            f"{type(error).__name__}: {str(error)[:160]}"
+        )
+        await _safe_send_ephemeral_error(
+            interaction,
+            f"เกิดข้อผิดพลาดระหว่างดำเนินการค่ะ (`{type(error).__name__}`) กรุณาลองใหม่อีกครั้งนะคะ",
+        )
 
 
 async def _deliver_button_followup_cleanly(interaction: discord.Interaction, answer: str) -> None:
     """
     Delivers a button follow-up answer cleanly WITHOUT any extra filler confirmation message:
     - Short answers (<=1900 chars): resolve the deferred interaction directly via `interaction.followup.send(answer)`.
-    - Long/chunked answers (>1900 chars): delete the deferred thinking placeholder silently and post via `send_chunked_response`.
+    - Long/chunked answers (>1900 chars): delete the deferred thinking placeholder silently and post via `send_chunked_response`
+      (or attach as `.md` file if `interaction.channel` is unavailable).
     """
     if not answer or not answer.strip():
         try:
@@ -244,12 +262,21 @@ async def _deliver_button_followup_cleanly(interaction: discord.Interaction, ans
         except Exception:
             pass
 
+    if interaction.channel is not None:
+        try:
+            await interaction.delete_original_response()
+        except Exception:
+            pass
+        await send_chunked_response(interaction.channel, answer)
+        return
+
     try:
-        await interaction.delete_original_response()
+        await interaction.followup.send(
+            content="**คำตอบมีความยาวมาก ฉันแนบเป็นไฟล์ไว้ให้ด้านล่างนะคะ:**",
+            file=discord.File(io.StringIO(answer), filename="output.md"),
+        )
     except Exception:
         pass
-    if interaction.channel is not None:
-        await send_chunked_response(interaction.channel, answer)
 
 
 async def _send_interaction_with_auto_view(
@@ -259,64 +286,79 @@ async def _send_interaction_with_auto_view(
     chunked_header: str = "❄️ ดำเนินการเรียบร้อยแล้วค่ะ:",
     allow_view_on_error: bool = False,
 ):
+    """
+    Resolves a deferred interaction with optional AutoDisappearingView.
+    Falls back cleanly to `interaction.channel.send(...)` if the deferred placeholder
+    was manually deleted or expired (`discord.NotFound` 10008).
+    """
     if not answer or not answer.strip():
         return
     effective_view = view if (allow_view_on_error or not is_failure_or_refusal_reply(answer)) else None
+
     if len(answer) <= 1900:
+        try:
+            if effective_view is not None:
+                sent_msg = await interaction.followup.send(answer, view=effective_view, wait=True)
+                effective_view.message = sent_msg
+                effective_view.delete_message_on_timeout = False
+            else:
+                await interaction.followup.send(answer)
+            return
+        except (discord.NotFound, discord.HTTPException):
+            if interaction.channel is not None:
+                sent_msg = await interaction.channel.send(answer, view=effective_view)
+                if effective_view is not None:
+                    effective_view.message = sent_msg
+                    effective_view.delete_message_on_timeout = False
+                return
+            raise
+
+    if interaction.channel is not None:
+        try:
+            await interaction.followup.send(chunked_header)
+        except Exception:
+            pass
+        await send_chunked_response(interaction.channel, answer)
         if effective_view is not None:
-            sent_msg = await interaction.followup.send(answer, view=effective_view, wait=True)
+            footer_msg = await interaction.channel.send("-# ตัวเลือกดำเนินการเพิ่มเติม:", view=effective_view)
+            effective_view.message = footer_msg
+            effective_view.delete_message_on_timeout = True
+    else:
+        kwargs = {
+            "content": chunked_header,
+            "file": discord.File(io.StringIO(answer), filename="output.md"),
+        }
+        if effective_view is not None:
+            sent_msg = await interaction.followup.send(**kwargs, view=effective_view, wait=True)
             effective_view.message = sent_msg
             effective_view.delete_message_on_timeout = False
         else:
-            await interaction.followup.send(answer)
-    else:
-        await interaction.followup.send(chunked_header)
-        if interaction.channel is not None:
-            await send_chunked_response(interaction.channel, answer)
-            if effective_view is not None:
-                footer_msg = await interaction.channel.send("-# ตัวเลือกดำเนินการเพิ่มเติม:", view=effective_view)
-                effective_view.message = footer_msg
-                effective_view.delete_message_on_timeout = True
+            await interaction.followup.send(**kwargs)
 
 
-async def _edit_deferred_component_or_send(
+async def _safe_edit_or_followup_after_defer(
     interaction: discord.Interaction,
     content: str,
-    view: AutoDisappearingView | None = None,
+    view: AutoDisappearingView | None,
+    allow_view_on_error: bool = False,
 ) -> None:
     """
-    Safely updates a button's parent message AFTER `await interaction.response.defer()`.
-    Handles >1900-char payloads without Discord HTTP 400 and falls back gracefully if the original message vanished (404).
+    Safely updates the original message after `interaction.response.defer()`.
+    Handles >1950-char cards cleanly and falls back to `followup.send` or `channel.send`
+    if the original message was deleted (`404 Unknown Message`).
     """
-    if len(content) <= 1900:
+    if len(content) <= 1950:
         try:
             edited = await interaction.edit_original_response(content=content, view=view)
             if view is not None and hasattr(view, "message"):
                 view.message = edited
-            return
-        except discord.NotFound:
-            pass
-        except Exception:
-            pass
-        try:
-            sent = await interaction.followup.send(content, view=view, wait=True)
-            if view is not None and hasattr(view, "message"):
-                view.message = sent
+                view.delete_message_on_timeout = False
             return
         except Exception:
             pass
-        return
-
-    # Content exceeds 1900 chars: keep button message compact and post full chunked content
-    try:
-        await interaction.edit_original_response(
-            content="❄️ อัปเดตข้อมูลเรียบร้อยแล้วค่ะ (เนื้อหายาว จึงส่งรายละเอียดด้านล่าง):",
-            view=view,
-        )
-    except Exception:
-        pass
-    if interaction.channel is not None:
-        await send_chunked_response(interaction.channel, content)
+    await _send_interaction_with_auto_view(
+        interaction, content, view, allow_view_on_error=allow_view_on_error
+    )
 
 
 # ==============================================================================
@@ -334,40 +376,45 @@ class CodeReviewActionView(AutoDisappearingView):
 
     async def _run_followup(self, interaction: discord.Interaction, followup_instruction: str):
         await interaction.response.defer(thinking=True)
-        try:
-            cached_files = get_cached_channel_attachments(self.channel_id, max_total_chars=45000)
-            composed = (
-                f"{followup_instruction}\n\n"
-                f"### [บริบทคำถามและการวิเคราะห์ก่อนหน้า]:\n"
-                f"คำถามเดิม: {self.original_prompt}\n"
-                f"คำตอบที่วิเคราะห์ไว้: {self.original_answer[:2500]}\n"
-            )
-            if cached_files:
-                composed += f"\n### [ไฟล์โค้ด/Log ที่แนบไว้ในห้องแชท]:\n{cached_files[:35000]}"
+        cached_files = get_cached_channel_attachments(self.channel_id, max_total_chars=45000)
+        composed = (
+            f"{followup_instruction}\n\n"
+            f"### [บริบทคำถามและการวิเคราะห์ก่อนหน้า]:\n"
+            f"คำถามเดิม: {self.original_prompt}\n"
+            f"คำตอบที่วิเคราะห์ไว้: {self.original_answer[:2500]}\n"
+        )
+        if cached_files:
+            composed += f"\n### [ไฟล์โค้ด/Log ที่แนบไว้ในห้องแชท]:\n{cached_files[:35000]}"
 
-            answer, _ = await query_local_ollama_chat(
-                composed,
-                model=ACTIVE_CODE_MODEL,
-                system_prompt=CODE_SYSTEM_PROMPT,
-                channel_id=self.channel_id,
-                temperature=0.2,
-                allow_agentic_search=False,
-                has_fresh_attachment=True,
-                speaker_user=interaction.user,
-                decision_plan={
-                    "route": "code",
-                    "route_confidence": 0.99,
-                    "needs_web_search": False,
-                    "search_confidence": 0.99,
-                    "needs_tool_use": False,
-                    "tool_confidence": 0.90,
-                    "complexity_score": 2.0,
-                    "complexity_confidence": 0.90,
-                },
-            )
-            await _deliver_button_followup_cleanly(interaction, answer)
-        except Exception as e:
-            await _send_safe_interaction_error(interaction, e, "CodeReviewActionView")
+        tool_ctx = ToolExecutionContext(
+            channel_id=self.channel_id,
+            guild=interaction.guild,
+            channel=interaction.channel,
+            speaker_user=interaction.user,
+            mode="code",
+        )
+        answer, _ = await query_local_ollama_chat(
+            composed,
+            model=ACTIVE_CODE_MODEL,
+            system_prompt=CODE_SYSTEM_PROMPT,
+            channel_id=self.channel_id,
+            temperature=0.2,
+            allow_agentic_search=False,
+            has_fresh_attachment=True,
+            speaker_user=interaction.user,
+            decision_plan={
+                "route": "code",
+                "route_confidence": 0.99,
+                "needs_web_search": False,
+                "search_confidence": 0.99,
+                "needs_tool_use": False,
+                "tool_confidence": 0.90,
+                "complexity_score": 2.0,
+                "complexity_confidence": 0.90,
+            },
+            tool_ctx=tool_ctx,
+        )
+        await _deliver_button_followup_cleanly(interaction, answer)
 
     @discord.ui.button(label="Code Map", style=discord.ButtonStyle.primary, emoji="🗺️")
     async def btn_code_map(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -574,27 +621,25 @@ class GeneralAssistantActionView(AutoDisappearingView):
                 "รับทราบค่ะ เดี๋ยวฉันจัดการแปลบทสนทนาในภาพเป็นภาษาไทยให้ รอสักครู่นะคะ",
                 ephemeral=True,
             )
-            try:
-                target_msg = self.source_message
-                if target_msg is None:
-                    class _FallbackLinkMsg:
-                        def __init__(self, q_txt: str, ch, usr):
-                            self.id = 0
-                            self.content = q_txt
-                            self.attachments = []
-                            self.embeds = []
-                            self.reference = None
-                            self.channel = ch
-                            self.author = usr
+            target_msg = self.source_message
+            if target_msg is None:
+                class _FallbackLinkMsg:
+                    def __init__(self, q_txt: str, ch, usr):
+                        self.id = 0
+                        self.content = q_txt
+                        self.attachments = []
+                        self.embeds = []
+                        self.stickers = []
+                        self.reference = None
+                        self.channel = ch
+                        self.author = usr
 
-                        async def reply(self, **kwargs):
-                            return await self.channel.send(**kwargs)
+                    async def reply(self, **kwargs):
+                        return await self.channel.send(**kwargs)
 
-                    target_msg = _FallbackLinkMsg(self.user_query, interaction.channel, interaction.user)
+                target_msg = _FallbackLinkMsg(self.user_query, interaction.channel, interaction.user)
 
-                await process_manga_translation_request(target_msg, "แปลมังงะเป็นภาษาไทย")
-            except Exception as e:
-                await _send_safe_interaction_error(interaction, e, "InBubbleButton")
+            await process_manga_translation_request(target_msg, "แปลมังงะเป็นภาษาไทย")
 
         return _callback
 
@@ -611,59 +656,57 @@ class GeneralAssistantActionView(AutoDisappearingView):
         use_search: bool = True,
     ):
         await interaction.response.defer(thinking=True)
-        try:
-            cached_ctx = get_cached_channel_attachments(self.channel_id, max_total_chars=25000)
+        cached_ctx = get_cached_channel_attachments(self.channel_id, max_total_chars=25000)
 
-            search_hint_tag = ""
-            if use_search:
-                artist_hint = _extract_clean_artist_or_topic_hint(cached_ctx, self.bot_reply)
-                if artist_hint and ("ศิลปิน" in btn_label or "ผลงาน" in btn_label):
-                    search_hint_tag = f"\n[SEARCH_HINT: {artist_hint}]"
+        search_hint_tag = ""
+        if use_search:
+            artist_hint = _extract_clean_artist_or_topic_hint(cached_ctx, self.bot_reply)
+            if artist_hint and ("ศิลปิน" in btn_label or "ผลงาน" in btn_label):
+                search_hint_tag = f"\n[SEARCH_HINT: {artist_hint}]"
 
-            # Deterministic button plan — skips redundant ~350ms Decision-1 `ButtonFollowup` round-trip!
-            dec_plan = {
-                "route": "web_search" if use_search else "chat",
-                "route_confidence": 0.95,
-                "needs_web_search": use_search,
-                "search_confidence": 0.95,
-                "needs_tool_use": use_search,
-                "tool_confidence": 0.95,
-                "complexity_score": 1.6 if use_search else 1.3,
-                "complexity_confidence": 0.90,
-            }
+        # Deterministic button plan — skips redundant ~350ms Decision-1 `ButtonFollowup` round-trip!
+        dec_plan = {
+            "route": "web_search" if use_search else "chat",
+            "route_confidence": 0.95,
+            "needs_web_search": use_search,
+            "search_confidence": 0.95,
+            "needs_tool_use": use_search,
+            "tool_confidence": 0.95,
+            "complexity_score": 1.6 if use_search else 1.3,
+            "complexity_confidence": 0.90,
+        }
 
-            composed = (
-                f"{instruction}{search_hint_tag}\n\n"
-                f"[กฎสำคัญ]: ห้ามคัดลอกหรือเขียนคำตอบเดิมซ้ำ ห้ามสร้างตาราง และห้ามเขียนหัวข้อเมตาของตัวละครเด็ดขาด\n\n"
-                f"[บริบทหัวข้อก่อนหน้า]: {self.user_query}\n"
-                f"[สรุปคำตอบก่อนหน้า (ห้ามเขียนซ้ำ)]: {self.bot_reply[:1500]}"
-            )
-            if cached_ctx:
-                ctx_limit = 18000 if not use_search else 5000
-                composed += f"\n\n[เนื้อหาอ้างอิงจากไฟล์/ลิงก์ในห้องแชท]:\n{cached_ctx[:ctx_limit]}"
+        composed = (
+            f"{instruction}{search_hint_tag}\n\n"
+            f"[กฎสำคัญ]: ห้ามคัดลอกหรือเขียนคำตอบเดิมซ้ำ ห้ามสร้างตาราง และห้ามเขียนหัวข้อเมตาของตัวละครเด็ดขาด\n\n"
+            f"[บริบทหัวข้อก่อนหน้า]: {self.user_query}\n"
+            f"[สรุปคำตอบก่อนหน้า (ห้ามเขียนซ้ำ)]: {self.bot_reply[:1500]}"
+        )
+        if cached_ctx:
+            # Always include compact visual/document context so product/model-kit follow-ups know the exact identified entity
+            ctx_limit = 18000 if not use_search else 5000
+            composed += f"\n\n[เนื้อหาอ้างอิงจากไฟล์/ลิงก์ในห้องแชท]:\n{cached_ctx[:ctx_limit]}"
 
-            tool_ctx = ToolExecutionContext(
-                channel_id=self.channel_id,
-                guild=interaction.guild,
-                channel=interaction.channel,
-                speaker_user=interaction.user,
-                mode="general",
-            )
-            answer, _ = await query_local_ollama_chat(
-                composed,
-                model=ACTIVE_FAST_MODEL,
-                system_prompt=YUKIPEDIA_SYSTEM_PROMPT if use_search else FAST_SYSTEM_PROMPT,
-                channel_id=self.channel_id,
-                temperature=0.45,
-                allow_agentic_search=use_search,
-                has_fresh_attachment=bool(cached_ctx),
-                speaker_user=interaction.user,
-                decision_plan=dec_plan,
-                tool_ctx=tool_ctx,
-            )
-            await _deliver_button_followup_cleanly(interaction, answer)
-        except Exception as e:
-            await _send_safe_interaction_error(interaction, e, "GeneralFollowupButton")
+        tool_ctx = ToolExecutionContext(
+            channel_id=self.channel_id,
+            guild=interaction.guild,
+            channel=interaction.channel,
+            speaker_user=interaction.user,
+            mode="general",
+        )
+        answer, _ = await query_local_ollama_chat(
+            composed,
+            model=ACTIVE_FAST_MODEL,
+            system_prompt=YUKIPEDIA_SYSTEM_PROMPT if use_search else FAST_SYSTEM_PROMPT,
+            channel_id=self.channel_id,
+            temperature=0.45,
+            allow_agentic_search=use_search,
+            has_fresh_attachment=bool(cached_ctx),
+            speaker_user=interaction.user,
+            decision_plan=dec_plan,
+            tool_ctx=tool_ctx,
+        )
+        await _deliver_button_followup_cleanly(interaction, answer)
 
 
 def build_contextual_suggestion_view(
@@ -926,7 +969,7 @@ def build_contextual_suggestion_view(
 # 3. INTERACTIVE PERSISTENT USER MEMORY MODAL & ACTION BUTTONS (5-Field Structured)
 # ==============================================================================
 class MemoryEditModal(discord.ui.Modal, title="แก้ไขความจำถาวร (User Memory)"):
-    # All modal TextInput labels strictly <= 45 chars (Discord API hard limit!)
+    # All modal TextInput labels strictly <= 45 chars (Discord Form Body limit!)
     display_name_input = discord.ui.TextInput(
         label="ชื่อที่แสดงในความจำ (Display Name)",
         placeholder="เช่น Partner (Owner) หรือชื่อเล่น",
@@ -934,14 +977,14 @@ class MemoryEditModal(discord.ui.Modal, title="แก้ไขความจำ
         max_length=36,
     )
     pinned_facts_input = discord.ui.TextInput(
-        label="ข้อมูลสำคัญถาวรที่ปักหมุด (แยกบรรทัดหรือ ;)",
+        label="ข้อมูลถาวรที่ปักหมุด (แยกบรรทัดหรือ ;)",
         style=discord.TextStyle.paragraph,
         placeholder="ข้อมูลถาวรที่ไม่ให้ถูกลบอัตโนมัติ (เช่น สเปคคอม, กาแฟที่ชอบ, งานที่ทำ)",
         required=False,
         max_length=900,
     )
     favorite_topics_input = discord.ui.TextInput(
-        label="หัวข้อที่ชอบ (คั่นด้วยเครื่องหมายจุลภาค ,)",
+        label="หัวข้อที่ชอบ (คั่นด้วยจุลภาค ,)",
         style=discord.TextStyle.paragraph,
         placeholder="เช่น PSO2 NGS, Anime & Manga, Software & Coding",
         required=False,
@@ -966,51 +1009,55 @@ class MemoryEditModal(discord.ui.Modal, title="แก้ไขความจำ
         super().__init__()
         self.target_uid = str(target_uid)
         prof = ensure_user_profile_exists(self.target_uid)
-        # Clamp every default strictly to its TextInput.max_length so Discord never throws HTTP 400
-        self.display_name_input.default = (prof.get("display_name") or "")[:36]
+        # Clamp every default strictly to its TextInput max_length to prevent HTTP 400
+        self.display_name_input.default = str(prof.get("display_name") or "")[:36]
         self.pinned_facts_input.default = "\n".join(prof.get("pinned_facts") or [])[:900]
         self.favorite_topics_input.default = ", ".join(prof.get("favorite_topics") or [])[:400]
         self.custom_notes_input.default = "\n".join(prof.get("custom_notes") or [])[:800]
         self.recent_topics_input.default = "\n".join(prof.get("recent_topics") or [])[:500]
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Defer immediately before cloud backup I/O so Discord's 3-second interaction window never expires!
+        # Explicit thinking=True ensures followup.send() works identically from both Slash and Button modals
         await interaction.response.defer(thinking=True)
-        try:
-            new_disp = self.display_name_input.value.strip()
-            raw_pinned = self.pinned_facts_input.value.strip()
-            raw_favs = self.favorite_topics_input.value.strip()
-            raw_notes = self.custom_notes_input.value.strip()
-            raw_recents = self.recent_topics_input.value.strip()
+        new_disp = self.display_name_input.value.strip()
+        raw_pinned = self.pinned_facts_input.value.strip()
+        raw_favs = self.favorite_topics_input.value.strip()
+        raw_notes = self.custom_notes_input.value.strip()
+        raw_recents = self.recent_topics_input.value.strip()
 
-            new_pinned = [x.strip() for x in re.split(r"[;\n]+", raw_pinned) if x.strip()] if raw_pinned else []
-            new_favs = [x.strip() for x in re.split(r"[,;،\n]+", raw_favs) if x.strip()] if raw_favs else []
-            new_notes = [x.strip() for x in re.split(r"[;\n]+", raw_notes) if x.strip()] if raw_notes else []
-            new_recents = [x.strip() for x in re.split(r"[;\n]+", raw_recents) if x.strip()] if raw_recents else []
+        new_pinned = [x.strip() for x in re.split(r"[;\n]+", raw_pinned) if x.strip()] if raw_pinned else []
+        new_favs = [x.strip() for x in re.split(r"[,;،\n]+", raw_favs) if x.strip()] if raw_favs else []
+        new_notes = [x.strip() for x in re.split(r"[;\n]+", raw_notes) if x.strip()] if raw_notes else []
+        new_recents = [x.strip() for x in re.split(r"[;\n]+", raw_recents) if x.strip()] if raw_recents else []
 
-            await update_user_memory_fields(
-                self.target_uid,
-                display_name=new_disp or None,
-                pinned_facts=new_pinned,
-                favorite_topics=new_favs,
-                custom_notes=new_notes,
-                recent_topics=new_recents,
-            )
+        await update_user_memory_fields(
+            self.target_uid,
+            display_name=new_disp or None,
+            pinned_facts=new_pinned,
+            favorite_topics=new_favs,
+            custom_notes=new_notes,
+            recent_topics=new_recents,
+        )
 
-            card_text = format_user_memory_card(
-                self.target_uid,
-                header_title="บันทึกการแก้ไขความจำถาวร (#yukinon-memory) เรียบร้อยแล้วค่ะ",
-            )
-            view = MemoryActionView(requester_id=interaction.user.id, target_uid=self.target_uid)
-            await _send_interaction_with_auto_view(
-                interaction,
-                card_text,
-                view,
-                chunked_header="❄️ บันทึกการแก้ไขความจำถาวรเรียบร้อยแล้วค่ะ:",
-                allow_view_on_error=True,
-            )
-        except Exception as e:
-            await _send_safe_interaction_error(interaction, e, "MemoryEditModal")
+        card_text = format_user_memory_card(
+            self.target_uid,
+            header_title="บันทึกการแก้ไขความจำถาวร (#yukinon-memory) เรียบร้อยแล้วค่ะ",
+        )
+        view = MemoryActionView(requester_id=interaction.user.id, target_uid=self.target_uid)
+        await _send_interaction_with_auto_view(
+            interaction,
+            card_text,
+            view,
+            chunked_header="❄️ บันทึกการแก้ไขความจำถาวรเรียบร้อยแล้วค่ะ:",
+            allow_view_on_error=True,
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        api_log(f"MemoryEditModal Error -> {type(error).__name__}: {str(error)[:160]}")
+        await _safe_send_ephemeral_error(
+            interaction,
+            f"เกิดข้อผิดพลาดระหว่างบันทึกความจำค่ะ (`{type(error).__name__}`) กรุณาลองใหม่อีกครั้งนะคะ",
+        )
 
 
 class MemoryActionView(AutoDisappearingView):
@@ -1029,41 +1076,35 @@ class MemoryActionView(AutoDisappearingView):
 
     @discord.ui.button(label="แก้ไขความจำ (Edit)", style=discord.ButtonStyle.primary, emoji="✏️")
     async def btn_edit_memory(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            await interaction.response.send_modal(MemoryEditModal(target_uid=self.target_uid))
-        except Exception as e:
-            await _send_safe_interaction_error(interaction, e, "MemoryActionView.edit")
+        await interaction.response.send_modal(MemoryEditModal(target_uid=self.target_uid))
 
     @discord.ui.button(label="ล้างเรื่องล่าสุด", style=discord.ButtonStyle.secondary, emoji="🧹")
     async def btn_clear_recent(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Defer BEFORE Discord cloud backup so 3s token never expires with 404 Unknown Message!
         await interaction.response.defer()
-        try:
-            await update_user_memory_fields(self.target_uid, recent_topics=[])
-            card_text = format_user_memory_card(
-                self.target_uid, header_title="ล้างรายการเรื่องที่คุยล่าสุดเรียบร้อยแล้วค่ะ"
-            )
-            await _edit_deferred_component_or_send(interaction, card_text, view=self)
-        except Exception as e:
-            await _send_safe_interaction_error(interaction, e, "MemoryActionView.clear_recent")
+        await update_user_memory_fields(self.target_uid, recent_topics=[])
+        card_text = format_user_memory_card(
+            self.target_uid, header_title="ล้างรายการเรื่องที่คุยล่าสุดเรียบร้อยแล้วค่ะ"
+        )
+        await _safe_edit_or_followup_after_defer(
+            interaction, card_text, self, allow_view_on_error=True
+        )
 
     @discord.ui.button(label="รีเซ็ตความจำ", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def btn_reset_memory(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        try:
-            await update_user_memory_fields(
-                self.target_uid,
-                pinned_facts=[],
-                favorite_topics=[],
-                custom_notes=[],
-                recent_topics=[],
-            )
-            card_text = format_user_memory_card(
-                self.target_uid, header_title="รีเซ็ตความจำถาวรเรียบร้อยแล้วค่ะ (คงข้อมูล OT ไว้ให้ครบ)"
-            )
-            await _edit_deferred_component_or_send(interaction, card_text, view=self)
-        except Exception as e:
-            await _send_safe_interaction_error(interaction, e, "MemoryActionView.reset")
+        await update_user_memory_fields(
+            self.target_uid,
+            pinned_facts=[],
+            favorite_topics=[],
+            custom_notes=[],
+            recent_topics=[],
+        )
+        card_text = format_user_memory_card(
+            self.target_uid, header_title="รีเซ็ตความจำถาวรเรียบร้อยแล้วค่ะ (คงข้อมูล OT ไว้ให้ครบ)"
+        )
+        await _safe_edit_or_followup_after_defer(
+            interaction, card_text, self, allow_view_on_error=True
+        )
 
 
 def parse_memory_record_metadata(mem_reply_text: str) -> str:
@@ -1098,43 +1139,47 @@ class OTEditModal(discord.ui.Modal, title="แก้ไขรายการบ�
     def __init__(self, default_date: str = "", default_slot: str = "", default_detail: str = ""):
         super().__init__()
         if default_date:
-            self.date_input.default = default_date[:16]
+            self.date_input.default = str(default_date)[:16]
         if default_slot:
-            self.time_input.default = default_slot[:20]
+            self.time_input.default = str(default_slot)[:20]
         if default_detail:
-            self.detail_input.default = default_detail[:300]
+            self.detail_input.default = str(default_detail)[:300]
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True)
-        try:
-            cmd_str = f"จด OT {self.date_input.value.strip()} {self.time_input.value.strip()} {self.detail_input.value.strip()}"
+        cmd_str = f"จด OT {self.date_input.value.strip()} {self.time_input.value.strip()} {self.detail_input.value.strip()}"
 
-            class _ProxyMsg:
-                def __init__(self, inter: discord.Interaction):
-                    self.author = inter.user
-                    self.channel = inter.channel
-                    self.guild = inter.guild
+        class _ProxyMsg:
+            def __init__(self, inter: discord.Interaction):
+                self.author = inter.user
+                self.channel = inter.channel
+                self.guild = inter.guild
 
-            reply = await process_ot_request(_ProxyMsg(interaction), cmd_str)
-            rec_date, rec_slot, rec_detail = parse_ot_record_metadata(reply)
-            view = (
-                OTActionView(
-                    owner_id=interaction.user.id,
-                    record_date=rec_date,
-                    record_slot=rec_slot,
-                    record_detail=rec_detail,
-                )
-                if rec_date and not is_failure_or_refusal_reply(reply)
-                else None
+        reply = await process_ot_request(_ProxyMsg(interaction), cmd_str)
+        rec_date, rec_slot, rec_detail = parse_ot_record_metadata(reply)
+        view = (
+            OTActionView(
+                owner_id=interaction.user.id,
+                record_date=rec_date,
+                record_slot=rec_slot,
+                record_detail=rec_detail,
             )
-            await _send_interaction_with_auto_view(
-                interaction,
-                reply,
-                view,
-                chunked_header="❄️ อัปเดตบันทึกเวลา OT เรียบร้อยแล้วค่ะ:",
-            )
-        except Exception as e:
-            await _send_safe_interaction_error(interaction, e, "OTEditModal")
+            if rec_date and not is_failure_or_refusal_reply(reply)
+            else None
+        )
+        await _send_interaction_with_auto_view(
+            interaction,
+            reply,
+            view,
+            chunked_header="❄️ อัปเดตบันทึกเวลา OT เรียบร้อยแล้วค่ะ:",
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        api_log(f"OTEditModal Error -> {type(error).__name__}: {str(error)[:160]}")
+        await _safe_send_ephemeral_error(
+            interaction,
+            f"เกิดข้อผิดพลาดระหว่างบันทึกรายการ OT ค่ะ (`{type(error).__name__}`) กรุณาลองใหม่อีกครั้งนะคะ",
+        )
 
 
 class OTActionView(AutoDisappearingView):
@@ -1153,66 +1198,63 @@ class OTActionView(AutoDisappearingView):
 
     @discord.ui.button(label="ดูตาราง OT เดือนนี้", style=discord.ButtonStyle.primary, emoji="📊")
     async def btn_monthly_table(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            uid_str = str(interaction.user.id)
-            ot_logs = (user_profiles.get(uid_str) or {}).get("ot_logs") or []
-            now_th = datetime.now(ZoneInfo("Asia/Bangkok"))
-            target_y, target_m = now_th.year, now_th.month
-            if self.record_date:
-                pk = _parse_stored_ot_date(self.record_date)
-                if pk:
-                    target_y, target_m = pk[0], pk[1]
-            summary_md = build_monthly_ot_summary_markdown(ot_logs, target_y, target_m)
-            if len(summary_md) <= 1950:
-                await interaction.response.send_message(summary_md, ephemeral=True)
-            else:
-                await interaction.response.defer(ephemeral=True)
-                chunks = [summary_md[i : i + 1900] for i in range(0, len(summary_md), 1900)]
-                for ch_txt in chunks:
-                    await interaction.followup.send(ch_txt, ephemeral=True)
-        except Exception as e:
-            await _send_safe_interaction_error(interaction, e, "OTActionView.monthly_table")
+        uid_str = str(interaction.user.id)
+        ot_logs = (user_profiles.get(uid_str) or {}).get("ot_logs") or []
+        now_th = datetime.now(ZoneInfo("Asia/Bangkok"))
+        target_y, target_m = now_th.year, now_th.month
+        if self.record_date:
+            pk = _parse_stored_ot_date(self.record_date)
+            if pk:
+                target_y, target_m = pk[0], pk[1]
+        summary_md = build_monthly_ot_summary_markdown(ot_logs, target_y, target_m)
+        if len(summary_md) <= 1950:
+            await interaction.response.send_message(summary_md, ephemeral=True)
+        else:
+            await interaction.response.send_message(
+                content=f"📊 ตาราง OT เดือน `{target_m:02d}/{target_y + 543}` ยาวเกิน 2,000 ตัวอักษร ฉันแนบเป็นไฟล์ไว้ให้นะคะ:",
+                file=discord.File(
+                    io.StringIO(summary_md),
+                    filename=f"ot_summary_{target_m:02d}_{target_y + 543}.md",
+                ),
+                ephemeral=True,
+            )
 
     @discord.ui.button(label="แก้ไขรายการนี้", style=discord.ButtonStyle.secondary, emoji="✏️")
     async def btn_edit_ot(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            await interaction.response.send_modal(
-                OTEditModal(
-                    default_date=self.record_date,
-                    default_slot=self.record_slot,
-                    default_detail=self.record_detail,
-                )
+        await interaction.response.send_modal(
+            OTEditModal(
+                default_date=self.record_date,
+                default_slot=self.record_slot,
+                default_detail=self.record_detail,
             )
-        except Exception as e:
-            await _send_safe_interaction_error(interaction, e, "OTActionView.edit")
+        )
 
     @discord.ui.button(label="ลบรายการนี้", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def btn_delete_ot(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid_str = str(interaction.user.id)
+        prof = user_profiles.get(uid_str)
+        if not prof or not self.record_date:
+            await interaction.response.send_message("ไม่พบข้อมูลรายการที่จะลบค่ะ", ephemeral=True)
+            return
         await interaction.response.defer()
-        try:
-            uid_str = str(interaction.user.id)
-            prof = user_profiles.get(uid_str)
-            if not prof or not self.record_date:
-                await interaction.followup.send("ไม่พบข้อมูลรายการที่จะลบค่ะ", ephemeral=True)
-                return
-            target_key = _parse_stored_ot_date(self.record_date)
-            ot_logs = list(prof.get("ot_logs") or [])
-            new_logs = [e for e in ot_logs if _parse_stored_ot_date(e.get("date", "")) != target_key]
-            if len(new_logs) < len(ot_logs):
-                prof["ot_logs"] = new_logs
-                save_user_profiles_local()
-                await backup_user_profiles_to_discord(force=True)
-                self.stop()
-                self.message = None
-                await _edit_deferred_component_or_send(
-                    interaction,
-                    f"🗑️ ลบรายการบันทึก OT ของวันที่ **`{self.record_date}`** เรียบร้อยแล้วค่ะ",
-                    view=None,
-                )
-            else:
-                await interaction.followup.send(f"ไม่พบรายการวันที่ `{self.record_date}` ในระบบแล้วค่ะ", ephemeral=True)
-        except Exception as e:
-            await _send_safe_interaction_error(interaction, e, "OTActionView.delete")
+        target_key = _parse_stored_ot_date(self.record_date)
+        ot_logs = list(prof.get("ot_logs") or [])
+        new_logs = [e for e in ot_logs if _parse_stored_ot_date(e.get("date", "")) != target_key]
+        if len(new_logs) < len(ot_logs):
+            prof["ot_logs"] = new_logs
+            save_user_profiles_local()
+            await backup_user_profiles_to_discord(force=True)
+            self.stop()
+            self.message = None
+            await _safe_edit_or_followup_after_defer(
+                interaction,
+                f"🗑️ ลบรายการบันทึก OT ของวันที่ **`{self.record_date}`** เรียบร้อยแล้วค่ะ",
+                None,
+            )
+        else:
+            await interaction.followup.send(
+                f"ไม่พบรายการวันที่ `{self.record_date}` ในระบบแล้วค่ะ", ephemeral=True
+            )
 
 
 def parse_ot_record_metadata(ot_reply_text: str) -> tuple[str, str, str]:
@@ -1229,6 +1271,28 @@ def parse_ot_record_metadata(ot_reply_text: str) -> tuple[str, str, str]:
 # 5. NATIVE SLASH COMMANDS & RIGHT-CLICK CONTEXT MENUS
 # ==============================================================================
 def register_app_commands(bot: discord.ext.commands.Bot):
+    async def _verify_allowed_guild_interaction(interaction: discord.Interaction) -> bool:
+        if not ALLOWED_GUILD_IDS or interaction.guild is None or interaction.guild.id in ALLOWED_GUILD_IDS:
+            return True
+        await _safe_send_ephemeral_error(
+            interaction, "This Discord server is not on the bot's authorized allowlist."
+        )
+        return False
+
+    bot.tree.interaction_check = _verify_allowed_guild_interaction
+
+    @bot.tree.error
+    async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+        orig = getattr(error, "original", error)
+        if isinstance(error, app_commands.CheckFailure):
+            return
+        cmd_name = getattr(interaction.command, "name", "unknown")
+        api_log(f"AppCommand Error (/{cmd_name}) -> {type(orig).__name__}: {str(orig)[:180]}")
+        await _safe_send_ephemeral_error(
+            interaction,
+            f"เกิดข้อผิดพลาดระหว่างรันคำสั่ง `/{cmd_name}` ค่ะ (`{type(orig).__name__}`) กรุณาลองใหม่อีกครั้งนะคะ",
+        )
+
     @bot.tree.command(name="memory", description="ดู แก้ไข ปักหมุด หรือรีเซ็ตข้อมูลความจำถาวร (user_profiles.json)")
     @app_commands.describe(
         action="เลือกการทำงานกับความจำถาวร",
@@ -1262,46 +1326,40 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             is_owner=owner_flag,
         )
 
-        # send_modal MUST be the initial response (never defer before send_modal!)
+        # Modals MUST be sent as the immediate initial response (never deferred beforehand)
         if action == "edit_modal":
-            try:
-                await interaction.response.send_modal(MemoryEditModal(target_uid=target_uid))
-            except Exception as e:
-                await _send_safe_interaction_error(interaction, e, "slash_memory.modal")
+            await interaction.response.send_modal(MemoryEditModal(target_uid=target_uid))
             return
 
-        # Defer all non-modal actions so Discord cloud backup I/O never hits the 3-second timeout
         await interaction.response.defer(thinking=True)
-        try:
-            class _ProxyMemMsg:
-                def __init__(self):
-                    self.author = interaction.user
-                    self.channel = interaction.channel
-                    self.guild = interaction.guild
 
-            mention_prefix = f"<@{target_uid}> " if target_uid != str(interaction.user.id) else ""
-            if action == "pin_fact" and value.strip():
-                cmd_str = f"{mention_prefix}ปักหมุดความจำ {value.strip()}"
-            elif action == "add_note" and value.strip():
-                cmd_str = f"{mention_prefix}เพิ่มบันทึก {value.strip()}"
-            elif action == "add_topic" and value.strip():
-                cmd_str = f"{mention_prefix}เพิ่มหัวข้อที่ชอบ {value.strip()}"
-            elif action == "clear_recent":
-                cmd_str = f"{mention_prefix}ล้างเรื่องล่าสุด"
-            else:
-                cmd_str = f"{mention_prefix}ดูความจำ"
+        class _ProxyMemMsg:
+            def __init__(self):
+                self.author = interaction.user
+                self.channel = interaction.channel
+                self.guild = interaction.guild
 
-            reply, resolved_uid = await process_memory_request(_ProxyMemMsg(), cmd_str)
-            view = MemoryActionView(requester_id=interaction.user.id, target_uid=resolved_uid)
-            await _send_interaction_with_auto_view(
-                interaction,
-                reply,
-                view,
-                chunked_header="❄️ ข้อมูลความจำถาวรพร้อมแล้วค่ะ:",
-                allow_view_on_error=True,
-            )
-        except Exception as e:
-            await _send_safe_interaction_error(interaction, e, "slash_memory")
+        mention_prefix = f"<@{target_uid}> " if target_uid != str(interaction.user.id) else ""
+        if action == "pin_fact" and value.strip():
+            cmd_str = f"{mention_prefix}ปักหมุดความจำ {value.strip()}"
+        elif action == "add_note" and value.strip():
+            cmd_str = f"{mention_prefix}เพิ่มบันทึก {value.strip()}"
+        elif action == "add_topic" and value.strip():
+            cmd_str = f"{mention_prefix}เพิ่มหัวข้อที่ชอบ {value.strip()}"
+        elif action == "clear_recent":
+            cmd_str = f"{mention_prefix}ล้างเรื่องล่าสุด"
+        else:
+            cmd_str = f"{mention_prefix}ดูความจำ"
+
+        reply, resolved_uid = await process_memory_request(_ProxyMemMsg(), cmd_str)
+        view = MemoryActionView(requester_id=interaction.user.id, target_uid=resolved_uid)
+        await _send_interaction_with_auto_view(
+            interaction,
+            reply,
+            view,
+            chunked_header="❄️ ข้อมูลความจำถาวรพร้อมแล้วค่ะ:",
+            allow_view_on_error=True,
+        )
 
     @bot.tree.command(name="code", description="วิเคราะห์โค้ด, Stack Trace, SQL หรือ Manifest ตามมาตรฐาน Enterprise")
     @app_commands.describe(
@@ -1325,64 +1383,70 @@ def register_app_commands(bot: discord.ext.commands.Bot):
         attachment: discord.Attachment | None = None,
     ):
         await interaction.response.defer(thinking=True)
-        try:
-            focus_notes = {
-                "java_spring": "[Focus: Java 17/21, Maven pom.xml, Spring Boot, @Transactional, JPA/Hibernate N+1, and Exception Handling]",
-                "oracle_sql": "[Focus: Oracle SQL, ORA- errors, Execution Plan, Foreign Key Indexes, Bind Variables, and PL/SQL Packages]",
-                "node_react": "[Focus: Node.js Async/Event Loop, React Hooks/State, TypeScript, and Bootstrap 5 Grid/Utility best practices]",
-                "docker_k8s": "[Focus: Multi-stage Dockerfile security, Kubernetes Probes/Resources, OOMKilled/CrashLoopBackOff, and Microservices/RabbitMQ]",
-            }
-            prefix = f"{focus_notes[focus]}\n" if focus in focus_notes else ""
+        focus_notes = {
+            "java_spring": "[Focus: Java 17/21, Maven pom.xml, Spring Boot, @Transactional, JPA/Hibernate N+1, and Exception Handling]",
+            "oracle_sql": "[Focus: Oracle SQL, ORA- errors, Execution Plan, Foreign Key Indexes, Bind Variables, and PL/SQL Packages]",
+            "node_react": "[Focus: Node.js Async/Event Loop, React Hooks/State, TypeScript, and Bootstrap 5 Grid/Utility best practices]",
+            "docker_k8s": "[Focus: Multi-stage Dockerfile security, Kubernetes Probes/Resources, OOMKilled/CrashLoopBackOff, and Microservices/RabbitMQ]",
+        }
+        prefix = f"{focus_notes[focus]}\n" if focus in focus_notes else ""
 
-            att_block = ""
-            if attachment is not None:
-                if attachment.size > 25 * 1024 * 1024:
-                    size_mb = round(attachment.size / (1024 * 1024), 2)
-                    await interaction.followup.send(
-                        f"ไฟล์ `{attachment.filename}` มีขนาด {size_mb} MB ซึ่งเกินขีดจำกัด 25 MB ของระบบค่ะ กรุณาตัดแบ่งไฟล์หรือส่งเฉพาะส่วนที่เกิดปัญหานะคะ",
-                        ephemeral=True,
-                    )
-                    return
-                raw_b = await attachment.read()
-                fname = attachment.filename.lower()
-                if fname.endswith(IMAGE_EXTENSIONS):
-                    ocr_out = await extract_image_via_transient_ocr(raw_b, attachment.filename, run_source_lookup=False)
-                    att_block = f"\n\n=== Attached Screenshot OCR (`{attachment.filename}`) ===\n{ocr_out}"
-                else:
-                    decoded = raw_b.decode("utf-8", errors="replace")
-                    formatted = format_code_or_log_attachment(decoded, is_log=fname.endswith(".log"))
-                    att_block = f"\n\n=== Attached File: `{attachment.filename}` ===\n```\n{formatted}\n```"
+        att_block = ""
+        if attachment is not None:
+            if attachment.size > 25 * 1024 * 1024:
+                size_mb = round(attachment.size / (1024 * 1024), 2)
+                await interaction.followup.send(
+                    f"ไฟล์ `{attachment.filename}` มีขนาด `{size_mb} MB` เกินขีดจำกัด `25 MB` ค่ะ กรุณาแบ่งไฟล์หรือตัดเฉพาะส่วนที่เกี่ยวข้องส่งมานะคะ",
+                    ephemeral=True,
+                )
+                return
+            raw_b = await attachment.read()
+            fname = attachment.filename.lower()
+            if fname.endswith(IMAGE_EXTENSIONS):
+                ocr_out = await extract_image_via_transient_ocr(raw_b, attachment.filename, run_source_lookup=False)
+                att_block = f"\n\n=== Attached Screenshot OCR (`{attachment.filename}`) ===\n{ocr_out}"
+            elif fname.endswith(".pdf"):
+                pdf_block, _ = await extract_pdf_context_async(raw_b, attachment.filename)
+                att_block = f"\n\n{pdf_block}"
+            elif fname.endswith(".docx"):
+                doc_txt = await asyncio.to_thread(parse_docx_bytes, raw_b)
+                att_block = f"\n\n=== Attached Word Document: `{attachment.filename}` ===\n{doc_txt}"
+            elif fname.endswith(".xlsx"):
+                xls_txt = await asyncio.to_thread(parse_xlsx_bytes_to_markdown, raw_b)
+                att_block = f"\n\n=== Attached Excel: `{attachment.filename}` ===\n{xls_txt}"
+            else:
+                decoded = raw_b.decode("utf-8", errors="replace")
+                formatted = format_code_or_log_attachment(decoded, is_log=fname.endswith(".log"))
+                att_block = f"\n\n=== Attached File: `{attachment.filename}` ===\n```\n{formatted}\n```"
 
-            full_prompt = f"{prefix}{prompt}{att_block}"
-            tool_ctx = ToolExecutionContext(
-                channel_id=interaction.channel_id,
-                guild=interaction.guild,
-                channel=interaction.channel,
-                speaker_user=interaction.user,
-                mode="code",
-            )
-            answer, _ = await query_local_ollama_chat(
-                full_prompt,
-                model=ACTIVE_CODE_MODEL,
-                system_prompt=CODE_SYSTEM_PROMPT,
-                channel_id=interaction.channel_id,
-                temperature=0.2,
-                allow_agentic_search=False,
-                has_fresh_attachment=bool(att_block),
-                speaker_user=interaction.user,
-                decision_plan={"route": "code", "route_confidence": 0.99, "needs_web_search": False, "search_confidence": 0.99},
-                tool_ctx=tool_ctx,
-            )
-            view = (
-                CodeReviewActionView(interaction.user.id, interaction.channel_id, prompt, answer)
-                if should_attach_interactive_view(prompt, answer, use_coder=True, extracted_ctx=att_block)
-                else None
-            )
-            await _send_interaction_with_auto_view(
-                interaction, answer, view, chunked_header="❄️ ผลการวิเคราะห์เสร็จสมบูรณ์แล้วค่ะ:"
-            )
-        except Exception as e:
-            await _send_safe_interaction_error(interaction, e, "slash_code")
+        full_prompt = f"{prefix}{prompt}{att_block}"
+        tool_ctx = ToolExecutionContext(
+            channel_id=interaction.channel_id,
+            guild=interaction.guild,
+            channel=interaction.channel,
+            speaker_user=interaction.user,
+            mode="code",
+        )
+        answer, _ = await query_local_ollama_chat(
+            full_prompt,
+            model=ACTIVE_CODE_MODEL,
+            system_prompt=CODE_SYSTEM_PROMPT,
+            channel_id=interaction.channel_id,
+            temperature=0.2,
+            allow_agentic_search=False,
+            has_fresh_attachment=bool(att_block),
+            speaker_user=interaction.user,
+            decision_plan={"route": "code", "route_confidence": 0.99, "needs_web_search": False, "search_confidence": 0.99},
+            tool_ctx=tool_ctx,
+        )
+        view = (
+            CodeReviewActionView(interaction.user.id, interaction.channel_id, prompt, answer)
+            if should_attach_interactive_view(prompt, answer, use_coder=True, extracted_ctx=att_block)
+            else None
+        )
+        await _send_interaction_with_auto_view(
+            interaction, answer, view, chunked_header="❄️ ผลการวิเคราะห์เสร็จสมบูรณ์แล้วค่ะ:"
+        )
 
     @bot.tree.command(name="ot", description="บันทึกเวลาทำ OT, แก้ไข, ลบ หรือดูตารางสรุปรายเดือน")
     @app_commands.describe(
@@ -1407,84 +1471,77 @@ def register_app_commands(bot: discord.ext.commands.Bot):
         date: str = "",
         time_range: str = "",
     ):
-        # Defer immediately so Discord cloud backup I/O & long monthly tables never fail
         await interaction.response.defer(thinking=True)
-        try:
-            now_th = datetime.now(ZoneInfo("Asia/Bangkok"))
-            if action == "summary":
-                cmd_text = f"สรุป OT {date}".strip()
-            elif action == "prev_summary":
-                py, pm, _ = get_previous_month_info(now_th)
-                cmd_text = f"สรุป OT {pm:02d}/{py + 543}"
-            elif action == "delete":
-                cmd_text = f"ลบ OT {date}".strip()
-            elif action == "edit":
-                cmd_text = f"แก้ OT {date} {detail}".strip()
-            else:
-                parts = ["จด OT", date.strip(), time_range.strip(), detail.strip()]
-                cmd_text = " ".join(p for p in parts if p)
+        now_th = datetime.now(ZoneInfo("Asia/Bangkok"))
+        if action == "summary":
+            cmd_text = f"สรุป OT {date}".strip()
+        elif action == "prev_summary":
+            py, pm, _ = get_previous_month_info(now_th)
+            cmd_text = f"สรุป OT {pm:02d}/{py + 543}"
+        elif action == "delete":
+            cmd_text = f"ลบ OT {date}".strip()
+        elif action == "edit":
+            cmd_text = f"แก้ OT {date} {detail}".strip()
+        else:
+            parts = ["จด OT", date.strip(), time_range.strip(), detail.strip()]
+            cmd_text = " ".join(p for p in parts if p)
 
-            class _ProxyMsg:
-                def __init__(self, inter: discord.Interaction):
-                    self.author = inter.user
-                    self.channel = inter.channel
-                    self.guild = inter.guild
+        class _ProxyMsg:
+            def __init__(self, inter: discord.Interaction):
+                self.author = inter.user
+                self.channel = inter.channel
+                self.guild = inter.guild
 
-            reply = await process_ot_request(_ProxyMsg(interaction), cmd_text)
-            rec_date, rec_slot, rec_detail = parse_ot_record_metadata(reply)
-            view = (
-                OTActionView(interaction.user.id, rec_date, rec_slot, rec_detail)
-                if rec_date and not is_failure_or_refusal_reply(reply)
-                else None
-            )
-            await _send_interaction_with_auto_view(
-                interaction,
-                reply,
-                view,
-                chunked_header="❄️ ข้อมูลสรุปเวลา OT พร้อมแล้วค่ะ:",
-            )
-        except Exception as e:
-            await _send_safe_interaction_error(interaction, e, "slash_ot")
+        reply = await process_ot_request(_ProxyMsg(interaction), cmd_text)
+        rec_date, rec_slot, rec_detail = parse_ot_record_metadata(reply)
+        view = (
+            OTActionView(interaction.user.id, rec_date, rec_slot, rec_detail)
+            if rec_date and not is_failure_or_refusal_reply(reply)
+            else None
+        )
+        await _send_interaction_with_auto_view(
+            interaction,
+            reply,
+            view,
+            chunked_header="❄️ ข้อมูลสรุปเวลา OT พร้อมแล้วค่ะ:",
+        )
 
     @bot.tree.command(name="yukipedia", description="ค้นหาข้อมูลเรียลไทม์ วิเคราะห์ข่าว เกม อนิเมะ หรือสรุปหัวข้อพร้อมปุ่มแนะนำ")
     @app_commands.describe(query="หัวข้อหรือคำถามที่ต้องการให้ Yukipedia ค้นหาและวิเคราะห์")
     async def slash_yukipedia(interaction: discord.Interaction, query: str):
         await interaction.response.defer(thinking=True)
-        try:
-            dec_plan = await orchestrate_message_with_decision_1(
-                query,
-                purpose="SlashYukipedia",
-                channel_id=interaction.channel_id,
-            )
-            tool_ctx = ToolExecutionContext(
-                channel_id=interaction.channel_id,
-                guild=interaction.guild,
-                channel=interaction.channel,
-                speaker_user=interaction.user,
-                mode="general",
-            )
-            answer, did_search = await query_local_ollama_chat(
-                query,
-                model=ACTIVE_FAST_MODEL,
-                system_prompt=YUKIPEDIA_SYSTEM_PROMPT,
-                channel_id=interaction.channel_id,
-                temperature=0.3,
-                allow_agentic_search=True,
-                has_fresh_attachment=False,
-                speaker_user=interaction.user,
-                decision_plan=dec_plan,
-                tool_ctx=tool_ctx,
-            )
-            view = (
-                build_contextual_suggestion_view(interaction.channel_id, query, answer, decision_plan=dec_plan)
-                if should_attach_interactive_view(query, answer, did_search=did_search, decision_plan=dec_plan)
-                else None
-            )
-            await _send_interaction_with_auto_view(
-                interaction, answer, view, chunked_header="❄️ ข้อมูลจาก Yukipedia พร้อมแล้วค่ะ:"
-            )
-        except Exception as e:
-            await _send_safe_interaction_error(interaction, e, "slash_yukipedia")
+        dec_plan = await orchestrate_message_with_decision_1(
+            query,
+            purpose="SlashYukipedia",
+            channel_id=interaction.channel_id,
+        )
+        tool_ctx = ToolExecutionContext(
+            channel_id=interaction.channel_id,
+            guild=interaction.guild,
+            channel=interaction.channel,
+            speaker_user=interaction.user,
+            mode="general",
+        )
+        answer, did_search = await query_local_ollama_chat(
+            query,
+            model=ACTIVE_FAST_MODEL,
+            system_prompt=YUKIPEDIA_SYSTEM_PROMPT,
+            channel_id=interaction.channel_id,
+            temperature=0.3,
+            allow_agentic_search=True,
+            has_fresh_attachment=False,
+            speaker_user=interaction.user,
+            decision_plan=dec_plan,
+            tool_ctx=tool_ctx,
+        )
+        view = (
+            build_contextual_suggestion_view(interaction.channel_id, query, answer, decision_plan=dec_plan)
+            if should_attach_interactive_view(query, answer, did_search=did_search, decision_plan=dec_plan)
+            else None
+        )
+        await _send_interaction_with_auto_view(
+            interaction, answer, view, chunked_header="❄️ ข้อมูลจาก Yukipedia พร้อมแล้วค่ะ:"
+        )
 
     @bot.tree.command(name="source", description="หาที่มาของรูปภาพ, งานวาด, อนิเมะ หรือโพสต์จากไฟล์แนบหรือลิงก์ (X/Pixiv/Embed)")
     @app_commands.describe(
@@ -1506,72 +1563,70 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             return
 
         await interaction.response.defer(thinking=True)
-        try:
-            class _FakeSourceMsg:
-                def __init__(self):
-                    self.id = 0
-                    self.content = link.strip()
-                    self.attachments = [attachment] if attachment is not None else []
-                    self.embeds = []
-                    self.stickers = []
-                    self.reference = None
-                    self.channel = interaction.channel
-                    self.author = interaction.user
 
-                async def reply(self, **kwargs):
-                    return await interaction.channel.send(**kwargs)
+        class _FakeSourceMsg:
+            def __init__(self):
+                self.id = 0
+                self.content = link.strip()
+                self.attachments = [attachment] if attachment is not None else []
+                self.embeds = []
+                self.stickers = []
+                self.reference = None
+                self.channel = interaction.channel
+                self.author = interaction.user
 
-            fake_msg = _FakeSourceMsg()
-            extracted_ctx, _ = await extract_all_context(fake_msg)
-            dec_plan = await orchestrate_message_with_decision_1(
-                question.strip() or link.strip(),
+            async def reply(self, **kwargs):
+                return await interaction.channel.send(**kwargs)
+
+        fake_msg = _FakeSourceMsg()
+        extracted_ctx, _ = await extract_all_context(fake_msg)
+        dec_plan = await orchestrate_message_with_decision_1(
+            question.strip() or link.strip(),
+            extracted_ctx=extracted_ctx,
+            purpose="SlashSource",
+            channel_id=interaction.channel_id,
+        )
+        user_q = question.strip() or (
+            "ช่วยระบุที่มาของภาพและลิงก์นี้อย่างละเอียด: "
+            "หากเป็นภาพวาด/อนิเมะ/มังงะ ให้บอกชื่อเรื่อง ชื่อตัวละคร ตอนที่/Chapter ชื่อผู้วาด และแนบลิงก์ที่มา (เช่น Pixiv/X/MyAnimeList) ถ้ามี "
+            "หากเป็นภาพถ่ายสิ่งของหรืออุปกรณ์ ให้ระบุยี่ห้อ รุ่น และรายละเอียดสำคัญของสิ่งนั้นค่ะ"
+        )
+        tool_ctx = ToolExecutionContext(
+            channel_id=interaction.channel_id,
+            guild=interaction.guild,
+            channel=interaction.channel,
+            speaker_user=interaction.user,
+            mode="general",
+        )
+        answer, did_search = await query_local_ollama_chat(
+            f"{user_q}\n\n{extracted_ctx}",
+            model=ACTIVE_FAST_MODEL,
+            system_prompt=FAST_SYSTEM_PROMPT,
+            channel_id=interaction.channel_id,
+            temperature=0.2,
+            allow_agentic_search=True,
+            has_fresh_attachment=True,
+            speaker_user=interaction.user,
+            decision_plan=dec_plan,
+            tool_ctx=tool_ctx,
+        )
+        view = (
+            build_contextual_suggestion_view(
+                interaction.channel_id,
+                link.strip() or user_q,
+                answer,
                 extracted_ctx=extracted_ctx,
-                purpose="SlashSource",
-                channel_id=interaction.channel_id,
-            )
-            user_q = question.strip() or (
-                "ช่วยระบุที่มาของภาพและลิงก์นี้อย่างละเอียด: "
-                "หากเป็นภาพวาด/อนิเมะ/มังงะ ให้บอกชื่อเรื่อง ชื่อตัวละคร ตอนที่/Chapter ชื่อผู้วาด และแนบลิงก์ที่มา (เช่น Pixiv/X/MyAnimeList) ถ้ามี "
-                "หากเป็นภาพถ่ายสิ่งของหรืออุปกรณ์ ให้ระบุยี่ห้อ รุ่น และรายละเอียดสำคัญของสิ่งนั้นค่ะ"
-            )
-            tool_ctx = ToolExecutionContext(
-                channel_id=interaction.channel_id,
-                guild=interaction.guild,
-                channel=interaction.channel,
-                speaker_user=interaction.user,
-                mode="general",
-            )
-            answer, did_search = await query_local_ollama_chat(
-                f"{user_q}\n\n{extracted_ctx}",
-                model=ACTIVE_FAST_MODEL,
-                system_prompt=FAST_SYSTEM_PROMPT,
-                channel_id=interaction.channel_id,
-                temperature=0.2,
-                allow_agentic_search=True,
-                has_fresh_attachment=True,
-                speaker_user=interaction.user,
+                source_message=fake_msg,
                 decision_plan=dec_plan,
-                tool_ctx=tool_ctx,
             )
-            view = (
-                build_contextual_suggestion_view(
-                    interaction.channel_id,
-                    link.strip() or user_q,
-                    answer,
-                    extracted_ctx=extracted_ctx,
-                    source_message=fake_msg,
-                    decision_plan=dec_plan,
-                )
-                if should_attach_interactive_view(
-                    user_q, answer, did_search=did_search, extracted_ctx=extracted_ctx, decision_plan=dec_plan
-                )
-                else None
+            if should_attach_interactive_view(
+                user_q, answer, did_search=did_search, extracted_ctx=extracted_ctx, decision_plan=dec_plan
             )
-            await _send_interaction_with_auto_view(
-                interaction, answer, view, chunked_header="❄️ ตรวจสอบที่มาเรียบร้อยแล้วค่ะ:"
-            )
-        except Exception as e:
-            await _send_safe_interaction_error(interaction, e, "slash_source")
+            else None
+        )
+        await _send_interaction_with_auto_view(
+            interaction, answer, view, chunked_header="❄️ ตรวจสอบที่มาเรียบร้อยแล้วค่ะ:"
+        )
 
     @bot.tree.command(name="manga", description="แปลหน้ามังงะในช่องคำพูดพร้อมฝังคำแปลลงในภาพ (รองรับไฟล์แนบและลิงก์ X/Pixiv)")
     @app_commands.describe(
@@ -1604,184 +1659,173 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             ephemeral=True,
         )
 
-        try:
-            class _FakeMangaMsg:
-                def __init__(self):
-                    self.id = 0
-                    self.content = link.strip()
-                    self.attachments = [attachment] if attachment is not None else []
-                    self.embeds = []
-                    self.reference = None
-                    self.channel = interaction.channel
-                    self.author = interaction.user
+        class _FakeMangaMsg:
+            def __init__(self):
+                self.id = 0
+                self.content = link.strip()
+                self.attachments = [attachment] if attachment is not None else []
+                self.embeds = []
+                self.stickers = []
+                self.reference = None
+                self.channel = interaction.channel
+                self.author = interaction.user
 
-                async def reply(self, **kwargs):
-                    return await interaction.channel.send(**kwargs)
+            async def reply(self, **kwargs):
+                return await interaction.channel.send(**kwargs)
 
-            class _FakeCtx:
-                def __init__(self):
-                    self.message = _FakeMangaMsg()
-                    self.channel = interaction.channel
+        class _FakeCtx:
+            def __init__(self):
+                self.message = _FakeMangaMsg()
+                self.channel = interaction.channel
 
-            await process_manga_translation_request(_FakeCtx(), f"translate manga to {language}")
-        except Exception as e:
-            await _send_safe_interaction_error(interaction, e, "slash_manga")
+        await process_manga_translation_request(_FakeCtx(), f"translate manga to {language}")
 
     # --- Right-Click Message Context Menus (5 max per Discord app) ---
     @bot.tree.context_menu(name="Analyze Code / Stack Trace")
     async def ctx_analyze_code(interaction: discord.Interaction, message: discord.Message):
         await interaction.response.defer(thinking=True)
-        try:
-            extracted_ctx, _ = await extract_all_context(message)
-            base_text = message.content.strip() or "ช่วยตรวจสอบโค้ดหรือ Stack Trace ในข้อความนี้และระบุ Root Cause พร้อมวิธีแก้ไข"
-            full_prompt = f"{base_text}\n\n{extracted_ctx}" if extracted_ctx else base_text
+        extracted_ctx, _ = await extract_all_context(message)
+        base_text = message.content.strip() or "ช่วยตรวจสอบโค้ดหรือ Stack Trace ในข้อความนี้และระบุ Root Cause พร้อมวิธีแก้ไข"
+        full_prompt = f"{base_text}\n\n{extracted_ctx}" if extracted_ctx else base_text
 
-            tool_ctx = ToolExecutionContext(
-                channel_id=interaction.channel_id,
-                guild=interaction.guild,
-                channel=interaction.channel,
-                speaker_user=interaction.user,
-                message=message,
-                mode="code",
-            )
-            answer, _ = await query_local_ollama_chat(
-                full_prompt,
-                model=ACTIVE_CODE_MODEL,
-                system_prompt=CODE_SYSTEM_PROMPT,
-                channel_id=interaction.channel_id,
-                temperature=0.2,
-                allow_agentic_search=False,
-                has_fresh_attachment=bool(extracted_ctx),
-                speaker_user=interaction.user,
-                decision_plan={"route": "code", "route_confidence": 0.99, "needs_web_search": False, "search_confidence": 0.99},
-                tool_ctx=tool_ctx,
-            )
-            view = (
-                CodeReviewActionView(interaction.user.id, interaction.channel_id, base_text, answer)
-                if should_attach_interactive_view(base_text, answer, use_coder=True, extracted_ctx=extracted_ctx)
-                else None
-            )
-            await _send_interaction_with_auto_view(
-                interaction, answer, view, chunked_header="❄️ วิเคราะห์โค้ด/Stack Trace เรียบร้อยแล้วค่ะ:"
-            )
-        except Exception as e:
-            await _send_safe_interaction_error(interaction, e, "ctx_analyze_code")
+        tool_ctx = ToolExecutionContext(
+            channel_id=interaction.channel_id,
+            guild=interaction.guild,
+            channel=interaction.channel,
+            speaker_user=interaction.user,
+            message=message,
+            mode="code",
+        )
+        answer, _ = await query_local_ollama_chat(
+            full_prompt,
+            model=ACTIVE_CODE_MODEL,
+            system_prompt=CODE_SYSTEM_PROMPT,
+            channel_id=interaction.channel_id,
+            temperature=0.2,
+            allow_agentic_search=False,
+            has_fresh_attachment=bool(extracted_ctx),
+            speaker_user=interaction.user,
+            decision_plan={"route": "code", "route_confidence": 0.99, "needs_web_search": False, "search_confidence": 0.99},
+            tool_ctx=tool_ctx,
+        )
+        view = (
+            CodeReviewActionView(interaction.user.id, interaction.channel_id, base_text, answer)
+            if should_attach_interactive_view(base_text, answer, use_coder=True, extracted_ctx=extracted_ctx)
+            else None
+        )
+        await _send_interaction_with_auto_view(
+            interaction, answer, view, chunked_header="❄️ วิเคราะห์โค้ด/Stack Trace เรียบร้อยแล้วค่ะ:"
+        )
 
     @bot.tree.context_menu(name="Yukipedia Fact-Check / Summary")
     async def ctx_yukipedia_summary(interaction: discord.Interaction, message: discord.Message):
         await interaction.response.defer(thinking=True)
-        try:
-            extracted_ctx, _ = await extract_all_context(message)
-            base_text = message.content.strip() or "ช่วยตรวจสอบข้อเท็จจริงและสรุปเนื้อหาในข้อความนี้ให้หน่อย"
-            dec_plan = await orchestrate_message_with_decision_1(
-                base_text,
-                extracted_ctx=extracted_ctx,
-                purpose="CtxYukipedia",
-                channel_id=interaction.channel_id,
-            )
-            full_prompt = f"{base_text}\n\n{extracted_ctx}" if extracted_ctx else base_text
+        extracted_ctx, _ = await extract_all_context(message)
+        base_text = message.content.strip() or "ช่วยตรวจสอบข้อเท็จจริงและสรุปเนื้อหาในข้อความนี้ให้หน่อย"
+        dec_plan = await orchestrate_message_with_decision_1(
+            base_text,
+            extracted_ctx=extracted_ctx,
+            purpose="CtxYukipedia",
+            channel_id=interaction.channel_id,
+        )
+        full_prompt = f"{base_text}\n\n{extracted_ctx}" if extracted_ctx else base_text
 
-            tool_ctx = ToolExecutionContext(
-                channel_id=interaction.channel_id,
-                guild=interaction.guild,
-                channel=interaction.channel,
-                speaker_user=interaction.user,
-                message=message,
-                mode="general",
-            )
-            answer, did_search = await query_local_ollama_chat(
-                full_prompt,
-                model=ACTIVE_FAST_MODEL,
-                system_prompt=YUKIPEDIA_SYSTEM_PROMPT,
-                channel_id=interaction.channel_id,
-                temperature=0.3,
-                allow_agentic_search=True,
-                has_fresh_attachment=bool(extracted_ctx),
-                speaker_user=interaction.user,
+        tool_ctx = ToolExecutionContext(
+            channel_id=interaction.channel_id,
+            guild=interaction.guild,
+            channel=interaction.channel,
+            speaker_user=interaction.user,
+            message=message,
+            mode="general",
+        )
+        answer, did_search = await query_local_ollama_chat(
+            full_prompt,
+            model=ACTIVE_FAST_MODEL,
+            system_prompt=YUKIPEDIA_SYSTEM_PROMPT,
+            channel_id=interaction.channel_id,
+            temperature=0.3,
+            allow_agentic_search=True,
+            has_fresh_attachment=bool(extracted_ctx),
+            speaker_user=interaction.user,
+            decision_plan=dec_plan,
+            tool_ctx=tool_ctx,
+        )
+        view = (
+            build_contextual_suggestion_view(
+                interaction.channel_id,
+                base_text,
+                answer,
+                extracted_ctx=extracted_ctx,
+                source_message=message,
                 decision_plan=dec_plan,
-                tool_ctx=tool_ctx,
             )
-            view = (
-                build_contextual_suggestion_view(
-                    interaction.channel_id,
-                    base_text,
-                    answer,
-                    extracted_ctx=extracted_ctx,
-                    source_message=message,
-                    decision_plan=dec_plan,
-                )
-                if should_attach_interactive_view(
-                    base_text, answer, did_search=did_search, extracted_ctx=extracted_ctx, decision_plan=dec_plan
-                )
-                else None
+            if should_attach_interactive_view(
+                base_text, answer, did_search=did_search, extracted_ctx=extracted_ctx, decision_plan=dec_plan
             )
-            await _send_interaction_with_auto_view(
-                interaction, answer, view, chunked_header="❄️ ตรวจสอบและสรุปข้อมูลเรียบร้อยแล้วค่ะ:"
-            )
-        except Exception as e:
-            await _send_safe_interaction_error(interaction, e, "ctx_yukipedia_summary")
+            else None
+        )
+        await _send_interaction_with_auto_view(
+            interaction, answer, view, chunked_header="❄️ ตรวจสอบและสรุปข้อมูลเรียบร้อยแล้วค่ะ:"
+        )
 
     @bot.tree.context_menu(name="Find Image / Link Source")
     async def ctx_find_source(interaction: discord.Interaction, message: discord.Message):
         await interaction.response.defer(thinking=True)
-        try:
-            extracted_ctx, _ = await extract_all_context(message)
-            if not has_valid_extracted_context(extracted_ctx):
-                await interaction.followup.send(
-                    "ไม่พบรูปภาพหรือลิงก์ที่สามารถตรวจสอบที่มาได้ในข้อความนี้ค่ะ",
-                    ephemeral=True,
-                )
-                return
-            dec_plan = await orchestrate_message_with_decision_1(
-                message.content or "",
+        extracted_ctx, _ = await extract_all_context(message)
+        if not has_valid_extracted_context(extracted_ctx):
+            await interaction.followup.send(
+                "ไม่พบรูปภาพหรือลิงก์ที่สามารถตรวจสอบที่มาได้ในข้อความนี้ค่ะ",
+                ephemeral=True,
+            )
+            return
+        dec_plan = await orchestrate_message_with_decision_1(
+            message.content or "",
+            extracted_ctx=extracted_ctx,
+            purpose="CtxFindSource",
+            channel_id=interaction.channel_id,
+        )
+        user_q = (
+            "ช่วยระบุที่มาของภาพและลิงก์นี้อย่างละเอียด: "
+            "หากเป็นภาพวาด/อนิเมะ/มังงะ ให้บอกชื่อเรื่อง ชื่อตัวละคร ตอนที่/Chapter ชื่อผู้วาด และแนบลิงก์ที่มา (เช่น Pixiv/X/MyAnimeList) ถ้ามี "
+            "หากเป็นภาพถ่ายสิ่งของหรืออุปกรณ์ ให้ระบุยี่ห้อ รุ่น และรายละเอียดสำคัญของสิ่งนั้นค่ะ"
+        )
+        tool_ctx = ToolExecutionContext(
+            channel_id=interaction.channel_id,
+            guild=interaction.guild,
+            channel=interaction.channel,
+            speaker_user=interaction.user,
+            message=message,
+            mode="general",
+        )
+        answer, did_search = await query_local_ollama_chat(
+            f"{user_q}\n\n{extracted_ctx}",
+            model=ACTIVE_FAST_MODEL,
+            system_prompt=FAST_SYSTEM_PROMPT,
+            channel_id=interaction.channel_id,
+            temperature=0.2,
+            allow_agentic_search=True,
+            has_fresh_attachment=True,
+            speaker_user=interaction.user,
+            decision_plan=dec_plan,
+            tool_ctx=tool_ctx,
+        )
+        view = (
+            build_contextual_suggestion_view(
+                interaction.channel_id,
+                message.content or user_q,
+                answer,
                 extracted_ctx=extracted_ctx,
-                purpose="CtxFindSource",
-                channel_id=interaction.channel_id,
-            )
-            user_q = (
-                "ช่วยระบุที่มาของภาพและลิงก์นี้อย่างละเอียด: "
-                "หากเป็นภาพวาด/อนิเมะ/มังงะ ให้บอกชื่อเรื่อง ชื่อตัวละคร ตอนที่/Chapter ชื่อผู้วาด และแนบลิงก์ที่มา (เช่น Pixiv/X/MyAnimeList) ถ้ามี "
-                "หากเป็นภาพถ่ายสิ่งของหรืออุปกรณ์ ให้ระบุยี่ห้อ รุ่น และรายละเอียดสำคัญของสิ่งนั้นค่ะ"
-            )
-            tool_ctx = ToolExecutionContext(
-                channel_id=interaction.channel_id,
-                guild=interaction.guild,
-                channel=interaction.channel,
-                speaker_user=interaction.user,
-                message=message,
-                mode="general",
-            )
-            answer, did_search = await query_local_ollama_chat(
-                f"{user_q}\n\n{extracted_ctx}",
-                model=ACTIVE_FAST_MODEL,
-                system_prompt=FAST_SYSTEM_PROMPT,
-                channel_id=interaction.channel_id,
-                temperature=0.2,
-                allow_agentic_search=True,
-                has_fresh_attachment=True,
-                speaker_user=interaction.user,
+                source_message=message,
                 decision_plan=dec_plan,
-                tool_ctx=tool_ctx,
             )
-            view = (
-                build_contextual_suggestion_view(
-                    interaction.channel_id,
-                    message.content or user_q,
-                    answer,
-                    extracted_ctx=extracted_ctx,
-                    source_message=message,
-                    decision_plan=dec_plan,
-                )
-                if should_attach_interactive_view(
-                    user_q, answer, did_search=did_search, extracted_ctx=extracted_ctx, decision_plan=dec_plan
-                )
-                else None
+            if should_attach_interactive_view(
+                user_q, answer, did_search=did_search, extracted_ctx=extracted_ctx, decision_plan=dec_plan
             )
-            await _send_interaction_with_auto_view(
-                interaction, answer, view, chunked_header="❄️ ตรวจสอบที่มาเรียบร้อยแล้วค่ะ:"
-            )
-        except Exception as e:
-            await _send_safe_interaction_error(interaction, e, "ctx_find_source")
+            else None
+        )
+        await _send_interaction_with_auto_view(
+            interaction, answer, view, chunked_header="❄️ ตรวจสอบที่มาเรียบร้อยแล้วค่ะ:"
+        )
 
     @bot.tree.context_menu(name="Translate Manga Page (TH)")
     async def ctx_translate_manga_th(interaction: discord.Interaction, message: discord.Message):
@@ -1797,10 +1841,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             "รับทราบค่ะ เดี๋ยวฉันจัดการแปลหน้านี้เป็นภาษาไทยให้ รอสักครู่นะคะ",
             ephemeral=True,
         )
-        try:
-            await process_manga_translation_request(message, "แปลมังงะเป็นภาษาไทย")
-        except Exception as e:
-            await _send_safe_interaction_error(interaction, e, "ctx_translate_manga_th")
+        await process_manga_translation_request(message, "แปลมังงะเป็นภาษาไทย")
 
     @bot.tree.context_menu(name="Translate Manga Page (EN)")
     async def ctx_translate_manga_en(interaction: discord.Interaction, message: discord.Message):
@@ -1816,7 +1857,4 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             "รับทราบค่ะ เดี๋ยวฉันจัดการแปลหน้านี้เป็นภาษาอังกฤษให้ รอสักครู่นะคะ",
             ephemeral=True,
         )
-        try:
-            await process_manga_translation_request(message, "translate manga to English")
-        except Exception as e:
-            await _send_safe_interaction_error(interaction, e, "ctx_translate_manga_en")
+        await process_manga_translation_request(message, "แปลมังงะเป็นภาษาอังกฤษ")
