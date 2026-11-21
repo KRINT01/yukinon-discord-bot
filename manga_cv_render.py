@@ -24,7 +24,7 @@ except ImportError:
 
 from config import THAI_CHAR_REGEX
 
-MANGA_CV_RENDER_VERSION = "v6"
+MANGA_CV_RENDER_VERSION = "v7"
 SOM_CV_MAX_DIM = 360  # Fast 360px grid derived from single 1024px resize (~1-2.5s for 10 pages with OpenCV+NumPy!)
 # Bundle 2 RAM & Discord upload optimization: quality=90 with standard 4:2:0 subsampling (~50% smaller than 94/4:4:4)
 MANGA_RENDER_JPEG_QUALITY = 90
@@ -64,23 +64,8 @@ _THAI_CODA_CONSONANTS = set("กขคฆงจชซฎฏฐฑฒณดตถ
 # Strict font-safe whitelist (ASCII printable + Thai Unicode block + Latin-1 accented letters)
 # Guarantees ZERO missing-glyph `[]` tofu boxes in Garuda-Bold.ttf / NotoSans-Bold.ttf!
 _FONT_UNSAFE_CHARS_REGEX = re.compile(r"[^\x20-\x7E\u00C0-\u00FF\u0E00-\u0E5B]")
-# Stray single Latin letter glued onto Thai text (e.g. 'ทะ...Eเป็นยังไง' -> 'ทะ...เป็นยังไง')
-# Fix malformed Thai tone-before-vowel order (e.g. อ๊ิก -> อิ๊ก) so Garuda-Bold never stacks/collides marks
+# Unicode invariant: fix malformed Thai tone-before-vowel order (e.g. อ๊ิก -> อิ๊ก) so Garuda-Bold never collides marks
 _THAI_TONE_BEFORE_VOWEL_REGEX = re.compile(r"([\u0E48-\u0E4B])([\u0E31\u0E34-\u0E3A])")
-# Unambiguous non-word Thai LLM/keyboard typos (ไม้โท ้ instead of ไม้ไต่คู้ ็)
-_THAI_SAFE_TYPO_MAP = (
-    ("เป้น", "เป็น"),
-    ("เห้น", "เห็น"),
-    ("เด้ก", "เด็ก"),
-    ("เล้ก", "เล็ก"),
-    ("เจ้บ", "เจ็บ"),
-    ("เต้ม", "เต็ม"),
-    ("เค้ม", "เค็ม"),
-    ("เช้ด", "เช็ด"),
-)
-_STRAY_SINGLE_LATIN_IN_THAI_REGEX = re.compile(
-    r"(?:(?<=[\u0E00-\u0E5B.])|(?<=[\u0E00-\u0E5B] ))([A-Za-z])(?=[\u0E00-\u0E5B])"
-)
 
 # Pre-allocated reusable OpenCV morphological kernels
 _CV2_K3 = np.ones((3, 3), np.uint8) if HAS_CV2 else None
@@ -105,7 +90,7 @@ def _load_manga_font(size: int, is_thai: bool = False) -> ImageFont.FreeTypeFont
 
 def _sanitize_text_for_manga_font(text: str) -> str:
     """
-    Normalizes Unicode punctuation, strips stray single Latin glitches inside Thai words,
+    Normalizes Unicode punctuation, fixes Thai combining-mark order (vowel before tone),
     and enforces a strict font-safe whitelist (`ASCII + Thai + Latin-1`) so `♥`, `♡`, `♪`,
     Hangul, Arabic, CJK, and emojis NEVER render as missing-glyph `[]` tofu boxes!
     """
@@ -138,13 +123,9 @@ def _sanitize_text_for_manga_font(text: str) -> str:
     )
     # Remove any character outside Garuda-Bold / NotoSans-Bold glyph coverage (kills ♥/♡/♪/Hangul/Arabic/CJK/emoji tofu!)
     s = _FONT_UNSAFE_CHARS_REGEX.sub("", s)
-    # Thai-specific cleanups: fix stray glued Latin letters, malformed tone-before-vowel order, and impossible typos
+    # Unicode combining-mark invariant: ensure Thai above/below vowels always precede tone marks
     if THAI_CHAR_REGEX.search(s):
-        s = _STRAY_SINGLE_LATIN_IN_THAI_REGEX.sub("", s)
         s = _THAI_TONE_BEFORE_VOWEL_REGEX.sub(r"\2\1", s)
-        for bad_w, good_w in _THAI_SAFE_TYPO_MAP:
-            if bad_w in s:
-                s = s.replace(bad_w, good_w)
     s = re.sub(r"\(\s*\)|\[\s*\]|'\s*'", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s

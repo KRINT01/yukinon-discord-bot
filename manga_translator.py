@@ -29,6 +29,7 @@ from llm import (
     call_gemini_generate_content_self_healing,
     call_gemma_ai_studio_vision,
     call_cloudflare_vision_chat,
+    call_cloudflare_gemma_chat,
     discover_active_groq_vision_models,
     _fetch_google_ai_studio_model_names,
     get_google_model_cooldown,
@@ -43,7 +44,7 @@ from manga_cv_render import (
     _release_cv_page_masks,
 )
 
-MANGA_TRANSLATOR_VERSION = "v8"
+MANGA_TRANSLATOR_VERSION = "v9"
 MANGA_CV_VER = getattr(_mcr_mod, "MANGA_CV_RENDER_VERSION", "old")
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
 # Bundle 2 dynamic parallel hedge: faster 15s recovery on typical 2-4p X threads, patient 25s on 5-12p batches
@@ -53,15 +54,6 @@ MANGA_BATCH_HEDGE_DELAY_LARGE_SEC = 25.0
 _FLASH_LITE_EXCLUDED = ("2.5", "2.0", "1.5", "latest", "image", "tts", "audio", "live", "embedding")
 _HANGUL_REGEX = re.compile(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF]")
 _SOURCE_EAST_ASIAN_REGEX = re.compile(r"[\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]")
-_LATIN_TOKEN_REGEX = re.compile(r"[A-Za-z]+")
-# Impossible trailing consonant glued after a Thai 'ะ' particle (e.g. ค่ะร, คะร, นะร, ล่ะร)
-_THAI_STRAY_AFTER_SARA_A_REGEX = re.compile(
-    r"(ค่ะ|คะ|นะคะ|นะ|ล่ะ|จ้ะ|จ๊ะ|เถอะ|เหอะ|เรอะ|เหรอ|สิ)[ก-ฮ](?=$|[\s.!?~\x22\x27)\]])"
-)
-_THAI_ALLOWED_ACRONYMS = frozenset({
-    "OK", "NG", "HP", "MP", "LV", "XP", "EXP", "VIP", "TV", "PC", "VR",
-    "AI", "VS", "DM", "SNS", "LINE", "BGM", "NPC", "ID", "DIY", "GPS", "USB", "PDF",
-})
 
 # Set-of-Mark (SoM) JSON responseSchema with explicit `propertyOrdering`:
 # - Every numbered CV bubble `[k]` maps 1-to-1 via `"bubble_id": k` (zero coordinate drift!).
@@ -282,51 +274,25 @@ def _extract_norm_box_2d(raw_box) -> list[float] | None:
     return coords
 
 
-def _has_unexpected_latin_in_thai(cleaned_tr: str, src_text: str) -> bool:
+def _is_valid_target_script(tr_text: str, src_text: str, target_lang_name: str) -> bool:
     """
-    Returns True if a Thai translation contains leaked Latin/English letters or words
-    (e.g. `เอ๋? Ehehe...`, `Eหมอนี่...`, `ทะ...Eเป็น`) that did NOT appear in `source_text`
-    and are not standard uppercase acronyms like `OK`, `HP`, `MP`, `VR`, `DM`.
-    """
-    tr_tokens = _LATIN_TOKEN_REGEX.findall(cleaned_tr or "")
-    if not tr_tokens:
-        return False
-    src_tokens_lower = {t.lower() for t in _LATIN_TOKEN_REGEX.findall(src_text or "")}
-    for tok in tr_tokens:
-        if tok in _THAI_ALLOWED_ACRONYMS:
-            continue
-        if tok.lower() in src_tokens_lower:
-            continue
-        return True
-    return False
-
-
-def _needs_target_language_repair(tr_text: str, src_text: str, target_lang_name: str) -> bool:
-    """
-    Detects when a bubble drifted into the wrong language or had a lightweight-LLM token slip:
-    - Korean Hangul (`하하, 뭐 신경 쓰지 마.`)
-    - Missing target-language script when Japanese/Korean source had real text
-    - Mixed leaked Latin/English inside Thai (`เอ๋? Ehehe...`, `Eหมอนี่...`)
-    - Impossible trailing Thai consonant glued onto `ะ` particles (`ค่ะร`, `คะร`, `นะร`)
+    Universal script sanity check (zero ad-hoc typo regexes):
+    Rejects empty outputs, leaked Korean Hangul, or translations missing any target-language
+    script character when `source_text` contained Japanese/East Asian text.
     """
     raw_tr = str(tr_text or "").strip()
-    if _HANGUL_REGEX.search(raw_tr):
-        return True
+    if not raw_tr or _HANGUL_REGEX.search(raw_tr):
+        return False
     cleaned = _sanitize_text_for_manga_font(raw_tr)
+    if not cleaned:
+        return False
     if target_lang_name.lower() == "thai":
-        if not THAI_CHAR_REGEX.search(cleaned):
-            if _SOURCE_EAST_ASIAN_REGEX.search(src_text or ""):
-                return True
-        if _has_unexpected_latin_in_thai(cleaned, src_text):
-            return True
-        if _THAI_STRAY_AFTER_SARA_A_REGEX.search(cleaned):
-            return True
+        if not THAI_CHAR_REGEX.search(cleaned) and _SOURCE_EAST_ASIAN_REGEX.search(src_text or ""):
+            return False
     elif target_lang_name.lower() == "english":
-        if not re.search(r"[A-Za-z]", cleaned):
-            if _SOURCE_EAST_ASIAN_REGEX.search(src_text or ""):
-                return True
-    return False
-
+        if not re.search(r"[A-Za-z]", cleaned) and _SOURCE_EAST_ASIAN_REGEX.search(src_text or ""):
+            return False
+    return True
 
 
 async def _recover_omitted_pages_async(
@@ -408,139 +374,376 @@ async def _recover_omitted_pages_async(
     return batch_results, cv_bubbles_per_page
 
 
-async def _repair_wrong_language_batch_async(
+def _parse_polish_json_response(raw_out: str) -> tuple[dict[int, str], dict[int, str]]:
+    """
+    Parses Stage 2 Gemma 4 polish JSON (`{"s": {"1": "..."}, "b": {"0": "...", ...}}` or
+    flat `{"0": "..."}` fallback). Returns `(summary_map, bubble_map)`.
+    """
+    if not raw_out:
+        return {}, {}
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", raw_out).strip()
+    cleaned = re.sub(r"^```(?:json)?|```$", "", cleaned).strip()
+    m_obj = re.search(r"\{[\s\S]*\}", cleaned)
+    if not m_obj:
+        return {}, {}
+    target = m_obj.group(0)
+    parsed = None
+    for cand in (
+        target,
+        re.sub(r",\s*([}\]])", r"\1", target),
+    ):
+        try:
+            parsed = json.loads(cand)
+            break
+        except Exception:
+            continue
+    if not isinstance(parsed, dict):
+        return {}, {}
+
+    summary_map: dict[int, str] = {}
+    bubble_map: dict[int, str] = {}
+
+    raw_s = parsed.get("s") or parsed.get("summaries")
+    if isinstance(raw_s, dict):
+        for k_str, val in raw_s.items():
+            try:
+                summary_map[int(k_str)] = str(val or "").strip()
+            except Exception:
+                continue
+
+    raw_b = parsed.get("b") or parsed.get("bubbles")
+    if isinstance(raw_b, dict):
+        for k_str, val in raw_b.items():
+            try:
+                bubble_map[int(k_str)] = str(val or "").strip()
+            except Exception:
+                continue
+    elif isinstance(raw_b, list):
+        for idx_i, val in enumerate(raw_b):
+            if isinstance(val, dict):
+                try:
+                    ki = int(val.get("i", val.get("idx", idx_i)))
+                    bubble_map[ki] = str(val.get("tr") or val.get("translated_text") or "").strip()
+                except Exception:
+                    continue
+            elif isinstance(val, str):
+                bubble_map[idx_i] = val.strip()
+    else:
+        # Flat `{"0": "...", "1": "..."}` format
+        for k_str, val in parsed.items():
+            if k_str in ("s", "summaries", "b", "bubbles"):
+                continue
+            try:
+                bubble_map[int(k_str)] = str(val or "").strip()
+            except Exception:
+                continue
+
+    return summary_map, bubble_map
+
+
+async def _call_gemma_ai_studio_polish_json(
+    model_id: str,
+    prompt_text: str,
+    req_id: str,
+    timeout_sec: float = 22.0,
+) -> tuple[str, float]:
+    """
+    Calls a Google AI Studio Gemma 4 model (`gemma-4-31b-it` or `gemma-4-26b-a4b-it`) for
+    Stage 2 text-only proofreading with generous `maxOutputTokens=12288` (prevents thinking-token
+    starvation) and automatic HTTP 400 fallback if `responseMimeType` is rejected.
+    """
+    if not GEMINI_API_KEY or _is_gemini_model_on_cooldown(model_id):
+        return "", 0.0
+
+    session = get_http_session()
+    url = clean_url(
+        f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
+        f"{model_id}:generateContent?key={GEMINI_API_KEY}"
+    )
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt_text}]}],
+        "generationConfig": {
+            "temperature": 0.0,
+            "maxOutputTokens": 12288,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    for attempt in range(2):
+        t0 = time.monotonic()
+        try:
+            async with session.post(
+                url, json=payload, timeout=aiohttp.ClientTimeout(total=timeout_sec)
+            ) as resp:
+                status = resp.status
+                body_text = await resp.text()
+                elapsed = time.monotonic() - t0
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            elapsed = time.monotonic() - t0
+            _mark_gemini_model_cooldown(model_id, 60.0)
+            api_log(f"MangaPolish [req={req_id}] -> {model_id} FAILED ({type(e).__name__}, {elapsed:.2f}s)")
+            return "", elapsed
+
+        if status == 200:
+            data = json.loads(body_text)
+            state.active_gemma_model = model_id
+            state.record_provider_call("gemma_ai_studio")
+            r_parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+            raw_out = "".join(
+                p.get("text", "") for p in r_parts
+                if p.get("text") and not p.get("thought", False)
+            ).strip()
+            return raw_out, elapsed
+
+        if status == 400 and attempt == 0 and "responseMimeType" in payload["generationConfig"]:
+            payload["generationConfig"].pop("responseMimeType", None)
+            api_log(f"MangaPolish [req={req_id}] -> {model_id} HTTP 400 ({elapsed:.2f}s); retrying without responseMimeType")
+            continue
+
+        if status == 429:
+            _mark_gemini_model_cooldown(model_id, 60.0)
+        elif status in (500, 503):
+            _mark_gemini_model_cooldown(model_id, 180.0)
+        elif status == 404:
+            _mark_gemini_model_cooldown(model_id, 3600.0)
+        api_log(f"MangaPolish [req={req_id}] -> {model_id} HTTP {status} ({elapsed:.2f}s)")
+        return "", elapsed
+
+    return "", 0.0
+
+
+async def _polish_manga_translations_gemma_async(
     batch_results: list[tuple[list[dict], str]],
     target_lang_name: str,
+    series_context_hint: str = "",
     req_id: str = "",
+    progress_cb=None,
 ) -> list[tuple[list[dict], str]]:
     """
-    Fast (<1s) post-parse language safeguard:
-    1) Sanitizes every page `summary` (removes stray Arabic/Hangul/CJK/symbol glitches).
-    2) Finds any bubble whose `translated_text` drifted into Korean/wrong script or became
-       empty after font-safe sanitization, and batch-retranslates ONLY those defective bubbles
-       from `source_text` via Gemini Flash-Lite (with Google NMT fallback).
+    Always-On Stage 2 Text-Only Proofreading & Localization Polish (Gemma 4):
+    Runs on every manga request (1-12 pages) right after Stage 1 Vision OCR+Draft:
+    - Model priority: `gemma-4-31b-it` -> `gemma-4-26b-a4b-it` -> Cloudflare Gemma 4 -> Flash-Lite text-only.
+    - Fixes subtle typos, mixed English/romanized slips (`Ehehe`, `Eหมอนี่`), foreign-script drift,
+      truncated sentences, and obvious Vision OCR kanji typos using surrounding dialogue context.
+    - Strictly preserves `bubble_id`, `box_2d`, and page structure; any omitted or invalid index
+      gracefully retains its Stage 1 draft (zero regression risk).
     """
-    defective: list[tuple[int, int, dict]] = []
-    cleaned_batch: list[tuple[list[dict], str]] = []
+    flat_bubbles: list[dict] = []
+    compact_pages: list[dict] = []
 
-    for p_idx, (bubbles, summary) in enumerate(batch_results):
-        clean_sum = _sanitize_text_for_manga_font(summary or "")
-        for b_idx, b in enumerate(bubbles):
-            raw_tr = b.get("_raw_translated_text") or b.get("translated_text") or ""
-            src_txt = b.get("source_text") or ""
-            if _needs_target_language_repair(raw_tr, src_txt, target_lang_name):
-                defective.append((p_idx, b_idx, b))
-        cleaned_batch.append((bubbles, clean_sum))
+    for p_idx, (bubbles, summary) in enumerate(batch_results, 1):
+        p_items = []
+        for b in bubbles:
+            g_idx = len(flat_bubbles)
+            flat_bubbles.append(b)
+            # Show Gemma the raw pre-sanitized draft if available so truncated foreign-script tails stay visible!
+            draft_val = b.get("_raw_translated_text") or b.get("translated_text") or ""
+            p_items.append({
+                "i": g_idx,
+                "spk": b.get("speaker_or_note") or "",
+                "src": b.get("source_text") or "",
+                "draft": draft_val,
+            })
+        if p_items or summary:
+            compact_pages.append({"p": p_idx, "sum": summary or "", "b": p_items})
 
-    if not defective:
-        return cleaned_batch
+    if not flat_bubbles:
+        return batch_results
 
+    num_pages = len(batch_results)
     api_log(
-        f"MangaLangRepair [req={req_id}] -> detected {len(defective)} wrong-language bubble(s); "
-        f"retranslating to {target_lang_name}"
+        f"MangaPolish [req={req_id}] START -> polishing {len(flat_bubbles)} bubble(s) "
+        f"across {num_pages} page(s) via Gemma 4 ({target_lang_name})"
     )
-    items_payload = [
-        {
-            "idx": i,
-            "speaker": b.get("speaker_or_note") or "",
-            "source_text": b.get("source_text") or "",
-            "wrong_translation": b.get("_raw_translated_text") or b.get("translated_text") or "",
-        }
-        for i, (_, _, b) in enumerate(defective)
-    ]
-    repaired_map: dict[int, str] = {}
+    if progress_cb is not None:
+        try:
+            await progress_cb("✨ **2/3** กำลังเกลาสำนวนคำแปลให้เนียนขึ้นนะคะ...")
+        except Exception:
+            pass
 
-    if GEMINI_API_KEY:
-        repair_prompt = (
-            f"Retranslate EVERY item below from Japanese (`source_text`) into clean, natural, correctly spelled {target_lang_name} manga dialogue.\n"
-            f"RULES: Use ONLY pure {target_lang_name} script and standard ASCII punctuation (..., ~, -, !, ?, '). "
-            "Do NOT mix English/romanized words (like Ehehe or single Latin letters) into Thai, and fix any garbled endings or typos. "
-            'Return ONLY a JSON object mapping string index to the corrected translation, e.g. {"0": "...", "1": "..."}.\n\n'
-            + json.dumps(items_payload, ensure_ascii=False)
+    ctx_snippet = (
+        f"Series context: {series_context_hint[:600]}\n\n"
+        if series_context_hint else ""
+    )
+
+    if target_lang_name.lower() == "thai":
+        lang_guidance = (
+            "- แปลและเกลาทุกช่องให้เป็นภาษาไทยธรรมชาติ ลื่นไหล สะกดถูกต้อง 100% (ไม่มีคำสะกดผิด ไม่มีสระ/วรรณยุกต์สลับตำแหน่ง)\n"
+            "- ใช้เฉพาะอักษรไทยและเครื่องหมาย ASCII มาตรฐาน (`...`, `~`, `-`, `!`, `?`, `'`) ห้ามมีอีโมจิ สัญลักษณ์หัวใจ/โน้ตเพลง ภาษาเกาหลี/จีน/อาหรับ หรือทับศัพท์อังกฤษปนกลางประโยคไทย (เช่น แปล `えへへ` เป็น `เอะเฮะ` แปล `…っ!!` เป็น `...อ๊ะ!!` แปล `コイツ` เป็น `ไอ้หมอนี่` ยกเว้นคำย่อสากลที่มีในต้นฉบับจริงเช่น OK/DM/HP)\n"
+            "- ใช้คำลงท้ายให้ตรงเพศและบุคลิกของตัวละคร (ตัวละครหญิง/แต่งหญิงใช้ `ค่ะ`/`คะ`/`นะคะ`/`นะ` ตัวเอกชายพูดกับเพื่อนสนิทใช้ภาษาเป็นกันเอง)\n"
+            "- หากต้นฉบับ `src` มีอักษรญี่ปุ่น OCR เพี้ยนเล็กน้อย (เช่น `渡する側のテ` จาก `渡す側のアテ`) หรือ `draft` ขาดหายกลางประโยค ให้ดูบริบทช่องก่อนหน้าแล้วแปลให้ครบสมบูรณ์ตามความหมายจริง\n"
+            "- เกลา `sum` (บริบทของฉาก) ของแต่ละหน้าให้สั้น กระชับ เป็นภาษาไทยสะอาดตาด้วย"
         )
-        payload = {
-            "contents": [{"parts": [{"text": repair_prompt}]}],
+    else:
+        lang_guidance = (
+            f"- Proofread and polish every bubble into natural, idiomatic, accurately spelled {target_lang_name} manga dialogue.\n"
+            f"- Use ONLY pure {target_lang_name} script and standard ASCII punctuation (`...`, `~`, `-`, `!`, `?`, `'`) — no emojis or heart/music symbols.\n"
+            "- Preserve Japanese honorifics directly attached with a hyphen (`-san`, `-kun`, `-chan`, `-sama`, `-sensei`, `-senpai`).\n"
+            "- If `src` has a minor OCR typo or `draft` is truncated/mistranslated, infer the true meaning from surrounding dialogue and complete it cleanly.\n"
+            f"- Also polish each page's 1-sentence `sum` into clean {target_lang_name}."
+        )
+
+    polish_prompt = (
+        f"You are a senior Manga Localization Proofreader ({target_lang_name}).\n"
+        f"Below is a draft translation of {num_pages} sequential manga page(s) produced by a fast OCR model.\n"
+        f"{ctx_snippet}"
+        "TASK: Review EVERY bubble `i` (`src` = Japanese OCR, `draft` = initial translation) and EVERY page `sum` in reading order, "
+        f"and return polished, natural, typo-free {target_lang_name}.\n\n"
+        f"RULES:\n{lang_guidance}\n"
+        "- Keep lines concise enough to fit cleanly inside manga speech bubbles.\n"
+        "- Return ONLY valid JSON with this exact compact schema (include EVERY bubble index `0..N-1` and page number `1..P`):\n"
+        '{"s": {"1": "polished summary page 1"}, "b": {"0": "polished bubble 0", "1": "polished bubble 1"}}\n\n'
+        "INPUT:\n"
+        + json.dumps({"pages": compact_pages}, ensure_ascii=False)
+    )
+
+    summary_map: dict[int, str] = {}
+    bubble_map: dict[int, str] = {}
+    used_model = ""
+    used_elapsed = 0.0
+
+    # Tier 1 & 2: Google AI Studio Gemma 4 (`gemma-4-31b-it` -> `gemma-4-26b-a4b-it`)
+    for g_model in ("gemma-4-31b-it", "gemma-4-26b-a4b-it"):
+        raw_out, el = await _call_gemma_ai_studio_polish_json(
+            g_model, polish_prompt, req_id=req_id, timeout_sec=22.0
+        )
+        if raw_out:
+            s_m, b_m = _parse_polish_json_response(raw_out)
+            if len(b_m) >= max(1, int(len(flat_bubbles) * 0.5)):
+                summary_map, bubble_map = s_m, b_m
+                used_model, used_elapsed = g_model, el
+                break
+            api_log(
+                f"MangaPolish [req={req_id}] -> {g_model} returned incomplete map "
+                f"({len(b_m)}/{len(flat_bubbles)}); trying next tier"
+            )
+
+    # Tier 3: Cloudflare Workers AI Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`)
+    if not bubble_map:
+        t_cf = time.monotonic()
+        try:
+            cf_out = await call_cloudflare_gemma_chat(
+                [{"role": "user", "content": polish_prompt}],
+                temperature=0.0,
+                max_tokens=8192,
+                purpose=f"MangaPolish[{req_id}]",
+            )
+            if cf_out:
+                s_m, b_m = _parse_polish_json_response(cf_out)
+                if len(b_m) >= max(1, int(len(flat_bubbles) * 0.5)):
+                    summary_map, bubble_map = s_m, b_m
+                    used_model = "cf-gemma-4-26b"
+                    used_elapsed = time.monotonic() - t_cf
+        except Exception as e:
+            api_log(f"MangaPolish [req={req_id}] Cloudflare Gemma note ({type(e).__name__})")
+
+    # Tier 4: Text-only Gemini Flash-Lite fallback (only if all Gemma tiers unavailable)
+    if not bubble_map and GEMINI_API_KEY:
+        t_fb = time.monotonic()
+        fb_payload = {
+            "contents": [{"parts": [{"text": polish_prompt}]}],
             "generationConfig": {
                 "temperature": 0.0,
-                "maxOutputTokens": 1024,
+                "maxOutputTokens": 8192,
                 "responseMimeType": "application/json",
-                "thinkingConfig": {"thinkingLevel": "LOW"},
+                "thinkingConfig": {"thinkingLevel": "MINIMAL"},
             },
         }
         try:
             data = await call_gemini_generate_content_self_healing(
-                payload,
-                timeout_sec=12,
-                purpose=f"MangaLangRepair[{req_id}]",
-                max_models=3,
-                max_wall_sec=16.0,
-                preferred_models=["gemini-3-flash-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
+                fb_payload,
+                timeout_sec=16,
+                purpose=f"MangaPolishFB[{req_id}]",
+                max_models=2,
+                max_wall_sec=22.0,
+                preferred_models=["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
             )
             if data:
                 r_parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
                 raw_out = "".join(
-                    p.get("text", "") for p in r_parts if p.get("text") and not p.get("thought", False)
+                    p.get("text", "") for p in r_parts
+                    if p.get("text") and not p.get("thought", False)
                 ).strip()
-                m_obj = re.search(r"\{[\s\S]*\}", raw_out)
-                if m_obj:
-                    parsed_map = json.loads(m_obj.group(0))
-                    if isinstance(parsed_map, dict):
-                        for k_str, val in parsed_map.items():
-                            try:
-                                ki = int(k_str)
-                            except Exception:
-                                continue
-                            if not (0 <= ki < len(defective)):
-                                continue
-                            src_i = defective[ki][2].get("source_text") or ""
-                            clean_val = _sanitize_text_for_manga_font(str(val or ""))
-                            if clean_val and not _needs_target_language_repair(clean_val, src_i, target_lang_name):
-                                repaired_map[ki] = clean_val
+                s_m, b_m = _parse_polish_json_response(raw_out)
+                if b_m:
+                    summary_map, bubble_map = s_m, b_m
+                    used_model = "gemini-flash-lite-fb"
+                    used_elapsed = time.monotonic() - t_fb
         except Exception as e:
-            api_log(f"MangaLangRepair [req={req_id}] Gemini note ({type(e).__name__})")
+            api_log(f"MangaPolish [req={req_id}] Flash-Lite fallback note ({type(e).__name__})")
 
-    # Tier 2 fast Google NMT fallback for any remaining defective bubble
-    tl_code = "th" if target_lang_name.lower() == "thai" else "en"
-    session = get_http_session()
-    for i, (_, _, b) in enumerate(defective):
-        if i in repaired_map:
-            continue
-        src_q = (b.get("source_text") or "").strip() or (b.get("_raw_translated_text") or "").strip()
-        if not src_q:
-            continue
-        try:
-            gtrans_host = "translate." + "googleapis.com"
-            gt_url = (
-                f"{HTTPS}{gtrans_host}/translate_a/single"
-                f"?client=gtx&sl=auto&tl={tl_code}&dt=t&q={quote_plus(src_q)}"
-            )
-            async with session.get(
-                gt_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=aiohttp.ClientTimeout(total=6)
-            ) as resp:
-                if resp.status == 200:
-                    gt_data = await resp.json(content_type=None)
-                    segs = [seg[0] for seg in (gt_data[0] or []) if seg and seg[0]]
-                    cand = _sanitize_text_for_manga_font("".join(segs))
-                    if cand:
-                        repaired_map[i] = cand
-        except Exception:
-            continue
+    # Apply polished results with per-bubble safety validation
+    updated_bubbles = 0
+    still_broken: list[dict] = []
 
-    repaired_cnt = 0
-    for i, (p_idx, b_idx, b) in enumerate(defective):
-        if i in repaired_map:
-            b["translated_text"] = repaired_map[i]
-            b.pop("_raw_translated_text", None)
-            repaired_cnt += 1
-        elif target_lang_name.lower() == "thai":
-            cur_t = b.get("translated_text") or ""
-            fixed_t = _THAI_STRAY_AFTER_SARA_A_REGEX.sub(r"\1", cur_t)
-            if fixed_t != cur_t:
-                b["translated_text"] = fixed_t
-                repaired_cnt += 1
+    for g_idx, b in enumerate(flat_bubbles):
+        src_txt = b.get("source_text") or ""
+        cand_raw = bubble_map.get(g_idx)
+        if cand_raw and _is_valid_target_script(cand_raw, src_txt, target_lang_name):
+            b["translated_text"] = _sanitize_text_for_manga_font(cand_raw)
+            updated_bubbles += 1
+        else:
+            # Keep Stage 1 draft sanitized cleanly
+            b["translated_text"] = _sanitize_text_for_manga_font(b.get("translated_text") or "")
 
-    api_log(f"MangaLangRepair [req={req_id}] -> repaired {repaired_cnt}/{len(defective)} bubble(s)")
-    return cleaned_batch
+        b.pop("_raw_translated_text", None)
+
+        if not _is_valid_target_script(b.get("translated_text") or "", src_txt, target_lang_name):
+            still_broken.append(b)
+
+    # Emergency per-bubble Google NMT rescue ONLY if a bubble still failed basic script validation
+    if still_broken:
+        tl_code = "th" if target_lang_name.lower() == "thai" else "en"
+        session = get_http_session()
+        rescued = 0
+        for b in still_broken:
+            src_q = (b.get("source_text") or "").strip()
+            if not src_q:
+                continue
+            try:
+                gtrans_host = "translate." + "googleapis.com"
+                gt_url = (
+                    f"{HTTPS}{gtrans_host}/translate_a/single"
+                    f"?client=gtx&sl=auto&tl={tl_code}&dt=t&q={quote_plus(src_q)}"
+                )
+                async with session.get(
+                    gt_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=aiohttp.ClientTimeout(total=6)
+                ) as resp:
+                    if resp.status == 200:
+                        gt_data = await resp.json(content_type=None)
+                        segs = [seg[0] for seg in (gt_data[0] or []) if seg and seg[0]]
+                        cand = _sanitize_text_for_manga_font("".join(segs))
+                        if cand:
+                            b["translated_text"] = cand
+                            rescued += 1
+            except Exception:
+                continue
+        if rescued:
+            api_log(f"MangaPolish [req={req_id}] -> NMT emergency rescue fixed {rescued}/{len(still_broken)} bubble(s)")
+
+    updated_summaries = 0
+    polished_batch: list[tuple[list[dict], str]] = []
+    for p_idx, (bubbles, summary) in enumerate(batch_results, 1):
+        cand_sum = summary_map.get(p_idx)
+        if cand_sum and _is_valid_target_script(cand_sum, "", target_lang_name):
+            final_sum = _sanitize_text_for_manga_font(cand_sum)
+            updated_summaries += 1
+        else:
+            final_sum = _sanitize_text_for_manga_font(summary or "")
+        polished_batch.append((bubbles, final_sum))
+
+    if used_model:
+        api_log(
+            f"MangaPolish [req={req_id}] DONE -> model={used_model} "
+            f"({used_elapsed:.2f}s, updated {updated_bubbles}/{len(flat_bubbles)} bubble(s), "
+            f"{updated_summaries}/{num_pages} summaries)"
+        )
+    else:
+        api_log(f"MangaPolish [req={req_id}] SKIPPED -> kept Stage 1 drafts ({len(flat_bubbles)} bubbles)")
+
+    return polished_batch
 
 
 def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
@@ -592,7 +795,7 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
             flags=re.IGNORECASE,
         )
         src_txt = re.sub(r"\s+", " ", str(src_txt)).strip()
-        if not tr_txt and not (_HANGUL_REGEX.search(raw_tr_before_sanitize) and src_txt):
+        if not tr_txt and not (raw_tr_before_sanitize and src_txt):
             continue
 
         spk_lower = str(speaker).strip().lower()
@@ -625,7 +828,7 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
             "translated_text": tr_txt,
             "box_2d": norm_box,
         }
-        if _HANGUL_REGEX.search(raw_tr_before_sanitize):
+        if raw_tr_before_sanitize and raw_tr_before_sanitize != tr_txt:
             entry["_raw_translated_text"] = raw_tr_before_sanitize
         valid.append(entry)
     return valid
@@ -1452,7 +1655,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
     - `manga_semaphore` (`Semaphore(1)`) OOM guard with queue waiting notice
     - Vectorized OpenCV + NumPy CV Set-of-Mark (SoM) detection (white, pastel, corner, dark) & render masking
     - Shared `llm.py` Google AI Studio catalog & cooldowns + dynamic `15s`/`25s` `3.5-flash-lite` -> `3.1-flash-lite` hedge
-    - Automatic post-parse wrong-language / foreign-script bubble auto-repair
+    - Always-on Stage 2 Gemma 4 text-only localization polish (`gemma-4-31b-it` -> `gemma-4-26b-a4b-it` -> Cloudflare Gemma 4)
     - Throttled live Discord progress messages (1/3 -> 2/3 -> 3/3 -> auto-delete)
     """
     from media_context import resolve_referenced_message, collect_embedded_images_and_metadata
@@ -1616,8 +1819,12 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
                     series_context_hint=series_context_hint,
                     req_id=req_id,
                 )
-                batch_results = await _repair_wrong_language_batch_async(
-                    batch_results, target_lang_name, req_id=req_id
+                batch_results = await _polish_manga_translations_gemma_async(
+                    batch_results,
+                    target_lang_name,
+                    series_context_hint=series_context_hint,
+                    req_id=req_id,
+                    progress_cb=lambda txt: _update_progress(txt, force=True),
                 )
 
                 header_title = (
