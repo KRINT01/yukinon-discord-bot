@@ -33,9 +33,12 @@ _THAI_GLUED_KATAKANA_REGEX = re.compile(
     r"(?<=[\u0E00-\u0E7F])([\u30A1-\u30F6])|([\u30A1-\u30F6])(?=[\u0E00-\u0E7F])"
 )
 _CODE_FENCE_SPLIT_REGEX = re.compile(r"(```[\s\S]*?```)")
-# Strip honorific 'คุณ' before third-party Latin names/handles (e.g. 'คุณ Akina Murasame' -> 'Akina Murasame')
-# while keeping standalone sarcastic 'คุณ' (e.g., 'คุณคิดแบบนั้นจริงๆ เหรอคะ') intact.
-_KHUN_BEFORE_LATIN_NAME_REGEX = re.compile(r"คุณ\s*(?=@?[A-Z][A-Za-z0-9_.-]{1,30}\b)")
+# Strip honorific 'คุณ' before third-party Latin names OR lowercase/uppercase @handles
+# (e.g. 'คุณ Akina Murasame' -> 'Akina Murasame', 'คุณ @akina_murasame' -> '@akina_murasame')
+# while keeping standalone sarcastic 'คุณ' and Thai compound words ('คุณภาพ', 'คุณค่า') intact.
+_KHUN_BEFORE_LATIN_NAME_REGEX = re.compile(
+    r"คุณ\s*(?=@[A-Za-z0-9_.-]{2,30}\b|[A-Z][A-Za-z0-9_.-]{1,30}\b)"
+)
 
 
 def is_owner_user(user) -> bool:
@@ -56,7 +59,7 @@ def get_speaker_identity_context(
     """
     Returns speaker identity rules + persistent memory for `systemInstruction`.
     Pass `include_volatile_memory=False` for Gemini implicit prefix caching so `systemInstruction`
-    remains byte-identical across turns (volatile counters/timestamps move to `get_speaker_volatile_context`).
+    remains byte-identical across turns (volatile counters/timestamps/topics move to `get_speaker_volatile_context`).
     """
     from user_memory import get_speaker_memory_context, get_speaker_static_memory_context
 
@@ -99,7 +102,7 @@ def get_speaker_identity_context(
 
 
 def get_speaker_volatile_context(user=None) -> str:
-    """Returns per-turn changing speaker memory (interaction count, last_seen, rolling notes, recent topics)."""
+    """Returns per-turn changing speaker memory (interaction count, last_seen, favorite_topics, rolling notes, recent topics)."""
     if user is None:
         return ""
     from user_memory import get_speaker_volatile_memory_context
@@ -435,5 +438,5 @@ Formatting Rules:
 Describe in Thai.
 </figure>
 - Page Numbers: Wrap page numbers in <page_number>...</page_number> tags.
-- Checkboxes: Represent using ☐ and ☑.
-"""
+- Checkboxes: Use ☐ for unchecked and ☑ for checked boxes.
+""".strip()

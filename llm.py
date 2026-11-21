@@ -128,6 +128,47 @@ _NATIVE_TOOL_CUE_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+# Shared ImageTriage questions reused by BOTH standalone `triage_image_with_decision_1`
+# AND Bundle 2 merged `PreRoute` (eliminating a redundant ~700ms multimodal Decision-1 call on uploaded images!)
+_IMAGE_TRIAGE_DECISION_QUESTIONS: dict[str, dict] = {
+    "image_type": {
+        "type": "choice",
+        "instructions": "Select the single best visual category for this image.",
+        "criteria": {
+            "anime_fanart": "Single anime/game illustration, character fanart, key visual, or anime episode screenshot without multi-panel comic speech bubbles.",
+            "code_or_error": "IDE editor screenshot, source code, terminal/CLI output, stack trace, database/SQL tool, server log, Kubernetes/Grafana/network dashboard, or software error dialog.",
+            "document_table": "Scanned document, receipt, invoice, form, slide deck, chart, spreadsheet table, or dense text/article screenshot.",
+            "manga_comic": "Manga, manhwa, webtoon, 4-koma, or comic page/strip containing speech bubbles or comic panel dialogue.",
+            "meme_casual": "Casual meme, sticker, reaction image, chat screenshot, or miscellaneous social post.",
+            "real_world_product": "Real-world photograph of physical hardware, electronics, coffee equipment, model kits, collectible figures, food, scenery, or consumer products.",
+        },
+    },
+    "has_japanese_dialogue": {
+        "type": "noul",
+        "instructions": (
+            "Answer YES if this image visibly contains Japanese speech-bubble dialogue, comic narration, "
+            "or Japanese character speech lines that a reader would want translated. "
+            "Answer NO for pure sound effects, logos, UI buttons, English/Thai-only images, or textless art."
+        ),
+    },
+    "needs_source_lookup": {
+        "type": "noul",
+        "instructions": (
+            "Answer YES if anime/illustration reverse-image databases (SauceNAO, IQDB, trace.moe) "
+            "would be useful to identify the artist, anime, or manga source. "
+            "Answer NO for code/error screenshots, documents, invoices, charts, or real-world hardware/model-kit photos."
+        ),
+    },
+    "is_anime_screenshot": {
+        "type": "noul",
+        "instructions": (
+            "Answer YES only if this is a colored frame or screenshot taken from an animated TV anime, "
+            "anime movie, or anime PV (suitable for trace.moe episode timestamp matching). "
+            "Answer NO for manga pages, static fanart illustrations, real photos, or software screenshots."
+        ),
+    },
+}
+
 # Phase 4: Atomic follow-up button relevance questions evaluated in the SAME Decision-1 forward pass (0 extra latency!)
 _DYNAMIC_FOLLOWUP_BUTTON_QUESTIONS: dict[str, dict] = {
     "btn_pros_cons": {
@@ -228,6 +269,34 @@ def _record_gemini_usage_cache(data: dict) -> str:
     if prompt_cnt > 0:
         return f", cache_hit={cached_cnt}/{prompt_cnt}"
     return f", cache_hit={cached_cnt}"
+
+
+def _parse_image_triage_answers(answers: dict) -> dict | None:
+    """Normalizes the 4 `_IMAGE_TRIAGE_DECISION_QUESTIONS` answers into a reusable triage dict."""
+    if not isinstance(answers, dict) or "image_type" not in answers:
+        return None
+    type_ans = answers.get("image_type") or {}
+    if not isinstance(type_ans, dict) or not type_ans.get("choice"):
+        return None
+    jp_ans = answers.get("has_japanese_dialogue") or {}
+    lookup_ans = answers.get("needs_source_lookup") or {}
+    anime_ss_ans = answers.get("is_anime_screenshot") or {}
+
+    img_type = str(type_ans.get("choice") or "meme_casual")
+    img_type_conf = float(type_ans.get("confidence") or 0.0)
+    jp_prob = float(jp_ans.get("noul") or 0.0)
+    lookup_prob = float(lookup_ans.get("noul") or 0.0)
+    anime_ss_prob = float(anime_ss_ans.get("noul") or 0.0)
+    return {
+        "image_type": img_type,
+        "image_type_confidence": img_type_conf,
+        "has_japanese_dialogue": jp_prob >= 0.55,
+        "jp_dialogue_prob": jp_prob,
+        "needs_source_lookup": lookup_prob >= 0.50,
+        "source_lookup_prob": lookup_prob,
+        "is_anime_screenshot": anime_ss_prob >= 0.55,
+        "anime_screenshot_prob": anime_ss_prob,
+    }
 
 
 def _estimate_messages_tokens(messages: list) -> int:
@@ -420,7 +489,10 @@ def _record_gemini_hydrogen_call():
 
 
 async def call_gemini_hydrogen_generate(
-    payload: dict, timeout_sec: int = 75, purpose: str = "HydrogenHeavy"
+    payload: dict,
+    timeout_sec: int = 75,
+    purpose: str = "HydrogenHeavy",
+    on_heavy_status=None,
 ) -> dict | None:
     if not _can_use_gemini_hydrogen():
         return None
@@ -435,6 +507,19 @@ async def call_gemini_hydrogen_generate(
 
     for attempt in range(2):
         t0 = time.monotonic()
+        hb_task = None
+        if on_heavy_status is not None:
+            async def _hydrogen_slow_tick():
+                try:
+                    await asyncio.sleep(16.0)
+                    await on_heavy_status("❄️ กำลังวิเคราะห์เชิงลึกอย่างละเอียด (ใช้เวลาสักครู่ รออีกนิดนะคะ)...")
+                except asyncio.CancelledError:
+                    return
+                except Exception:
+                    return
+
+            hb_task = asyncio.create_task(_hydrogen_slow_tick())
+
         try:
             async with session.post(
                 url, json=work_payload, timeout=aiohttp.ClientTimeout(total=timeout_sec)
@@ -442,43 +527,50 @@ async def call_gemini_hydrogen_generate(
                 status = resp.status
                 body_text = await resp.text()
                 elapsed = time.monotonic() - t0
-
-                if status == 200:
-                    _record_gemini_hydrogen_call()
-                    state.record_provider_call("gemini_hydrogen")
-                    parsed = json.loads(body_text)
-                    cache_note = _record_gemini_usage_cache(parsed)
-                    api_log(f"Gemini Hydrogen ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s{cache_note})")
-                    return parsed
-
-                if status == 400 and attempt == 0:
-                    changed = False
-                    if "thinkingConfig" in body_text and "thinkingConfig" in work_payload.get("generationConfig", {}):
-                        work_payload["generationConfig"].pop("thinkingConfig", None)
-                        changed = True
-                    if ("tools" in body_text.lower() or "function" in body_text.lower()) and "tools" in work_payload:
-                        work_payload.pop("tools", None)
-                        work_payload.pop("toolConfig", None)
-                        changed = True
-                    if changed:
-                        continue
-
-                if status == 429:
-                    state.gemini_hydrogen_cooldown_until = time.time() + 75.0
-                elif status in (404, 400, 500, 503):
-                    state.gemini_hydrogen_cooldown_until = time.time() + 180.0
-
-                api_log(
-                    f"Gemini Hydrogen ({purpose}) -> {model_id} HTTP {status} "
-                    f"({elapsed:.2f}s); falling back"
-                )
-                return None
         except Exception as e:
             state.gemini_hydrogen_cooldown_until = time.time() + 120.0
             api_log(
                 f"Gemini Hydrogen ({purpose}) -> {model_id} failed ({type(e).__name__}); falling back"
             )
             return None
+        finally:
+            if hb_task is not None:
+                hb_task.cancel()
+                try:
+                    await hb_task
+                except Exception:
+                    pass
+
+        if status == 200:
+            _record_gemini_hydrogen_call()
+            state.record_provider_call("gemini_hydrogen")
+            parsed = json.loads(body_text)
+            cache_note = _record_gemini_usage_cache(parsed)
+            api_log(f"Gemini Hydrogen ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s{cache_note})")
+            return parsed
+
+        if status == 400 and attempt == 0:
+            changed = False
+            if "thinkingConfig" in body_text and "thinkingConfig" in work_payload.get("generationConfig", {}):
+                work_payload["generationConfig"].pop("thinkingConfig", None)
+                changed = True
+            if ("tools" in body_text.lower() or "function" in body_text.lower()) and "tools" in work_payload:
+                work_payload.pop("tools", None)
+                work_payload.pop("toolConfig", None)
+                changed = True
+            if changed:
+                continue
+
+        if status == 429:
+            state.gemini_hydrogen_cooldown_until = time.time() + 75.0
+        elif status in (404, 400, 500, 503):
+            state.gemini_hydrogen_cooldown_until = time.time() + 180.0
+
+        api_log(
+            f"Gemini Hydrogen ({purpose}) -> {model_id} HTTP {status} "
+            f"({elapsed:.2f}s); falling back"
+        )
+        return None
 
     return None
 
@@ -489,6 +581,7 @@ async def call_gemini_hydrogen_chat(
     purpose: str = "HydrogenChat",
     tool_ctx: ToolExecutionContext | None = None,
     max_tool_rounds: int = 3,
+    on_heavy_status=None,
 ) -> str:
     if not _can_use_gemini_hydrogen():
         return ""
@@ -518,7 +611,12 @@ async def call_gemini_hydrogen_chat(
             payload["tools"] = [{"functionDeclarations": tool_decls}]
             payload["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
 
-        data = await call_gemini_hydrogen_generate(payload, timeout_sec=60, purpose=purpose)
+        data = await call_gemini_hydrogen_generate(
+            payload,
+            timeout_sec=60,
+            purpose=purpose,
+            on_heavy_status=(on_heavy_status if r_idx == 0 else None),
+        )
         if not data:
             return ""
 
@@ -552,6 +650,8 @@ async def call_gemini_hydrogen_chat(
 #          guardrails, tone cues, and passive durable-fact memory trigger).
 # Phase 2: Multimodal pre-OCR triage for images (`image` block) & scanned PDFs
 #          (`document` block) + native Gemini PDF extraction fallback.
+#          Bundle 2: Merges `_IMAGE_TRIAGE_DECISION_QUESTIONS` directly into `PreRoute`
+#          when an inline thumbnail is already attached (eliminates duplicate Decision-1 call!).
 # Phase 3: Multi-speaker voice room awareness (`addressed_to_bot`, `voice_action`,
 #          natural `start_scribe` / `stop_scribe` detection).
 # Phase 4: Search snippet relevance/clickbait denoising, Fact-Check Arbitrator
@@ -661,7 +761,8 @@ async def orchestrate_message_with_decision_1(
         f"Attached / Embedded Context Preview:\n{ctx_preview or '(None)'}"
     )
 
-    if inline_images_b64:
+    has_inline_images = bool(inline_images_b64)
+    if has_inline_images:
         shared_input: str | list[dict] = [{"type": "text", "text": text_block + "\n"}]
         for b64_data, mime_t in inline_images_b64[:2]:
             shared_input.append({
@@ -768,10 +869,14 @@ async def orchestrate_message_with_decision_1(
         },
     }
 
+    # Bundle 2: Merge ImageTriage questions directly into the SAME forward pass when an inline image is attached!
+    if has_inline_images:
+        questions.update(_IMAGE_TRIAGE_DECISION_QUESTIONS)
+
     if not has_code_attachment:
         questions.update(_DYNAMIC_FOLLOWUP_BUTTON_QUESTIONS)
 
-    answers = await call_gemini_decision_orchestrator(shared_input, questions, timeout_sec=4.0, purpose=purpose)
+    answers = await call_gemini_decision_orchestrator(shared_input, questions, timeout_sec=4.5, purpose=purpose)
     if not answers:
         return None
 
@@ -842,6 +947,8 @@ async def orchestrate_message_with_decision_1(
         if isinstance(b_ans, dict) and b_ans.get("noul") is not None:
             button_scores[q_key[4:]] = round(float(b_ans.get("noul") or 0.0), 3)
 
+    image_triage = _parse_image_triage_answers(answers) if has_inline_images else None
+
     if has_code_attachment:
         chosen_route = "code"
         route_conf = 0.99
@@ -850,11 +957,16 @@ async def orchestrate_message_with_decision_1(
         needs_search = False
         search_conf = 0.99
 
+    triage_log = (
+        f", img_triage={image_triage['image_type']}({image_triage['image_type_confidence']:.2f})"
+        if image_triage
+        else ""
+    )
     api_log(
         f"Orchestrator Plan ({purpose}) -> route={chosen_route} ({route_conf:.2f}), "
         f"complexity={complexity_score:.2f} ({complexity_conf:.2f}), "
         f"search={needs_search} ({search_conf:.2f}), tools={needs_tools} ({tool_conf:.2f}), "
-        f"buttons={attach_btns} ({buttons_conf:.2f}/{btn_domain}:{domain_conf:.2f}), tone={tone_cue}"
+        f"buttons={attach_btns} ({buttons_conf:.2f}/{btn_domain}:{domain_conf:.2f}), tone={tone_cue}{triage_log}"
     )
     return {
         "route": chosen_route,
@@ -882,6 +994,7 @@ async def orchestrate_message_with_decision_1(
         "button_domain": btn_domain,
         "domain_confidence": domain_conf,
         "button_scores": button_scores,
+        "image_triage": image_triage,
     }
 
 
@@ -921,7 +1034,7 @@ async def orchestrate_voice_utterance_with_decision_1(
 
     sections = [
         "Voice Room State:",
-        f"- Bot Persona Names: Yukino / Yukinon / ยูกิโนะ / ยูกิน่อน / บอท",
+        "- Bot Persona Names: Yukino / Yukinon / ยูกิโนะ / ยูกิน่อน / บอท",
         f"- Humans Currently in Voice Channel: {max(1, int(human_count_in_vc))}",
         f"- Explicit Wake Word Spoken: {bool(explicit_wake_word)}",
         f"- Time Since Bot Last Spoke: {bot_age_str}",
@@ -1404,77 +1517,20 @@ async def triage_image_with_decision_1(
         },
     ]
 
-    questions = {
-        "image_type": {
-            "type": "choice",
-            "instructions": "Select the single best visual category for this image.",
-            "criteria": {
-                "anime_fanart": "Single anime/game illustration, character fanart, key visual, or anime episode screenshot without multi-panel comic speech bubbles.",
-                "code_or_error": "IDE editor screenshot, source code, terminal/CLI output, stack trace, database/SQL tool, server log, Kubernetes/Grafana/network dashboard, or software error dialog.",
-                "document_table": "Scanned document, receipt, invoice, form, slide deck, chart, spreadsheet table, or dense text/article screenshot.",
-                "manga_comic": "Manga, manhwa, webtoon, 4-koma, or comic page/strip containing speech bubbles or comic panel dialogue.",
-                "meme_casual": "Casual meme, sticker, reaction image, chat screenshot, or miscellaneous social post.",
-                "real_world_product": "Real-world photograph of physical hardware, electronics, coffee equipment, model kits, collectible figures, food, scenery, or consumer products.",
-            },
-        },
-        "has_japanese_dialogue": {
-            "type": "noul",
-            "instructions": (
-                "Answer YES if this image visibly contains Japanese speech-bubble dialogue, comic narration, "
-                "or Japanese character speech lines that a reader would want translated. "
-                "Answer NO for pure sound effects, logos, UI buttons, English/Thai-only images, or textless art."
-            ),
-        },
-        "needs_source_lookup": {
-            "type": "noul",
-            "instructions": (
-                "Answer YES if anime/illustration reverse-image databases (SauceNAO, IQDB, trace.moe) "
-                "would be useful to identify the artist, anime, or manga source. "
-                "Answer NO for code/error screenshots, documents, invoices, charts, or real-world hardware/model-kit photos."
-            ),
-        },
-        "is_anime_screenshot": {
-            "type": "noul",
-            "instructions": (
-                "Answer YES only if this is a colored frame or screenshot taken from an animated TV anime, "
-                "anime movie, or anime PV (suitable for trace.moe episode timestamp matching). "
-                "Answer NO for manga pages, static fanart illustrations, real photos, or software screenshots."
-            ),
-        },
-    }
-
     answers = await call_gemini_decision_orchestrator(
-        shared_input, questions, timeout_sec=4.0, purpose="ImageTriage"
+        shared_input, _IMAGE_TRIAGE_DECISION_QUESTIONS, timeout_sec=4.0, purpose="ImageTriage"
     )
-    if not answers:
+    parsed = _parse_image_triage_answers(answers)
+    if not parsed:
         return None
 
-    type_ans = answers.get("image_type") or {}
-    jp_ans = answers.get("has_japanese_dialogue") or {}
-    lookup_ans = answers.get("needs_source_lookup") or {}
-    anime_ss_ans = answers.get("is_anime_screenshot") or {}
-
-    img_type = str(type_ans.get("choice") or "meme_casual")
-    img_type_conf = float(type_ans.get("confidence") or 0.0)
-    jp_prob = float(jp_ans.get("noul") or 0.0)
-    lookup_prob = float(lookup_ans.get("noul") or 0.0)
-    anime_ss_prob = float(anime_ss_ans.get("noul") or 0.0)
-
     api_log(
-        f"ImageTriage ({(filename or 'img')[:32]}) -> type={img_type} ({img_type_conf:.2f}), "
-        f"jp_dlg={jp_prob >= 0.55} ({jp_prob:.2f}), lookup={lookup_prob >= 0.50} ({lookup_prob:.2f}), "
-        f"anime_ss={anime_ss_prob >= 0.55} ({anime_ss_prob:.2f})"
+        f"ImageTriage ({(filename or 'img')[:32]}) -> type={parsed['image_type']} ({parsed['image_type_confidence']:.2f}), "
+        f"jp_dlg={parsed['has_japanese_dialogue']} ({parsed['jp_dialogue_prob']:.2f}), "
+        f"lookup={parsed['needs_source_lookup']} ({parsed['source_lookup_prob']:.2f}), "
+        f"anime_ss={parsed['is_anime_screenshot']} ({parsed['anime_screenshot_prob']:.2f})"
     )
-    return {
-        "image_type": img_type,
-        "image_type_confidence": img_type_conf,
-        "has_japanese_dialogue": jp_prob >= 0.55,
-        "jp_dialogue_prob": jp_prob,
-        "needs_source_lookup": lookup_prob >= 0.50,
-        "source_lookup_prob": lookup_prob,
-        "is_anime_screenshot": anime_ss_prob >= 0.55,
-        "anime_screenshot_prob": anime_ss_prob,
-    }
+    return parsed
 
 
 async def triage_pdf_with_decision_1(
@@ -1870,10 +1926,10 @@ async def discover_active_gemma_models(vision_required: bool = False) -> list[st
 async def _discover_active_gemini_flash_model(force_remote: bool = False) -> list[str]:
     """
     Deterministic priority order for Gemini Flash models:
-      1. `gemini-3.5-flash-lite`
-      2. `gemini-3.1-flash-lite`
-      3. `gemini-3-flash-preview`
-      4. `gemini-3.6-flash`
+    1. `gemini-3.5-flash-lite`
+    2. `gemini-3.1-flash-lite`
+    3. `gemini-3-flash-preview`
+    4. `gemini-3.6-flash`
     """
     preferred_seed = [
         "gemini-3.5-flash-lite",
@@ -2751,9 +2807,17 @@ async def query_local_ollama_chat(
     speaker_name: str = "",
     decision_plan: dict | None = None,
     tool_ctx: ToolExecutionContext | None = None,
+    on_heavy_status=None,
 ) -> tuple[str, bool]:
     raw_user_query = _extract_raw_user_turn(prompt)
     plan = decision_plan or {}
+
+    async def _notify_heavy(status_text: str):
+        if on_heavy_status is not None:
+            try:
+                await on_heavy_status(status_text)
+            except Exception:
+                pass
 
     # 1. Regex + Semantic Decision-1 Prompt-Injection Defense
     is_semantic_injection = bool(plan.get("is_prompt_injection") and float(plan.get("injection_prob") or 0.0) >= 0.88)
@@ -2820,9 +2884,9 @@ async def query_local_ollama_chat(
     live_clock_str = get_current_thai_datetime_str()
 
     # TRUE IMPLICIT PREFIX CACHING (Gemini 3.5 / 4):
-    # `systemInstruction` contains ONLY static persona + static speaker role + stable pinned_facts/favorite_topics.
-    # All per-turn mutating fields (clock, interaction_count, last_seen, rolling notes, recent topics, active topic, tone)
-    # go into the trailing `[ข้อมูลบริบทระบบปัจจุบัน]` block on the latest user turn!
+    # `systemInstruction` contains ONLY static persona + static speaker role + permanent `pinned_facts`.
+    # All per-turn / auto-updating fields (clock, interaction_count, last_seen, favorite_topics,
+    # rolling notes, recent topics, active topic, tone) go into trailing `[ข้อมูลบริบทระบบปัจจุบัน]`!
     speaker_static_block = get_speaker_identity_context(
         speaker_user, fallback_name=speaker_name, include_volatile_memory=False
     )
@@ -3076,9 +3140,14 @@ async def query_local_ollama_chat(
                 len(user_content) > 13000
                 or (complexity_score is not None and complexity_score >= 2.35 and complexity_conf >= 0.60)
             )
-            if use_hydrogen_code:
+            if use_hydrogen_code and _can_use_gemini_hydrogen():
+                await _notify_heavy("❄️ กำลังวิเคราะห์โค้ดและโครงสร้างเชิงลึก รอสักครู่นะคะ...")
                 ans = await call_gemini_hydrogen_chat(
-                    messages, thinking_level="MEDIUM", purpose="HeavyCode", tool_ctx=active_tool_ctx
+                    messages,
+                    thinking_level="MEDIUM",
+                    purpose="HeavyCode",
+                    tool_ctx=active_tool_ctx,
+                    on_heavy_status=on_heavy_status,
                 )
                 if ans:
                     return ans
@@ -3132,9 +3201,14 @@ async def query_local_ollama_chat(
                 or (complexity_score is not None and complexity_score >= 2.55 and complexity_conf >= 0.65)
             )
         )
-        if use_hydrogen_heavy:
+        if use_hydrogen_heavy and _can_use_gemini_hydrogen():
+            await _notify_heavy("❄️ กำลังวิเคราะห์เอกสารและข้อมูลเชิงลึก รอสักครู่นะคะ...")
             ans = await call_gemini_hydrogen_chat(
-                messages, thinking_level="LOW", purpose="HeavyDoc", tool_ctx=active_tool_ctx
+                messages,
+                thinking_level="LOW",
+                purpose="HeavyDoc",
+                tool_ctx=active_tool_ctx,
+                on_heavy_status=on_heavy_status,
             )
             if ans:
                 return ans

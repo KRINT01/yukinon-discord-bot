@@ -107,6 +107,7 @@ _BLIND_VERIFY_QUERY_REGEX = re.compile(
     r"^(?:https?://\S+|@?[A-Za-z0-9_]{2,30}|\d{6,24}|@?[A-Za-z0-9_]{2,30}\s+\d{6,24})$",
     re.IGNORECASE,
 )
+_EMBEDDED_SOCIAL_STATUS_ID_REGEX = re.compile(r"\b\d{15,22}\b")
 
 
 def _extract_x_page_range_bounds(text: str) -> tuple[int, int] | None:
@@ -159,7 +160,7 @@ def _is_pure_sfx_query(q: str) -> bool:
 
 
 def _is_blind_handle_or_id_query(q: str) -> bool:
-    """Blocks blind web_verify queries containing only a social handle, raw URL, or tweet/post ID."""
+    """Blocks blind web_verify queries containing a handle, raw URL, or raw/embedded 15-22 digit status ID."""
     if not q:
         return True
     s = re.sub(r"\s+", " ", q).strip()
@@ -167,7 +168,13 @@ def _is_blind_handle_or_id_query(q: str) -> bool:
         return True
     if _BLIND_VERIFY_QUERY_REGEX.match(s):
         return True
-    if "status/" in s.lower() or "x.com/" in s.lower() or "twitter.com/" in s.lower() or "pixiv.net/" in s.lower():
+    if _EMBEDDED_SOCIAL_STATUS_ID_REGEX.search(s):
+        return True
+    low = s.lower()
+    if any(
+        tok in low
+        for tok in ("status/", "x.com/", "twitter.com/", "fxtwitter.com/", "vxtwitter.com/", "fixupx.com/", "pixiv.net/")
+    ):
         return True
     return False
 
@@ -240,11 +247,11 @@ async def extract_pdf_context_async(
 ) -> tuple[str, bool]:
     """
     Phase 2 Smart PDF Extractor:
-      1) Runs fast local `pypdf` extraction first (0 API calls for normal digital PDFs).
-      2) If `pypdf` detects a scanned/image-only PDF (`< 60` selectable chars) and the PDF fits
-         within `MAX_NATIVE_INLINE_PDF_BYTES` (20 MB), triages it via Decision-1's native
-         `document` block (`application/pdf`) and extracts full content via native Gemini PDF vision
-         (`gemini-3.5-flash-lite` or `gemini-4-hydrogen` for dense tables/diagrams).
+    1) Runs fast local `pypdf` extraction first (0 API calls for normal digital PDFs).
+    2) If `pypdf` detects a scanned/image-only PDF (`< 60` selectable chars) and the PDF fits
+       within `MAX_NATIVE_INLINE_PDF_BYTES` (20 MB), triages it via Decision-1's native
+       `document` block (`application/pdf`) and extracts full content via native Gemini PDF vision
+       (`gemini-3.5-flash-lite` or `gemini-4-hydrogen` for dense tables/diagrams).
     Returns `(formatted_context_block, is_code_or_technical)`.
     """
     pypdf_text = await asyncio.to_thread(parse_pdf_bytes, raw_bytes, max_chars)
@@ -1030,8 +1037,8 @@ async def collect_embedded_images_and_metadata(
             if tw_meta:
                 resolved_social_api_post = True
                 metadata_sections.append(f"=== Embedded X (Twitter) Post Metadata & Caption ===\n{tw_meta}")
-                for p_url in tw_photos:
-                    _queue_img(p_url)
+            for p_url in tw_photos:
+                _queue_img(p_url)
             continue
 
         px_m = PIXIV_ILLUST_URL_REGEX.search(url)
@@ -1042,8 +1049,8 @@ async def collect_embedded_images_and_metadata(
             if px_meta:
                 resolved_social_api_post = True
                 metadata_sections.append(f"=== Embedded Pixiv Artwork Metadata & Caption ===\n{px_meta}")
-                for p_url in px_photos:
-                    _queue_img(p_url, referer=f"{HTTPS}www.pixiv.net/artworks/{illust_id}")
+            for p_url in px_photos:
+                _queue_img(p_url, referer=f"{HTTPS}www.pixiv.net/artworks/{illust_id}")
             continue
 
         bsky_m = BSKY_POST_URL_REGEX.search(url)
@@ -1053,8 +1060,8 @@ async def collect_embedded_images_and_metadata(
             if b_meta:
                 resolved_social_api_post = True
                 metadata_sections.append(f"=== Embedded Bluesky Post Metadata & Caption ===\n{b_meta}")
-                for p_url in b_photos:
-                    _queue_img(p_url)
+            for p_url in b_photos:
+                _queue_img(p_url)
             continue
 
         if DIRECT_IMAGE_URL_REGEX.match(url):
@@ -1580,6 +1587,7 @@ async def _call_cf_multi_image_batch(
                     content = (choices[0].get("message") or {}).get("content") or ""
                     content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
                     if content:
+                        state.record_provider_call("cloudflare")
                         api_log(f"MultiImageOCR (Tier 2 CF) -> {CF_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
                         prefix = f"{triage_header}\n" if triage_header else ""
                         return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{prefix}{content}"
@@ -1594,6 +1602,7 @@ async def _call_cf_multi_image_batch(
 async def extract_multi_images_batch_ocr(
     images_list: list[tuple[bytes, str, str]],
     post_meta_hint: str = "",
+    pre_triage: dict | None = None,
 ) -> str:
     target_list = images_list[:MAX_BATCH_IMAGES]
     if len(target_list) < 2:
@@ -1622,22 +1631,29 @@ async def extract_multi_images_batch_ocr(
     if len(encoded_images) < 2:
         return ""
 
-    # Phase 2 Pre-OCR Batch Triage on Page 1 (~250ms, ~260 tokens):
-    # Tailors batch prompt for code/document/product photo sets and preserves Japanese dialogue flags.
-    triage = await triage_image_with_decision_1(
-        encoded_images[0][0],
-        encoded_images[0][1],
-        filename=encoded_images[0][2],
-        post_meta_hint=post_meta_hint,
-        resolution="low",
-    )
+    # Bundle 2: Reuse PreRoute's merged multimodal ImageTriage when available (eliminates redundant Decision-1 call!)
+    if isinstance(pre_triage, dict) and pre_triage.get("image_type"):
+        triage = pre_triage
+        api_log(
+            f"ImageTriage (Reused PreRoute | {encoded_images[0][2][:28]}) -> "
+            f"type={triage['image_type']} ({float(triage.get('image_type_confidence') or 0.0):.2f}), "
+            f"jp_dlg={bool(triage.get('has_japanese_dialogue'))}"
+        )
+    else:
+        triage = await triage_image_with_decision_1(
+            encoded_images[0][0],
+            encoded_images[0][1],
+            filename=encoded_images[0][2],
+            post_meta_hint=post_meta_hint,
+            resolution="low",
+        )
     triage_type = (
         triage["image_type"]
         if (triage and float(triage.get("image_type_confidence") or 0.0) >= 0.65)
         else ""
     )
     triage_header = (
-        f"[ImageTriage: type={triage_type} | conf={triage['image_type_confidence']:.2f} | "
+        f"[ImageTriage: type={triage_type} | conf={float(triage.get('image_type_confidence') or 0.0):.2f} | "
         f"has_japanese_dialogue={bool(triage.get('has_japanese_dialogue'))}]"
         if triage_type
         else ""
@@ -1794,6 +1810,7 @@ async def extract_image_via_transient_ocr(
     post_meta_hint: str = "",
     page_label: str = "",
     skip_triage: bool = False,
+    pre_triage: dict | None = None,
 ) -> str:
     try:
         b64_img, mime_type, is_color_img = await asyncio.to_thread(
@@ -1804,10 +1821,16 @@ async def extract_image_via_transient_ocr(
         mime_type = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
         is_color_img = True
 
-    # Phase 2 Pre-OCR Multimodal Triage (~250-350ms, 0 output tokens):
-    # Skips wasted 2-6s anime reverse-image lookups on code/doc/product photos and selects a tailored Lens prompt.
+    # Bundle 2: Reuse PreRoute's merged multimodal ImageTriage when available (0 extra Decision-1 latency!)
     triage = None
-    if not skip_triage:
+    if isinstance(pre_triage, dict) and pre_triage.get("image_type"):
+        triage = pre_triage
+        api_log(
+            f"ImageTriage (Reused PreRoute | {(filename or 'img')[:28]}) -> "
+            f"type={triage['image_type']} ({float(triage.get('image_type_confidence') or 0.0):.2f}), "
+            f"jp_dlg={bool(triage.get('has_japanese_dialogue'))}"
+        )
+    elif not skip_triage:
         triage = await triage_image_with_decision_1(
             b64_img,
             mime_type,
@@ -1926,6 +1949,7 @@ async def extract_image_via_transient_ocr(
                         content = g_data["choices"][0]["message"]["content"].strip()
                         content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
                         if content:
+                            state.record_provider_call("groq")
                             api_log(f"Image OCR (Tier 4 Groq) -> {g_mod} 200 OK ({elapsed:.2f}s)")
                             vision_result = content
                             break
@@ -1959,6 +1983,7 @@ async def extract_image_via_transient_ocr(
                         data = await resp.json()
                         content = data.get("message", {}).get("content", "").strip()
                         if content:
+                            state.record_provider_call("modal")
                             api_log(f"Image OCR (Tier 5 Modal) -> {ACTIVE_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
                             vision_result = content
         except Exception as e:
@@ -2027,6 +2052,7 @@ async def resolve_referenced_message(message: discord.Message) -> discord.Messag
 async def extract_all_context(
     message: discord.Message,
     preloaded_attachments: dict[int, bytes] | None = None,
+    pre_triage: dict | None = None,
 ) -> tuple[str, str]:
     from voice_engine import convert_audio_bytes_to_wav_sync, transcribe_wav_bytes_hybrid
 
@@ -2103,7 +2129,11 @@ async def extract_all_context(
         if getattr(message, "id", 0):
             await asyncio.to_thread(save_temp_image_cache, message.id, image_att_batch, [])
         if len(image_att_batch) >= 2:
-            batch_vis = await extract_multi_images_batch_ocr(image_att_batch, post_meta_hint=message.content or "")
+            batch_vis = await extract_multi_images_batch_ocr(
+                image_att_batch,
+                post_meta_hint=message.content or "",
+                pre_triage=pre_triage,
+            )
             if batch_vis:
                 processed_image_count += len(image_att_batch)
                 if "[ImageTriage: type=code_or_error" in batch_vis or STACK_TRACE_SIGNATURE_REGEX.search(batch_vis):
@@ -2121,6 +2151,7 @@ async def extract_all_context(
                         run_source_lookup=(idx <= 2),
                         post_meta_hint=message.content or "",
                         page_label=f"Page {idx} of {total_att_imgs}" if total_att_imgs > 1 else "",
+                        pre_triage=(pre_triage if idx == 1 else None),
                     )
                     return idx, img_fn, ocr_out
 

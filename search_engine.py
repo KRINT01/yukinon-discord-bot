@@ -28,6 +28,7 @@ from config import (
     WEB_SEARCH_INTENT_PATTERN,
     RECENCY_INTENT_REGEX,
     USER_CORRECTION_PATTERN,
+    OWNER_NAME_STRIP_REGEX,
     THAI_CHAR_REGEX,
     NEWS_QUERY_REGEX,
     ANIME_MANGA_QUERY_REGEX,
@@ -55,8 +56,13 @@ STOPWORD_ENTITIES = {
     "web", "extraction", "error", "readable", "found", "embed",
     "markdown", "json", "html", "table", "tables", "bullet", "bullets", "points", "checklist",
     "items", "in-bubble", "bubble", "ocr", "sfx", "canon", "lore",
+    "yukino", "yukinon", "yuki", "bot", "partner", "owner", "member", "user", "discord",
+    "ot", "ping", "ram", "status", "memory", "profile", "scribe", "voice",
+    "hi", "hello", "hey", "thanks", "thank", "please", "sorry", "test", "check",
+    "fix", "code", "bug", "log", "run", "try", "lol", "gg",
 }
 _MARKUP_NOISE_WORDS = {"markdown", "json", "html", "in-bubble", "ocr", "sfx", "error", "extraction", "readable"}
+_USER_TAG_REGEX = re.compile(r"^user_\d+$", re.IGNORECASE)
 
 # Bounded 5-minute in-memory TTL cache for search results (eliminates redundant lookups on follow-up buttons)
 _SEARCH_CACHE: dict[str, tuple[float, str]] = {}
@@ -89,7 +95,7 @@ def _store_cached_search(cache_key: str, value: str):
 
 
 def _strip_context_and_system_blocks(text: str) -> str:
-    """Strips appended context headers, speaker tags, and internal prompt directives before intent/entity scanning."""
+    """Strips appended context headers, speaker tags, voice prefixes, @handles, and internal prompt directives before intent/entity scanning."""
     if not text:
         return ""
     head = re.split(
@@ -99,6 +105,8 @@ def _strip_context_and_system_blocks(text: str) -> str:
         maxsplit=1,
     )[0]
     head = re.sub(r"^\[ผู้พูด:[^\]]+\]\s*", "", head.strip())
+    head = re.sub(r"^[^\n:]{1,40}\s+พูดในห้องเสียงว่า:\s*", "", head)
+    head = re.sub(r"@[A-Za-z0-9_.-]+", " ", head)
     head = re.sub(
         r"\[(?:Web extraction error|Error reading|Attachment Size Notice|PDF Notice|กฎสำคัญ|SEARCH_HINT):[^\]]+\]",
         " ",
@@ -160,14 +168,22 @@ def detect_web_search_intent(text: str, channel_id: int = None) -> bool:
 
 def _is_valid_entity_phrase(phrase: str) -> bool:
     p = phrase.strip()
-    if not p or p.lower() in STOPWORD_ENTITIES:
+    if not p or len(p) < 3 or p.lower() in STOPWORD_ENTITIES:
+        return False
+    if p.startswith("@") or _USER_TAG_REGEX.match(p):
+        return False
+    if OWNER_NAME_STRIP_REGEX.search(p):
         return False
     words = [w.lower() for w in p.split()]
-    if all(w in STOPWORD_ENTITIES for w in words):
-        return False
     if any(w in _MARKUP_NOISE_WORDS for w in words):
         return False
-    return True
+    if any(OWNER_NAME_STRIP_REGEX.search(w) for w in words):
+        return False
+    meaningful_words = [
+        w for w in words
+        if re.search(r"[a-z]", w) and w not in STOPWORD_ENTITIES and not _USER_TAG_REGEX.match(w)
+    ]
+    return bool(meaningful_words)
 
 
 def update_and_get_channel_topic(user_text: str, channel_id: int = None) -> str:
@@ -598,6 +614,12 @@ async def _search_google_ai_studio_grounded_async(query: str) -> list[dict]:
                         if (ch.get("web") or {}).get("uri")
                     ]
                     if summary_text:
+                        state.record_provider_call("gemini_flash")
+                        usage = data.get("usageMetadata") if isinstance(data, dict) else None
+                        if isinstance(usage, dict):
+                            cached_cnt = int(usage.get("cachedContentTokenCount") or 0)
+                            if cached_cnt > 0:
+                                state.record_gemini_cache_hit(cached_cnt)
                         api_log(f"Search (Gemini Grounding) -> {model_id} 200 OK ({elapsed:.2f}s)")
                         return [{
                             "title": "[Google Search Grounded Summary]",
@@ -631,18 +653,18 @@ async def _search_google_news_rss_async(query: str, is_thai: bool, max_results: 
             if resp.status != 200:
                 return []
             xml_bytes = await resp.read()
-        root = ET.fromstring(xml_bytes)
-        for item in root.findall("./channel/item")[:max_results]:
-            title = (item.findtext("title") or "").strip()
-            link = (item.findtext("link") or "").strip()
-            pub_date = (item.findtext("pubDate") or "").strip()
-            source = (item.findtext("source") or "").strip()
-            results.append({
-                "title": f"[{source}] {title}" if source else title,
-                "href": link,
-                "body": f"สำนักข่าว (Source): {source or 'Unknown'} | วันที่เผยแพร่: {pub_date} | พาดหัวข่าว: {title}",
-                "skip_scrape": True,
-            })
+            root = ET.fromstring(xml_bytes)
+            for item in root.findall("./channel/item")[:max_results]:
+                title = (item.findtext("title") or "").strip()
+                link = (item.findtext("link") or "").strip()
+                pub_date = (item.findtext("pubDate") or "").strip()
+                source = (item.findtext("source") or "").strip()
+                results.append({
+                    "title": f"[{source}] {title}" if source else title,
+                    "href": link,
+                    "body": f"สำนักข่าว (Source): {source or 'Unknown'} | วันที่เผยแพร่: {pub_date} | พาดหัวข่าว: {title}",
+                    "skip_scrape": True,
+                })
         if results:
             api_log(f"Search (Google News RSS) -> {len(results)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception as e:
@@ -681,36 +703,36 @@ async def _search_wikipedia_full_extract_async(query: str, is_thai: bool, max_re
                 if resp.status != 200:
                     continue
                 data = await resp.json()
-            search_items = ((data.get("query") or {}).get("search")) or []
-            titles = [item.get("title", "") for item in search_items[:max_results] if item.get("title")]
-            if not titles:
-                continue
-
-            # Batch-fetch all matched Wikipedia page extracts in ONE HTTP request (instead of N serial requests!)
-            titles_param = "|".join(titles)
-            ext_url = clean_url(
-                f"{HTTPS}{lang_host}.wikipedia.org/w/api.php"
-                f"?action=query&prop=extracts&explaintext=1&exchars=3800"
-                f"&titles={quote_plus(titles_param)}&format=json"
-            )
-            async with session.get(
-                ext_url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)
-            ) as e_resp:
-                if e_resp.status != 200:
+                search_items = ((data.get("query") or {}).get("search")) or []
+                titles = [item.get("title", "") for item in search_items[:max_results] if item.get("title")]
+                if not titles:
                     continue
-                e_data = await e_resp.json()
-            pages = ((e_data.get("query") or {}).get("pages")) or {}
-            for _, p_obj in pages.items():
-                title = p_obj.get("title") or ""
-                extract = (p_obj.get("extract") or "").strip()
-                if title and extract:
-                    page_url = f"{HTTPS}{lang_host}.wikipedia.org/wiki/{quote_plus(title.replace(' ', '_'))}"
-                    hits.append({
-                        "title": f"[Wikipedia {lang_host.upper()}] {title}",
-                        "href": page_url,
-                        "body": extract[:3800],
-                        "skip_scrape": True,
-                    })
+
+                # Batch-fetch all matched Wikipedia page extracts in ONE HTTP request (instead of N serial requests!)
+                titles_param = "|".join(titles)
+                ext_url = clean_url(
+                    f"{HTTPS}{lang_host}.wikipedia.org/w/api.php"
+                    f"?action=query&prop=extracts&explaintext=1&exchars=3800"
+                    f"&titles={quote_plus(titles_param)}&format=json"
+                )
+                async with session.get(
+                    ext_url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)
+                ) as e_resp:
+                    if e_resp.status != 200:
+                        continue
+                    e_data = await e_resp.json()
+                    pages = ((e_data.get("query") or {}).get("pages")) or {}
+                    for _, p_obj in pages.items():
+                        title = p_obj.get("title") or ""
+                        extract = (p_obj.get("extract") or "").strip()
+                        if title and extract:
+                            page_url = f"{HTTPS}{lang_host}.wikipedia.org/wiki/{quote_plus(title.replace(' ', '_'))}"
+                            hits.append({
+                                "title": f"[Wikipedia {lang_host.upper()}] {title}",
+                                "href": page_url,
+                                "body": extract[:3800],
+                                "skip_scrape": True,
+                            })
             if hits:
                 api_log(f"Search (Wikipedia:{lang_host} q='{q_for_wiki[:35]}') -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
         except Exception:
@@ -740,23 +762,23 @@ async def _search_jikan_anime_manga_async(query: str, max_results: int = 2) -> l
             if resp.status != 200:
                 return []
             data = await resp.json()
-        for item in (data.get("data") or [])[:max_results]:
-            title = item.get("title") or "Unknown"
-            title_jp = item.get("title_japanese") or ""
-            score = item.get("score") or "N/A"
-            status = item.get("status") or "Unknown"
-            episodes_or_ch = item.get("episodes") or item.get("chapters") or "?"
-            synopsis = (item.get("synopsis") or "").strip()[:1200]
-            mal_url = item.get("url") or ""
-            hits.append({
-                "title": f"[MyAnimeList {media_type.upper()}] {title} ({title_jp})",
-                "href": mal_url,
-                "body": (
-                    f"Type: {item.get('type')} | Score: {score}/10 | Status: {status} | "
-                    f"Episodes/Chapters: {episodes_or_ch}\nSynopsis: {synopsis}"
-                ),
-                "skip_scrape": True,
-            })
+            for item in (data.get("data") or [])[:max_results]:
+                title = item.get("title") or "Unknown"
+                title_jp = item.get("title_japanese") or ""
+                score = item.get("score") or "N/A"
+                status = item.get("status") or "Unknown"
+                episodes_or_ch = item.get("episodes") or item.get("chapters") or "?"
+                synopsis = (item.get("synopsis") or "").strip()[:1200]
+                mal_url = item.get("url") or ""
+                hits.append({
+                    "title": f"[MyAnimeList {media_type.upper()}] {title} ({title_jp})",
+                    "href": mal_url,
+                    "body": (
+                        f"Type: {item.get('type')} | Score: {score}/10 | Status: {status} | "
+                        f"Episodes/Chapters: {episodes_or_ch}\nSynopsis: {synopsis}"
+                    ),
+                    "skip_scrape": True,
+                })
         if hits:
             api_log(f"Search (Jikan MAL:{media_type}) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception:
@@ -786,19 +808,19 @@ async def _search_steam_games_async(query: str, max_results: int = 2) -> list[di
             if resp.status != 200:
                 return []
             data = await resp.json()
-        for item in (data.get("items") or [])[:max_results]:
-            gid = item.get("id")
-            name = item.get("name") or "Unknown Game"
-            price_info = item.get("price") or {}
-            final_thb = (price_info.get("final", 0) / 100.0) if price_info else 0
-            price_str = f"{final_thb:,.2f} THB" if final_thb > 0 else "Free-to-Play / TBA"
-            store_url = f"{HTTPS}store.steampowered.com/app/{gid}" if gid else ""
-            hits.append({
-                "title": f"[Steam Store TH] {name}",
-                "href": store_url,
-                "body": f"Game: {name} | Steam Thailand Price: {price_str} | AppID: {gid}",
-                "skip_scrape": True,
-            })
+            for item in (data.get("items") or [])[:max_results]:
+                gid = item.get("id")
+                name = item.get("name") or "Unknown Game"
+                price_info = item.get("price") or {}
+                final_thb = (price_info.get("final", 0) / 100.0) if price_info else 0
+                price_str = f"{final_thb:,.2f} THB" if final_thb > 0 else "Free-to-Play / TBA"
+                store_url = f"{HTTPS}store.steampowered.com/app/{gid}" if gid else ""
+                hits.append({
+                    "title": f"[Steam Store TH] {name}",
+                    "href": store_url,
+                    "body": f"Game: {name} | Steam Thailand Price: {price_str} | AppID: {gid}",
+                    "skip_scrape": True,
+                })
         if hits:
             api_log(f"Search (Steam Store) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception:
@@ -821,12 +843,12 @@ async def _search_tavily_async(query: str, max_results: int = 5) -> list[dict]:
             if resp.status != 200:
                 return []
             t_data = await resp.json()
-        for r in t_data.get("results", []):
-            hits.append({
-                "title": r.get("title", ""),
-                "href": r.get("url", ""),
-                "body": r.get("content", ""),
-            })
+            for r in t_data.get("results", []):
+                hits.append({
+                    "title": r.get("title", ""),
+                    "href": r.get("url", ""),
+                    "body": r.get("content", ""),
+                })
         if hits:
             api_log(f"Search (Tavily) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception as e:
@@ -872,13 +894,13 @@ def _search_ddgs_sync(query: str, region_code: str, timelimit: str | None, max_r
 async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
     """
     High-speed parallel async multi-engine web search with 5-minute TTL caching + Phase 4 Decision-1 denoising:
-      - Fans out fast domain-matched async backends (Gemini Grounding, Google News RSS, Jikan MAL,
-        Wikipedia batched extracts, Steam Store, Tavily) concurrently with DDGS.
-      - Soft-caps DDGS tail latency to `_DDGS_SOFT_WAIT_SEC` (3.0s) once fast backends already
-        returned hits, shaving 3-5s off Render IP rate-limited DDGS stalls (full 8s allowed if fast backends are empty).
-      - Filters off-topic & clickbait/rumor snippets in ONE Decision-1 forward pass (~250ms)
-        BEFORE deep-scraping, keeping only the cleanest, highest-relevance evidence for Gemma/Flash-Lite.
-      - Deep-scrapes up to 2 surviving short-snippet web pages concurrently via `fetch_webpage_async`.
+    - Fans out fast domain-matched async backends (Gemini Grounding, Google News RSS, Jikan MAL,
+      Wikipedia batched extracts, Steam Store, Tavily) concurrently with DDGS.
+    - Soft-caps DDGS tail latency to `_DDGS_SOFT_WAIT_SEC` (3.0s) once fast backends already
+      returned hits, shaving 3-5s off Render IP rate-limited DDGS stalls (full 8s allowed if fast backends are empty).
+    - Filters off-topic & clickbait/rumor snippets in ONE Decision-1 forward pass (~250ms)
+      BEFORE deep-scraping, keeping only the cleanest, highest-relevance evidence for Gemma/Flash-Lite.
+    - Deep-scrapes up to 2 surviving short-snippet web pages concurrently via `fetch_webpage_async`.
     """
     clean_q = re.sub(r"[\r\n]+", " ", query or "").strip()
     clean_q = re.sub(

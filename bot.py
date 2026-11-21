@@ -142,6 +142,46 @@ _OT_INLINE_CUE_REGEX = re.compile(
 )
 
 
+class _HeavyStatusTracker:
+    """
+    Bundle 2 progressive status message manager for heavy `gemini-4-hydrogen` calls:
+    - Posts a temporary status message ONLY if Hydrogen is actually invoked.
+    - Edits in place on slow-thinking heartbeat updates (throttled to >= 2.0s).
+    - Auto-deletes cleanly before the final response is posted (or on exception).
+    """
+
+    def __init__(self, channel, reply_to: discord.Message | None = None):
+        self.channel = channel
+        self.reply_to = reply_to
+        self._msg: discord.Message | None = None
+        self._last_edit_ts: float = 0.0
+
+    async def update(self, text: str) -> None:
+        if not text or not self.channel:
+            return
+        now = time.monotonic()
+        if self._msg is not None and (now - self._last_edit_ts) < 2.0:
+            return
+        try:
+            if self._msg is None:
+                self._msg = await _send_or_reply(self.channel, self.reply_to, content=text)
+            else:
+                await self._msg.edit(content=text)
+            self._last_edit_ts = now
+        except Exception:
+            pass
+
+    async def cleanup(self) -> None:
+        msg = self._msg
+        self._msg = None
+        if msg is None:
+            return
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+
 def _looks_like_compound_request(text: str) -> bool:
     """
     Detects multi-intent compound prompts (e.g., weather + math + memory, or search + image gen)
@@ -620,9 +660,9 @@ async def _dispatch_post_tool_side_effects(
 async def process_yukipedia_request(ctx_or_message, raw_prompt: str = ""):
     """
     Unified 'Yukipedia Mode' dispatcher:
-      1) If image/link + manga translation requested -> runs Manga Localization.
-      2) If image/document/reply attached -> runs OCR/Document extraction + Yukipedia analysis.
-      3) Otherwise -> runs Web Search & Decision-1 in parallel for faster Yukipedia answers.
+    1) If image/link + manga translation requested -> runs Manga Localization.
+    2) If image/document/reply attached -> runs OCR/Document extraction + Yukipedia analysis.
+    3) Otherwise -> runs Web Search & Decision-1 in parallel for faster Yukipedia answers.
     """
     msg = ctx_or_message.message if hasattr(ctx_or_message, "message") else ctx_or_message
     channel = ctx_or_message.channel
@@ -701,18 +741,24 @@ async def process_yukipedia_request(ctx_or_message, raw_prompt: str = ""):
             message=msg,
             mode="general",
         )
-        answer, did_search = await query_local_ollama_chat(
-            composed_prompt,
-            model=ACTIVE_FAST_MODEL,
-            system_prompt=YUKIPEDIA_SYSTEM_PROMPT,
-            channel_id=channel.id,
-            temperature=0.3,
-            allow_agentic_search=True,
-            has_fresh_attachment=bool(extracted_ctx or search_block),
-            speaker_user=author,
-            decision_plan=dec_plan,
-            tool_ctx=tool_ctx,
-        )
+        heavy_tracker = _HeavyStatusTracker(channel, reply_to=msg)
+        try:
+            answer, did_search = await query_local_ollama_chat(
+                composed_prompt,
+                model=ACTIVE_FAST_MODEL,
+                system_prompt=YUKIPEDIA_SYSTEM_PROMPT,
+                channel_id=channel.id,
+                temperature=0.3,
+                allow_agentic_search=True,
+                has_fresh_attachment=bool(extracted_ctx or search_block),
+                speaker_user=author,
+                decision_plan=dec_plan,
+                tool_ctx=tool_ctx,
+                on_heavy_status=heavy_tracker.update,
+            )
+        finally:
+            await heavy_tracker.cleanup()
+
         view = (
             build_contextual_suggestion_view(
                 channel.id,
@@ -841,6 +887,8 @@ async def on_message(message: discord.Message):
             return
 
     # 1. Single-Pass vs PreRoute Decision-1 Orchestration (context-aware with last 2 turns of channel_memory!)
+    # Bundle 2: When an image is uploaded, PreRoute also evaluates ImageTriage in the SAME pass so
+    # `extract_all_context(..., pre_triage=...)` reuses it directly without a second multimodal Decision-1 call!
     text_without_urls = URL_REGEX.sub("", clean_prompt).strip()
     is_bare_link_only = bool(has_embedded_media_or_link and not text_without_urls and not all_msg_atts)
     has_ambiguous_action_cue = bool(
@@ -872,6 +920,7 @@ async def on_message(message: discord.Message):
     )
     pre_route = (pre_plan or {}).get("route", "")
     pre_conf = float((pre_plan or {}).get("route_confidence") or 0.0)
+    pre_image_triage = (pre_plan or {}).get("image_triage")
 
     if pre_route == "ot_log" and pre_conf >= 0.82:
         preloaded_att_bytes.clear()
@@ -898,7 +947,9 @@ async def on_message(message: discord.Message):
 
     async with message.channel.typing():
         extracted_ctx, spoken_clip_text = await extract_all_context(
-            message, preloaded_attachments=preloaded_att_bytes
+            message,
+            preloaded_attachments=preloaded_att_bytes,
+            pre_triage=pre_image_triage,
         )
         preloaded_att_bytes.clear()
 
@@ -982,18 +1033,23 @@ async def on_message(message: discord.Message):
             message=message,
             mode="code" if use_coder else "general",
         )
-        answer, did_search = await query_local_ollama_chat(
-            full_prompt,
-            model=model,
-            system_prompt=sys_prompt,
-            channel_id=message.channel.id,
-            temperature=0.2 if use_coder else 0.55,
-            allow_agentic_search=(not use_coder),
-            has_fresh_attachment=bool(extracted_ctx),
-            speaker_user=message.author,
-            decision_plan=decision_plan,
-            tool_ctx=tool_ctx,
-        )
+        heavy_tracker = _HeavyStatusTracker(message.channel, reply_to=message)
+        try:
+            answer, did_search = await query_local_ollama_chat(
+                full_prompt,
+                model=model,
+                system_prompt=sys_prompt,
+                channel_id=message.channel.id,
+                temperature=0.2 if use_coder else 0.55,
+                allow_agentic_search=(not use_coder),
+                has_fresh_attachment=bool(extracted_ctx),
+                speaker_user=message.author,
+                decision_plan=decision_plan,
+                tool_ctx=tool_ctx,
+                on_heavy_status=heavy_tracker.update,
+            )
+        finally:
+            await heavy_tracker.cleanup()
 
         use_reply = should_reply_to_message(
             user_request, has_attachments=bool(message.attachments or extracted_ctx or tool_ctx.tools_used)
@@ -1313,16 +1369,22 @@ async def ask_fast(ctx, *, prompt: str = ""):
             message=ctx.message,
             mode="general",
         )
-        answer, did_search = await query_local_ollama_chat(
-            f"{effective_prompt}\n\n{ctx_text}" if ctx_text else effective_prompt,
-            ACTIVE_FAST_MODEL,
-            FAST_SYSTEM_PROMPT,
-            ctx.channel.id,
-            has_fresh_attachment=bool(ctx_text),
-            speaker_user=ctx.author,
-            decision_plan=dec_plan,
-            tool_ctx=tool_ctx,
-        )
+        heavy_tracker = _HeavyStatusTracker(ctx.channel, reply_to=ctx.message)
+        try:
+            answer, did_search = await query_local_ollama_chat(
+                f"{effective_prompt}\n\n{ctx_text}" if ctx_text else effective_prompt,
+                ACTIVE_FAST_MODEL,
+                FAST_SYSTEM_PROMPT,
+                ctx.channel.id,
+                has_fresh_attachment=bool(ctx_text),
+                speaker_user=ctx.author,
+                decision_plan=dec_plan,
+                tool_ctx=tool_ctx,
+                on_heavy_status=heavy_tracker.update,
+            )
+        finally:
+            await heavy_tracker.cleanup()
+
         use_reply = should_reply_to_message(
             effective_prompt, has_attachments=bool(ctx_text or tool_ctx.tools_used), is_instant_datetime=is_dt
         )
@@ -1361,18 +1423,24 @@ async def ask_code(ctx, *, prompt: str = "วิเคราะห์โค้�
             message=ctx.message,
             mode="code",
         )
-        answer, _ = await query_local_ollama_chat(
-            f"{prompt}\n\n{ctx_text}" if ctx_text else prompt,
-            ACTIVE_CODE_MODEL,
-            CODE_SYSTEM_PROMPT,
-            ctx.channel.id,
-            temperature=0.2,
-            allow_agentic_search=False,
-            has_fresh_attachment=bool(ctx_text),
-            speaker_user=ctx.author,
-            decision_plan={"route": "code", "route_confidence": 0.99, "needs_web_search": False, "search_confidence": 0.99},
-            tool_ctx=tool_ctx,
-        )
+        heavy_tracker = _HeavyStatusTracker(ctx.channel, reply_to=ctx.message)
+        try:
+            answer, _ = await query_local_ollama_chat(
+                f"{prompt}\n\n{ctx_text}" if ctx_text else prompt,
+                ACTIVE_CODE_MODEL,
+                CODE_SYSTEM_PROMPT,
+                ctx.channel.id,
+                temperature=0.2,
+                allow_agentic_search=False,
+                has_fresh_attachment=bool(ctx_text),
+                speaker_user=ctx.author,
+                decision_plan={"route": "code", "route_confidence": 0.99, "needs_web_search": False, "search_confidence": 0.99},
+                tool_ctx=tool_ctx,
+                on_heavy_status=heavy_tracker.update,
+            )
+        finally:
+            await heavy_tracker.cleanup()
+
         view = (
             CodeReviewActionView(ctx.author.id, ctx.channel.id, prompt, answer)
             if should_attach_interactive_view(prompt, answer, use_coder=True, extracted_ctx=ctx_text)
@@ -1411,18 +1479,24 @@ async def source_command(ctx, *, question: str = ""):
             message=ctx.message,
             mode="general",
         )
-        answer, did_search = await query_local_ollama_chat(
-            f"{user_q}\n\n{ctx_text}",
-            model=ACTIVE_FAST_MODEL,
-            system_prompt=FAST_SYSTEM_PROMPT,
-            channel_id=ctx.channel.id,
-            temperature=0.2,
-            allow_agentic_search=True,
-            has_fresh_attachment=True,
-            speaker_user=ctx.author,
-            decision_plan=dec_plan,
-            tool_ctx=tool_ctx,
-        )
+        heavy_tracker = _HeavyStatusTracker(ctx.channel, reply_to=ctx.message)
+        try:
+            answer, did_search = await query_local_ollama_chat(
+                f"{user_q}\n\n{ctx_text}",
+                model=ACTIVE_FAST_MODEL,
+                system_prompt=FAST_SYSTEM_PROMPT,
+                channel_id=ctx.channel.id,
+                temperature=0.2,
+                allow_agentic_search=True,
+                has_fresh_attachment=True,
+                speaker_user=ctx.author,
+                decision_plan=dec_plan,
+                tool_ctx=tool_ctx,
+                on_heavy_status=heavy_tracker.update,
+            )
+        finally:
+            await heavy_tracker.cleanup()
+
         view = (
             build_contextual_suggestion_view(
                 ctx.channel.id,

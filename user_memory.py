@@ -17,6 +17,7 @@ from config import (
     CODE_INTENT_PATTERN,
     CAT_TOPIC_REGEX,
     WEATHER_INTENT_PATTERN,
+    OWNER_NAME_STRIP_REGEX,
     channel_active_topic,
     state,
     api_log,
@@ -45,6 +46,53 @@ TOPIC_KEYWORDS_MAP = {
     "Cats & Pan-san": CAT_TOPIC_REGEX,
     "Weather Forecast": WEATHER_INTENT_PATTERN,
 }
+
+_USER_TAG_REGEX = re.compile(r"^user_\d+$", re.IGNORECASE)
+_FAV_TOPIC_NOISE_TOKENS = frozenset({
+    "partner", "owner", "partner (owner)", "member", "yukino", "yukinon", "yuki",
+    "bot", "discord", "ot", "unknown", "user",
+})
+
+
+def _is_blocked_favorite_topic(topic: str, user=None, profile: dict | None = None) -> bool:
+    """Blocks Discord usernames, display names, owner names, @handles, and bot/system noise from favorite_topics."""
+    t = re.sub(r"\s+", " ", str(topic or "")).strip()
+    if len(t) < 2:
+        return True
+    tl = t.lower()
+    if tl in _FAV_TOPIC_NOISE_TOKENS or tl.startswith(("@", "http://", "https://", "<@")):
+        return True
+    if _USER_TAG_REGEX.match(tl):
+        return True
+    if OWNER_NAME_STRIP_REGEX.search(t):
+        return True
+
+    identity_names: set[str] = set()
+    if user is not None:
+        for attr in ("name", "display_name", "global_name"):
+            val = str(getattr(user, attr, "") or "").strip().lower()
+            if len(val) >= 3:
+                identity_names.add(val)
+    if isinstance(profile, dict):
+        for key in ("username", "display_name"):
+            val = str(profile.get(key) or "").strip().lower()
+            if len(val) >= 3 and val != "partner (owner)":
+                identity_names.add(val)
+
+    for id_n in identity_names:
+        if tl == id_n or re.search(rf"(?<!\w){re.escape(id_n)}(?!\w)", tl):
+            return True
+    return False
+
+
+def _scrub_profile_favorite_topics(profile: dict, user=None) -> bool:
+    """Removes polluted Discord names/noise from a profile's favorite_topics in-place. Returns True if modified."""
+    raw_favs = list(profile.get("favorite_topics") or [])
+    cleaned = [t for t in raw_favs if not _is_blocked_favorite_topic(t, user=user, profile=profile)]
+    if cleaned != raw_favs:
+        profile["favorite_topics"] = cleaned
+        return True
+    return False
 
 
 def has_dirty_user_profiles() -> bool:
@@ -104,9 +152,10 @@ def _find_backup_channel(bot: discord.Client):
 async def restore_user_profiles_from_discord(bot: discord.Client):
     """
     Restores user_profiles.json from a private Discord channel (#yukinon-memory or MEMORY_BACKUP_CHANNEL_ID)
-    on startup, and also scans #work channels to recover any OT logs so records survive Render redeploys.
+    on startup, auto-scrubs polluted Discord names from favorite_topics, and scans #work channels
+    to recover any OT logs so records survive Render redeploys.
     """
-    global user_profiles
+    global user_profiles, _DIRTY_SINCE_LAST_BACKUP
     load_user_profiles_local()
     ch = _find_backup_channel(bot)
     if ch:
@@ -134,6 +183,16 @@ async def restore_user_profiles_from_discord(bot: discord.Client):
             print(f"[User Memory] Cloud restore note: {e}", flush=True)
 
     await recover_ot_logs_from_work_channels(bot)
+
+    scrubbed_any = False
+    for prof in user_profiles.values():
+        if isinstance(prof, dict) and _scrub_profile_favorite_topics(prof):
+            scrubbed_any = True
+    if scrubbed_any:
+        _DIRTY_SINCE_LAST_BACKUP = True
+        save_user_profiles_local()
+        print("[User Memory] Auto-scrubbed polluted Discord names/noise from favorite_topics.", flush=True)
+        await backup_user_profiles_to_discord(force=True)
 
 
 async def backup_user_profiles_to_discord(force: bool = False):
@@ -367,10 +426,11 @@ def record_user_interaction(
     profile["interaction_count"] = 1 if is_new else (int(profile.get("interaction_count", 0)) + 1)
     profile["last_seen"] = now_str
 
+    _scrub_profile_favorite_topics(profile, user=user)
     favs = list(profile.get("favorite_topics") or [])
     if channel_id and channel_id in channel_active_topic:
         act_t = channel_active_topic[channel_id].get("topic", "").strip()
-        if act_t and act_t not in favs:
+        if act_t and act_t not in favs and not _is_blocked_favorite_topic(act_t, user=user, profile=profile):
             favs.append(act_t)
 
     for label, pattern in TOPIC_KEYWORDS_MAP.items():
@@ -406,8 +466,8 @@ def record_user_interaction(
 
 def get_speaker_static_memory_context(user) -> str:
     """
-    Returns ONLY stable, rarely-changing user profile fields (`pinned_facts` & `favorite_topics`)
-    for Gemini implicit prefix caching so `systemInstruction` stays byte-identical across turns.
+    Returns ONLY permanent `pinned_facts` for Gemini implicit prefix caching so `systemInstruction`
+    remains 100% byte-identical across turns even when auto-detected topics change.
     """
     if user is None:
         return ""
@@ -416,21 +476,17 @@ def get_speaker_static_memory_context(user) -> str:
     if not profile:
         return ""
 
-    lines: list[str] = []
     pinned = "; ".join(profile.get("pinned_facts") or [])
-    favs = ", ".join(profile.get("favorite_topics") or [])
     if pinned:
-        lines.append(f"- ข้อมูลสำคัญถาวรที่ปักหมุดไว้ (Pinned Facts): **{pinned}**")
-    if favs:
-        lines.append(f"- หัวข้อ/ความสนใจหลักของผู้พูดคนนี้: **{favs}**")
-    return "\n".join(lines)
+        return f"- ข้อมูลสำคัญถาวรที่ปักหมุดไว้ (Pinned Facts): **{pinned}**"
+    return ""
 
 
 def get_speaker_volatile_memory_context(user) -> str:
     """
-    Returns per-turn changing user profile fields (`interaction_count`, `last_seen`, `custom_notes`,
-    `recent_topics`) meant to be injected at the tail of the latest user turn so `systemInstruction`
-    never invalidates Gemini implicit prefix caches.
+    Returns per-turn or auto-updating user profile fields (`interaction_count`, `last_seen`,
+    `favorite_topics`, `custom_notes`, `recent_topics`) meant to be injected at the tail of
+    the latest user turn so `systemInstruction` never invalidates Gemini implicit prefix caches.
     """
     if user is None:
         return ""
@@ -443,12 +499,15 @@ def get_speaker_volatile_memory_context(user) -> str:
             return ""
 
     cnt = profile.get("interaction_count", 1)
+    favs = ", ".join(profile.get("favorite_topics") or [])
     notes = "; ".join(profile.get("custom_notes") or [])
     recents = " | ".join(profile.get("recent_topics") or [])
 
     lines = [
         f"- ประวัติความคุ้นเคยกับผู้พูดคนนี้: เคยคุยกันมาแล้ว **{cnt} ครั้ง** (คุยล่าสุดเมื่อ: {profile.get('last_seen', 'ไม่นานมานี้')})",
     ]
+    if favs:
+        lines.append(f"- หัวข้อ/ความสนใจหลักของผู้พูดคนนี้: **{favs}**")
     if notes:
         lines.append(f"- บันทึกความจำระยะสั้น (Rolling Notes): **{notes}**")
     if recents:
@@ -1014,10 +1073,10 @@ def _normalize_colloquial_thai_times_in_ot_text(text: str) -> str:
     """
     Converts spoken Thai time expressions into 24-hour `HH.MM` format so OT parsing works
     identically for voice commands and casual Thai text:
-      - '6 โมงถึงทุ่มนึง' -> '18.00 ถึง 19.00'
-      - 'หกโมงเย็นถึงสองทุ่มครึ่ง' -> '18.00 ถึง 20.30'
-      - 'บ่ายโมงถึงสี่โมงเย็น' -> '13.00 ถึง 16.00'
-      - '9 โมงเช้าถึงเที่ยงครึ่ง' -> '09.00 ถึง 12.30'
+    - '6 โมงถึงทุ่มนึง' -> '18.00 ถึง 19.00'
+    - 'หกโมงเย็นถึงสองทุ่มครึ่ง' -> '18.00 ถึง 20.30'
+    - 'บ่ายโมงถึงสี่โมงเย็น' -> '13.00 ถึง 16.00'
+    - '9 โมงเช้าถึงเที่ยงครึ่ง' -> '09.00 ถึง 12.30'
     """
     if not text:
         return text
