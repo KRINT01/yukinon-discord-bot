@@ -183,11 +183,11 @@ async def _discover_manga_batch_models() -> list[tuple[str, bool]]:
     """
     Returns the ordered model chain for multi-page `MangaBatch` using `llm.py`'s shared
     1-hour Google AI Studio catalog cache:
-      1. `gemini-3.5-flash-lite`
-      2. `gemini-3.1-flash-lite`
-      3. Any strictly newer (>3.5) `flash-lite` model discovered via shared catalog
-      4. `gemma-4-31b-it`
-      5. `gemma-4-26b-a4b-it`
+    1. `gemini-3.5-flash-lite`
+    2. `gemini-3.1-flash-lite`
+    3. Any strictly newer (>3.5) `flash-lite` model discovered via shared catalog
+    4. `gemma-4-31b-it`
+    5. `gemma-4-26b-a4b-it`
     Each entry is `(model_id, is_gemma)`.
     """
     newer_flash_lites: list[str] = []
@@ -405,10 +405,10 @@ def _parse_manga_pages_batch_json(
             if any(b or s for b, s in results):
                 return results
 
-        if expected_pages == 1 and isinstance(parsed, dict) and "bubbles" in parsed:
-            bubbles = _normalize_and_validate_bubbles(parsed.get("bubbles") or [])
-            summary = str(parsed.get("summary") or "").strip()
-            return [(bubbles, summary)]
+    if expected_pages == 1 and isinstance(parsed, dict) and "bubbles" in parsed:
+        bubbles = _normalize_and_validate_bubbles(parsed.get("bubbles") or [])
+        summary = str(parsed.get("summary") or "").strip()
+        return [(bubbles, summary)]
 
     if expected_pages == 1:
         b, s = _parse_manga_bubbles_json(raw_text)
@@ -610,7 +610,7 @@ async def _invoke_manga_batch_single_model(
             resp_parts = (
                 ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
             )
-            raw_json_str = "\n".join(
+            raw_json_str = "".join(
                 p.get("text", "") for p in resp_parts
                 if p.get("text") and not p.get("thought", False)
             ).strip()
@@ -699,8 +699,8 @@ async def extract_and_translate_manga_pages_batch(
     1) Detects enclosed speech bubbles via vectorized OpenCV+NumPy (or lazy PIL fallback)
        and stamps compact top-right-rim red badges `[1]`, `[2]`, ...
     2) Calls `MangaBatch` strictly across:
-         `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> (newer >3.5 `flash-lite`)
-         -> `gemma-4-31b-it` -> `gemma-4-26b-a4b-it`
+       `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> (newer >3.5 `flash-lite`)
+       -> `gemma-4-31b-it` -> `gemma-4-26b-a4b-it`
        using shared `llm.py` catalog/cooldowns AND dynamic parallel hedging
        (15s for 2-4p batches, 25s for 5-12p batches) on `3.5-flash-lite`!
     3) Returns `(batch_results, cv_bubbles_per_page, is_service_unavailable)`.
@@ -1035,7 +1035,7 @@ CRITICAL SET-OF-MARK (RED BADGE) & TRANSLATION RULES:
                 parts = (
                     ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
                 )
-                raw_json_str = "\n".join(
+                raw_json_str = "".join(
                     p.get("text", "") for p in parts if p.get("text") and not p.get("thought", False)
                 ).strip()
                 bubbles, summary = _parse_manga_bubbles_json(raw_json_str)
@@ -1356,7 +1356,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
                         src_txt = re.sub(r"\s+", " ", (b.get("source_text") or "")).strip()
                         tr_txt = re.sub(r"\s+", " ", (b.get("translated_text") or "")).strip()
                         if tr_txt:
-                            transcript_lines.append(f"**[#{idx} | {speaker}]** `{src_txt}`\n  ↳ **{tr_txt}**")
+                            transcript_lines.append(f"**[#{idx} | {speaker}]** `{src_txt}`\n ↳ **{tr_txt}**")
 
                     try:
                         rendered_jpg = await asyncio.to_thread(

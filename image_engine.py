@@ -64,6 +64,46 @@ EXPLICIT_FILENAME_COMMENT_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+_THAI_LEADING_VOWELS = frozenset("เแโใไ")
+_THAI_ATTACH_NEXT_CHARS = frozenset("ๆฯ?!.,:;'\")]-~")
+
+
+def _is_thai_combining_char(ch: str) -> bool:
+    return ("\u0E31" <= ch <= "\u0E3A") or ("\u0E47" <= ch <= "\u0E4E")
+
+
+def _find_safe_thai_split_index(line: str, max_len: int) -> int:
+    """
+    Finds a clean split position <= `max_len` that prefers whitespace/punctuation and
+    NEVER cuts a Thai syllable cluster before a combining vowel/tone mark (`\u0E31`,
+    `\u0E34-\u0E3A`, `\u0E47-\u0E4E`, `ๆ`, `ฯ`) or right after a leading vowel (`เแโใไ`).
+    """
+    if len(line) <= max_len:
+        return len(line)
+
+    # 1. Prefer a natural whitespace boundary in the latter 65% of the window
+    split_at = line.rfind(" ", int(max_len * 0.35), max_len)
+    if split_at > 0:
+        return split_at
+
+    # 2. Otherwise step backward from `max_len` to avoid breaking any Thai cluster or Latin token
+    idx = max_len
+    min_floor = max(1, max_len - 80)
+    while idx > min_floor:
+        prev_ch = line[idx - 1]
+        next_ch = line[idx]
+        if _is_thai_combining_char(next_ch) or next_ch in _THAI_ATTACH_NEXT_CHARS:
+            idx -= 1
+            continue
+        if prev_ch in _THAI_LEADING_VOWELS:
+            idx -= 1
+            continue
+        if prev_ch.isascii() and prev_ch.isalnum() and next_ch.isascii() and next_ch.isalnum():
+            idx -= 1
+            continue
+        break
+    return idx if idx > 0 else max_len
+
 
 # ==============================================================================
 # DISCORD SMART CHUNKING & NAMED SOURCE-FILE DELIVERY
@@ -124,9 +164,7 @@ def split_discord_message_smart(text: str, max_len: int = 1900) -> list[str]:
                 current_len = len(code_fence_header) + 1 if in_code_block else 0
 
             while len(line) > max_len:
-                split_at = line.rfind(" ", 0, max_len)
-                if split_at == -1:
-                    split_at = max_len
+                split_at = _find_safe_thai_split_index(line, max_len)
                 part = line[:split_at]
                 if in_code_block:
                     chunks.append(f"{code_fence_header}\n{part}\n```")

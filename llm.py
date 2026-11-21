@@ -442,7 +442,9 @@ def _adapt_gemini_thinking_config_for_model(payload: dict, model_id: str) -> dic
 def _extract_gemini_text_and_calls(data: dict) -> tuple[str, list[tuple[str, dict]], list[dict]]:
     """
     Extracts `(text_output, [(fn_name, fn_args), ...], raw_model_parts)` from a Gemini API response.
-    Preserves `raw_model_parts` verbatim (including any `thoughtSignature`) for multi-turn tool calls!
+    Preserves `raw_model_parts` verbatim (including any `thoughtSignature`) for multi-turn tool calls,
+    and concatenates adjacent text `parts` with `""` (never `"\n"`) so multi-part responses never
+    split a Thai word or combining vowel/tone mark across lines!
     """
     cand = (data.get("candidates") or [{}])[0]
     raw_parts = (cand.get("content") or {}).get("parts") or []
@@ -461,7 +463,7 @@ def _extract_gemini_text_and_calls(data: dict) -> tuple[str, list[tuple[str, dic
         elif part.get("text") and not part.get("thought", False):
             text_chunks.append(part["text"])
 
-    out_txt = "\n".join(text_chunks).strip()
+    out_txt = "".join(text_chunks).strip()
     out_txt = re.sub(r"<think>[\s\S]*?</think>", "", out_txt).strip()
     out_txt = re.sub(r"<\|thought\|>[\s\S]*?<\|/thought\|>", "", out_txt).strip()
     return out_txt, fn_calls, raw_parts
@@ -2492,7 +2494,7 @@ async def call_cloudflare_gpt_oss(
                                         extracted_chunks.append(c_part["text"])
                             elif item.get("text"):
                                 extracted_chunks.append(item["text"])
-                        out_txt = "\n".join(extracted_chunks).strip()
+                        out_txt = "".join(extracted_chunks).strip()
                     out_txt = re.sub(r"<think>[\s\S]*?</think>", "", out_txt).strip()
                     if out_txt:
                         state.record_provider_call("cloudflare")

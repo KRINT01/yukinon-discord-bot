@@ -982,7 +982,7 @@ def _extract_native_discord_embeds_data(embeds: list[discord.Embed]) -> tuple[li
                 if clean_img and dkey not in seen_dedup_keys:
                     seen_dedup_keys.add(dkey)
                     image_urls.append(clean_img)
-                    break
+                break
 
         if parts:
             meta_blocks.append(f"[Discord Embed #{idx}]\n" + "\n".join(parts))
@@ -1467,7 +1467,7 @@ def _build_tailored_single_image_ocr_prompt(
             "whenever recognizable from unmistakable design cues, plus likely manufacturer (e.g., Bandai Spirits, Tamashii Nations, Good Smile, Kotobukiya).\n"
             "   - If it is consumer hardware, coffee gear, audio gear, or everyday product: identify the exact Brand, Product Line, and Model Name/Number.\n"
             "2. [Visual Cues & Possible Product Lines / Scales]:\n"
-            "   - List the concrete distinguishing visual features (colors, hull/armor silhouette, weapons/markings, crest/emblem, display stand, paint/finish, ports).\n"
+            "   - List the concrete distinguishing visual features (colors, hull/armor shape, weapons/markings, crest/emblem, display stand, paint/finish, ports).\n"
             "   - If multiple releases or scales share this design (e.g., 1/1000 plastic model kit vs. Mecha Collection vs. pre-painted Kikan-Taizen / Soul of Chogokin figure), "
             "name the top likely candidates AND note clearly if the exact scale or release cannot be confirmed from this angle alone.\n"
             "3. [Verbatim Visible Text]: Transcribe ALL visible text, decals, labels, or model stickers verbatim (if none, write 'None').\n"
@@ -1486,7 +1486,7 @@ def _build_tailored_single_image_ocr_prompt(
         "unmistakable visual features (hair ornaments, outfits, weapons, insignia, halos/no halos) or the post caption above. "
         "NEVER mix character names from one franchise with a different franchise title, and write 'Unknown / Unconfirmed Series' if genuinely ambiguous.\n"
         "   - For comics/manga: describe what happens visually in each panel in traditional Japanese reading order (Top-to-Bottom, Right-to-Left).\n"
-        "   - For illustrations/fanart: describe the pose, expression, outfit, props, and mood concisely.\n"
+        "   - For drawings/fanart: describe the pose, expression, outfit, props, and mood concisely.\n"
         "2. [Ordered Dialogue & Verbatim OCR Text]:\n"
         "   - For comics/manga: list the dialogue and key SFX in reading order (Right-to-Left, Top-to-Bottom) tagged with the speaker.\n"
         "   - Transcribe ALL visible text (Thai, Japanese, English, code, labels) verbatim, paying close attention to Thai tone marks/vowels.\n"
@@ -1528,7 +1528,7 @@ async def _call_gemini_multi_image_batch(
         )
         if data:
             resp_parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-            out_txt = "\n".join(p.get("text", "") for p in resp_parts if p.get("text") and not p.get("thought", False)).strip()
+            out_txt = "".join(p.get("text", "") for p in resp_parts if p.get("text") and not p.get("thought", False)).strip()
             out_txt = re.sub(r"<think>[\s\S]*?</think>", "", out_txt).strip()
             if out_txt:
                 prefix = f"{triage_header}\n" if triage_header else ""
@@ -1799,7 +1799,7 @@ async def _call_gemini_single_image_vision(
     if not data:
         return ""
     parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-    out = "\n".join(p.get("text", "") for p in parts if p.get("text") and not p.get("thought", False)).strip()
+    out = "".join(p.get("text", "") for p in parts if p.get("text") and not p.get("thought", False)).strip()
     return re.sub(r"<think>[\s\S]*?</think>", "", out).strip()
 
 

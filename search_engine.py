@@ -604,7 +604,7 @@ async def _search_google_ai_studio_grounded_async(query: str) -> list[dict]:
                         continue
                     cand = candidates[0]
                     parts = (cand.get("content") or {}).get("parts") or []
-                    summary_text = "\n".join(
+                    summary_text = "".join(
                         p.get("text", "") for p in parts if p.get("text") and not p.get("thought", False)
                     ).strip()
                     chunks = (cand.get("groundingMetadata") or {}).get("groundingChunks") or []
@@ -665,8 +665,8 @@ async def _search_google_news_rss_async(query: str, is_thai: bool, max_results: 
                     "body": f"สำนักข่าว (Source): {source or 'Unknown'} | วันที่เผยแพร่: {pub_date} | พาดหัวข่าว: {title}",
                     "skip_scrape": True,
                 })
-        if results:
-            api_log(f"Search (Google News RSS) -> {len(results)} hits ({time.monotonic() - t0:.2f}s)")
+            if results:
+                api_log(f"Search (Google News RSS) -> {len(results)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception as e:
         api_log(f"Search (Google News RSS) -> failed ({type(e).__name__})")
     return results
@@ -779,8 +779,8 @@ async def _search_jikan_anime_manga_async(query: str, max_results: int = 2) -> l
                     ),
                     "skip_scrape": True,
                 })
-        if hits:
-            api_log(f"Search (Jikan MAL:{media_type}) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
+            if hits:
+                api_log(f"Search (Jikan MAL:{media_type}) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception:
         pass
     return hits
@@ -821,8 +821,8 @@ async def _search_steam_games_async(query: str, max_results: int = 2) -> list[di
                     "body": f"Game: {name} | Steam Thailand Price: {price_str} | AppID: {gid}",
                     "skip_scrape": True,
                 })
-        if hits:
-            api_log(f"Search (Steam Store) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
+            if hits:
+                api_log(f"Search (Steam Store) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception:
         pass
     return hits
@@ -849,8 +849,8 @@ async def _search_tavily_async(query: str, max_results: int = 5) -> list[dict]:
                     "href": r.get("url", ""),
                     "body": r.get("content", ""),
                 })
-        if hits:
-            api_log(f"Search (Tavily) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
+            if hits:
+                api_log(f"Search (Tavily) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception as e:
         api_log(f"Search (Tavily) -> failed ({type(e).__name__})")
     return hits

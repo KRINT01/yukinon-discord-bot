@@ -34,10 +34,18 @@ _THAI_GLUED_KATAKANA_REGEX = re.compile(
 )
 _CODE_FENCE_SPLIT_REGEX = re.compile(r"(```[\s\S]*?```)")
 # Strip honorific 'คุณ' before third-party Latin names OR lowercase/uppercase @handles
-# (e.g. 'คุณ Akina Murasame' -> 'Akina Murasame', 'คุณ @akina_murasame' -> '@akina_murasame')
+# (e.g. 'ผลงานจากคุณ Rain' -> 'ผลงานจาก Rain', 'คุณ @akina_murasame' -> '@akina_murasame')
 # while keeping standalone sarcastic 'คุณ' and Thai compound words ('คุณภาพ', 'คุณค่า') intact.
 _KHUN_BEFORE_LATIN_NAME_REGEX = re.compile(
-    r"คุณ\s*(?=@[A-Za-z0-9_.-]{2,30}\b|[A-Z][A-Za-z0-9_.-]{1,30}\b)"
+    r"คุณ[ \t]*(?=@[A-Za-z0-9_.-]{2,30}\b|[A-Z][A-Za-z0-9_.-]{1,30}\b)"
+)
+
+# Defensive Thai syllable-cluster newline healers (never valid line breaks in Thai prose)
+_THAI_BROKEN_COMBINING_NL_REGEX = re.compile(
+    r"[ \t]*\r?\n+[ \t]*(?=[\u0E31\u0E34-\u0E3A\u0E47-\u0E4Eๆฯ])"
+)
+_THAI_BROKEN_LEADING_VOWEL_NL_REGEX = re.compile(
+    r"(?<=[เแโใไ])[ \t]*\r?\n+[ \t]*(?=[\u0E01-\u0E2E])"
 )
 
 # Prose-only cleanup for awkward literal English-to-Thai transliterations
@@ -133,6 +141,10 @@ def _sanitize_prose_segment(
     s = re.sub(r"\[MEMO:\s*[^\]]+?\]", "", s, flags=re.IGNORECASE)
     s = AGENTIC_REACT_TAG_REGEX.sub("", s)
 
+    # 1B. Heal any accidental hard newline splitting a Thai syllable cluster (e.g. 'ช\nิ้นนี้' -> 'ชิ้นนี้')
+    s = _THAI_BROKEN_COMBINING_NL_REGEX.sub("", s)
+    s = _THAI_BROKEN_LEADING_VOWEL_NL_REGEX.sub("", s)
+
     # 2. Strip stray CJK characters unless user prompt contains CJK, and fix Katakana glued to Thai words
     if not allow_cjk:
         s = CJK_LEAK_REGEX.sub("", s)
@@ -175,9 +187,17 @@ def _sanitize_prose_segment(
     elif clean_other_name:
         s = re.sub(rf"คุณ\s*{re.escape(clean_other_name)}", clean_other_name, s, flags=re.IGNORECASE)
 
-    # Strip 'คุณ' if used before a Discord @mention OR a third-party Latin artist/author name/handle
+    # Strip 'คุณ' before Discord @mentions or third-party Latin names while keeping 1 space if glued to Thai text
     s = re.sub(r"คุณ\s*(?=<@)", "", s)
-    s = _KHUN_BEFORE_LATIN_NAME_REGEX.sub("", s)
+
+    def _strip_khun_preserving_space(m: re.Match) -> str:
+        if m.start() > 0:
+            prev_ch = s[m.start() - 1]
+            if not prev_ch.isspace() and prev_ch not in "([{\"'`*_~-":
+                return " "
+        return ""
+
+    s = _KHUN_BEFORE_LATIN_NAME_REGEX.sub(_strip_khun_preserving_space, s)
 
     # 5. Strip awkward openings, meta-persona headings, 4B repetition tics, and out-of-character emojis
     s = re.sub(r"^สวัสดีค่ะ\s*(?:คุณ|นาย)?\s*(?=\n|\r|\d+\.)", "", s)
@@ -200,7 +220,7 @@ def sanitize_yukino_output(text: str, user_prompt: str = "", speaker_user=None, 
     """
     Sanitizes prose segments strictly OUTSIDE fenced code blocks (```...```) so Python, YAML,
     Java, SQL, and React indentation/strings are preserved 100% verbatim while enforcing Yukino's
-    persona, female particles, pronoun rules, and anti-CJK/Katakana-glue/transliteration protections.
+    persona, female particles, pronoun rules, and anti-CJK/Katakana-glue/transliteration/Thai-cluster protections.
     """
     if not text:
         return ""
