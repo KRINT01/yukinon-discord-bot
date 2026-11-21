@@ -44,7 +44,7 @@ from manga_cv_render import (
     _release_cv_page_masks,
 )
 
-MANGA_TRANSLATOR_VERSION = "v9"
+MANGA_TRANSLATOR_VERSION = "v10"
 MANGA_CV_VER = getattr(_mcr_mod, "MANGA_CV_RENDER_VERSION", "old")
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
 # Bundle 2 dynamic parallel hedge: faster 15s recovery on typical 2-4p X threads, patient 25s on 5-12p batches
@@ -466,6 +466,7 @@ async def _call_gemma_ai_studio_polish_json(
             "temperature": 0.0,
             "maxOutputTokens": 12288,
             "responseMimeType": "application/json",
+            "thinkingConfig": {"thinkingLevel": "MINIMAL"},
         },
     }
 
@@ -497,10 +498,17 @@ async def _call_gemma_ai_studio_polish_json(
             ).strip()
             return raw_out, elapsed
 
-        if status == 400 and attempt == 0 and "responseMimeType" in payload["generationConfig"]:
-            payload["generationConfig"].pop("responseMimeType", None)
-            api_log(f"MangaPolish [req={req_id}] -> {model_id} HTTP 400 ({elapsed:.2f}s); retrying without responseMimeType")
-            continue
+        if status == 400 and attempt == 0:
+            changed = False
+            if "thinkingConfig" in payload["generationConfig"]:
+                payload["generationConfig"].pop("thinkingConfig", None)
+                changed = True
+            if "responseMimeType" in payload["generationConfig"]:
+                payload["generationConfig"].pop("responseMimeType", None)
+                changed = True
+            if changed:
+                api_log(f"MangaPolish [req={req_id}] -> {model_id} HTTP 400 ({elapsed:.2f}s); retrying without thinkingConfig/responseMimeType")
+                continue
 
         if status == 429:
             _mark_gemini_model_cooldown(model_id, 60.0)
@@ -524,7 +532,7 @@ async def _polish_manga_translations_gemma_async(
     """
     Always-On Stage 2 Text-Only Proofreading & Localization Polish (Gemma 4):
     Runs on every manga request (1-12 pages) right after Stage 1 Vision OCR+Draft:
-    - Model priority: `gemma-4-31b-it` -> `gemma-4-26b-a4b-it` -> Cloudflare Gemma 4 -> Flash-Lite text-only.
+    - Model priority: Cloudflare Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`) -> AI Studio Gemma 4 (`gemma-4-26b-a4b-it` -> `gemma-4-31b-it`) -> Flash-Lite text-only.
     - Fixes subtle typos, mixed English/romanized slips (`Ehehe`, `Eหมอนี่`), foreign-script drift,
       truncated sentences, and obvious Vision OCR kanji typos using surrounding dialogue context.
     - Strictly preserves `bubble_id`, `box_2d`, and page structure; any omitted or invalid index
@@ -555,7 +563,7 @@ async def _polish_manga_translations_gemma_async(
     num_pages = len(batch_results)
     api_log(
         f"MangaPolish [req={req_id}] START -> polishing {len(flat_bubbles)} bubble(s) "
-        f"across {num_pages} page(s) via Gemma 4 ({target_lang_name})"
+        f"across {num_pages} page(s) via Cloudflare Gemma 4 ({target_lang_name})"
     )
     if progress_cb is not None:
         try:
@@ -604,40 +612,45 @@ async def _polish_manga_translations_gemma_async(
     used_model = ""
     used_elapsed = 0.0
 
-    # Tier 1 & 2: Google AI Studio Gemma 4 (`gemma-4-31b-it` -> `gemma-4-26b-a4b-it`)
-    for g_model in ("gemma-4-31b-it", "gemma-4-26b-a4b-it"):
-        raw_out, el = await _call_gemma_ai_studio_polish_json(
-            g_model, polish_prompt, req_id=req_id, timeout_sec=22.0
+    # Tier 1: Cloudflare Workers AI Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`, thinking disabled for fast polish!)
+    t_cf = time.monotonic()
+    try:
+        cf_out = await call_cloudflare_gemma_chat(
+            [{"role": "user", "content": polish_prompt}],
+            temperature=0.0,
+            max_tokens=8192,
+            purpose=f"MangaPolish[{req_id}]",
         )
-        if raw_out:
-            s_m, b_m = _parse_polish_json_response(raw_out)
+        if cf_out:
+            s_m, b_m = _parse_polish_json_response(cf_out)
             if len(b_m) >= max(1, int(len(flat_bubbles) * 0.5)):
                 summary_map, bubble_map = s_m, b_m
-                used_model, used_elapsed = g_model, el
-                break
-            api_log(
-                f"MangaPolish [req={req_id}] -> {g_model} returned incomplete map "
-                f"({len(b_m)}/{len(flat_bubbles)}); trying next tier"
-            )
+                used_model = "cf-gemma-4-26b"
+                used_elapsed = time.monotonic() - t_cf
+            else:
+                api_log(
+                    f"MangaPolish [req={req_id}] -> cf-gemma-4-26b returned incomplete map "
+                    f"({len(b_m)}/{len(flat_bubbles)}); trying AI Studio Gemma fallback"
+                )
+    except Exception as e:
+        api_log(f"MangaPolish [req={req_id}] Cloudflare Gemma note ({type(e).__name__})")
 
-    # Tier 3: Cloudflare Workers AI Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`)
+    # Tier 2 & 3: Google AI Studio Gemma 4 fallback (`gemma-4-26b-a4b-it` -> `gemma-4-31b-it`)
     if not bubble_map:
-        t_cf = time.monotonic()
-        try:
-            cf_out = await call_cloudflare_gemma_chat(
-                [{"role": "user", "content": polish_prompt}],
-                temperature=0.0,
-                max_tokens=8192,
-                purpose=f"MangaPolish[{req_id}]",
+        for g_model in ("gemma-4-26b-a4b-it", "gemma-4-31b-it"):
+            raw_out, el = await _call_gemma_ai_studio_polish_json(
+                g_model, polish_prompt, req_id=req_id, timeout_sec=30.0
             )
-            if cf_out:
-                s_m, b_m = _parse_polish_json_response(cf_out)
+            if raw_out:
+                s_m, b_m = _parse_polish_json_response(raw_out)
                 if len(b_m) >= max(1, int(len(flat_bubbles) * 0.5)):
                     summary_map, bubble_map = s_m, b_m
-                    used_model = "cf-gemma-4-26b"
-                    used_elapsed = time.monotonic() - t_cf
-        except Exception as e:
-            api_log(f"MangaPolish [req={req_id}] Cloudflare Gemma note ({type(e).__name__})")
+                    used_model, used_elapsed = g_model, el
+                    break
+                api_log(
+                    f"MangaPolish [req={req_id}] -> {g_model} returned incomplete map "
+                    f"({len(b_m)}/{len(flat_bubbles)}); trying next tier"
+                )
 
     # Tier 4: Text-only Gemini Flash-Lite fallback (only if all Gemma tiers unavailable)
     if not bubble_map and GEMINI_API_KEY:
@@ -1655,7 +1668,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
     - `manga_semaphore` (`Semaphore(1)`) OOM guard with queue waiting notice
     - Vectorized OpenCV + NumPy CV Set-of-Mark (SoM) detection (white, pastel, corner, dark) & render masking
     - Shared `llm.py` Google AI Studio catalog & cooldowns + dynamic `15s`/`25s` `3.5-flash-lite` -> `3.1-flash-lite` hedge
-    - Always-on Stage 2 Gemma 4 text-only localization polish (`gemma-4-31b-it` -> `gemma-4-26b-a4b-it` -> Cloudflare Gemma 4)
+    - Always-on Stage 2 Gemma 4 text-only localization polish (Cloudflare Gemma 4 -> AI Studio Gemma 4 -> Flash-Lite)
     - Throttled live Discord progress messages (1/3 -> 2/3 -> 3/3 -> auto-delete)
     """
     from media_context import resolve_referenced_message, collect_embedded_images_and_metadata
