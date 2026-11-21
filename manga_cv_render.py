@@ -71,6 +71,7 @@ _STRAY_SINGLE_LATIN_IN_THAI_REGEX = re.compile(
 # Pre-allocated reusable OpenCV morphological kernels
 _CV2_K3 = np.ones((3, 3), np.uint8) if HAS_CV2 else None
 _CV2_K5 = np.ones((5, 5), np.uint8) if HAS_CV2 else None
+_CV2_ELLIPSE_9 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)) if HAS_CV2 else None
 
 
 # ==============================================================================
@@ -593,6 +594,20 @@ def _fill_mask_holes_cv2(comp_crop: "np.ndarray") -> "np.ndarray":
     return np.where(padded[1:-1, 1:-1] == 128, np.uint8(0), np.uint8(255))
 
 
+def _close_rim_bays_cv2(filled_crop: "np.ndarray") -> "np.ndarray":
+    """
+    Seals concave kanji-to-border bays on validated pastel/borderless bubbles (e.g. kanji
+    touching dark gloom shading lines near the bubble rim) without leaking outward.
+    """
+    ch, cw = filled_crop.shape
+    pad = 5
+    buf = np.zeros((ch + pad * 2, cw + pad * 2), dtype=np.uint8)
+    buf[pad:-pad, pad:-pad] = filled_crop
+    closed = cv2.morphologyEx(buf, cv2.MORPH_CLOSE, _CV2_ELLIPSE_9)
+    closed = _fill_mask_holes_cv2(closed)
+    return closed[pad:-pad, pad:-pad]
+
+
 def _collect_margin_labels_cv2(
     labels: "np.ndarray",
     stats: "np.ndarray",
@@ -721,6 +736,16 @@ def _extract_and_filter_white_components_cv2(
         ):
             continue
 
+        # Anti-False-Positive Guard 1: Convex Hull Solidity >= 0.79
+        # Rejects irregular shirt sleeves, SFX outlines, and panel corners while keeping spiky shout bubbles!
+        cnts, _ = cv2.findContours(filled_crop, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cnts:
+            main_cnt = max(cnts, key=cv2.contourArea)
+            hull_area = cv2.contourArea(cv2.convexHull(main_cnt))
+            solidity = cv2.contourArea(main_cnt) / max(1.0, hull_area)
+            if solidity < 0.79:
+                continue
+
         if is_pastel_pass:
             ov_px = int(np.count_nonzero(filled_crop & already_covered[cy1:cy2, cx1:cx2]))
             if ov_px > filled_area * 0.65:
@@ -752,20 +777,25 @@ def _extract_and_filter_white_components_cv2(
             if bg_std > 32.0:
                 continue
 
+        # Anti-False-Positive Guard 2: True dark achromatic ink count, density bounds, and glyph count
+        # Kills blank white sleeves/skin (dens < 0.012), single-stroke SFX/folds (ccs < 3), and solid SFX blobs (dens > 0.45)
         inner_core = cv2.erode(filled_crop, _CV2_K5, iterations=1)
         if not np.any(inner_core):
             inner_core = cv2.erode(filled_crop, _CV2_K3, iterations=1)
+        inner_area = max(1, int(np.count_nonzero(inner_core)))
+        black_ink_px = int(np.count_nonzero((inner_core > 0) & (g_sub < 135) & (c_sub < 32)))
+        ink_density = black_ink_px / float(inner_area)
+        if black_ink_px < 12 or ink_density < 0.012 or ink_density > 0.45:
+            continue
 
-        if is_pastel_pass:
-            inner_ink_px = int(np.count_nonzero((inner_core > 0) & (g_sub < 160) & (c_sub < 32)))
-            if inner_ink_px < 10:
-                continue
-        else:
-            inner_ink_px = int(np.count_nonzero((inner_core > 0) & (g_sub < 175) & (c_sub < 26)))
-            if inner_ink_px < 4:
-                continue
+        ink_bin = np.where((inner_core > 0) & (g_sub < 145) & (c_sub < 35), np.uint8(255), np.uint8(0))
+        num_ink_cc, _ = cv2.connectedComponents(ink_bin, connectivity=8)
+        if (num_ink_cc - 1) < 3:
+            continue
 
-        already_covered[cy1:cy2, cx1:cx2] |= filled_crop
+        # Seal concave rim-kanji bays ONLY AFTER passing all validation guards (keeps Page 3 調子乗/思 inside mask!)
+        final_mask = _close_rim_bays_cv2(filled_crop) if is_pastel_pass else filled_crop
+        already_covered[cy1:cy2, cx1:cx2] |= final_mask
         bbox_norm = [
             int(round((cy1 / float(sh)) * 1000.0)),
             int(round((cx1 / float(sw)) * 1000.0)),
@@ -774,7 +804,7 @@ def _extract_and_filter_white_components_cv2(
         ]
         found.append({
             "bbox_norm": bbox_norm,
-            "mask_np": filled_crop,
+            "mask_np": final_mask,
             "rect_fill": rect_fill,
             "is_dark": False,
             "is_pastel": bool(is_pastel_pass),
@@ -1039,15 +1069,16 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
         else:
             by2 = min(vh - 2, max(ph + 2, vy1 + 6))
             by1 = max(2, by2 - ph)
+        cv2.rectangle(vis_bgr, (max(0, bx1 - 2), max(0, by1 - 2)), (min(vw - 1, bx2 + 2), min(vh - 1, by2 + 2)), (15, 15, 15), -1)
         cv2.rectangle(vis_bgr, (bx1 - 1, by1 - 1), (bx2 + 1, by2 + 1), (255, 255, 255), -1)
-        cv2.rectangle(vis_bgr, (bx1, by1), (bx2, by2), (18, 18, 18), -1)
+        cv2.rectangle(vis_bgr, (bx1, by1), (bx2, by2), (18, 18, 225), -1)
         cv2.putText(
             vis_bgr,
             label,
             (bx1 + 5, by1 + ph - 4),
             cv2.FONT_HERSHEY_SIMPLEX,
             font_scale,
-            (0, 235, 255),  # Bright yellow in BGR
+            (255, 255, 255),
             thickness,
             cv2.LINE_AA,
         )
@@ -1166,18 +1197,26 @@ def _inpaint_pastel_bubble_region_cv2(
         np.uint8(0),
     )
 
-    # Dilate dark ink to cover anti-aliased strokes + surrounding white outline halos on colored bubbles
+    # Dilate dark ink proportionally to bubble size to swallow full anti-aliased strokes + wide white halos
     ink_halo = _fast_dilate_mask_cv2(dark_ink, kernel_half=5)
-    ink_halo = cv2.dilate(ink_halo, _CV2_K5, iterations=1)
+    extra_iters = 2 if max(bw, bh) >= 260 else 1
+    ink_halo = cv2.dilate(ink_halo, _CV2_K5, iterations=extra_iters)
     if bg_lum < 242 or bg_chroma >= 10:
-        near_ink = cv2.dilate(ink_halo, _CV2_K5, iterations=1)
+        near_ink = cv2.dilate(ink_halo, _CV2_K5, iterations=extra_iters + 1)
+        glow_lum_thresh = min(236, max(210, bg_lum + 14))
+        glow_chroma_max = max(14, int(bg_chroma * 0.72))
         white_halo = (
             (near_ink > 0)
             & core_bool
-            & (sub_gray >= max(240, bg_lum + 8))
-            & (sub_chroma <= max(10, bg_chroma // 2))
+            & (sub_gray >= glow_lum_thresh)
+            & (sub_chroma <= glow_chroma_max)
         )
-        erase_bool = ((ink_halo > 0) | white_halo) & core_bool
+        # Dilate detected white glow by 2px so soft outer fringes never leave cloudy ghost outlines
+        if np.any(white_halo):
+            wh_u8 = cv2.dilate(np.where(white_halo, np.uint8(255), np.uint8(0)), _CV2_K5, iterations=1)
+            erase_bool = ((ink_halo > 0) | (wh_u8 > 0)) & core_bool
+        else:
+            erase_bool = (ink_halo > 0) & core_bool
     else:
         erase_bool = (ink_halo > 0) & core_bool
 

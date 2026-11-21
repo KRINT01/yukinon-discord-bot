@@ -315,17 +315,12 @@ def _filter_white_components_pil(
             inner_core.close()
             inner_core = filled_crop.filter(ImageFilter.MinFilter(3))
 
-        if is_pastel_pass:
-            dark_ink_bin = gray_crop.point(lambda p: 255 if p < 160 else 0)
-            achrom_bin = ch_crop.point(lambda p: 255 if p < 32 else 0)
-            min_inner_ink = 10
-        else:
-            dark_ink_bin = gray_crop.point(lambda p: 255 if p < 175 else 0)
-            achrom_bin = ch_crop.point(lambda p: 255 if p < 26 else 0)
-            min_inner_ink = 4
-
+        dark_ink_bin = gray_crop.point(lambda p: 255 if p < 135 else 0)
+        achrom_bin = ch_crop.point(lambda p: 255 if p < 32 else 0)
+        inner_area = max(1, inner_core.histogram()[255])
         inner_ink = ImageChops.darker(ImageChops.darker(dark_ink_bin, achrom_bin), inner_core)
         inner_ink_px = inner_ink.histogram()[255]
+        ink_density = inner_ink_px / float(inner_area)
 
         dark_ink_bin.close()
         achrom_bin.close()
@@ -334,9 +329,19 @@ def _filter_white_components_pil(
         ch_crop.close()
         gray_crop.close()
 
-        if inner_ink_px < min_inner_ink:
+        if inner_ink_px < 12 or ink_density < 0.012 or ink_density > 0.45:
             filled_crop.close()
             continue
+
+        if is_pastel_pass:
+            # Close small concave rim bays after passing validation
+            pad_m = Image.new("L", (cw + 8, ch + 8), 0)
+            pad_m.paste(filled_crop, (4, 4))
+            closed_m = pad_m.filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.MinFilter(5))
+            pad_m.close()
+            filled_crop.close()
+            filled_crop = closed_m.crop((4, 4, cw + 4, ch + 4))
+            closed_m.close()
 
         already_covered.paste(255, (cx1, cy1, cx2, cy2), mask=filled_crop)
         bbox_norm = [
@@ -595,13 +600,14 @@ def _detect_page_bubbles_and_build_som_b64_pil_sync(
             else:
                 by2 = min(vh - 2, max(ph + 2, vy1 + 6))
                 by1 = max(2, by2 - ph)
+            vdraw.rectangle([max(0, bx1 - 2), max(0, by1 - 2), min(vw - 1, bx2 + 2), min(vh - 1, by2 + 2)], fill=(15, 15, 15))
             vdraw.rectangle([bx1 - 1, by1 - 1, bx2 + 1, by2 + 1], fill=(255, 255, 255))
-            vdraw.rectangle([bx1, by1, bx2, by2], fill=(18, 18, 18))
+            vdraw.rectangle([bx1, by1, bx2, by2], fill=(225, 18, 18))
             vdraw.text(
                 (bx1 + 4 - tb[0], by1 + 3 - tb[1]),
                 label,
                 font=badge_font,
-                fill=(255, 235, 0),
+                fill=(255, 255, 255),
             )
 
         buf = io.BytesIO()

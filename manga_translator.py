@@ -71,7 +71,7 @@ MANGA_BATCH_SOM_SCHEMA = {
                             "properties": {
                                 "id": {"type": "INTEGER"},
                                 "bubble_id": {"type": "INTEGER", "nullable": True},
-                                "is_dialogue": {"type": "BOOLEAN"},
+                                "should_translate": {"type": "BOOLEAN"},
                                 "speaker_or_note": {"type": "STRING"},
                                 "source_text": {"type": "STRING"},
                                 "box_2d": {
@@ -84,7 +84,7 @@ MANGA_BATCH_SOM_SCHEMA = {
                             "propertyOrdering": [
                                 "id",
                                 "bubble_id",
-                                "is_dialogue",
+                                "should_translate",
                                 "speaker_or_note",
                                 "source_text",
                                 "box_2d",
@@ -93,7 +93,7 @@ MANGA_BATCH_SOM_SCHEMA = {
                             "required": [
                                 "id",
                                 "bubble_id",
-                                "is_dialogue",
+                                "should_translate",
                                 "speaker_or_note",
                                 "source_text",
                                 "translated_text",
@@ -121,7 +121,7 @@ MANGA_SINGLE_SOM_SCHEMA = {
                 "properties": {
                     "id": {"type": "INTEGER"},
                     "bubble_id": {"type": "INTEGER", "nullable": True},
-                    "is_dialogue": {"type": "BOOLEAN"},
+                    "should_translate": {"type": "BOOLEAN"},
                     "speaker_or_note": {"type": "STRING"},
                     "source_text": {"type": "STRING"},
                     "box_2d": {
@@ -134,7 +134,7 @@ MANGA_SINGLE_SOM_SCHEMA = {
                 "propertyOrdering": [
                     "id",
                     "bubble_id",
-                    "is_dialogue",
+                    "should_translate",
                     "speaker_or_note",
                     "source_text",
                     "box_2d",
@@ -143,7 +143,7 @@ MANGA_SINGLE_SOM_SCHEMA = {
                 "required": [
                     "id",
                     "bubble_id",
-                    "is_dialogue",
+                    "should_translate",
                     "speaker_or_note",
                     "source_text",
                     "translated_text",
@@ -423,8 +423,17 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
         if not isinstance(item, dict):
             continue
 
-        if item.get("is_dialogue") is False:
-            continue
+        flag_val = item.get("should_translate")
+        if flag_val is None:
+            flag_val = item.get("is_dialogue")
+        if flag_val is False:
+            # Safety guard: only skip if there is truly no translated sentence OR explicitly marked SFX/blank!
+            _tmp_spk = str(item.get("speaker_or_note") or item.get("speaker") or "").lower()
+            _tmp_tr = str(item.get("translated_text") or item.get("translation") or "").strip()
+            _tmp_src = str(item.get("source_text") or item.get("original_text") or "").strip()
+            _is_explicit_non_speech = any(k in _tmp_spk for k in ("sfx", "sound", "blank", "empty", "background", "artwork", "sleeve", "เอฟเฟกต์"))
+            if _is_explicit_non_speech or not _tmp_tr or not _tmp_src:
+                continue
 
         speaker = (
             item.get("speaker_or_note")
@@ -631,7 +640,7 @@ def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
         extracted_bubbles.append({
             "id": idx,
             "bubble_id": int(bid_m.group(1)) if bid_m else None,
-            "is_dialogue": True,
+            "should_translate": True,
             "speaker_or_note": spk_m.group(1).strip() if spk_m else f"Bubble {idx}",
             "source_text": src_m.group(1).strip() if src_m else "",
             "translated_text": raw_tr_val,
@@ -922,7 +931,7 @@ async def extract_and_translate_manga_pages_batch(
     manga_batch_instruction = f"""
 You are a professional Manga, Manhwa, and Comic Localizer.
 You are given {num_pages} sequential manga page image(s) (labeled PAGE 1 to PAGE {num_pages}).
-Every enclosed speech bubble and caption box has ALREADY been outlined in RED with a high-contrast BLACK/YELLOW NUMBERED BADGE (`1`, `2`, `3`, ...) at its top-right rim!
+Every enclosed speech bubble AND rectangular narration/caption box has ALREADY been outlined in RED with a high-contrast RED/WHITE/BLACK NUMBERED BADGE (`1`, `2`, `3`, ...) at its top-right rim!
 {context_block}
 Analyze all {num_pages} page(s) in sequence so character names, titles/ranks, pronouns, and ongoing story stay consistent across every page,
 and translate EVERY SINGLE speech bubble and narration/caption box on EVERY page into natural, idiomatic {target_lang_name}.
@@ -931,12 +940,12 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
 1. MANDATORY 1-TO-1 NUMBERED BADGE CHECKLIST (`bubble_id`):
    - Each page header lists the exact numbered badge IDs present on that page (`[1, 2, ..., K]`).
    - You MUST inspect and output an entry for EVERY SINGLE badge ID `1..K` on that page — NEVER skip a badge ID, NEVER merge two separate badges into one entry, and NEVER put text from a DIFFERENT bubble into another bubble's badge ID!
-   - Double-check which exact BLACK/YELLOW badge number touches the bubble whose Japanese text you are reading before assigning `"bubble_id"`.
-   - If badge `k` contains Japanese dialogue, monologue, or a caption box: set `"bubble_id": k`, `"is_dialogue": true`, `"box_2d": null`, transcribe ONLY the exact `"source_text"` visually INSIDE badge `k`, and write its natural {target_lang_name} `"translated_text"`.
-   - If badge `k` is NOT dialogue (for example, a sound effect / SFX, a non-speech diagram/icon, or a blank background/face/clothing region with no dialogue): set `"bubble_id": k`, `"is_dialogue": false`, `"source_text": ""`, `"translated_text": ""` so it is left untouched!
+   - Double-check which exact RED/WHITE NUMBERED badge touches the bubble or narration box whose Japanese text you are reading before assigning `"bubble_id"`.
+   - MANDATORY: Translate BOTH spoken speech bubbles AND EVERY rectangular white/colored narration/caption box (คำบรรยาย)! If badge `k` contains ANY Japanese sentence, dialogue, monologue, or narration caption: set `"bubble_id": k`, `"should_translate": true`, `"box_2d": null`, transcribe ONLY the exact `"source_text"` visually INSIDE badge `k`, and write its natural {target_lang_name} `"translated_text"`.
+   - Set `"should_translate": false` ONLY if badge `k` is a blank/artwork/clothing region with NO text or a pure sound effect (SFX) with no sentence — NEVER set `"should_translate": false` on a narration/caption box!
 2. UNMARKED / BORDERLESS DIALOGUE (`bubble_id: null`):
    - ALSO scan every panel for real spoken dialogue or monologue written WITHOUT a numbered badge around it.
-   - For each unmarked dialogue line, add a SEPARATE entry with `"bubble_id": null`, `"is_dialogue": true`, transcribe `"source_text"`, and provide `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY that Japanese text in its OWN panel — NEVER over faces, hands, or artwork!).
+   - For each unmarked dialogue or narration box, add a SEPARATE entry with `"bubble_id": null`, `"should_translate": true`, transcribe `"source_text"`, and provide `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY that Japanese text in its OWN panel — NEVER over faces, hands, or artwork!).
    - NEVER merge unbadged dialogue from another panel into an earlier panel's badge!
    - NEVER output floating handwritten SFX (e.g. ドーン, トスッ, ポスン, ムチッ, ぐっ, カチャッ, ガチャ, ぎゅっ, にま, べた, もじっ) as `box_2d`.
 3. Accurate Speaker Attribution, Names & Visual Gender:
@@ -955,7 +964,7 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
         {{
           "id": 1,
           "bubble_id": 1,
-          "is_dialogue": true,
+          "should_translate": true,
           "speaker_or_note": "Actual speaker name / Narration",
           "source_text": "Original Japanese text inside badge 1",
           "box_2d": null,
@@ -1116,7 +1125,7 @@ async def extract_and_translate_manga_bubbles(
     )
     if cv_bubbles:
         badge_ids_str = ", ".join(str(i) for i in range(1, len(cv_bubbles) + 1))
-        badge_note = f"NUMBERED BLACK/YELLOW BADGES ON THIS PAGE: [{badge_ids_str}] (account for EVERY badge ID strictly inside its own red outline!)"
+        badge_note = f"RED/WHITE NUMBERED BADGES ON THIS PAGE: [{badge_ids_str}] (account for EVERY badge ID strictly inside its own red outline!)"
     else:
         badge_note = "no numbered badges (use bubble_id=null + box_2d)"
 
@@ -1129,10 +1138,10 @@ Translate EVERY SINGLE speech bubble and narration/caption box on this page into
 CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
 1. MANDATORY 1-TO-1 NUMBERED BADGE CHECKLIST (`bubble_id`):
    - Output an entry for EVERY SINGLE badge ID listed above — NEVER skip a badge ID, NEVER merge two separate badges, and NEVER put text from a different bubble into another bubble's badge ID!
-   - If badge `k` contains Japanese dialogue/narration: set `"bubble_id": k`, `"is_dialogue": true`, `"box_2d": null`, exact `"source_text"` inside ONLY badge `k`, and its natural {target_lang_name} `"translated_text"`.
-   - If badge `k` is NOT dialogue (SFX, diagram, background object, face): set `"bubble_id": k`, `"is_dialogue": false`, `"source_text": ""`, `"translated_text": ""`.
+   - MANDATORY: Translate BOTH spoken speech bubbles AND EVERY rectangular narration/caption box (คำบรรยาย)! If badge `k` contains ANY Japanese dialogue, monologue, or narration caption: set `"bubble_id": k`, `"should_translate": true`, `"box_2d": null`, exact `"source_text"` inside ONLY badge `k`, and its natural {target_lang_name} `"translated_text"`.
+   - Set `"should_translate": false` ONLY if badge `k` is blank artwork/clothing or a pure SFX with no sentence — NEVER skip a narration/caption box!
 2. UNMARKED / BORDERLESS DIALOGUE (`bubble_id: null`):
-   - For real spoken dialogue/narration WITHOUT a numbered badge (e.g. vertical text on open white panels), output a SEPARATE entry with `"bubble_id": null`, `"is_dialogue": true`, `"source_text"`, and `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY the Japanese text in its own panel).
+   - For real spoken dialogue/narration WITHOUT a numbered badge (e.g. vertical text on open white panels), output a SEPARATE entry with `"bubble_id": null`, `"should_translate": true`, `"source_text"`, and `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY the Japanese text in its own panel).
 3. Accurate Speaker Attribution, Names & Visual Gender:
    - Identify the actual speaker visually; match Thai/English tone to visual gender (never use male Thai `ครับ`/`ผม` for female characters/guards).
    - STRICT TARGET LANGUAGE & FONT-SAFE OUTPUT: Write EVERY `translated_text` and `summary` STRICTLY in {target_lang_name} ONLY — NEVER switch any bubble to Korean (Hangul), Chinese, or Arabic, NEVER glue stray random Latin letters inside Thai words, and NEVER include heart/music symbols (`♥`, `♡`, `♪`, `★`) or emojis (use standard ASCII punctuation `...`, `~`, `-`, `'`, `!`, `?` only).
@@ -1143,7 +1152,7 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
     {{
       "id": 1,
       "bubble_id": 1,
-      "is_dialogue": true,
+      "should_translate": true,
       "speaker_or_note": "Actual speaker name / Narration",
       "source_text": "Original Japanese text inside badge 1",
       "box_2d": null,
