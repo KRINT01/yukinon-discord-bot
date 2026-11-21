@@ -954,7 +954,6 @@ async def on_message(message: discord.Message):
         preloaded_att_bytes.clear()
 
         if is_compound_prompt:
-            # Still run Decision-1 once for complexity, tone, guardrails, and passive memory (forcing compound route)
             decision_plan = await orchestrate_message_with_decision_1(
                 clean_prompt or spoken_clip_text,
                 extracted_ctx=extracted_ctx,
@@ -1181,7 +1180,10 @@ async def _connect_bot_to_voice_channel(ctx, target_channel, greet: bool = True)
 
 @bot.command(name="join")
 async def join_voice(ctx):
-    if not ctx.author.voice or not ctx.author.voice.channel:
+    if not ctx.guild:
+        await ctx.send("คำสั่งนี้ใช้ได้เฉพาะในเซิร์ฟเวอร์ที่มีห้องเสียงค่ะ")
+        return
+    if not getattr(ctx.author, "voice", None) or not ctx.author.voice.channel:
         await ctx.send("ต้องเข้าไปอยู่ในห้องเสียงก่อนนะคะ ถึงจะเรียกฉันเข้าไปได้")
         return
     target_channel = ctx.author.voice.channel
@@ -1221,7 +1223,7 @@ async def scribe_command(ctx, *, args: str = ""):
 
     vc = ctx.guild.voice_client
     if not vc or not vc.is_connected():
-        if not ctx.author.voice or not ctx.author.voice.channel:
+        if not getattr(ctx.author, "voice", None) or not ctx.author.voice.channel:
             await ctx.send("กรุณาเข้าไปในห้องเสียงก่อนนะคะ แล้วค่อยพิมพ์ `!scribe` หรือ `!join` ค่ะ")
             return
         try:
@@ -1574,9 +1576,21 @@ async def clear_memory(ctx, scope: str = ""):
 
 
 @bot.command(name="calc")
-async def calc_exp(ctx, *, expr: str):
+async def calc_exp(ctx, *, expr: str = ""):
+    cleaned = expr.strip()
+    if not cleaned:
+        await ctx.send("กรุณาระบุนิพจน์ที่ต้องการคำนวณด้วยนะคะ เช่น `!calc (1250 * 1.07) / 3` ค่ะ")
+        return
+    if len(cleaned) > 200 or cleaned.count("**") > 2:
+        await ctx.send("นิพจน์ยาวหรือซับซ้อนเกินไปค่ะ กรุณาพิมพ์ให้กระชับขึ้นนะคะ")
+        return
     try:
-        await ctx.send(f"Result: `{SimpleEval().eval(expr)}`")
+        ev = SimpleEval()
+        ev.MAX_POWER = 1000
+        res_str = str(ev.eval(cleaned))
+        if len(res_str) > 1800:
+            res_str = res_str[:1800] + "... (truncated)"
+        await ctx.send(f"Result: `{res_str}`")
     except Exception as e:
         await ctx.send(f"Error: `{e}`")
 
@@ -1602,6 +1616,21 @@ async def memory_command(ctx, *, args: str = ""):
     reply, target_uid = await process_memory_request(ctx.message, query)
     mem_view = MemoryActionView(requester_id=ctx.author.id, target_uid=target_uid)
     await _send_response_with_interactive_view(ctx.channel, reply, mem_view, reply_to=ctx.message)
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, (commands.CommandNotFound, commands.CheckFailure)):
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"ยังระบุพารามิเตอร์ไม่ครบนะคะ (`{error.param.name}`)")
+        return
+    orig = getattr(error, "original", error)
+    api_log(f"Prefix Command Error (!{getattr(ctx.command, 'name', 'unknown')}) -> {type(orig).__name__}: {str(orig)[:140]}")
+    try:
+        await ctx.send(f"เกิดข้อผิดพลาดระหว่างรันคำสั่งค่ะ (`{type(orig).__name__}`)")
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
