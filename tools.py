@@ -21,11 +21,13 @@ from search_engine import (
 MAX_TOOL_OUTPUT_CHARS = 7500
 MAX_TOOLS_PER_TURN = 6
 
-# Reject blind web searches that only contain a raw URL, bare @handle, or numeric tweet/post ID
+# Reject blind web searches that contain a raw URL, bare @handle, numeric tweet/post ID,
+# or an embedded 15-22 digit social status/snowflake ID (e.g. "AkinaMurasame status 2122997367670718604").
 _BLIND_HANDLE_OR_URL_ONLY_REGEX = re.compile(
     r"^(?:https?://\S+|@?[A-Za-z0-9_]{2,30}|\d{8,24}|@?[A-Za-z0-9_]{2,30}\s+\d{8,24})$",
     re.IGNORECASE,
 )
+_EMBEDDED_SOCIAL_STATUS_ID_REGEX = re.compile(r"\b\d{15,22}\b")
 
 
 # ==============================================================================
@@ -327,6 +329,21 @@ def _safe_parse_tool_args(raw_args: Any) -> dict[str, Any]:
     return {}
 
 
+def _is_blind_web_search_query(query: str) -> bool:
+    """Returns True if query is a raw URL, bare handle, status ID, or contains an embedded 15-22 digit tweet/post ID."""
+    q = re.sub(r"\s+", " ", (query or "")).strip()
+    if not q:
+        return True
+    if _BLIND_HANDLE_OR_URL_ONLY_REGEX.match(q):
+        return True
+    if _EMBEDDED_SOCIAL_STATUS_ID_REGEX.search(q):
+        return True
+    low = q.lower()
+    if any(tok in low for tok in ("x.com/", "twitter.com/", "fxtwitter.com/", "vxtwitter.com/", "fixupx.com/", "/status/")):
+        return True
+    return False
+
+
 class _ToolProxyMessage:
     """Lightweight message proxy for OT/Memory handlers invoked from voice or slash interactions."""
 
@@ -364,10 +381,10 @@ async def execute_tool_call(
             query = str(args.get("query") or "").strip()[:180]
             if not query:
                 return "[Tool Error: 'query' is required.]"
-            if _BLIND_HANDLE_OR_URL_ONLY_REGEX.match(query):
-                api_log(f"ToolExec -> web_search BLOCKED blind handle/URL/ID query '{query[:45]}'")
+            if _is_blind_web_search_query(query):
+                api_log(f"ToolExec -> web_search BLOCKED blind handle/URL/ID query '{query[:50]}'")
                 return (
-                    "[Tool Notice: Do not search bare URLs, raw status IDs, or single handles. "
+                    "[Tool Notice: Do not search bare URLs, raw/embedded status IDs, or single handles. "
                     "Answer directly from the Vision/OCR context already provided, or search using "
                     "the specific identified subject/product/series name instead.]"
                 )

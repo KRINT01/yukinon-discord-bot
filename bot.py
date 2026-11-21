@@ -2,6 +2,7 @@ import os
 import io
 import re
 import time
+import signal
 import base64
 import asyncio
 import platform
@@ -55,6 +56,7 @@ from config import (
     voice_scribe_sessions,
     state,
     davey,
+    api_log,
     get_http_session,
     release_unused_memory,
     prune_stale_attachments,
@@ -72,6 +74,8 @@ from persona import (
 )
 from user_memory import (
     restore_user_profiles_from_discord,
+    backup_user_profiles_to_discord,
+    has_dirty_user_profiles,
     resolve_user_mentions_and_build_dossier,
     is_ot_command_text,
     process_ot_request,
@@ -231,6 +235,7 @@ def _collect_health_metrics() -> dict:
     edge_cd = max(0, int(state.edge_tts_cooldown_until - now))
     cached_files_count = sum(len(q) for q in channel_last_attachment.values())
     active_scribe_count = sum(1 for s in voice_scribe_sessions.values() if s.get("active"))
+    telemetry = state.get_telemetry_summary()
 
     return {
         "status": "ok" if rss_mb < 480 else "warning_high_memory",
@@ -254,6 +259,7 @@ def _collect_health_metrics() -> dict:
             "cached_attachments": cached_files_count,
             "stored_user_profiles": len(user_profiles),
         },
+        "telemetry": telemetry,
         "ai_backends": {
             "native_function_calling": True,
             "registered_tools": [s["name"] for s in TOOL_SPECS],
@@ -289,6 +295,8 @@ async def handle_root(request: web.Request) -> web.Response:
     d = m["discord"]
     mem = m["memory"]
     ai = m["ai_backends"]
+    tel = m["telemetry"]
+    pc = tel["provider_calls"]
 
     ping_str = f"{d['gateway_ping_ms']} ms" if d["gateway_ping_ms"] is not None else "N/A"
     gw_status = (
@@ -301,11 +309,11 @@ async def handle_root(request: web.Request) -> web.Response:
 
     html = f"""
     <html>
-      <head>
+    <head>
         <meta charset="utf-8">
         <title>Yukinon Discord Bot - System Telemetry</title>
-      </head>
-      <body style="font-family: system-ui, sans-serif; max-width: 740px; margin: 36px auto; line-height: 1.6; color: #1f2937; padding: 0 16px;">
+    </head>
+    <body style="font-family: system-ui, sans-serif; max-width: 740px; margin: 36px auto; line-height: 1.6; color: #1f2937; padding: 0 16px;">
         <h2>❄️ Yukino Yukinoshita Discord Bot (Decision-1 Orchestrated, Native Tools &amp; Voice Scribe Edition)</h2>
         <p><b>System Time (TH):</b> {m['system_time_th']}</p>
         <p><b>Discord Gateway:</b> {gw_status}</p>
@@ -313,13 +321,17 @@ async def handle_root(request: web.Request) -> web.Response:
         <p><b>Voice &amp; Scribe:</b> {d['active_voice_sessions']} voice session(s), {d['active_scribe_sessions']} active scribe(s) | DAVE Ready: {d['dave_e2ee_ready']} | Live STT: <code>{ai['gemini_transcribe_live_model']}</code>{tts_note}</p>
         <p><b>Container RAM:</b> {mem['bot_ram_mb']} MB / {mem['render_limit_mb']} MB ({mem['ram_usage_pct']}%) |
            <b>Cached Contexts:</b> {mem['active_chat_channels']} chat(s), {mem['cached_attachments']} file(s), {mem['stored_user_profiles']} profile(s)</p>
+        <p><b>Runtime Telemetry:</b> Decision-1 <code>{tel['decision_calls']}</code> calls (avg <code>{tel['decision_avg_ms']}ms</code>, errs <code>{tel['decision_errors']}</code>) |
+           SearchFilter dropped <code>{tel['search_filter_dropped']}</code> (<code>{tel['search_filter_drop_pct']}%</code>) |
+           Gemini Implicit Cache: <code>{tel['gemini_cache_hits']}</code> hit(s), <code>{tel['gemini_cached_tokens_total']:,}</code> tokens</p>
+        <p><b>Provider Calls:</b> Flash <code>{pc.get('gemini_flash', 0)}</code> | Hydrogen <code>{pc.get('gemini_hydrogen', 0)}</code> | Gemma <code>{pc.get('gemma_ai_studio', 0)}</code> | Groq <code>{pc.get('groq', 0)}</code> | CF <code>{pc.get('cloudflare', 0)}</code> | Modal <code>{pc.get('modal', 0)}</code></p>
         <hr style="border: 0; border-top: 1px solid #e5e7eb; margin: 16px 0;">
         <p><b>Google AI Studio:</b> {"Enabled (Orchestrator: <code>" + str(ai['gemini_decision_orchestrator']) + "</code> | Heavy Specialist: <code>" + str(ai['gemini_heavy_specialist']) + "</code> | Live STT: <code>" + str(ai['gemini_transcribe_live_model']) + "</code> | Gemma 4: <code>" + str(ai['gemma_active_model']) + "</code> | Flash-Lite: <code>" + str(ai['gemini_active_model']) + "</code>)" + gemini_cd_note if ai['gemini_enabled'] else "Disabled"}</p>
         <p><b>Cloudflare Workers AI:</b> {"Enabled (Code: <code>" + CF_CODE_MODEL + "</code> | Fast: <code>" + CF_CHAT_FAST_MODEL + "</code> | Vision/Gemma: <code>" + str(ai['cloudflare_gemma_model']) + "</code> | Image: <code>" + str(ai['cloudflare_image_model']) + "</code>)" if ai['cloudflare_enabled'] else "Disabled"}</p>
         <p><b>Groq LPU Acceleration:</b> {"Enabled (Code: <code>" + GROQ_CODE_MODEL + "</code> | Search: <code>" + str(ai['groq_search_model']) + "</code> | Vision: <code>" + str(ai['groq_vision_model']) + "</code>)" if ai['groq_enabled'] else "Disabled"}</p>
         <p><b>Modal GPU Ollama:</b> {"Configured" if ai['modal_ollama_configured'] else "Not Configured"} (Fallback: <code>{ai['fast_model']}</code>)</p>
         <p><b>Uptime:</b> {m['uptime_human']} ({m['uptime_sec']}s)</p>
-      </body>
+    </body>
     </html>
     """
     return web.Response(
@@ -391,6 +403,46 @@ class YukinonBot(commands.Bot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.web_runner = None
+        self._shutdown_flushed = False
+
+    async def _flush_state_before_shutdown(self, reason: str = "Shutdown") -> None:
+        """
+        Gracefully finalizes any active in-RAM Voice Scribe sessions and force-flushes
+        dirty `user_profiles.json` to `#yukinon-memory` before Render stops the container.
+        """
+        if self._shutdown_flushed:
+            return
+        self._shutdown_flushed = True
+        api_log(f"Graceful Shutdown ({reason}) -> flushing active Scribe sessions & dirty user profiles...")
+
+        # 1. Finalize active Voice Scribe sessions (bounded to 10s so SIGTERM completes cleanly)
+        for gid in list(voice_scribe_sessions.keys()):
+            if is_voice_scribe_active(gid):
+                guild = self.get_guild(gid)
+                if guild is not None:
+                    try:
+                        await asyncio.wait_for(
+                            stop_voice_scribe_session(
+                                guild,
+                                triggered_by=reason,
+                                speak_ack=False,
+                                reason=f"รีสตาร์ทระบบอัตโนมัติ ({reason})",
+                            ),
+                            timeout=10.0,
+                        )
+                    except Exception as e:
+                        api_log(f"Graceful Shutdown Scribe note (guild={gid}): {type(e).__name__}")
+                        clear_voice_scribe_session(gid)
+                else:
+                    clear_voice_scribe_session(gid)
+
+        # 2. Force-flush any dirty user_profiles.json edits to #yukinon-memory
+        if has_dirty_user_profiles() and self.is_ready():
+            try:
+                await asyncio.wait_for(backup_user_profiles_to_discord(force=True), timeout=6.0)
+                api_log("Graceful Shutdown -> flushed dirty user_profiles.json to Discord cloud backup.")
+            except Exception as e:
+                api_log(f"Graceful Shutdown profile flush note: {type(e).__name__}")
 
     async def setup_hook(self):
         register_app_commands(self)
@@ -404,7 +456,23 @@ class YukinonBot(commands.Bot):
         await site.start()
         print(f"[Render Web Service Health Server] Listening on 0.0.0.0:{PORT}", flush=True)
 
+        # Register POSIX SIGTERM handler for clean Render redeploy / restart flushes
+        try:
+            loop = asyncio.get_running_loop()
+
+            def _on_sigterm():
+                api_log("Received SIGTERM from host — initiating graceful flush & shutdown...")
+                loop.create_task(self.close())
+
+            loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass
+
     async def close(self):
+        try:
+            await self._flush_state_before_shutdown(reason="SIGTERM/Close")
+        except Exception:
+            pass
         for gid in list(voice_scribe_sessions.keys()):
             clear_voice_scribe_session(gid)
         if monthly_ot_auto_report_task.is_running():
@@ -429,7 +497,12 @@ async def verify_allowed_guild(ctx):
 
 @bot.event
 async def on_ready():
-    await restore_user_profiles_from_discord(bot)
+    # Guard against Discord gateway reconnects so unsaved in-RAM profile updates are never overwritten!
+    if not state.profiles_restored:
+        await restore_user_profiles_from_discord(bot)
+        state.profiles_restored = True
+    else:
+        api_log("Discord Gateway reconnected (on_ready) -> preserved in-RAM user profiles.")
     if not monthly_ot_auto_report_task.is_running():
         monthly_ot_auto_report_task.start()
     print(f"Logged in as {bot.user} on {platform.machine()} at {get_current_thai_datetime_str()}", flush=True)
@@ -547,9 +620,9 @@ async def _dispatch_post_tool_side_effects(
 async def process_yukipedia_request(ctx_or_message, raw_prompt: str = ""):
     """
     Unified 'Yukipedia Mode' dispatcher:
-    1) If image/link + manga translation requested -> runs Manga Localization.
-    2) If image/document/reply attached -> runs OCR/Document extraction + Yukipedia analysis.
-    3) Otherwise -> runs Web Search & Decision-1 in parallel for faster Yukipedia answers.
+      1) If image/link + manga translation requested -> runs Manga Localization.
+      2) If image/document/reply attached -> runs OCR/Document extraction + Yukipedia analysis.
+      3) Otherwise -> runs Web Search & Decision-1 in parallel for faster Yukipedia answers.
     """
     msg = ctx_or_message.message if hasattr(ctx_or_message, "message") else ctx_or_message
     channel = ctx_or_message.channel
@@ -1306,6 +1379,7 @@ async def ask_code(ctx, *, prompt: str = "วิเคราะห์โค้�
             else None
         )
         await _send_response_with_interactive_view(ctx.channel, answer, view, reply_to=ctx.message)
+        await _dispatch_post_tool_side_effects(ctx.channel, ctx.message, answer, prompt, tool_ctx)
 
 
 @bot.command(name="source", aliases=["sauce", "whatis", "วาร์ป"])
@@ -1364,6 +1438,7 @@ async def source_command(ctx, *, question: str = ""):
             else None
         )
         await _send_response_with_interactive_view(ctx.channel, answer, view, reply_to=ctx.message)
+        await _dispatch_post_tool_side_effects(ctx.channel, ctx.message, answer, user_q, tool_ctx)
 
 
 @bot.command(name="status", aliases=["stat", "ping", "ram"])
@@ -1372,6 +1447,8 @@ async def status_command(ctx):
     d = m["discord"]
     mem = m["memory"]
     ai = m["ai_backends"]
+    tel = m["telemetry"]
+    pc = tel["provider_calls"]
 
     ping_str = f"{d['gateway_ping_ms']} ms" if d["gateway_ping_ms"] is not None else "N/A"
     active_topics_count = len(getattr(config, "channel_active_topic", {}))
@@ -1386,7 +1463,12 @@ async def status_command(ctx):
         f"- **Cached Contexts:** `{mem['active_chat_channels']}` แชท | "
         f"`{mem['cached_attachments']}` ไฟล์แนบ | "
         f"`{active_topics_count}` หัวข้อสนทนา | "
-        f"`{mem['stored_user_profiles']}` โปรไฟล์ผู้ใช้"
+        f"`{mem['stored_user_profiles']}` โปรไฟล์ผู้ใช้\n"
+        f"- **Telemetry:** Decision-1 `{tel['decision_calls']}` calls (`{tel['decision_avg_ms']}ms`, err `{tel['decision_errors']}`) | "
+        f"SearchFilter drop `{tel['search_filter_dropped']}` (`{tel['search_filter_drop_pct']}%`) | "
+        f"Cache `{tel['gemini_cache_hits']}` hits (`{tel['gemini_cached_tokens_total']:,}` tok)\n"
+        f"- **Provider Calls:** Flash `{pc.get('gemini_flash', 0)}` | H2 `{pc.get('gemini_hydrogen', 0)}` | "
+        f"Gemma `{pc.get('gemma_ai_studio', 0)}` | Groq `{pc.get('groq', 0)}` | CF `{pc.get('cloudflare', 0)}` | Modal `{pc.get('modal', 0)}`"
     )
 
 

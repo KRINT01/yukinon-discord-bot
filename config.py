@@ -157,12 +157,13 @@ BOOT_TIME = time.time()
 
 
 class RuntimeState:
-    """Centralized mutable runtime state shared safely across all modules."""
+    """Centralized mutable runtime state and lightweight performance telemetry shared across all modules."""
 
     def __init__(self):
         self.bot = None
         self.http_session: aiohttp.ClientSession | None = None
         self.has_voice_recv: bool = False
+        self.profiles_restored: bool = False
         self.active_gemini_model: str = "gemini-3.5-flash-lite"
         self.active_gemma_model: str = GEMMA_CHAT_MODEL
         self.active_groq_search_model: str = GROQ_SEARCH_MODEL
@@ -175,6 +176,62 @@ class RuntimeState:
         self.cf_gpt_oss_cooldown_until: float = 0.0
         self.edge_tts_cooldown_until: float = 0.0
         self.last_ot_auto_report_ym: str = ""
+
+        # Lightweight zero-RAM runtime telemetry counters
+        self.decision_calls: int = 0
+        self.decision_errors: int = 0
+        self.decision_total_sec: float = 0.0
+        self.search_filter_kept: int = 0
+        self.search_filter_dropped: int = 0
+        self.gemini_cache_hits: int = 0
+        self.gemini_cached_tokens_total: int = 0
+        self.provider_calls: dict[str, int] = {
+            "gemini_flash": 0,
+            "gemini_hydrogen": 0,
+            "gemma_ai_studio": 0,
+            "groq": 0,
+            "cloudflare": 0,
+            "modal": 0,
+        }
+
+    def record_decision_stat(self, elapsed_sec: float, ok: bool = True) -> None:
+        self.decision_calls += 1
+        if ok:
+            self.decision_total_sec += max(0.0, float(elapsed_sec))
+        else:
+            self.decision_errors += 1
+
+    def record_provider_call(self, provider_key: str) -> None:
+        if provider_key in self.provider_calls:
+            self.provider_calls[provider_key] += 1
+        else:
+            self.provider_calls[provider_key] = 1
+
+    def record_gemini_cache_hit(self, cached_tokens: int) -> None:
+        if cached_tokens > 0:
+            self.gemini_cache_hits += 1
+            self.gemini_cached_tokens_total += int(cached_tokens)
+
+    def record_search_filter_stats(self, kept: int, dropped: int) -> None:
+        self.search_filter_kept += max(0, int(kept))
+        self.search_filter_dropped += max(0, int(dropped))
+
+    def get_telemetry_summary(self) -> dict:
+        ok_dec = max(0, self.decision_calls - self.decision_errors)
+        avg_dec_ms = round((self.decision_total_sec / ok_dec) * 1000.0, 1) if ok_dec > 0 else 0.0
+        total_sf = self.search_filter_kept + self.search_filter_dropped
+        sf_drop_pct = round((self.search_filter_dropped / total_sf) * 100.0, 1) if total_sf > 0 else 0.0
+        return {
+            "decision_calls": self.decision_calls,
+            "decision_errors": self.decision_errors,
+            "decision_avg_ms": avg_dec_ms,
+            "search_filter_kept": self.search_filter_kept,
+            "search_filter_dropped": self.search_filter_dropped,
+            "search_filter_drop_pct": sf_drop_pct,
+            "gemini_cache_hits": self.gemini_cache_hits,
+            "gemini_cached_tokens_total": self.gemini_cached_tokens_total,
+            "provider_calls": dict(self.provider_calls),
+        }
 
 
 state = RuntimeState()

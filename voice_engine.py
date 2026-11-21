@@ -1,12 +1,13 @@
 import os
 import io
 import re
+import math
 import json
 import time
 import wave
+import array
 import base64
 import logging
-import audioop
 import tempfile
 import threading
 import asyncio
@@ -15,6 +16,13 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from collections import defaultdict, deque
 from urllib.parse import quote_plus
+
+try:
+    import numpy as np
+    _HAS_NUMPY = True
+except ImportError:
+    np = None
+    _HAS_NUMPY = False
 
 import aiohttp
 import discord
@@ -82,6 +90,12 @@ PCM_SILENCE_20MS = b"\x00" * 3840
 # Hard 18-second cap per continuous utterance (~3.45 MB @ 48kHz stereo 16-bit) to protect 512MB Render RAM
 MAX_UTTERANCE_BYTES = 192000 * 18
 
+# Mode-aware silence flush windows: snappier in interactive voice chat, patient in Voice Scribe meetings
+INTERACTIVE_SILENCE_FLUSH_SEC = 0.85
+INTERACTIVE_HANGOVER_SEC = 0.75
+SCRIBE_SILENCE_FLUSH_SEC = 1.20
+SCRIBE_HANGOVER_SEC = 1.00
+
 # Consistent TTS voice selection: defaults to steady Google TTS + Yukino filter (set TTS_PRIMARY_ENGINE=edge to override)
 TTS_PRIMARY_ENGINE = os.getenv("TTS_PRIMARY_ENGINE", "google").strip().lower()
 
@@ -96,6 +110,29 @@ _ACTIVE_VOICE_SINKS: dict[int, "SilenceGatedVoiceSink"] = {}
 # Phase 3: Rolling per-guild multi-speaker voice room history (last 8 turns) & last bot reply timestamp
 _VOICE_ROOM_HISTORY: dict[int, deque] = defaultdict(lambda: deque(maxlen=8))
 _VOICE_LAST_BOT_REPLY_TS: dict[int, float] = {}
+
+
+def _calc_pcm16_rms(pcm_bytes: bytes) -> float:
+    """
+    Python 3.13+ safe 16-bit signed PCM RMS calculator (replaces removed stdlib `audioop.rms`).
+    Casts int16 samples to float64 before squaring so int16 overflow never occurs.
+    """
+    n_bytes = len(pcm_bytes)
+    if n_bytes < 2:
+        return 0.0
+    if n_bytes & 1:
+        pcm_bytes = pcm_bytes[:-1]
+    if _HAS_NUMPY:
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float64)
+        if samples.size == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(samples * samples)))
+    arr = array.array("h")
+    arr.frombytes(pcm_bytes)
+    if not arr:
+        return 0.0
+    return math.sqrt(sum(x * x for x in arr) / float(len(arr)))
+
 
 # Spoken test phrases (including common STT phonetic variations like ชัด/แชท, ตัดสอบ/ทดสอบ, หยิน/ยิน)
 VOICE_TEST_PHRASE_REGEX = re.compile(
@@ -1565,7 +1602,7 @@ async def handle_spoken_voice_command(
     speaker_label_ai = "Partner (Owner)" if speaker_is_owner else (speaker_name or "Member")
 
     # 0. Passive Multi-Speaker Voice Scribe Mode:
-    #    Silently record everyone; stop on deterministic command OR Decision-1 natural stop confirmation!
+    # Silently record everyone; stop on deterministic command OR Decision-1 natural stop confirmation!
     if guild and is_voice_scribe_active(gid):
         sess = voice_scribe_sessions.get(gid)
         if sess and not sess.get("stopping"):
@@ -1593,17 +1630,17 @@ async def handle_spoken_voice_command(
                 )
                 return
 
-        _, hit_limit = _append_scribe_entry(
-            gid, speaker_user, speaker_name, cleaned, utterance_ts=utterance_ts
-        )
-        if hit_limit and sess and not sess.get("stopping"):
-            await stop_voice_scribe_session(
-                guild,
-                fallback_text_channel=text_channel,
-                triggered_by="Auto-Limit",
-                speak_ack=True,
-                reason="ถึงขีดจำกัดระยะเวลาหรือจำนวนข้อความสูงสุดอัตโนมัติ",
+            _, hit_limit = _append_scribe_entry(
+                gid, speaker_user, speaker_name, cleaned, utterance_ts=utterance_ts
             )
+            if hit_limit and sess and not sess.get("stopping"):
+                await stop_voice_scribe_session(
+                    guild,
+                    fallback_text_channel=text_channel,
+                    triggered_by="Auto-Limit",
+                    speak_ack=True,
+                    reason="ถึงขีดจำกัดระยะเวลาหรือจำนวนข้อความสูงสุดอัตโนมัติ",
+                )
         return
 
     human_count_in_vc = _count_humans_in_voice_channel(guild)
@@ -1682,7 +1719,7 @@ async def handle_spoken_voice_command(
             return
 
     # 3. Phase 3 Multi-Speaker Voice Orchestrator (Single Forward Pass via Decision-1):
-    #    Decides `addressed_to_bot`, `voice_action`, `route`, `complexity`, and guardrails together!
+    # Decides `addressed_to_bot`, `voice_action`, `route`, `complexity`, and guardrails together!
     dec_plan = await orchestrate_voice_utterance_with_decision_1(
         command_body,
         speaker_label=speaker_label_ai,
@@ -1810,6 +1847,8 @@ async def handle_spoken_voice_command(
 class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
     """
     Adaptive Noise-Floor Multi-Speaker VAD Sink tuned for rooms with steady fan noise:
+      - Python 3.13+ safe NumPy int16->float64 RMS calculation (zero `audioop` dependency).
+      - Mode-aware silence flush: snappier `0.85s` in interactive voice chat, patient `1.20s` in Voice Scribe Mode.
       - Tracks a slow per-speaker ambient noise floor EMA so steady fan hum (rms 30-65) never triggers STT.
       - Preserves per-speaker utterance start timestamps so overlapping multi-speaker conversations
         sort in exact chronological order during Voice Scribe Mode.
@@ -1879,11 +1918,14 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
         if self.guild.voice_client and self.guild.voice_client.is_playing():
             return
         try:
-            frame_rms = float(audioop.rms(data.pcm, 2))
+            frame_rms = _calc_pcm16_rms(data.pcm)
         except Exception:
             return
 
         now = time.monotonic()
+        gid = int(self.guild.id) if self.guild else 0
+        hangover_sec = SCRIBE_HANGOVER_SEC if is_voice_scribe_active(gid) else INTERACTIVE_HANGOVER_SEC
+
         with self._lock:
             floor = self.noise_floors[speaker]
             start_thresh = max(self.BASE_SPEECH_RMS_MIN, floor * 2.25)
@@ -1905,7 +1947,7 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
                 if frame_rms > self.peak_rms[speaker]:
                     self.peak_rms[speaker] = frame_rms
                 self.last_spoken[speaker] = now
-            elif is_capturing and (now - self.last_spoken.get(speaker, 0) < 0.95):
+            elif is_capturing and (now - self.last_spoken.get(speaker, 0) < hangover_sec):
                 if len(buf) < MAX_UTTERANCE_BYTES:
                     buf.extend(data.pcm)
             else:
@@ -1914,13 +1956,13 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
                     self.noise_floors[speaker] = max(15.0, min(95.0, updated_floor))
                 self.pre_roll_buffers[speaker].append(data.pcm)
 
-        if frame_rms > 25.0 and (now - self._last_rms_log > 5.0):
-            self._last_rms_log = now
-            print(
-                f"[Voice Mic Level] speaker={speaker.display_name}, "
-                f"rms={int(frame_rms)}, floor={int(self.noise_floors[speaker])}, thresh={int(start_thresh)}",
-                flush=True,
-            )
+            if frame_rms > 25.0 and (now - self._last_rms_log > 5.0):
+                self._last_rms_log = now
+                print(
+                    f"[Voice Mic Level] speaker={speaker.display_name}, "
+                    f"rms={int(frame_rms)}, floor={int(self.noise_floors[speaker])}, thresh={int(start_thresh)}",
+                    flush=True,
+                )
 
     def _spawn_pcm_task(self, user, pcm_bytes: bytes, utterance_ts: float) -> asyncio.Task:
         task = self._loop.create_task(self._process_user_pcm(user, pcm_bytes, utterance_ts))
@@ -1969,14 +2011,17 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
 
     async def _silence_monitor_loop(self):
         while self.running:
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(0.30)
             now = time.monotonic()
+            gid = int(self.guild.id) if self.guild else 0
+            flush_sec = SCRIBE_SILENCE_FLUSH_SEC if is_voice_scribe_active(gid) else INTERACTIVE_SILENCE_FLUSH_SEC
+
             ready_payloads = []
             with self._lock:
                 for user, last_t in list(self.last_spoken.items()):
                     buf_len = len(self.user_buffers.get(user, b""))
-                    # Flush after 1.1s silence OR immediately if continuous speech hits MAX_UTTERANCE_BYTES
-                    if (now - last_t >= 1.1) or (buf_len >= MAX_UTTERANCE_BYTES):
+                    # Flush after mode-aware silence window (0.85s interactive / 1.20s Scribe) OR 18s RAM cap
+                    if (now - last_t >= flush_sec) or (buf_len >= MAX_UTTERANCE_BYTES):
                         pcm_bytes = bytes(self.user_buffers.pop(user, b""))
                         active_frames = self.speech_frame_counts.pop(user, 0)
                         peak = self.peak_rms.pop(user, 0.0)
@@ -2015,16 +2060,16 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
                     wf.writeframes(pcm_bytes)
                 compact_wav = await asyncio.to_thread(convert_audio_bytes_to_wav_sync, raw_wav_io.getvalue())
                 spoken_text = await transcribe_wav_bytes_hybrid(compact_wav)
-            if spoken_text:
-                await handle_spoken_voice_command(
-                    self.guild,
-                    self.text_channel,
-                    user,
-                    user.display_name,
-                    spoken_text,
-                    utterance_ts=utterance_ts,
-                )
-            else:
-                print(f"[Voice STT] Audio captured from {user.display_name}, but STT returned empty text.", flush=True)
+                if spoken_text:
+                    await handle_spoken_voice_command(
+                        self.guild,
+                        self.text_channel,
+                        user,
+                        user.display_name,
+                        spoken_text,
+                        utterance_ts=utterance_ts,
+                    )
+                else:
+                    print(f"[Voice STT] Audio captured from {user.display_name}, but STT returned empty text.", flush=True)
         except Exception as e:
-            print(f"Voice PCM processing error: {e}", flush=True)
+            print(f"Voice PCM processing error: {type(e).__name__}: {e}", flush=True)

@@ -63,6 +63,9 @@ _SEARCH_CACHE: dict[str, tuple[float, str]] = {}
 _SEARCH_CACHE_TTL_SEC = 300.0
 _SEARCH_CACHE_MAX_ENTRIES = 32
 
+# Soft deadline for DDGS once fast async backends (Tavily, Grounding, Wikipedia, Jikan, RSS) already returned hits
+_DDGS_SOFT_WAIT_SEC = 3.0
+
 
 def _get_cached_search(cache_key: str) -> str:
     entry = _SEARCH_CACHE.get(cache_key)
@@ -869,8 +872,10 @@ def _search_ddgs_sync(query: str, region_code: str, timelimit: str | None, max_r
 async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
     """
     High-speed parallel async multi-engine web search with 5-minute TTL caching + Phase 4 Decision-1 denoising:
-      - Fans out domain-appropriate backends (Gemini Grounding, Google News RSS, Jikan MAL,
-        Wikipedia batched extracts, Steam Store, Tavily, DDGS) concurrently via `asyncio.gather`.
+      - Fans out fast domain-matched async backends (Gemini Grounding, Google News RSS, Jikan MAL,
+        Wikipedia batched extracts, Steam Store, Tavily) concurrently with DDGS.
+      - Soft-caps DDGS tail latency to `_DDGS_SOFT_WAIT_SEC` (3.0s) once fast backends already
+        returned hits, shaving 3-5s off Render IP rate-limited DDGS stalls (full 8s allowed if fast backends are empty).
       - Filters off-topic & clickbait/rumor snippets in ONE Decision-1 forward pass (~250ms)
         BEFORE deep-scraping, keeping only the cleanest, highest-relevance evidence for Gemma/Flash-Lite.
       - Deep-scrapes up to 2 surviving short-snippet web pages concurrently via `fetch_webpage_async`.
@@ -908,35 +913,63 @@ async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
     if is_news and not re.search(r"\b202\d\b|\b256\d\b", clean_q):
         dated_q = f"{clean_q} {current_year_ce}".strip()
 
-    # Phase 1: Parallel fan-out across fast domain-matched async APIs
-    phase1_tasks = []
+    # Phase 1: Parallel fan-out across fast domain-matched async APIs + soft-capped DDGS
+    fast_tasks = []
     if is_news or is_recency:
-        phase1_tasks.append(_search_google_ai_studio_grounded_async(dated_q))
+        fast_tasks.append(_search_google_ai_studio_grounded_async(dated_q))
     if is_news:
-        phase1_tasks.append(_search_google_news_rss_async(dated_q, is_thai=is_thai, max_results=3))
+        fast_tasks.append(_search_google_news_rss_async(dated_q, is_thai=is_thai, max_results=3))
     if is_anime_manga:
-        phase1_tasks.append(_search_jikan_anime_manga_async(clean_q, max_results=2))
-        phase1_tasks.append(_search_wikipedia_full_extract_async(clean_q, is_thai=is_thai, max_results=2))
+        fast_tasks.append(_search_jikan_anime_manga_async(clean_q, max_results=2))
+        fast_tasks.append(_search_wikipedia_full_extract_async(clean_q, is_thai=is_thai, max_results=2))
     elif is_game:
-        phase1_tasks.append(_search_wikipedia_full_extract_async(clean_q, is_thai=is_thai, max_results=2))
-        phase1_tasks.append(_search_steam_games_async(clean_q, max_results=1))
+        fast_tasks.append(_search_wikipedia_full_extract_async(clean_q, is_thai=is_thai, max_results=2))
+        fast_tasks.append(_search_steam_games_async(clean_q, max_results=1))
     elif not is_news:
-        phase1_tasks.append(_search_wikipedia_full_extract_async(clean_q, is_thai=is_thai, max_results=2))
+        fast_tasks.append(_search_wikipedia_full_extract_async(clean_q, is_thai=is_thai, max_results=2))
 
     if TAVILY_API_KEY:
-        phase1_tasks.append(_search_tavily_async(dated_q if is_news else clean_q, max_results=max_results))
+        fast_tasks.append(_search_tavily_async(dated_q if is_news else clean_q, max_results=max_results))
 
-    # Launch DDGS concurrently whenever we don't have Tavily or need broader web snippets
     preferred_tl = "m" if (is_news and not is_game and not is_anime_manga) else None
-    phase1_tasks.append(
+    ddgs_start = time.monotonic()
+    ddgs_task = asyncio.create_task(
         asyncio.to_thread(_search_ddgs_sync, dated_q if is_news else clean_q, region_code, preferred_tl, max_results)
     )
 
-    batches = await asyncio.gather(*phase1_tasks, return_exceptions=True)
     hits: list[dict] = []
-    for batch in batches:
-        if isinstance(batch, list):
-            hits.extend(batch)
+    if fast_tasks:
+        fast_batches = await asyncio.gather(*fast_tasks, return_exceptions=True)
+        for batch in fast_batches:
+            if isinstance(batch, list):
+                hits.extend(batch)
+
+    # Soft-cap DDGS wait if fast backends already gave us usable hits; wait up to 8s if fast backends returned empty
+    if ddgs_task.done():
+        try:
+            ddg_res = ddgs_task.result()
+            if isinstance(ddg_res, list):
+                hits.extend(ddg_res)
+        except Exception:
+            pass
+    else:
+        elapsed_ddgs = time.monotonic() - ddgs_start
+        ddgs_budget = max(0.25, _DDGS_SOFT_WAIT_SEC - elapsed_ddgs) if hits else max(1.0, 8.5 - elapsed_ddgs)
+        done_set, _ = await asyncio.wait({ddgs_task}, timeout=ddgs_budget)
+        if ddgs_task in done_set:
+            try:
+                ddg_res = ddgs_task.result()
+                if isinstance(ddg_res, list):
+                    hits.extend(ddg_res)
+            except Exception:
+                pass
+        else:
+            api_log(
+                f"Search (DDGS Soft-Cap) -> skipped slow DDGS after {time.monotonic() - ddgs_start:.2f}s "
+                f"(already have {len(hits)} fast hit(s))"
+            )
+            # Attach silent done callback so background thread exception is never logged as unhandled
+            ddgs_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
     # Last-resort fallback if everything above returned empty
     if not hits:

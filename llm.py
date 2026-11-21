@@ -50,6 +50,7 @@ from config import (
 )
 from persona import (
     get_speaker_identity_context,
+    get_speaker_volatile_context,
     sanitize_yukino_output,
     get_current_thai_datetime_str,
     try_instant_datetime_reply,
@@ -209,6 +210,24 @@ def get_google_model_cooldown(model_id: str) -> float:
 
 def set_google_model_cooldown(model_id: str, duration_sec: float):
     _GEMINI_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + max(1.0, float(duration_sec))
+
+
+def _record_gemini_usage_cache(data: dict) -> str:
+    """
+    Safely inspects `usageMetadata.cachedContentTokenCount` (omitted by REST API when 0)
+    and records implicit cache hits on `state`. Returns a compact log suffix when > 0.
+    """
+    usage = data.get("usageMetadata") if isinstance(data, dict) else None
+    if not isinstance(usage, dict):
+        return ""
+    cached_cnt = int(usage.get("cachedContentTokenCount") or 0)
+    if cached_cnt <= 0:
+        return ""
+    prompt_cnt = int(usage.get("promptTokenCount") or 0)
+    state.record_gemini_cache_hit(cached_cnt)
+    if prompt_cnt > 0:
+        return f", cache_hit={cached_cnt}/{prompt_cnt}"
+    return f", cache_hit={cached_cnt}"
 
 
 def _estimate_messages_tokens(messages: list) -> int:
@@ -426,8 +445,11 @@ async def call_gemini_hydrogen_generate(
 
                 if status == 200:
                     _record_gemini_hydrogen_call()
-                    api_log(f"Gemini Hydrogen ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
-                    return json.loads(body_text)
+                    state.record_provider_call("gemini_hydrogen")
+                    parsed = json.loads(body_text)
+                    cache_note = _record_gemini_usage_cache(parsed)
+                    api_log(f"Gemini Hydrogen ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s{cache_note})")
+                    return parsed
 
                 if status == 400 and attempt == 0:
                     changed = False
@@ -589,22 +611,27 @@ async def call_gemini_decision_orchestrator(
                 data = await resp.json()
                 answers = data.get("answers") or {}
                 if isinstance(answers, dict) and answers:
+                    state.record_decision_stat(elapsed, ok=True)
                     api_log(f"Decision API ({purpose}) -> {GEMINI_DECISION_MODEL} 200 OK ({elapsed:.2f}s)")
                     return answers
             elif resp.status == 429:
+                state.record_decision_stat(elapsed, ok=False)
                 state.gemini_decision_cooldown_until = time.time() + 60.0
                 api_log(f"Decision API ({purpose}) -> HTTP 429 (cooldown 60s)")
             elif resp.status == 400:
+                state.record_decision_stat(elapsed, ok=False)
                 err_txt = await resp.text()
                 # Do NOT put Decision API on a 3m cooldown if a single message triggered safety filters
                 if "safety" not in err_txt.lower():
                     state.gemini_decision_cooldown_until = time.time() + 30.0
                 api_log(f"Decision API ({purpose}) -> HTTP 400 ({elapsed:.2f}s): {err_txt[:120]}")
             else:
+                state.record_decision_stat(elapsed, ok=False)
                 err_txt = await resp.text()
                 state.gemini_decision_cooldown_until = time.time() + 180.0
                 api_log(f"Decision API ({purpose}) -> HTTP {resp.status} ({elapsed:.2f}s): {err_txt[:100]}")
     except Exception as e:
+        state.record_decision_stat(time.monotonic() - t0, ok=False)
         state.gemini_decision_cooldown_until = time.time() + 120.0
         api_log(f"Decision API ({purpose}) -> skipped ({type(e).__name__})")
     return {}
@@ -1254,6 +1281,7 @@ async def filter_search_snippets_with_decision_1(
         # Safety fallback: never return empty when search returned raw hits — keep top 2 by effective score
         scored_rows.sort(key=lambda x: (-x[0], x[3]))
         kept = [row[4] for row in scored_rows[: min(2, max_keep)]]
+        state.record_search_filter_stats(len(kept), max(0, len(candidates) - len(kept)))
         api_log(
             f"SearchFilter -> fallback kept {len(kept)}/{len(candidates)} snippets "
             f"(all scored low; best_rel={scored_rows[0][1]:.2f})"
@@ -1262,6 +1290,7 @@ async def filter_search_snippets_with_decision_1(
 
     survivors.sort(key=lambda x: (-x[0], x[1]))
     kept = [row[2] for row in survivors[:max_keep]]
+    state.record_search_filter_stats(len(kept), dropped_cnt)
     api_log(
         f"SearchFilter -> kept {len(kept)}/{len(candidates)} snippets "
         f"(dropped {dropped_cnt} clickbait/low-rel)"
@@ -1918,6 +1947,7 @@ async def call_gemma_ai_studio_chat(
                     out, _, _ = _extract_gemini_text_and_calls(data)
                     if out:
                         state.active_gemma_model = model_id
+                        state.record_provider_call("gemma_ai_studio")
                         api_log(f"Gemma AI Studio ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
                         return out
 
@@ -1991,6 +2021,7 @@ async def call_gemma_ai_studio_vision(
                         data = json.loads(body_text)
                         out, _, _ = _extract_gemini_text_and_calls(data)
                         if out:
+                            state.record_provider_call("gemma_ai_studio")
                             api_log(f"Gemma AI Studio ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
                             return out
 
@@ -2076,8 +2107,11 @@ async def call_gemini_generate_content_self_healing(
                     if status == 200:
                         if not preferred_models and state.active_gemini_model != model_id:
                             state.active_gemini_model = model_id
-                        api_log(f"Gemini ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
-                        return json.loads(body_text)
+                        state.record_provider_call("gemini_flash")
+                        parsed = json.loads(body_text)
+                        cache_note = _record_gemini_usage_cache(parsed)
+                        api_log(f"Gemini ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s{cache_note})")
+                        return parsed
 
                     if status == 400 and attempt == 0:
                         changed = False
@@ -2242,6 +2276,7 @@ async def call_cloudflare_gemma_chat(
                     content = msg_obj.get("content") or ""
                     content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
                     if content:
+                        state.record_provider_call("cloudflare")
                         api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
                         return content
             elif resp.status == 429:
@@ -2404,6 +2439,7 @@ async def call_cloudflare_gpt_oss(
                         out_txt = "\n".join(extracted_chunks).strip()
                     out_txt = re.sub(r"<think>[\s\S]*?</think>", "", out_txt).strip()
                     if out_txt:
+                        state.record_provider_call("cloudflare")
                         api_log(f"Cloudflare Responses ({purpose}) -> {target_model} 200 OK ({elapsed:.2f}s)")
                         return out_txt
                 elif resp.status == 429:
@@ -2472,6 +2508,7 @@ async def call_cloudflare_gpt_oss(
                     content = msg_obj.get("content") or ""
                     content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
                     if content:
+                        state.record_provider_call("cloudflare")
                         api_log(f"Cloudflare Chat ({purpose}) -> {target_model} 200 OK ({elapsed:.2f}s)")
                         return content
                     return ""
@@ -2537,6 +2574,7 @@ async def call_cloudflare_vision_chat(
                     content = msg_obj.get("content") or ""
                     content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
                     if content:
+                        state.record_provider_call("cloudflare")
                         api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
                         return content
             api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} HTTP {resp.status} ({elapsed:.2f}s)")
@@ -2633,6 +2671,7 @@ async def call_groq_chat(
                 content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
                 if not is_coding and groq_model != GROQ_CODE_MODEL:
                     state.active_groq_search_model = groq_model
+                state.record_provider_call("groq")
                 api_log(
                     f"Groq ({purpose}) -> {groq_model} 200 OK ({elapsed:.2f}s"
                     + (f", tools={len(tool_ctx.tools_used)}" if (tool_ctx and tool_ctx.tools_used) else "")
@@ -2688,6 +2727,7 @@ async def call_modal_ollama_chat(
             if resp.status == 200:
                 data = await resp.json()
                 content = data.get("message", {}).get("content", "").strip()
+                state.record_provider_call("modal")
                 api_log(f"Modal Ollama ({purpose}) -> {ollama_model} 200 OK ({elapsed:.2f}s)")
                 return content
             else:
@@ -2778,13 +2818,20 @@ async def query_local_ollama_chat(
 
     active_topic = update_and_get_channel_topic(raw_user_query, channel_id=channel_id)
     live_clock_str = get_current_thai_datetime_str()
-    speaker_context_block = get_speaker_identity_context(speaker_user, fallback_name=speaker_name)
 
-    # IMPLICIT PREFIX CACHING: Keep `systemInstruction` 100% static across turns!
-    static_system_prompt = f"{system_prompt}\n\n{speaker_context_block}".strip()
+    # TRUE IMPLICIT PREFIX CACHING (Gemini 3.5 / 4):
+    # `systemInstruction` contains ONLY static persona + static speaker role + stable pinned_facts/favorite_topics.
+    # All per-turn mutating fields (clock, interaction_count, last_seen, rolling notes, recent topics, active topic, tone)
+    # go into the trailing `[ข้อมูลบริบทระบบปัจจุบัน]` block on the latest user turn!
+    speaker_static_block = get_speaker_identity_context(
+        speaker_user, fallback_name=speaker_name, include_volatile_memory=False
+    )
+    static_system_prompt = f"{system_prompt}\n\n{speaker_static_block}".strip()
 
-    # Move volatile clock, active topic, and dynamic tone/visual cues to the tail of the latest user turn
     volatile_ctx_lines = [f"- เวลาปัจจุบันของระบบ (Real-Time System Clock): **{live_clock_str}**"]
+    speaker_volatile_mem = get_speaker_volatile_context(speaker_user)
+    if speaker_volatile_mem:
+        volatile_ctx_lines.append(speaker_volatile_mem)
     if active_topic:
         volatile_ctx_lines.append(
             f"- หัวข้อหลักที่กำลังสนทนาต่อเนื่อง (Active Topic): **{active_topic}** "

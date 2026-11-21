@@ -33,6 +33,9 @@ _THAI_GLUED_KATAKANA_REGEX = re.compile(
     r"(?<=[\u0E00-\u0E7F])([\u30A1-\u30F6])|([\u30A1-\u30F6])(?=[\u0E00-\u0E7F])"
 )
 _CODE_FENCE_SPLIT_REGEX = re.compile(r"(```[\s\S]*?```)")
+# Strip honorific 'คุณ' before third-party Latin names/handles (e.g. 'คุณ Akina Murasame' -> 'Akina Murasame')
+# while keeping standalone sarcastic 'คุณ' (e.g., 'คุณคิดแบบนั้นจริงๆ เหรอคะ') intact.
+_KHUN_BEFORE_LATIN_NAME_REGEX = re.compile(r"คุณ\s*(?=@?[A-Z][A-Za-z0-9_.-]{1,30}\b)")
 
 
 def is_owner_user(user) -> bool:
@@ -47,10 +50,26 @@ def is_owner_user(user) -> bool:
     return any("krint" in n for n in (uname, dname, gname))
 
 
-def get_speaker_identity_context(user=None, fallback_name: str = "") -> str:
-    from user_memory import get_speaker_memory_context
+def get_speaker_identity_context(
+    user=None, fallback_name: str = "", include_volatile_memory: bool = True
+) -> str:
+    """
+    Returns speaker identity rules + persistent memory for `systemInstruction`.
+    Pass `include_volatile_memory=False` for Gemini implicit prefix caching so `systemInstruction`
+    remains byte-identical across turns (volatile counters/timestamps move to `get_speaker_volatile_context`).
+    """
+    from user_memory import get_speaker_memory_context, get_speaker_static_memory_context
 
-    mem_lines = get_speaker_memory_context(user) if user else ""
+    if user:
+        mem_lines = (
+            get_speaker_memory_context(user)
+            if include_volatile_memory
+            else get_speaker_static_memory_context(user)
+        )
+    else:
+        mem_lines = ""
+
+    mem_section = f"\n{mem_lines}" if mem_lines else ""
     memo_instruction = (
         "\n- การจดจำข้อมูลผู้ใช้ระยะยาว: หากคู่สนทนาบอกข้อมูลส่วนตัว ความชอบ เป้าหมาย หรือสั่งให้ช่วยจำเรื่องใดๆ "
         "ให้เรียกใช้เครื่องมือ `manage_user_memory` (ใช้ `action='pin_fact'` สำหรับข้อมูลถาวรที่สำคัญ หรือ `add_note` สำหรับบันทึกสั้นๆ)"
@@ -62,8 +81,8 @@ def get_speaker_identity_context(user=None, fallback_name: str = "") -> str:
             "- ผู้ที่กำลังคุยกับคุณคือ **คู่หูคนคุ้นเคยของคุณในชมรมบริการ (และผู้สร้างของคุณเอง)** ไม่ใช่คนแปลกหน้า\n"
             "- **ห้ามเรียกหรือพิมพ์ชื่อของเขาในคำตอบเด็ดขาดไม่ว่ากรณีใดๆ!**\n"
             "- สรรพนามบุรุษที่ 2: โดยปกติให้ใช้คำว่า **\"นาย\"** (ภาษาไทย) หรือ **\"you\"** (ภาษาอังกฤษ) เท่านั้น (และห้ามเติมคำว่า `, นายค่ะ?` ต่อท้ายประโยค)\n"
-            "- **ข้อยกเว้นเชิงวาทศิลป์**: หากอยู่ในบริบทที่ต้องการประชดประชัน เหน็บแนม หรือสร้างระยะห่างอย่างเย็นชา สามารถใช้คำว่า **\"คุณ\"** เดี่ยวๆ ด้วยน้ำเสียงห่างเหินได้ แต่ **ห้ามใช้คำว่า \"คุณ\" นำหน้าชื่อใครเด็ดขาด**\n"
-            f"{mem_lines}{memo_instruction}"
+            "- **ข้อยกเว้นเชิงวาทศิลป์**: หากอยู่ในบริบทที่ต้องการประชดประชัน เหน็บแนม หรือสร้างระยะห่างอย่างเย็นชา สามารถใช้คำว่า **\"คุณ\"** เดี่ยวๆ ด้วยน้ำเสียงห่างเหินได้ แต่ **ห้ามใช้คำว่า \"คุณ\" นำหน้าชื่อใครเด็ดขาด**"
+            f"{mem_section}{memo_instruction}"
         ).strip()
 
     raw_name = getattr(user, "display_name", "") if user else fallback_name
@@ -73,10 +92,18 @@ def get_speaker_identity_context(user=None, fallback_name: str = "") -> str:
             "### [กฎการเรียกคู่สนทนาปัจจุบัน (Current Speaker Rules — SERVER MEMBER)]:\n"
             f"- ผู้ที่กำลังคุยกับคุณคือสมาชิกในเซิร์ฟเวอร์ชื่อ: **{clean_name}** (ไม่ใช่คู่หูเจ้าของบอท แต่เป็นสมาชิกที่มาใช้บริการชมรม)\n"
             f"- การเรียกชื่อ: ให้เรียกชื่อเขาตรงๆ ว่า **\"{clean_name}\"** (หรือใช้สรรพนาม \"นาย\" / \"เธอ\") โดย **ห้ามใส่คำว่า \"คุณ\" นำหน้าชื่อเด็ดขาด** (เช่น ห้ามพูดว่า \"คุณ {clean_name}\")\n"
-            "- **ข้อยกเว้นเชิงวาทศิลป์**: หากต้องการประชดประชันหรือเหน็บแนมด้วยน้ำเสียงห่างเหิน สามารถใช้คำสรรพนาม **\"คุณ\"** เดี่ยวๆ (โดยไม่มีชื่อตามหลัง) ได้\n"
-            f"{mem_lines}{memo_instruction}"
+            "- **ข้อยกเว้นเชิงวาทศิลป์**: หากต้องการประชดประชันหรือเหน็บแนมด้วยน้ำเสียงห่างเหิน สามารถใช้คำสรรพนาม **\"คุณ\"** เดี่ยวๆ (โดยไม่มีชื่อตามหลัง) ได้"
+            f"{mem_section}{memo_instruction}"
         ).strip()
     return ""
+
+
+def get_speaker_volatile_context(user=None) -> str:
+    """Returns per-turn changing speaker memory (interaction count, last_seen, rolling notes, recent topics)."""
+    if user is None:
+        return ""
+    from user_memory import get_speaker_volatile_memory_context
+    return get_speaker_volatile_memory_context(user)
 
 
 def _sanitize_prose_segment(
@@ -130,8 +157,9 @@ def _sanitize_prose_segment(
     elif clean_other_name:
         s = re.sub(rf"คุณ\s*{re.escape(clean_other_name)}", clean_other_name, s, flags=re.IGNORECASE)
 
-    # Strip 'คุณ' if used before a Discord @mention
+    # Strip 'คุณ' if used before a Discord @mention OR a third-party Latin artist/author name/handle
     s = re.sub(r"คุณ\s*(?=<@)", "", s)
+    s = _KHUN_BEFORE_LATIN_NAME_REGEX.sub("", s)
 
     # 5. Strip awkward openings, meta-persona headings, 4B repetition tics, and out-of-character emojis
     s = re.sub(r"^สวัสดีค่ะ\s*(?:คุณ|นาย)?\s*(?=\n|\r|\d+\.)", "", s)
@@ -407,4 +435,5 @@ Formatting Rules:
 Describe in Thai.
 </figure>
 - Page Numbers: Wrap page numbers in <page_number>...</page_number> tags.
-- Checkboxes: Use ☐ for unchecked and ☑ for checked boxes."""
+- Checkboxes: Represent using ☐ and ☑.
+"""

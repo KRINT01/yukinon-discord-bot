@@ -47,6 +47,11 @@ TOPIC_KEYWORDS_MAP = {
 }
 
 
+def has_dirty_user_profiles() -> bool:
+    """Returns True if local in-RAM user_profiles has changes not yet flushed to Discord cloud backup."""
+    return bool(_DIRTY_SINCE_LAST_BACKUP)
+
+
 def _get_cloud_backup_lock() -> asyncio.Lock:
     global _CLOUD_BACKUP_LOCK
     if _CLOUD_BACKUP_LOCK is None:
@@ -277,7 +282,7 @@ async def consolidate_user_memory_async(uid_str: str):
             "from `custom_notes` into `pinned_facts` (max 15 items total).\n"
             "3. Keep only distinct, recent short-term context in `custom_notes` (max 8 items total), merging duplicates.\n"
             "4. Preserve original language (Thai/English) concisely.\n"
-            "5. Return ONLY valid JSON: {\"pinned_facts\": [...], \"custom_notes\": [...]}\n\n"
+            '5. Return ONLY valid JSON: {"pinned_facts": [...], "custom_notes": [...]}\n\n'
             f"Current pinned_facts: {json.dumps(pinned, ensure_ascii=False)}\n"
             f"Current custom_notes: {json.dumps(notes, ensure_ascii=False)}"
         )
@@ -399,8 +404,34 @@ def record_user_interaction(
     _schedule_bg_task(backup_user_profiles_to_discord(force=False))
 
 
-def get_speaker_memory_context(user) -> str:
-    """Returns a concise structured memory summary for the current speaker so Yukino remembers their history & facts."""
+def get_speaker_static_memory_context(user) -> str:
+    """
+    Returns ONLY stable, rarely-changing user profile fields (`pinned_facts` & `favorite_topics`)
+    for Gemini implicit prefix caching so `systemInstruction` stays byte-identical across turns.
+    """
+    if user is None:
+        return ""
+    uid_str = str(getattr(user, "id", ""))
+    profile = user_profiles.get(uid_str)
+    if not profile:
+        return ""
+
+    lines: list[str] = []
+    pinned = "; ".join(profile.get("pinned_facts") or [])
+    favs = ", ".join(profile.get("favorite_topics") or [])
+    if pinned:
+        lines.append(f"- ข้อมูลสำคัญถาวรที่ปักหมุดไว้ (Pinned Facts): **{pinned}**")
+    if favs:
+        lines.append(f"- หัวข้อ/ความสนใจหลักของผู้พูดคนนี้: **{favs}**")
+    return "\n".join(lines)
+
+
+def get_speaker_volatile_memory_context(user) -> str:
+    """
+    Returns per-turn changing user profile fields (`interaction_count`, `last_seen`, `custom_notes`,
+    `recent_topics`) meant to be injected at the tail of the latest user turn so `systemInstruction`
+    never invalidates Gemini implicit prefix caches.
+    """
     if user is None:
         return ""
     uid_str = str(getattr(user, "id", ""))
@@ -412,22 +443,29 @@ def get_speaker_memory_context(user) -> str:
             return ""
 
     cnt = profile.get("interaction_count", 1)
-    favs = ", ".join(profile.get("favorite_topics") or []) or "ทั่วไป"
-    pinned = "; ".join(profile.get("pinned_facts") or [])
     notes = "; ".join(profile.get("custom_notes") or [])
     recents = " | ".join(profile.get("recent_topics") or [])
 
     lines = [
         f"- ประวัติความคุ้นเคยกับผู้พูดคนนี้: เคยคุยกันมาแล้ว **{cnt} ครั้ง** (คุยล่าสุดเมื่อ: {profile.get('last_seen', 'ไม่นานมานี้')})",
-        f"- หัวข้อ/ความสนใจที่ผู้พูดคนนี้ชอบถามบ่อย: **{favs}**",
     ]
-    if pinned:
-        lines.append(f"- ข้อมูลสำคัญถาวรที่ปักหมุดไว้ (Pinned Facts): **{pinned}**")
     if notes:
         lines.append(f"- บันทึกความจำระยะสั้น (Rolling Notes): **{notes}**")
     if recents:
         lines.append(f"- เรื่องล่าสุดที่เคยคุยกัน: `{recents}`")
     return "\n".join(lines)
+
+
+def get_speaker_memory_context(user) -> str:
+    """Returns full structured memory summary (static + volatile) for backward-compatible callers."""
+    parts = [
+        p for p in (
+            get_speaker_static_memory_context(user),
+            get_speaker_volatile_memory_context(user),
+        )
+        if p
+    ]
+    return "\n".join(parts)
 
 
 def resolve_user_mentions_and_build_dossier(
