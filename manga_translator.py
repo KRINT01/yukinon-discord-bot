@@ -43,7 +43,7 @@ from manga_cv_render import (
     _release_cv_page_masks,
 )
 
-MANGA_TRANSLATOR_VERSION = "v6"
+MANGA_TRANSLATOR_VERSION = "v7"
 MANGA_CV_VER = getattr(_mcr_mod, "MANGA_CV_RENDER_VERSION", "old")
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
 # Bundle 2 dynamic parallel hedge: faster 15s recovery on typical 2-4p X threads, patient 25s on 5-12p batches
@@ -1038,6 +1038,7 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
    - Keep character names, titles/ranks, and faction names consistent across all pages using accurate Japanese phonetics.
    - Match pronouns and politeness particles strictly to each speaker's visual gender and setting: in Thai, visually female characters (including female subordinates, guards, and attendants) must use female/neutral endings (`ค่ะ`, `คะ`, `นะคะ`, `นะ`, `ล่ะ`, `สิ`) — NEVER use male `ครับ`/`ผม` unless the speaker is clearly drawn as male!
    - STRICT TARGET LANGUAGE & FONT-SAFE OUTPUT: Write EVERY `translated_text` and `summary` STRICTLY in {target_lang_name} ONLY — NEVER switch any bubble to Korean (Hangul), Chinese, or Arabic, NEVER glue stray random Latin letters inside Thai words, and NEVER include heart/music symbols (`♥`, `♡`, `♪`, `★`) or emojis (use standard ASCII punctuation `...`, `~`, `-`, `'`, `!`, `?` only).
+   - THAI SPELLING & NATURAL GASPS (when translating to Thai): Double-check Thai spelling and vowel-before-tone order (`เป็น` not `เป้น`, `เห็น` not `เห้น`, `เด็ก` not `เด้ก`); translate brief startled gasps like `…っ!!` naturally as `...อ๊ะ!!` or `...อึก!!` (never garbled `อ๊ิก`).
    - When translating to English, preserve Japanese honorifics attached directly with a hyphen and NO space (`-san`, `-kun`, `-chan`, `-sama`, `-sensei`, `-senpai`).
 4. Return ONLY valid JSON matching this exact structure for all {num_pages} page(s) (write `summary` in {target_lang_name}):
 {{
@@ -1230,6 +1231,7 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
 3. Accurate Speaker Attribution, Names & Visual Gender:
    - Identify the actual speaker visually; match Thai/English tone to visual gender (never use male Thai `ครับ`/`ผม` for female characters/guards).
    - STRICT TARGET LANGUAGE & FONT-SAFE OUTPUT: Write EVERY `translated_text` and `summary` STRICTLY in {target_lang_name} ONLY — NEVER switch any bubble to Korean (Hangul), Chinese, or Arabic, NEVER glue stray random Latin letters inside Thai words, and NEVER include heart/music symbols (`♥`, `♡`, `♪`, `★`) or emojis (use standard ASCII punctuation `...`, `~`, `-`, `'`, `!`, `?` only).
+   - THAI SPELLING & NATURAL GASPS (when translating to Thai): Double-check Thai spelling and vowel-before-tone order (`เป็น` not `เป้น`, `เห็น` not `เห้น`, `เด็ก` not `เด้ก`); translate brief startled gasps like `…っ!!` naturally as `...อ๊ะ!!` or `...อึก!!` (never garbled `อ๊ิก`).
 4. Return ONLY valid JSON matching this exact structure (write `summary` in {target_lang_name}):
 {{
   "summary": "Brief 1-sentence scene context in {target_lang_name}",

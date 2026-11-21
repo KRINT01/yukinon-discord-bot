@@ -24,7 +24,7 @@ except ImportError:
 
 from config import THAI_CHAR_REGEX
 
-MANGA_CV_RENDER_VERSION = "v5"
+MANGA_CV_RENDER_VERSION = "v6"
 SOM_CV_MAX_DIM = 360  # Fast 360px grid derived from single 1024px resize (~1-2.5s for 10 pages with OpenCV+NumPy!)
 # Bundle 2 RAM & Discord upload optimization: quality=90 with standard 4:2:0 subsampling (~50% smaller than 94/4:4:4)
 MANGA_RENDER_JPEG_QUALITY = 90
@@ -59,12 +59,25 @@ _THAI_PREFIX_LEAD = set("สปกตฉผถข")
 _THAI_PUNCT_ATTACH = set("ๆฯ?!.,:;'\"')]-~")
 _THAI_OPEN_ENDINGS = set("าำ\u0E31\u0E34\u0E35\u0E36\u0E37\u0E38\u0E39\u0E47\u0E48\u0E49\u0E4A\u0E4Bอว")
 _THAI_CAN_TAKE_CODA_VOWEL = set("เแโา\u0E31\u0E34\u0E35\u0E36\u0E37\u0E38\u0E39\u0E47อว")
-_THAI_CODA_CONSONANTS = set("กขคฆงจชซฎฏฐฑฒณดตถทธนบปพฟภมยรลวศษสฬ")
+_THAI_CODA_CONSONANTS = set("กขคฆงจชซฎฏฐฑฒณดตถทธนบปพฟภมยรลวศษสฬญ")
 
 # Strict font-safe whitelist (ASCII printable + Thai Unicode block + Latin-1 accented letters)
 # Guarantees ZERO missing-glyph `[]` tofu boxes in Garuda-Bold.ttf / NotoSans-Bold.ttf!
 _FONT_UNSAFE_CHARS_REGEX = re.compile(r"[^\x20-\x7E\u00C0-\u00FF\u0E00-\u0E5B]")
 # Stray single Latin letter glued onto Thai text (e.g. 'ทะ...Eเป็นยังไง' -> 'ทะ...เป็นยังไง')
+# Fix malformed Thai tone-before-vowel order (e.g. อ๊ิก -> อิ๊ก) so Garuda-Bold never stacks/collides marks
+_THAI_TONE_BEFORE_VOWEL_REGEX = re.compile(r"([\u0E48-\u0E4B])([\u0E31\u0E34-\u0E3A])")
+# Unambiguous non-word Thai LLM/keyboard typos (ไม้โท ้ instead of ไม้ไต่คู้ ็)
+_THAI_SAFE_TYPO_MAP = (
+    ("เป้น", "เป็น"),
+    ("เห้น", "เห็น"),
+    ("เด้ก", "เด็ก"),
+    ("เล้ก", "เล็ก"),
+    ("เจ้บ", "เจ็บ"),
+    ("เต้ม", "เต็ม"),
+    ("เค้ม", "เค็ม"),
+    ("เช้ด", "เช็ด"),
+)
 _STRAY_SINGLE_LATIN_IN_THAI_REGEX = re.compile(
     r"(?:(?<=[\u0E00-\u0E5B.])|(?<=[\u0E00-\u0E5B] ))([A-Za-z])(?=[\u0E00-\u0E5B])"
 )
@@ -125,9 +138,13 @@ def _sanitize_text_for_manga_font(text: str) -> str:
     )
     # Remove any character outside Garuda-Bold / NotoSans-Bold glyph coverage (kills ♥/♡/♪/Hangul/Arabic/CJK/emoji tofu!)
     s = _FONT_UNSAFE_CHARS_REGEX.sub("", s)
-    # Remove accidental single-letter Latin glitch glued directly before Thai (e.g. 'ทะ...Eเป็น' -> 'ทะ...เป็น')
+    # Thai-specific cleanups: fix stray glued Latin letters, malformed tone-before-vowel order, and impossible typos
     if THAI_CHAR_REGEX.search(s):
         s = _STRAY_SINGLE_LATIN_IN_THAI_REGEX.sub("", s)
+        s = _THAI_TONE_BEFORE_VOWEL_REGEX.sub(r"\2\1", s)
+        for bad_w, good_w in _THAI_SAFE_TYPO_MAP:
+            if bad_w in s:
+                s = s.replace(bad_w, good_w)
     s = re.sub(r"\(\s*\)|\[\s*\]|'\s*'", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -220,7 +237,15 @@ def _tokenize_thai_syllables(word: str) -> list[str]:
                 ((tok == "ห") or (len(tok) == 2 and tok[0] in _THAI_LEADING_VOWELS and tok[1] == "ห"))
                 and nxt[0] in _THAI_HO_NAM_FOLLOW
             )
-            is_o_nam = (tok == "อ" and nxt[0] == "ย")
+            # Restrict อ-นำ-ย strictly to the 4 real Thai words (อย่า, อยู่, อย่าง, อยาก)
+            # so คอย, หน่อย, บ่อย, น้อย, อร่อย, ปล่อย are never split!
+            is_o_nam = (
+                tok == "อ"
+                and (
+                    nxt.startswith(("ย่า", "ยู่"))
+                    or (nxt == "ยา" and (i + 2) < n and raw[i + 2] == "ก")
+                )
+            )
             if is_ho_nam or is_o_nam:
                 merged_onsets.append(tok + nxt)
                 i += 2
@@ -250,6 +275,11 @@ def _tokenize_thai_syllables(word: str) -> list[str]:
                     merged_vowels.append(tok + nxt)
                     i += 2
                     continue
+            # Merge 'ว' as part of สระอัว (ไม้หันอากาศ '\u0E31' + 'ว', e.g. ตัว/หัว/กลัว/ด้วย/ช่วย)
+            if nxt == "ว" and "\u0E31" in tok and any("\u0E01" <= c <= "\u0E2E" for c in tok):
+                merged_vowels.append(tok + nxt)
+                i += 2
+                continue
             # Merge bare 'อ' (including after '\u0E47' as in ช็อก/ล็อก) or 'ว' (สระอัวลดรูป like พวก/สวย)
             tok_other_v = any(c in _THAI_VOWEL_SIGNALS and c != "\u0E47" for c in tok)
             if (nxt == "อ" and not tok_other_v and any("\u0E01" <= c <= "\u0E2E" for c in tok)) or (
@@ -292,17 +322,25 @@ def _tokenize_thai_syllables(word: str) -> list[str]:
         # Attach coda consonant to an open previous syllable BEFORE considering prefix merge
         # (fixes 'ช็อก' -> ['ช็อก'], 'หรอก' -> ['หรอก'], 'พวก' -> ['พวก'])
         prev_closed_vowel = prev.endswith(("ะ", "ำ")) or (prev[0] in ("ใ", "ไ"))
-        prev_open_for_coda = (
-            not prev_closed_vowel
-            and len(prev) <= 6
-            and (
-                (len(prev) >= 2 and prev[-1] in ("อ", "ว"))
-                or (
-                    any(c in _THAI_CAN_TAKE_CODA_VOWEL for c in prev)
-                    and (prev[-1] in _THAI_OPEN_ENDINGS or (len(prev) == 2 and prev[0] in ("เ", "แ", "โ")))
+        # Recognize สระเอีย (เ-ีย like เยี่ย+ม, เรีย+ก, เสีย+ง) as open vowel ready for coda
+        prev_is_ia_vowel = (prev.startswith("เ") and "\u0E35" in prev and prev.endswith("ย"))
+        # Recognize สระอัว (ั+ว like ตัว, ด้วย) — only accepts 'ย' coda (ด้วย/ช่วย/ป่วย), never steals next onset!
+        prev_is_ua_vowel = ("\u0E31" in prev and prev.endswith("ว"))
+        if prev_is_ua_vowel:
+            prev_open_for_coda = (tok == "ย")
+        else:
+            prev_open_for_coda = (
+                not prev_closed_vowel
+                and len(prev) <= 6
+                and (
+                    prev_is_ia_vowel
+                    or (len(prev) >= 2 and prev[-1] in ("อ", "ว"))
+                    or (
+                        any(c in _THAI_CAN_TAKE_CODA_VOWEL for c in prev)
+                        and (prev[-1] in _THAI_OPEN_ENDINGS or (len(prev) == 2 and prev[0] in ("เ", "แ", "โ")))
+                    )
                 )
             )
-        )
         if is_bare_single and tok in _THAI_CODA_CONSONANTS and prev_open_for_coda:
             syllables[-1] += tok
             i += 1
@@ -1233,11 +1271,21 @@ def _inpaint_pastel_bubble_region_cv2(
         sm_bgr = cv2.resize(sub_bgr, (iw, ih), interpolation=cv2.INTER_AREA)
         sm_mask = cv2.resize(erase_u8, (iw, ih), interpolation=cv2.INTER_LINEAR)
         sm_mask = np.where(sm_mask >= 32, np.uint8(255), np.uint8(0))
+        # Guard temporary scratch buffer so TELEA never pulls dark black bubble-outline pixels inward!
+        sm_gray_tmp = cv2.cvtColor(sm_bgr, cv2.COLOR_BGR2GRAY)
+        sm_dark_border = (sm_mask == 0) & (sm_gray_tmp < ink_thresh)
+        if np.any(sm_dark_border):
+            sm_bgr = sm_bgr.copy()
+            sm_bgr[sm_dark_border] = bg_bgr
         sm_inp = cv2.inpaint(sm_bgr, sm_mask, 3, cv2.INPAINT_TELEA)
         full_inp = cv2.resize(sm_inp, (bw, bh), interpolation=cv2.INTER_LINEAR)
         sub_bgr[erase_bool] = full_inp[erase_bool]
     else:
-        full_inp = cv2.inpaint(sub_bgr, erase_u8, 3, cv2.INPAINT_TELEA)
+        tmp_bgr = sub_bgr.copy()
+        tmp_dark_border = (erase_u8 == 0) & (sub_gray < ink_thresh)
+        if np.any(tmp_dark_border):
+            tmp_bgr[tmp_dark_border] = bg_bgr
+        full_inp = cv2.inpaint(tmp_bgr, erase_u8, 3, cv2.INPAINT_TELEA)
         sub_bgr[erase_bool] = full_inp[erase_bool]
 
     return erase_bool, bg_bgr
