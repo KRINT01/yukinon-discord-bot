@@ -24,7 +24,7 @@ except ImportError:
 
 from config import THAI_CHAR_REGEX
 
-MANGA_CV_RENDER_VERSION = "v15"
+MANGA_CV_RENDER_VERSION = "v16"
 SOM_CV_MAX_DIM = 360  # Fast 360px grid derived from single 1024px resize (~1-2.5s for 10 pages with OpenCV+NumPy!)
 # Bundle 2 RAM & Discord upload optimization: quality=90 with standard 4:2:0 subsampling (~50% smaller than 94/4:4:4)
 MANGA_RENDER_JPEG_QUALITY = 90
@@ -73,6 +73,7 @@ _CV2_K5 = np.ones((5, 5), np.uint8) if HAS_CV2 else None
 _CV2_K7 = np.ones((7, 7), np.uint8) if HAS_CV2 else None
 _CV2_K9 = np.ones((9, 9), np.uint8) if HAS_CV2 else None
 _CV2_ELLIPSE_7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)) if HAS_CV2 else None
+_CV2_ELLIPSE_11 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)) if HAS_CV2 else None
 _CV2_ELLIPSE_13 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)) if HAS_CV2 else None
 _CV2_ELLIPSE_17 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)) if HAS_CV2 else None
 
@@ -652,17 +653,18 @@ def _fill_mask_holes_cv2(comp_crop: "np.ndarray") -> "np.ndarray":
     return np.where(padded[1:-1, 1:-1] == 128, np.uint8(0), np.uint8(255))
 
 
-def _close_rim_bays_cv2(filled_crop: "np.ndarray") -> "np.ndarray":
+def _close_rim_bays_cv2(filled_crop: "np.ndarray", gentle: bool = False) -> "np.ndarray":
     """
-    Seals concave kanji-to-border bays on validated pastel/borderless bubbles (e.g. kanji
-    touching dark gloom shading lines near the bubble rim) using a 13x13 elliptical closing
-    strictly inside the bubble's own bounding box without leaking outward.
+    Seals concave kanji/furigana-to-border bays on validated bubbles (e.g. `技 わざ` touching
+    the diagonal right rim of a white bubble, or kanji touching gloom shading lines) using
+    elliptical closing strictly inside the bubble's bounding box without bridging figure-8 waists.
     """
     ch, cw = filled_crop.shape
-    pad = 7
+    kern = _CV2_ELLIPSE_11 if gentle else _CV2_ELLIPSE_13
+    pad = 6 if gentle else 7
     buf = np.zeros((ch + pad * 2, cw + pad * 2), dtype=np.uint8)
     buf[pad:-pad, pad:-pad] = filled_crop
-    closed = cv2.morphologyEx(buf, cv2.MORPH_CLOSE, _CV2_ELLIPSE_13)
+    closed = cv2.morphologyEx(buf, cv2.MORPH_CLOSE, kern)
     closed = _fill_mask_holes_cv2(closed)
     return closed[pad:-pad, pad:-pad]
 
@@ -895,7 +897,7 @@ def _extract_and_filter_white_components_cv2(
                     continue
 
         # Seal concave rim-kanji bays ONLY AFTER passing all validation guards (keeps Page 3 調子乗/思 inside mask!)
-        final_mask = _close_rim_bays_cv2(filled_crop) if is_pastel_pass else filled_crop
+        final_mask = _close_rim_bays_cv2(filled_crop, gentle=(not is_pastel_pass))
         already_covered[cy1:cy2, cx1:cx2] |= final_mask
         bbox_norm = [
             int(round((cy1 / float(sh)) * 1000.0)),
@@ -1190,9 +1192,9 @@ def _extract_bw_soft_shaded_bubbles_cv2(
             ga_v = int(vcc_st[k_cc, cv2.CC_STAT_AREA])
             if (3 <= gw_v <= 40 and 3 <= gh_v <= 42 and ga_v >= 8) or (2 <= gw_v <= 5 and 2 <= gh_v <= 5 and 4 <= ga_v <= 16):
                 glyph_count += 1
-            elif max(gw_v, gh_v) > 52:
+            elif max(gw_v, gh_v) > 48 or ga_v > 700:
                 long_art += 1
-        if glyph_count < 5 or long_art >= 2:
+        if glyph_count < 5 or long_art >= 1:
             continue
 
         already_covered[cy1:cy2, cx1:cx2] |= filled_crop
@@ -1656,7 +1658,8 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
                         detected.append(sub_ok)
                         recovered_any = True
 
-                if not recovered_any and cw >= 28 and ch >= 28:
+                rf_raw_d = float(np.count_nonzero(filled_crop)) / float(max(1, cw * ch))
+                if not recovered_any and cw >= 28 and ch >= 28 and cw <= max_dw and ch <= max_dh and rf_raw_d < 0.58:
                     best_v = None
                     col_cnt = np.count_nonzero(filled_crop, axis=0)
                     s_lo, s_hi = max(6, int(cw * 0.22)), min(cw - 6, int(cw * 0.78))
@@ -2183,7 +2186,7 @@ def _refine_cv_bubble_mask_locally_cv2(
     if (int(t_l) + int(t_t) + int(t_r) + int(t_b)) >= 3 or (t_l and t_r) or (t_t and t_b):
         return _fallback_orig()
 
-    filled_s = _fill_mask_holes_cv2(comp[cy1:cy2, cx1:cx2])
+    filled_s = _close_rim_bays_cv2(_fill_mask_holes_cv2(comp[cy1:cy2, cx1:cx2]), gentle=True)
     new_area_s = max(1, int(np.count_nonzero(filled_s)))
     new_rect_fill = new_area_s / float(max(1, cw_s * ch_s))
     if (
@@ -2703,6 +2706,21 @@ def _clean_unmarked_open_bubble_and_measure_box_cv2(
     ink_ratio = float(np.count_nonzero(sub_g < 155)) / float(total_px)
     if white_ratio < 0.38 or ink_ratio < 0.010:
         return _fallback_case4()
+    # Anti-White-Face Guard: verify genuine compact dark text glyphs inside the eroded inner box
+    # (rejects drifted `box_2d` over a blank white anime forehead/cheek whose only dark pixels are border cracks!)
+    if has_cv_bubbles and bw >= 28 and bh >= 24:
+        mx_i, my_i = max(2, int(bw * 0.10)), max(2, int(bh * 0.10))
+        inner_g = sub_g[my_i : bh - my_i, mx_i : bw - mx_i]
+        inner_ink = np.where(inner_g < 145, np.uint8(255), np.uint8(0))
+        in_cc, _, in_st, _ = cv2.connectedComponentsWithStats(inner_ink, connectivity=8)
+        inner_gly = sum(
+            1
+            for k_i in range(1, in_cc)
+            if (3 <= int(in_st[k_i, cv2.CC_STAT_WIDTH]) <= 44 and 3 <= int(in_st[k_i, cv2.CC_STAT_HEIGHT]) <= 46 and int(in_st[k_i, cv2.CC_STAT_AREA]) >= 8)
+            or (2 <= int(in_st[k_i, cv2.CC_STAT_WIDTH]) <= 5 and 2 <= int(in_st[k_i, cv2.CC_STAT_HEIGHT]) <= 5 and 4 <= int(in_st[k_i, cv2.CC_STAT_AREA]) <= 16)
+        )
+        if inner_gly < 3:
+            return None
 
     pad_x, pad_y = 8, 12
     wx1, wy1 = max(0, raw_x1 - pad_x), max(0, raw_y1 - pad_y)
