@@ -24,7 +24,7 @@ except ImportError:
 
 from config import THAI_CHAR_REGEX
 
-MANGA_CV_RENDER_VERSION = "v12"
+MANGA_CV_RENDER_VERSION = "v13"
 SOM_CV_MAX_DIM = 360  # Fast 360px grid derived from single 1024px resize (~1-2.5s for 10 pages with OpenCV+NumPy!)
 # Bundle 2 RAM & Discord upload optimization: quality=90 with standard 4:2:0 subsampling (~50% smaller than 94/4:4:4)
 MANGA_RENDER_JPEG_QUALITY = 90
@@ -71,6 +71,7 @@ _THAI_TONE_BEFORE_VOWEL_REGEX = re.compile(r"([\u0E48-\u0E4B])([\u0E31\u0E34-\u0
 _CV2_K3 = np.ones((3, 3), np.uint8) if HAS_CV2 else None
 _CV2_K5 = np.ones((5, 5), np.uint8) if HAS_CV2 else None
 _CV2_K7 = np.ones((7, 7), np.uint8) if HAS_CV2 else None
+_CV2_K9 = np.ones((9, 9), np.uint8) if HAS_CV2 else None
 _CV2_ELLIPSE_13 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)) if HAS_CV2 else None
 
 
@@ -913,6 +914,161 @@ def _extract_and_filter_white_components_cv2(
     return found
 
 
+def _extract_bw_soft_shaded_bubbles_cv2(
+    small_gray: "np.ndarray",
+    vis_gray: "np.ndarray",
+    sw: int,
+    sh: int,
+    already_covered: "np.ndarray",
+    min_w: int,
+    min_h: int,
+    max_area_px: int,
+) -> list[dict]:
+    """
+    Pass A3-BW (runs ONLY on pure B&W manga pages):
+    Detects soft-shaded / airbrush / gradient-rim vertical flashback & monologue ovals
+    (`190 <= median_bg <= 244`, surrounded by a darker forest/screentone background with
+    `in_lum - out_lum >= 35` and crisp vertical kanji glyphs) that fall below Pass A1's
+    `gray >= 232` threshold. Marked `is_pastel=True` so Stage 3 erases ink cleanly via
+    TELEA inpainting without losing the soft-gray oval gradient!
+    """
+    found: list[dict] = []
+    vh_v, vw_v = vis_gray.shape[:2]
+    # Hard-ink border mask (<140) preserves panel frames while keeping soft gray bubble interiors intact
+    vis_hard_dark = np.where(vis_gray < 140, np.uint8(255), np.uint8(0))
+    sdark_hard = cv2.resize(vis_hard_dark, (sw, sh), interpolation=cv2.INTER_AREA)
+    del vis_hard_dark
+
+    soft_bin = np.where((small_gray >= 195) & (sdark_hard < 28), np.uint8(255), np.uint8(0))
+    soft_bin[:2, :] = 0
+    soft_bin[-2:, :] = 0
+    soft_bin[:, :2] = 0
+    soft_bin[:, -2:] = 0
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(soft_bin, connectivity=4)
+    if num_labels <= 1:
+        return found
+
+    margin_lbls = _collect_margin_labels_cv2(labels, stats, sw, sh, max_area_px, edge_pad=2)
+    max_soft_w = int(sw * 0.40)
+    max_soft_h = int(sh * 0.45)
+    max_soft_area = int(sw * sh * 0.12)
+
+    for lbl in range(1, num_labels):
+        if lbl in margin_lbls:
+            continue
+        cx1 = int(stats[lbl, cv2.CC_STAT_LEFT])
+        cy1 = int(stats[lbl, cv2.CC_STAT_TOP])
+        cw = int(stats[lbl, cv2.CC_STAT_WIDTH])
+        ch = int(stats[lbl, cv2.CC_STAT_HEIGHT])
+        comp_area = int(stats[lbl, cv2.CC_STAT_AREA])
+        cx2, cy2 = cx1 + cw, cy1 + ch
+
+        if (
+            comp_area > max_soft_area
+            or cw < min_w
+            or ch < min_h
+            or cw > max_soft_w
+            or ch > max_soft_h
+            or ch < int(cw * 1.15)
+        ):
+            continue
+
+        comp_crop = np.where(labels[cy1:cy2, cx1:cx2] == lbl, np.uint8(255), np.uint8(0))
+        if int(np.count_nonzero(comp_crop & already_covered[cy1:cy2, cx1:cx2])) > comp_area * 0.20:
+            continue
+
+        filled_crop = _close_rim_bays_cv2(_fill_mask_holes_cv2(comp_crop))
+        fa = max(1, int(np.count_nonzero(filled_crop)))
+        if fa < 220 or fa > max_soft_area:
+            continue
+
+        rect_fill = fa / float(max(1, cw * ch))
+        if rect_fill < 0.66:
+            continue
+
+        cnts, _ = cv2.findContours(filled_crop, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            continue
+        main_cnt = max(cnts, key=cv2.contourArea)
+        solidity = cv2.contourArea(main_cnt) / max(1.0, cv2.contourArea(cv2.convexHull(main_cnt)))
+        if solidity < 0.80:
+            continue
+
+        g_sub = small_gray[cy1:cy2, cx1:cx2]
+        bg_mask = (filled_crop > 0) & (g_sub >= 165)
+        if int(np.count_nonzero(bg_mask)) < int(fa * 0.45):
+            continue
+        in_bg_lum = float(np.median(g_sub[bg_mask]))
+        # Soft-shaded flashback oval (190..244); rejects pure-white 255 faces & panels!
+        if not (190.0 <= in_bg_lum <= 244.0) or float(np.std(g_sub[bg_mask])) > 26.0:
+            continue
+
+        # Surrounding ring must be significantly darker than the soft-shaded oval
+        px1, py1 = max(0, cx1 - 5), max(0, cy1 - 5)
+        px2, py2 = min(sw, cx2 + 5), min(sh, cy2 + 5)
+        full_m = np.zeros((py2 - py1, px2 - px1), dtype=np.uint8)
+        full_m[cy1 - py1 : cy2 - py1, cx1 - px1 : cx2 - px1] = filled_crop
+        outer_ring = cv2.dilate(full_m, _CV2_K9, iterations=1) - full_m
+        out_lum = float(np.median(small_gray[py1:py2, px1:px2][outer_ring > 0])) if np.any(outer_ring) else 255.0
+        if out_lum > 195.0 or (in_bg_lum - out_lum) < 35.0:
+            continue
+
+        inner_core = cv2.erode(filled_crop, _CV2_K5, iterations=1)
+        if not np.any(inner_core):
+            inner_core = cv2.erode(filled_crop, _CV2_K3, iterations=1)
+        blk = int(np.count_nonzero((inner_core > 0) & (g_sub < 135)))
+        dens = blk / float(max(1, int(np.count_nonzero(inner_core))))
+        if blk < 6 or dens < 0.045 or dens > 0.35:
+            continue
+
+        # Full-res (~1024px) compact-glyph verification & long line-art stroke rejection
+        vy1_v = max(0, int(round((cy1 / float(sh)) * vh_v)))
+        vx1_v = max(0, int(round((cx1 / float(sw)) * vw_v)))
+        vy2_v = min(vh_v, int(round((cy2 / float(sh)) * vh_v)))
+        vx2_v = min(vw_v, int(round((cx2 / float(sw)) * vw_v)))
+        if (vx2_v - vx1_v) < 12 or (vy2_v - vy1_v) < 12:
+            continue
+        vm_full = cv2.resize(filled_crop, (vx2_v - vx1_v, vy2_v - vy1_v), interpolation=cv2.INTER_NEAREST)
+        v_in = cv2.erode(vm_full, _CV2_K7, iterations=1)
+        if not np.any(v_in):
+            v_in = cv2.erode(vm_full, _CV2_K5, iterations=1)
+        vg_sub = vis_gray[vy1_v:vy2_v, vx1_v:vx2_v]
+        v_ink = np.where((v_in > 0) & (vg_sub < 145), np.uint8(255), np.uint8(0))
+        vn_cc, _, vcc_st, _ = cv2.connectedComponentsWithStats(v_ink, connectivity=8)
+        glyph_count = 0
+        long_art = 0
+        for k_cc in range(1, vn_cc):
+            gw_v = int(vcc_st[k_cc, cv2.CC_STAT_WIDTH])
+            gh_v = int(vcc_st[k_cc, cv2.CC_STAT_HEIGHT])
+            ga_v = int(vcc_st[k_cc, cv2.CC_STAT_AREA])
+            if (3 <= gw_v <= 40 and 3 <= gh_v <= 42 and ga_v >= 8) or (2 <= gw_v <= 5 and 2 <= gh_v <= 5 and 4 <= ga_v <= 16):
+                glyph_count += 1
+            elif max(gw_v, gh_v) > 52:
+                long_art += 1
+        if glyph_count < 5 or long_art >= 2:
+            continue
+
+        already_covered[cy1:cy2, cx1:cx2] |= filled_crop
+        bbox_norm = [
+            int(round((cy1 / float(sh)) * 1000.0)),
+            int(round((cx1 / float(sw)) * 1000.0)),
+            int(round((cy2 / float(sh)) * 1000.0)),
+            int(round((cx2 / float(sw)) * 1000.0)),
+        ]
+        found.append({
+            "bbox_norm": bbox_norm,
+            "mask_np": filled_crop,
+            "rect_fill": rect_fill,
+            "solidity": solidity,
+            "glyph_count": glyph_count,
+            "is_dark": False,
+            "is_pastel": True,
+        })
+
+    return found
+
+
 def _detect_white_outlined_text_clusters_cv2(
     vis_gray: "np.ndarray",
     vis_chroma: "np.ndarray",
@@ -1150,6 +1306,20 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
                 is_pastel_pass=True,
                 vis_gray=vis_gray,
                 vis_chroma=vis_chroma,
+            )
+        )
+    else:
+        # Pass A3-BW: Soft-shaded / gradient-rim vertical B&W flashback & monologue ovals
+        detected.extend(
+            _extract_bw_soft_shaded_bubbles_cv2(
+                small_gray,
+                vis_gray,
+                sw,
+                sh,
+                already_covered,
+                min_w_px,
+                min_h_px,
+                max_area_px,
             )
         )
     del small_bgr
@@ -1958,6 +2128,32 @@ def _clean_direct_on_art_box_cv2(
     sub_bgr = img_bgr[raw_y1:raw_y2, raw_x1:raw_x2]
     sub_ch = sub_bgr.max(axis=2) - sub_bgr.min(axis=2)
     total_px = max(1, sub_g.size)
+
+    # Anti-Face/Foliage Guard: On standard manga pages that ALREADY have CV speech bubbles,
+    # Cases 1-3 already handle dark, pastel, and white open bubbles. Reject drifted `box_2d`
+    # over character faces/bodies/trees unless the box genuinely contains white-halo-outlined text!
+    if has_cv_bubbles:
+        w_halo_px = (sub_g >= 225) & (sub_ch <= 30)
+        d_any_px = (sub_g <= 140)
+        if not np.any(w_halo_px) or not np.any(d_any_px):
+            return None
+        w_near_d = cv2.dilate(w_halo_px.astype(np.uint8), _CV2_K7, iterations=1) > 0
+        d_cand = np.where(d_any_px & w_near_d, np.uint8(255), np.uint8(0))
+        n_hc, h_lbls, h_st, _ = cv2.connectedComponentsWithStats(d_cand, connectivity=8)
+        halo_glyphs = 0
+        for hk in range(1, n_hc):
+            hgw, hgh, hga = int(h_st[hk, cv2.CC_STAT_WIDTH]), int(h_st[hk, cv2.CC_STAT_HEIGHT]), int(h_st[hk, cv2.CC_STAT_AREA])
+            if 3 <= hgw <= 44 and 3 <= hgh <= 46 and hga >= 8:
+                hx1, hy1 = int(h_st[hk, cv2.CC_STAT_LEFT]), int(h_st[hk, cv2.CC_STAT_TOP])
+                p_x1, p_y1 = max(0, hx1 - 4), max(0, hy1 - 4)
+                p_x2, p_y2 = min(bw, hx1 + hgw + 4), min(bh, hy1 + hgh + 4)
+                sc_m = (h_lbls[p_y1:p_y2, p_x1:p_x2] == hk).astype(np.uint8)
+                hring = cv2.dilate(sc_m, _CV2_K7, iterations=1) - sc_m
+                hrcnt = max(1, int(np.count_nonzero(hring)))
+                if (int(np.count_nonzero((hring > 0) & w_halo_px[p_y1:p_y2, p_x1:p_x2])) / float(hrcnt)) >= 0.45:
+                    halo_glyphs += 1
+        if halo_glyphs < 4:
+            return None
 
     p05, p50, p95 = [float(v) for v in np.percentile(sub_g, (5, 50, 95))]
     if (p95 - p05) < 60.0:
