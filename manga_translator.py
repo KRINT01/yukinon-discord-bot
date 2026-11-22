@@ -44,7 +44,7 @@ from manga_cv_render import (
     _release_cv_page_masks,
 )
 
-MANGA_TRANSLATOR_VERSION = "v10"
+MANGA_TRANSLATOR_VERSION = "v11"
 MANGA_CV_VER = getattr(_mcr_mod, "MANGA_CV_RENDER_VERSION", "old")
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
 # Bundle 2 dynamic parallel hedge: faster 15s recovery on typical 2-4p X threads, patient 25s on 5-12p batches
@@ -522,67 +522,96 @@ async def _call_gemma_ai_studio_polish_json(
     return "", 0.0
 
 
-async def _polish_manga_translations_gemma_async(
-    batch_results: list[tuple[list[dict], str]],
+def _split_polish_pages_into_chunks(
+    compact_pages: list[dict],
+    max_bubbles_per_chunk: int = 22,
+) -> list[list[dict]]:
+    """
+    Groups sequential manga pages into balanced chunks of <= `max_bubbles_per_chunk` bubbles
+    so no trailing tiny chunk stalls a wave and every chunk stays <= ~750-850 Thai output tokens
+    (~8-12s on Cloudflare Gemma 4, comfortably under `llm.py`'s 28s HTTP timeout).
+    """
+    total_b = sum(len(p.get("b") or []) for p in compact_pages)
+    if total_b <= max_bubbles_per_chunk:
+        return [compact_pages] if compact_pages else []
+
+    # Target balanced chunk size so e.g. 47 bubbles splits ~[14, 15, 18] instead of [21, 22, 4]
+    num_target = max(2, (total_b + max_bubbles_per_chunk - 1) // max_bubbles_per_chunk)
+    soft_cap = max(12, min(max_bubbles_per_chunk, (total_b + num_target - 1) // num_target + 2))
+
+    chunks: list[list[dict]] = []
+    cur_chunk: list[dict] = []
+    cur_cnt = 0
+
+    for page_obj in compact_pages:
+        p_bubbles = page_obj.get("b") or []
+        p_cnt = len(p_bubbles)
+
+        # Rare edge case: a single dense page with > max_bubbles_per_chunk bubbles
+        if p_cnt > max_bubbles_per_chunk:
+            if cur_chunk:
+                chunks.append(cur_chunk)
+                cur_chunk = []
+                cur_cnt = 0
+            for start_i in range(0, p_cnt, max_bubbles_per_chunk):
+                sub_p = {
+                    "p": page_obj["p"],
+                    "sum": page_obj.get("sum", "") if start_i == 0 else "",
+                    "b": p_bubbles[start_i : start_i + max_bubbles_per_chunk],
+                }
+                chunks.append([sub_p])
+            continue
+
+        cap_now = max_bubbles_per_chunk if len(chunks) >= (num_target - 1) else soft_cap
+        if cur_chunk and (cur_cnt + p_cnt) > cap_now:
+            chunks.append(cur_chunk)
+            cur_chunk = [page_obj]
+            cur_cnt = p_cnt
+        else:
+            cur_chunk.append(page_obj)
+            cur_cnt += p_cnt
+
+    if cur_chunk:
+        chunks.append(cur_chunk)
+    return chunks
+
+
+async def _polish_single_chunk_gemma_async(
+    chunk_idx: int,
+    total_chunks: int,
+    chunk_pages: list[dict],
+    story_overview: str,
     target_lang_name: str,
-    series_context_hint: str = "",
-    req_id: str = "",
-    progress_cb=None,
-) -> list[tuple[list[dict], str]]:
+    series_context_hint: str,
+    req_id: str,
+    cf_sem: asyncio.Semaphore,
+) -> tuple[dict[int, str], dict[int, str], str, float]:
     """
-    Always-On Stage 2 Text-Only Proofreading & Localization Polish (Gemma 4):
-    Runs on every manga request (1-12 pages) right after Stage 1 Vision OCR+Draft:
-    - Model priority: Cloudflare Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`) -> AI Studio Gemma 4 (`gemma-4-26b-a4b-it` -> `gemma-4-31b-it`) -> Flash-Lite text-only.
-    - Fixes subtle typos, mixed English/romanized slips (`Ehehe`, `Eหมอนี่`), foreign-script drift,
-      truncated sentences, and obvious Vision OCR kanji typos using surrounding dialogue context.
-    - Strictly preserves `bubble_id`, `box_2d`, and page structure; any omitted or invalid index
-      gracefully retains its Stage 1 draft (zero regression risk).
+    Polishes one <=22-bubble chunk using:
+    1) Cloudflare Workers AI Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`) with explicit `system`
+       + `user` roles (activates `llm.py`'s anti-thinking guard and finishes in ~9-13s!).
+    2) Google AI Studio Gemma 4 (`gemma-4-26b-a4b-it` -> `gemma-4-31b-it`).
+    3) Text-only Gemini Flash-Lite fallback.
     """
-    flat_bubbles: list[dict] = []
-    compact_pages: list[dict] = []
+    chunk_bubble_cnt = sum(len(p.get("b") or []) for p in chunk_pages)
+    if chunk_bubble_cnt == 0:
+        return {}, {}, "", 0.0
 
-    for p_idx, (bubbles, summary) in enumerate(batch_results, 1):
-        p_items = []
-        for b in bubbles:
-            g_idx = len(flat_bubbles)
-            flat_bubbles.append(b)
-            # Show Gemma the raw pre-sanitized draft if available so truncated foreign-script tails stay visible!
-            draft_val = b.get("_raw_translated_text") or b.get("translated_text") or ""
-            p_items.append({
-                "i": g_idx,
-                "spk": b.get("speaker_or_note") or "",
-                "src": b.get("source_text") or "",
-                "draft": draft_val,
-            })
-        if p_items or summary:
-            compact_pages.append({"p": p_idx, "sum": summary or "", "b": p_items})
-
-    if not flat_bubbles:
-        return batch_results
-
-    num_pages = len(batch_results)
-    api_log(
-        f"MangaPolish [req={req_id}] START -> polishing {len(flat_bubbles)} bubble(s) "
-        f"across {num_pages} page(s) via Cloudflare Gemma 4 ({target_lang_name})"
-    )
-    if progress_cb is not None:
-        try:
-            await progress_cb("✨ **2/3** กำลังเกลาสำนวนคำแปลให้เนียนขึ้นนะคะ...")
-        except Exception:
-            pass
-
-    ctx_snippet = (
-        f"Series context: {series_context_hint[:600]}\n\n"
-        if series_context_hint else ""
-    )
+    chunk_tag = f"{req_id}-c{chunk_idx}/{total_chunks}" if total_chunks > 1 else req_id
+    ctx_parts = []
+    if series_context_hint:
+        ctx_parts.append(f"Series context: {series_context_hint[:450]}")
+    if total_chunks > 1 and story_overview:
+        ctx_parts.append(f"Full chapter scene flow (for cross-page continuity): {story_overview[:700]}")
+    ctx_block = ("\n".join(ctx_parts) + "\n\n") if ctx_parts else ""
 
     if target_lang_name.lower() == "thai":
         lang_guidance = (
             "- แปลและเกลาทุกช่องให้เป็นภาษาไทยธรรมชาติ ลื่นไหล สะกดถูกต้อง 100% (ไม่มีคำสะกดผิด ไม่มีสระ/วรรณยุกต์สลับตำแหน่ง)\n"
-            "- ใช้เฉพาะอักษรไทยและเครื่องหมาย ASCII มาตรฐาน (`...`, `~`, `-`, `!`, `?`, `'`) ห้ามมีอีโมจิ สัญลักษณ์หัวใจ/โน้ตเพลง ภาษาเกาหลี/จีน/อาหรับ หรือทับศัพท์อังกฤษปนกลางประโยคไทย (เช่น แปล `えへへ` เป็น `เอะเฮะ` แปล `…っ!!` เป็น `...อ๊ะ!!` แปล `コイツ` เป็น `ไอ้หมอนี่` ยกเว้นคำย่อสากลที่มีในต้นฉบับจริงเช่น OK/DM/HP)\n"
+            "- ใช้เฉพาะอักษรไทยและเครื่องหมาย ASCII มาตรฐาน (`...`, `~`, `-`, `!`, `?`, `'`) ห้ามมีอีโมจิ สัญลักษณ์หัวใจ/โน้ตเพลง ภาษาเกาหลี/จีน/อาหรับ หรือทับศัพท์อังกฤษปนกลางประโยคไทย (เช่น แปล `えへへ` เป็น `เอะเฮะ`, `…っ!!` เป็น `...อ๊ะ!!`, `コイツ` เป็น `ไอ้หมอนี่` ยกเว้นคำย่อสากลที่มีในต้นฉบับจริงเช่น OK/DM/HP)\n"
             "- ใช้คำลงท้ายให้ตรงเพศและบุคลิกของตัวละคร (ตัวละครหญิง/แต่งหญิงใช้ `ค่ะ`/`คะ`/`นะคะ`/`นะ` ตัวเอกชายพูดกับเพื่อนสนิทใช้ภาษาเป็นกันเอง)\n"
-            "- หากต้นฉบับ `src` มีอักษรญี่ปุ่น OCR เพี้ยนเล็กน้อย (เช่น `渡する側のテ` จาก `渡す側のアテ`) หรือ `draft` ขาดหายกลางประโยค ให้ดูบริบทช่องก่อนหน้าแล้วแปลให้ครบสมบูรณ์ตามความหมายจริง\n"
-            "- เกลา `sum` (บริบทของฉาก) ของแต่ละหน้าให้สั้น กระชับ เป็นภาษาไทยสะอาดตาด้วย"
+            "- หากต้นฉบับ `src` มีอักษรญี่ปุ่น OCR เพี้ยนเล็กน้อย หรือ `draft` ขาดหายกลางประโยค ให้ดูบริบทช่องก่อนหน้าแล้วแปลให้ครบสมบูรณ์\n"
+            "- เกลา `sum` (บริบทของฉาก) ของแต่ละหน้าในชุดนี้ให้สั้น กระชับ เป็นภาษาไทยสะอาดตาด้วย"
         )
     else:
         lang_guidance = (
@@ -593,73 +622,68 @@ async def _polish_manga_translations_gemma_async(
             f"- Also polish each page's 1-sentence `sum` into clean {target_lang_name}."
         )
 
-    polish_prompt = (
+    system_rules = (
         f"You are a senior Manga Localization Proofreader ({target_lang_name}).\n"
-        f"Below is a draft translation of {num_pages} sequential manga page(s) produced by a fast OCR model.\n"
-        f"{ctx_snippet}"
-        "TASK: Review EVERY bubble `i` (`src` = Japanese OCR, `draft` = initial translation) and EVERY page `sum` in reading order, "
-        f"and return polished, natural, typo-free {target_lang_name}.\n\n"
+        "Review EVERY bubble `i` (`src` = Japanese OCR, `draft` = initial translation) and EVERY page `sum` in the JSON input, "
+        f"and return polished, natural, typo-free {target_lang_name}.\n"
         f"RULES:\n{lang_guidance}\n"
         "- Keep lines concise enough to fit cleanly inside manga speech bubbles.\n"
-        "- Return ONLY valid JSON with this exact compact schema (include EVERY bubble index `0..N-1` and page number `1..P`):\n"
-        '{"s": {"1": "polished summary page 1"}, "b": {"0": "polished bubble 0", "1": "polished bubble 1"}}\n\n'
-        "INPUT:\n"
-        + json.dumps({"pages": compact_pages}, ensure_ascii=False)
+        "- Return ONLY valid JSON with this exact compact schema (include EVERY bubble index `i` and page number `p` present in INPUT):\n"
+        '{"s": {"1": "polished summary"}, "b": {"0": "polished bubble 0"}}'
     )
+    compact_json_input = json.dumps({"pages": chunk_pages}, ensure_ascii=False, separators=(",", ":"))
+    user_payload = f"{ctx_block}INPUT:\n{compact_json_input}"
+    combined_prompt = f"{system_rules}\n\n{user_payload}"
 
-    summary_map: dict[int, str] = {}
-    bubble_map: dict[int, str] = {}
-    used_model = ""
-    used_elapsed = 0.0
+    min_accept = max(1, int(chunk_bubble_cnt * 0.5))
 
-    # Tier 1: Cloudflare Workers AI Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`, thinking disabled for fast polish!)
-    t_cf = time.monotonic()
-    try:
-        cf_out = await call_cloudflare_gemma_chat(
-            [{"role": "user", "content": polish_prompt}],
-            temperature=0.0,
-            max_tokens=8192,
-            purpose=f"MangaPolish[{req_id}]",
-        )
-        if cf_out:
-            s_m, b_m = _parse_polish_json_response(cf_out)
-            if len(b_m) >= max(1, int(len(flat_bubbles) * 0.5)):
-                summary_map, bubble_map = s_m, b_m
-                used_model = "cf-gemma-4-26b"
-                used_elapsed = time.monotonic() - t_cf
-            else:
+    # Tier 1: Cloudflare Workers AI Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`)
+    # Passing an explicit `system` role activates `llm.py`'s anti-thinking directive!
+    async with cf_sem:
+        t_cf = time.monotonic()
+        try:
+            cf_out = await call_cloudflare_gemma_chat(
+                [
+                    {"role": "system", "content": system_rules},
+                    {"role": "user", "content": user_payload},
+                ],
+                temperature=0.0,
+                max_tokens=4096,
+                purpose=f"MangaPolish[{chunk_tag}]",
+            )
+            if cf_out:
+                s_m, b_m = _parse_polish_json_response(cf_out)
+                if len(b_m) >= min_accept:
+                    return s_m, b_m, "cf-gemma-4-26b", time.monotonic() - t_cf
                 api_log(
-                    f"MangaPolish [req={req_id}] -> cf-gemma-4-26b returned incomplete map "
-                    f"({len(b_m)}/{len(flat_bubbles)}); trying AI Studio Gemma fallback"
+                    f"MangaPolish [req={chunk_tag}] -> cf-gemma-4-26b incomplete "
+                    f"({len(b_m)}/{chunk_bubble_cnt}); trying AI Studio Gemma fallback"
                 )
-    except Exception as e:
-        api_log(f"MangaPolish [req={req_id}] Cloudflare Gemma note ({type(e).__name__})")
+        except Exception as e:
+            api_log(f"MangaPolish [req={chunk_tag}] Cloudflare Gemma note ({type(e).__name__})")
 
     # Tier 2 & 3: Google AI Studio Gemma 4 fallback (`gemma-4-26b-a4b-it` -> `gemma-4-31b-it`)
-    if not bubble_map:
-        for g_model in ("gemma-4-26b-a4b-it", "gemma-4-31b-it"):
-            raw_out, el = await _call_gemma_ai_studio_polish_json(
-                g_model, polish_prompt, req_id=req_id, timeout_sec=30.0
+    for g_model in ("gemma-4-26b-a4b-it", "gemma-4-31b-it"):
+        raw_out, el = await _call_gemma_ai_studio_polish_json(
+            g_model, combined_prompt, req_id=chunk_tag, timeout_sec=26.0
+        )
+        if raw_out:
+            s_m, b_m = _parse_polish_json_response(raw_out)
+            if len(b_m) >= min_accept:
+                return s_m, b_m, g_model, el
+            api_log(
+                f"MangaPolish [req={chunk_tag}] -> {g_model} incomplete "
+                f"({len(b_m)}/{chunk_bubble_cnt}); trying next tier"
             )
-            if raw_out:
-                s_m, b_m = _parse_polish_json_response(raw_out)
-                if len(b_m) >= max(1, int(len(flat_bubbles) * 0.5)):
-                    summary_map, bubble_map = s_m, b_m
-                    used_model, used_elapsed = g_model, el
-                    break
-                api_log(
-                    f"MangaPolish [req={req_id}] -> {g_model} returned incomplete map "
-                    f"({len(b_m)}/{len(flat_bubbles)}); trying next tier"
-                )
 
     # Tier 4: Text-only Gemini Flash-Lite fallback (only if all Gemma tiers unavailable)
-    if not bubble_map and GEMINI_API_KEY:
+    if GEMINI_API_KEY:
         t_fb = time.monotonic()
         fb_payload = {
-            "contents": [{"parts": [{"text": polish_prompt}]}],
+            "contents": [{"parts": [{"text": combined_prompt}]}],
             "generationConfig": {
                 "temperature": 0.0,
-                "maxOutputTokens": 8192,
+                "maxOutputTokens": 4096,
                 "responseMimeType": "application/json",
                 "thinkingConfig": {"thinkingLevel": "MINIMAL"},
             },
@@ -668,7 +692,7 @@ async def _polish_manga_translations_gemma_async(
             data = await call_gemini_generate_content_self_healing(
                 fb_payload,
                 timeout_sec=16,
-                purpose=f"MangaPolishFB[{req_id}]",
+                purpose=f"MangaPolishFB[{chunk_tag}]",
                 max_models=2,
                 max_wall_sec=22.0,
                 preferred_models=["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
@@ -681,11 +705,102 @@ async def _polish_manga_translations_gemma_async(
                 ).strip()
                 s_m, b_m = _parse_polish_json_response(raw_out)
                 if b_m:
-                    summary_map, bubble_map = s_m, b_m
-                    used_model = "gemini-flash-lite-fb"
-                    used_elapsed = time.monotonic() - t_fb
+                    return s_m, b_m, "gemini-flash-lite-fb", time.monotonic() - t_fb
         except Exception as e:
-            api_log(f"MangaPolish [req={req_id}] Flash-Lite fallback note ({type(e).__name__})")
+            api_log(f"MangaPolish [req={chunk_tag}] Flash-Lite fallback note ({type(e).__name__})")
+
+    return {}, {}, "", 0.0
+
+
+async def _polish_manga_translations_gemma_async(
+    batch_results: list[tuple[list[dict], str]],
+    target_lang_name: str,
+    series_context_hint: str = "",
+    req_id: str = "",
+    progress_cb=None,
+) -> list[tuple[list[dict], str]]:
+    """
+    Always-On Stage 2 Text-Only Proofreading & Localization Polish (Parallel-Chunked Gemma 4):
+    - Splits large batches (>22 bubbles) into concurrent chunks of <=22 bubbles (~700-850 output
+      tokens each) so Cloudflare Gemma 4 finishes in ~9-13s wall time instead of hitting its
+      28s HTTP timeout on 47-62 bubble batches!
+    - Passes a compact cross-page `story_overview` into every chunk so pronouns, character
+      continuity, and multi-page punchlines stay consistent across chunk boundaries.
+    - Per-chunk priority: Cloudflare Gemma 4 -> AI Studio Gemma 4 -> Flash-Lite text-only.
+    """
+    flat_bubbles: list[dict] = []
+    compact_pages: list[dict] = []
+    overview_lines: list[str] = []
+
+    for p_idx, (bubbles, summary) in enumerate(batch_results, 1):
+        p_items = []
+        for b in bubbles:
+            g_idx = len(flat_bubbles)
+            flat_bubbles.append(b)
+            draft_val = b.get("_raw_translated_text") or b.get("translated_text") or ""
+            p_items.append({
+                "i": g_idx,
+                "spk": b.get("speaker_or_note") or "",
+                "src": b.get("source_text") or "",
+                "draft": draft_val,
+            })
+        if summary:
+            overview_lines.append(f"P{p_idx}: {summary.strip()}")
+        if p_items or summary:
+            compact_pages.append({"p": p_idx, "sum": summary or "", "b": p_items})
+
+    if not flat_bubbles:
+        return batch_results
+
+    num_pages = len(batch_results)
+    chunks = _split_polish_pages_into_chunks(compact_pages, max_bubbles_per_chunk=22)
+    total_chunks = len(chunks)
+    story_overview = " | ".join(overview_lines)
+
+    api_log(
+        f"MangaPolish [req={req_id}] START -> polishing {len(flat_bubbles)} bubble(s) "
+        f"across {num_pages} page(s) in {total_chunks} parallel chunk(s) via Cloudflare Gemma 4 ({target_lang_name})"
+    )
+    if progress_cb is not None:
+        try:
+            await progress_cb("✨ **2/3** กำลังเกลาสำนวนคำแปลให้เนียนขึ้นนะคะ...")
+        except Exception:
+            pass
+
+    wall_t0 = time.monotonic()
+    # Cap concurrent Cloudflare calls to 3 to stay well inside burst rate limits
+    cf_sem = asyncio.Semaphore(4)
+    chunk_tasks = [
+        _polish_single_chunk_gemma_async(
+            c_idx,
+            total_chunks,
+            c_pages,
+            story_overview,
+            target_lang_name,
+            series_context_hint,
+            req_id,
+            cf_sem,
+        )
+        for c_idx, c_pages in enumerate(chunks, 1)
+    ]
+    chunk_outputs = await asyncio.gather(*chunk_tasks, return_exceptions=True)
+
+    summary_map: dict[int, str] = {}
+    bubble_map: dict[int, str] = {}
+    used_models: list[str] = []
+
+    for out in chunk_outputs:
+        if isinstance(out, Exception) or not isinstance(out, tuple):
+            continue
+        s_m, b_m, m_name, _ = out
+        if s_m:
+            summary_map.update(s_m)
+        if b_m:
+            bubble_map.update(b_m)
+        if m_name and m_name not in used_models:
+            used_models.append(m_name)
+
+    wall_elapsed = time.monotonic() - wall_t0
 
     # Apply polished results with per-bubble safety validation
     updated_bubbles = 0
@@ -698,7 +813,6 @@ async def _polish_manga_translations_gemma_async(
             b["translated_text"] = _sanitize_text_for_manga_font(cand_raw)
             updated_bubbles += 1
         else:
-            # Keep Stage 1 draft sanitized cleanly
             b["translated_text"] = _sanitize_text_for_manga_font(b.get("translated_text") or "")
 
         b.pop("_raw_translated_text", None)
@@ -747,10 +861,10 @@ async def _polish_manga_translations_gemma_async(
             final_sum = _sanitize_text_for_manga_font(summary or "")
         polished_batch.append((bubbles, final_sum))
 
-    if used_model:
+    if used_models:
         api_log(
-            f"MangaPolish [req={req_id}] DONE -> model={used_model} "
-            f"({used_elapsed:.2f}s, updated {updated_bubbles}/{len(flat_bubbles)} bubble(s), "
+            f"MangaPolish [req={req_id}] DONE -> model={'+'.join(used_models)} "
+            f"({wall_elapsed:.2f}s wall, {total_chunks} chunk(s), updated {updated_bubbles}/{len(flat_bubbles)} bubble(s), "
             f"{updated_summaries}/{num_pages} summaries)"
         )
     else:
