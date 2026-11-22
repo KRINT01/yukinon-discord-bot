@@ -284,9 +284,10 @@ def _filter_white_components_pil(
             sat_crop = small_sat.crop((cx1, cy1, cx2, cy2))
             s_hist = sat_crop.histogram(mask=filled_crop)
             mean_s = ImageStat.Stat(sat_crop, mask=filled_crop).mean[0]
+            mean_c_p = ImageStat.Stat(ch_crop, mask=filled_crop).mean[0]
             high_sat_ratio = sum(s_hist[95:]) / float(max(1, sum(s_hist)))
             sat_crop.close()
-            if mean_s >= 75.0 or high_sat_ratio >= 0.30:
+            if (mean_s < 10.0 and mean_c_p < 8.0) or mean_s >= 75.0 or high_sat_ratio >= 0.30:
                 ch_crop.close()
                 gray_crop.close()
                 filled_crop.close()
@@ -422,29 +423,32 @@ def _detect_page_bubbles_and_build_som_b64_pil_sync(
             )
         )
 
-        # Pass A3: Pastel / colored light bubbles
-        g_pastel = small_gray.point(lambda p: 255 if p >= 178 else 0)
-        s_pastel = small_sat.point(lambda p: 255 if p < 95 else 0)
-        pastel_bin = ImageChops.darker(ImageChops.darker(g_pastel, s_pastel), non_outline)
-        g_pastel.close()
-        s_pastel.close()
-        non_outline.close()
-        pdraw = ImageDraw.Draw(pastel_bin)
-        pdraw.rectangle([0, 0, sw - 1, 1], fill=0)
-        pdraw.rectangle([0, sh - 2, sw - 1, sh - 1], fill=0)
-        pdraw.rectangle([0, 0, 1, sh - 1], fill=0)
-        pdraw.rectangle([sw - 2, 0, sw - 1, sh - 1], fill=0)
+        # Pass A3: Pastel / colored light bubbles — ONLY on actual color pages!
+        ch_h = small_chroma.histogram()
+        page_is_color = (sum(ch_h[16:]) / float(max(1, sum(ch_h)))) >= 0.03
+        if page_is_color:
+            g_pastel = small_gray.point(lambda p: 255 if p >= 178 else 0)
+            s_pastel = small_sat.point(lambda p: 255 if p < 95 else 0)
+            pastel_bin = ImageChops.darker(ImageChops.darker(g_pastel, s_pastel), non_outline)
+            g_pastel.close()
+            s_pastel.close()
+            pdraw = ImageDraw.Draw(pastel_bin)
+            pdraw.rectangle([0, 0, sw - 1, 1], fill=0)
+            pdraw.rectangle([0, sh - 2, sw - 1, sh - 1], fill=0)
+            pdraw.rectangle([0, 0, 1, sh - 1], fill=0)
+            pdraw.rectangle([sw - 2, 0, sw - 1, sh - 1], fill=0)
 
-        raw_a3 = _extract_components_bytearray_bfs_pil(
-            pastel_bin, min_w_px, min_h_px, max_w_px, max_h_px, max_area_px, step=2, core_radius=1, edge_pad=2
-        )
-        pastel_bin.close()
-        detected.extend(
-            _filter_white_components_pil(
-                raw_a3, small_rgb, small_gray, small_chroma, small_sat, sw, sh, already_covered,
-                is_secondary_pass=True, is_pastel_pass=True,
+            raw_a3 = _extract_components_bytearray_bfs_pil(
+                pastel_bin, min_w_px, min_h_px, max_w_px, max_h_px, max_area_px, step=2, core_radius=1, edge_pad=2
             )
-        )
+            pastel_bin.close()
+            detected.extend(
+                _filter_white_components_pil(
+                    raw_a3, small_rgb, small_gray, small_chroma, small_sat, sw, sh, already_covered,
+                    is_secondary_pass=True, is_pastel_pass=True,
+                )
+            )
+        non_outline.close()
         small_rgb.close()
 
         detected = _prune_nested_child_bubbles(detected, close_pil=True)

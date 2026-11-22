@@ -24,7 +24,7 @@ except ImportError:
 
 from config import THAI_CHAR_REGEX
 
-MANGA_CV_RENDER_VERSION = "v7"
+MANGA_CV_RENDER_VERSION = "v8"
 SOM_CV_MAX_DIM = 360  # Fast 360px grid derived from single 1024px resize (~1-2.5s for 10 pages with OpenCV+NumPy!)
 # Bundle 2 RAM & Discord upload optimization: quality=90 with standard 4:2:0 subsampling (~50% smaller than 94/4:4:4)
 MANGA_RENDER_JPEG_QUALITY = 90
@@ -70,6 +70,7 @@ _THAI_TONE_BEFORE_VOWEL_REGEX = re.compile(r"([\u0E48-\u0E4B])([\u0E31\u0E34-\u0
 # Pre-allocated reusable OpenCV morphological kernels
 _CV2_K3 = np.ones((3, 3), np.uint8) if HAS_CV2 else None
 _CV2_K5 = np.ones((5, 5), np.uint8) if HAS_CV2 else None
+_CV2_K7 = np.ones((7, 7), np.uint8) if HAS_CV2 else None
 _CV2_ELLIPSE_13 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)) if HAS_CV2 else None
 
 
@@ -133,38 +134,66 @@ def _sanitize_text_for_manga_font(text: str) -> str:
 
 def _prune_nested_child_bubbles(detected: list[dict], close_pil: bool = False) -> list[dict]:
     """
-    Drops tiny inner white text-glow halos (from Pass A1) that sit >=70% inside a larger
-    enclosing speech bubble (from Pass A3 pastel detection), preventing overlapping SoM
-    badges and microscopic text crammed inside a single kanji column.
+    Drops tiny inner white text-glow halos (from Pass A1/A2) that sit >=70% inside a larger
+    enclosing colored pastel speech bubble (`is_pastel=True`).
+    Safety guard: NEVER lets a non-pastel B&W panel background prune white bubbles inside it,
+    and if a pastel candidate somehow wraps >=2 independent large white speech bubbles,
+    drops the enclosing panel instead of the real bubbles!
     """
     if len(detected) <= 1:
         return detected
-    pruned: list[dict] = []
+
+    def _contained_ratio(child_box, parent_box) -> float:
+        ay1, ax1, ay2, ax2 = child_box
+        by1, bx1, by2, bx2 = parent_box
+        a_area = max(1, (ay2 - ay1) * (ax2 - ax1))
+        b_area = max(1, (by2 - by1) * (bx2 - bx1))
+        if b_area <= a_area * 1.15:
+            return 0.0
+        ov_y = max(0, min(ay2, by2) - max(ay1, by1))
+        ov_x = max(0, min(ax2, bx2) - max(ax1, bx1))
+        return (ov_x * ov_y) / float(a_area)
+
+    drop_indices: set[int] = set()
+
+    # Check if any large enclosing region wraps >=2 distinct full-sized bubbles (panel leak guard!)
+    for j, b in enumerate(detected):
+        if not b.get("is_pastel"):
+            continue
+        contained_real = []
+        for i, a in enumerate(detected):
+            if i == j or a.get("is_pastel"):
+                continue
+            if _contained_ratio(a["bbox_norm"], b["bbox_norm"]) >= 0.70:
+                ay1, ax1, ay2, ax2 = a["bbox_norm"]
+                # Count substantial speech bubbles (not tiny narrow kanji-column halos)
+                if (ax2 - ax1) >= 75 and (ay2 - ay1) >= 75 and float(a.get("rect_fill") or 0.0) >= 0.72:
+                    contained_real.append(i)
+        if len(contained_real) >= 2:
+            drop_indices.add(j)
+
+    # Drop tiny white text-glow halos inside surviving pastel speech bubbles
     for i, a in enumerate(detected):
-        ay1, ax1, ay2, ax2 = a["bbox_norm"]
-        a_box_area = max(1, (ay2 - ay1) * (ax2 - ax1))
-        is_nested_child = False
+        if i in drop_indices or a.get("is_pastel"):
+            continue
         for j, b in enumerate(detected):
-            if i == j:
+            if i == j or j in drop_indices or not b.get("is_pastel"):
                 continue
-            by1, bx1, by2, bx2 = b["bbox_norm"]
-            b_box_area = max(1, (by2 - by1) * (bx2 - bx1))
-            if b_box_area <= a_box_area * 1.15:
-                continue
-            ov_y = max(0, min(ay2, by2) - max(ay1, by1))
-            ov_x = max(0, min(ax2, bx2) - max(ax1, bx1))
-            if (ov_x * ov_y) / float(a_box_area) >= 0.70:
-                is_nested_child = True
+            if _contained_ratio(a["bbox_norm"], b["bbox_norm"]) >= 0.70:
+                drop_indices.add(i)
                 break
-        if is_nested_child:
-            if close_pil and a.get("mask_small") is not None:
+
+    pruned: list[dict] = []
+    for idx, item in enumerate(detected):
+        if idx in drop_indices:
+            if close_pil and item.get("mask_small") is not None:
                 try:
-                    a["mask_small"].close()
+                    item["mask_small"].close()
                 except Exception:
                     pass
-                a["mask_small"] = None
+                item["mask_small"] = None
             continue
-        pruned.append(a)
+        pruned.append(item)
     return pruned
 
 
@@ -688,6 +717,8 @@ def _extract_and_filter_white_components_cv2(
     max_area_px: int,
     is_secondary_pass: bool = False,
     is_pastel_pass: bool = False,
+    vis_gray: "np.ndarray | None" = None,
+    vis_chroma: "np.ndarray | None" = None,
 ) -> list[dict]:
     """
     Vectorized `cv2.connectedComponentsWithStats` + NumPy bubble validator supporting BOTH
@@ -759,6 +790,7 @@ def _extract_and_filter_white_components_cv2(
 
         # Anti-False-Positive Guard 1: Convex Hull Solidity >= 0.79
         # Rejects irregular shirt sleeves, SFX outlines, and panel corners while keeping spiky shout bubbles!
+        solidity = 1.0
         cnts, _ = cv2.findContours(filled_crop, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if cnts:
             main_cnt = max(cnts, key=cv2.contourArea)
@@ -786,8 +818,10 @@ def _extract_and_filter_white_components_cv2(
             s_sub = small_sat[cy1:cy2, cx1:cx2]
             s_vals = s_sub[mask_bool]
             mean_s = float(s_vals.mean()) if s_vals.size else 255.0
+            mean_c_p = float(c_sub[mask_bool].mean()) if mask_bool.any() else 0.0
             high_sat_ratio = float(np.count_nonzero(s_vals >= 95)) / float(max(1, s_vals.size))
-            if mean_s >= 75.0 or high_sat_ratio >= 0.30:
+            # Pass A3 is strictly for colored/pastel bubbles (reject achromatic B&W gray panels/screentones!)
+            if (mean_s < 10.0 and mean_c_p < 8.0) or mean_s >= 75.0 or high_sat_ratio >= 0.30:
                 continue
 
             bgr_sub = small_bgr[cy1:cy2, cx1:cx2]
@@ -814,6 +848,36 @@ def _extract_and_filter_white_components_cv2(
         if (num_ink_cc - 1) < 3:
             continue
 
+        # Anti-False-Positive Guard 3: Full-res (~1024px) compact text-glyph count!
+        # Eliminates B&W & color anime faces/bodies (which have only 1-3 eye/mouth/crease marks inside the core)
+        # while keeping 100% of real speech bubbles (including 2-char bubbles like `は？`, `…っ!!` and spiky shout bubbles!)
+        glyph_count = int(num_ink_cc - 1)
+        if vis_gray is not None and vis_chroma is not None:
+            vh_v, vw_v = vis_gray.shape[:2]
+            vy1_v = max(0, int(round((cy1 / float(sh)) * vh_v)))
+            vx1_v = max(0, int(round((cx1 / float(sw)) * vw_v)))
+            vy2_v = min(vh_v, int(round((cy2 / float(sh)) * vh_v)))
+            vx2_v = min(vw_v, int(round((cx2 / float(sw)) * vw_v)))
+            if (vx2_v - vx1_v) >= 12 and (vy2_v - vy1_v) >= 12:
+                vm_full = cv2.resize(filled_crop, (vx2_v - vx1_v, vy2_v - vy1_v), interpolation=cv2.INTER_NEAREST)
+                v_in = cv2.erode(vm_full, _CV2_K7, iterations=1)
+                if not np.any(v_in):
+                    v_in = cv2.erode(vm_full, _CV2_K5, iterations=1)
+                vg_sub = vis_gray[vy1_v:vy2_v, vx1_v:vx2_v]
+                vc_sub = vis_chroma[vy1_v:vy2_v, vx1_v:vx2_v]
+                v_ink = np.where((v_in > 0) & (vg_sub < 145) & (vc_sub < 38), np.uint8(255), np.uint8(0))
+                vn_cc, _, vcc_st, _ = cv2.connectedComponentsWithStats(v_ink, connectivity=8)
+                glyph_count = sum(
+                    1
+                    for k_cc in range(1, vn_cc)
+                    if 3 <= int(vcc_st[k_cc, cv2.CC_STAT_WIDTH]) <= 40
+                    and 3 <= int(vcc_st[k_cc, cv2.CC_STAT_HEIGHT]) <= 42
+                    and int(vcc_st[k_cc, cv2.CC_STAT_AREA]) >= 8
+                )
+                min_glyphs = 5 if (rect_fill < 0.62 or solidity < 0.86) else 3
+                if glyph_count < min_glyphs:
+                    continue
+
         # Seal concave rim-kanji bays ONLY AFTER passing all validation guards (keeps Page 3 調子乗/思 inside mask!)
         final_mask = _close_rim_bays_cv2(filled_crop) if is_pastel_pass else filled_crop
         already_covered[cy1:cy2, cx1:cx2] |= final_mask
@@ -827,6 +891,8 @@ def _extract_and_filter_white_components_cv2(
             "bbox_norm": bbox_norm,
             "mask_np": final_mask,
             "rect_fill": rect_fill,
+            "solidity": solidity,
+            "glyph_count": glyph_count,
             "is_dark": False,
             "is_pastel": bool(is_pastel_pass),
         })
@@ -880,10 +946,11 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
 
     # Zero-thickening dark-outline preservation via C box-area downscale
     vis_gray = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2GRAY)
+    vis_chroma = vis_bgr.max(axis=2) - vis_bgr.min(axis=2)
     vis_dark = np.where(vis_gray < 185, np.uint8(255), np.uint8(0))
-    del vis_gray
     small_dark_box = cv2.resize(vis_dark, (sw, sh), interpolation=cv2.INTER_AREA)
     del vis_dark
+    page_is_color = (float(np.count_nonzero(small_chroma >= 16)) / float(max(1, small_chroma.size))) >= 0.03
 
     min_w_px = max(11, int(sw * 0.042))
     min_h_px = max(11, int(sh * 0.028))
@@ -911,6 +978,8 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
         max_area_px,
         is_secondary_pass=False,
         is_pastel_pass=False,
+        vis_gray=vis_gray,
+        vis_chroma=vis_chroma,
     )
 
     # Pass A2: Dark-outline-preserved pass (thin-outline ovals on white panels)
@@ -934,39 +1003,45 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
             max_area_px,
             is_secondary_pass=True,
             is_pastel_pass=False,
+            vis_gray=vis_gray,
+            vis_chroma=vis_chroma,
         )
     )
 
-    # Pass A3: Enclosed pastel / colored light speech bubbles (pale blue, pink, green, lavender, cream, yellow)
-    pastel_bin = np.where(
-        (small_gray >= 178) & (small_sat < 95) & (small_dark_box < 24),
-        np.uint8(255),
-        np.uint8(0),
-    )
-    pastel_bin[:2, :] = 0
-    pastel_bin[-2:, :] = 0
-    pastel_bin[:, :2] = 0
-    pastel_bin[:, -2:] = 0
-    detected.extend(
-        _extract_and_filter_white_components_cv2(
-            pastel_bin,
-            small_bgr,
-            small_gray,
-            small_chroma,
-            small_sat,
-            sw,
-            sh,
-            already_covered,
-            min_w_px,
-            min_h_px,
-            max_w_px,
-            max_h_px,
-            max_area_px,
-            is_secondary_pass=True,
-            is_pastel_pass=True,
+    # Pass A3: Enclosed pastel / colored light speech bubbles — ONLY on actual color pages!
+    # (Prevents pure B&W screentone panels/faces from being misclassified as pastel bubbles!)
+    if page_is_color:
+        pastel_bin = np.where(
+            (small_gray >= 178) & (small_sat < 95) & (small_dark_box < 24),
+            np.uint8(255),
+            np.uint8(0),
         )
-    )
-    del small_bgr
+        pastel_bin[:2, :] = 0
+        pastel_bin[-2:, :] = 0
+        pastel_bin[:, :2] = 0
+        pastel_bin[:, -2:] = 0
+        detected.extend(
+            _extract_and_filter_white_components_cv2(
+                pastel_bin,
+                small_bgr,
+                small_gray,
+                small_chroma,
+                small_sat,
+                sw,
+                sh,
+                already_covered,
+                min_w_px,
+                min_h_px,
+                max_w_px,
+                max_h_px,
+                max_area_px,
+                is_secondary_pass=True,
+                is_pastel_pass=True,
+                vis_gray=vis_gray,
+                vis_chroma=vis_chroma,
+            )
+        )
+    del small_bgr, vis_gray, vis_chroma
 
     # Remove tiny Pass A1 white text-glow halos nested inside larger Pass A3 pastel bubbles!
     detected = _prune_nested_child_bubbles(detected, close_pil=False)
@@ -1040,6 +1115,8 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
                     "bbox_norm": bbox_norm,
                     "mask_np": filled_crop,
                     "rect_fill": rect_fill,
+                    "solidity": 0.95,
+                    "glyph_count": max(6, int(inner_bright_px)),
                     "is_dark": True,
                     "is_pastel": False,
                 })

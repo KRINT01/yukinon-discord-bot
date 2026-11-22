@@ -44,7 +44,7 @@ from manga_cv_render import (
     _release_cv_page_masks,
 )
 
-MANGA_TRANSLATOR_VERSION = "v11"
+MANGA_TRANSLATOR_VERSION = "v12"
 MANGA_CV_VER = getattr(_mcr_mod, "MANGA_CV_RENDER_VERSION", "old")
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
 # Bundle 2 dynamic parallel hedge: faster 15s recovery on typical 2-4p X threads, patient 25s on 5-12p batches
@@ -293,6 +293,73 @@ def _is_valid_target_script(tr_text: str, src_text: str, target_lang_name: str) 
         if not re.search(r"[A-Za-z]", cleaned) and _SOURCE_EAST_ASIAN_REGEX.search(src_text or ""):
             return False
     return True
+
+
+def _dedupe_hallucinated_page_bubbles(
+    batch_results: list[tuple[list[dict], str]],
+    cv_bubbles_per_page: list[list[dict]],
+    req_id: str = "",
+) -> list[tuple[list[dict], str]]:
+    """
+    Universal, zero-regex safeguard against LLM duplicate hallucinations on false-positive
+    face/body/clothing badges (e.g., `#5 == #6` or `#8 == #9` on the same page):
+    If two distinct `bubble_id`s on the same page carry the exact same non-trivial `source_text`
+    (>= 4 non-punctuation characters), keeps ONLY the bubble with the stronger CV text-glyph
+    confidence score (`glyph_count`, `rect_fill`, `solidity`) and drops the hallucinated copy.
+    """
+    total_dropped = 0
+    cleaned_results: list[tuple[list[dict], str]] = []
+
+    for p_idx, (bubbles, summary) in enumerate(batch_results):
+        if len(bubbles) <= 1:
+            cleaned_results.append((bubbles, summary))
+            continue
+
+        page_cv = cv_bubbles_per_page[p_idx] if p_idx < len(cv_bubbles_per_page) else []
+        cv_by_id = {int(c["bubble_id"]): c for c in page_cv if c.get("bubble_id") is not None}
+
+        def _cv_text_score(b_item: dict) -> float:
+            bid = b_item.get("bubble_id")
+            if bid is None or int(bid) not in cv_by_id:
+                return 0.0
+            c = cv_by_id[int(bid)]
+            gly = float(c.get("glyph_count") or 0.0)
+            rf = float(c.get("rect_fill") or 0.70)
+            sol = float(c.get("solidity") or 0.90)
+            return (gly * 2.0) + (rf * 10.0) + (sol * 10.0)
+
+        # Group by normalized `source_text` (ignore whitespace & common punctuation)
+        groups: dict[str, list[int]] = {}
+        for idx_b, b_item in enumerate(bubbles):
+            if b_item.get("bubble_id") is None:
+                continue
+            src_key = re.sub(r"[\s\.…!！?？~〜～、。,，・\-―—\x27\x22「」『』()（）]+", "", b_item.get("source_text") or "")
+            if len(src_key) >= 4:
+                groups.setdefault(src_key, []).append(idx_b)
+
+        drop_idx: set[int] = set()
+        for src_key, idxs in groups.items():
+            if len(idxs) <= 1:
+                continue
+            # Keep the single highest-scoring CV bubble (tie-break: keep first)
+            best_i = max(idxs, key=lambda ii: (_cv_text_score(bubbles[ii]), -ii))
+            for ii in idxs:
+                if ii != best_i:
+                    drop_idx.add(ii)
+
+        if drop_idx:
+            total_dropped += len(drop_idx)
+            kept = [b for ii, b in enumerate(bubbles) if ii not in drop_idx]
+            cleaned_results.append((kept, summary))
+        else:
+            cleaned_results.append((bubbles, summary))
+
+    if total_dropped:
+        api_log(
+            f"MangaDedupe [req={req_id}] -> dropped {total_dropped} hallucinated duplicate bubble(s) "
+            "(kept highest CV text-glyph match)"
+        )
+    return cleaned_results
 
 
 async def _recover_omitted_pages_async(
@@ -1400,7 +1467,7 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
    - You MUST inspect and output an entry for EVERY SINGLE badge ID `1..K` on that page — NEVER skip a badge ID, NEVER merge two separate badges into one entry, and NEVER put text from a DIFFERENT bubble into another bubble's badge ID!
    - Double-check which exact RED/WHITE NUMBERED badge touches the bubble or narration box whose Japanese text you are reading before assigning `"bubble_id"`.
    - MANDATORY: Translate BOTH spoken speech bubbles AND EVERY rectangular white/colored narration/caption box (คำบรรยาย)! If badge `k` contains ANY Japanese sentence, dialogue, monologue, or narration caption: set `"bubble_id": k`, `"should_translate": true`, `"box_2d": null`, transcribe ONLY the exact `"source_text"` visually INSIDE badge `k`, and write its natural {target_lang_name} `"translated_text"`.
-   - Set `"should_translate": false` ONLY if badge `k` is a blank/artwork/clothing region with NO text or a pure sound effect (SFX) with no sentence — NEVER set `"should_translate": false` on a narration/caption box!
+   - CRITICAL ANTI-DUPLICATE RULE: If badge `k` outlines a character face, body, clothing, hand, background art, or pure SFX with NO dialogue text visually inside badge `k`, you MUST set `"should_translate": false`, `"source_text": ""`, `"translated_text": ""` — NEVER copy or duplicate dialogue from a neighboring bubble onto an empty face/body badge! (Conversely, NEVER set `"should_translate": false` on a real narration/caption box.)
 2. UNMARKED / BORDERLESS DIALOGUE (`bubble_id: null`):
    - ALSO scan every panel for real spoken dialogue or monologue written WITHOUT a numbered badge around it.
    - For each unmarked dialogue or narration box, add a SEPARATE entry with `"bubble_id": null`, `"should_translate": true`, transcribe `"source_text"`, and provide `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY that Japanese text in its OWN panel — NEVER over faces, hands, or artwork!).
@@ -1597,7 +1664,7 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
 1. MANDATORY 1-TO-1 NUMBERED BADGE CHECKLIST (`bubble_id`):
    - Output an entry for EVERY SINGLE badge ID listed above — NEVER skip a badge ID, NEVER merge two separate badges, and NEVER put text from a different bubble into another bubble's badge ID!
    - MANDATORY: Translate BOTH spoken speech bubbles AND EVERY rectangular narration/caption box (คำบรรยาย)! If badge `k` contains ANY Japanese dialogue, monologue, or narration caption: set `"bubble_id": k`, `"should_translate": true`, `"box_2d": null`, exact `"source_text"` inside ONLY badge `k`, and its natural {target_lang_name} `"translated_text"`.
-   - Set `"should_translate": false` ONLY if badge `k` is blank artwork/clothing or a pure SFX with no sentence — NEVER skip a narration/caption box!
+   - CRITICAL ANTI-DUPLICATE RULE: If badge `k` outlines a character face, body, clothing, hand, background art, or pure SFX with NO dialogue text inside it, set `"should_translate": false`, `"source_text": ""`, `"translated_text": ""` — NEVER copy dialogue from a nearby bubble onto an empty face/body badge! (Never skip a real narration/caption box.)
 2. UNMARKED / BORDERLESS DIALOGUE (`bubble_id: null`):
    - For real spoken dialogue/narration WITHOUT a numbered badge (e.g. vertical text on open white panels), output a SEPARATE entry with `"bubble_id": null`, `"should_translate": true`, `"source_text"`, and `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY the Japanese text in its own panel).
 3. Accurate Speaker Attribution, Names & Visual Gender:
@@ -1938,6 +2005,9 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
                     )
                     return
 
+                batch_results = _dedupe_hallucinated_page_bubbles(
+                    batch_results, cv_bubbles_per_page, req_id=req_id
+                )
                 batch_results, cv_bubbles_per_page = await _recover_omitted_pages_async(
                     pages_input,
                     batch_results,
