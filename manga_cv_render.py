@@ -24,7 +24,7 @@ except ImportError:
 
 from config import THAI_CHAR_REGEX
 
-MANGA_CV_RENDER_VERSION = "v17"
+MANGA_CV_RENDER_VERSION = "v18"
 SOM_CV_MAX_DIM = 360  # Fast 360px grid derived from single 1024px resize (~1-2.5s for 10 pages with OpenCV+NumPy!)
 # Bundle 2 RAM & Discord upload optimization: quality=90 with standard 4:2:0 subsampling (~50% smaller than 94/4:4:4)
 MANGA_RENDER_JPEG_QUALITY = 90
@@ -898,10 +898,13 @@ def _extract_and_filter_white_components_cv2(
                 vn_cc, _, vcc_st, _ = cv2.connectedComponentsWithStats(v_ink, connectivity=8)
                 reg_glyphs = 0
                 dot_glyphs = 0
+                max_ink_span_v = 0
                 for k_cc in range(1, vn_cc):
                     gw_v = int(vcc_st[k_cc, cv2.CC_STAT_WIDTH])
                     gh_v = int(vcc_st[k_cc, cv2.CC_STAT_HEIGHT])
                     ga_v = int(vcc_st[k_cc, cv2.CC_STAT_AREA])
+                    if ga_v >= 8:
+                        max_ink_span_v = max(max_ink_span_v, gw_v, gh_v)
                     if 3 <= gw_v <= 40 and 3 <= gh_v <= 42 and ga_v >= 8:
                         reg_glyphs += 1
                     elif 2 <= gw_v <= 5 and 2 <= gh_v <= 5 and 4 <= ga_v <= 16:
@@ -910,11 +913,17 @@ def _extract_and_filter_white_components_cv2(
                 min_glyphs = 6 if (rect_fill < 0.62 or solidity < 0.86) else 3
                 if glyph_count < min_glyphs:
                     continue
+                gly_per_k = glyph_count / float(max(1, filled_area)) * 1000.0
+                # Anti-Face / Anti-Hair-Gap Guard for irregular low-rect_fill (< 0.65) white shapes:
+                # Rejects character faces (`gly/k ~ 4.0`) and hair/earring gaps (`gly/k ~ 7.4`, `max_span=135`)
+                # across ALL resolutions (1.0x/1.5x/2.0x), while keeping 100% of real low-rf bubbles (`gly/k >= 9.7`)!
+                if (not is_pastel_pass) and rect_fill < 0.65 and (gly_per_k < 8.5 or max_ink_span_v > 75):
+                    continue
                 if (
                     (not is_pastel_pass)
                     and filled_area > int(sw * sh * 0.035)
                     and (rect_fill < 0.70 or solidity < 0.88)
-                    and (glyph_count / float(max(1, filled_area)) * 1000.0) < 8.0
+                    and gly_per_k < 8.0
                 ):
                     continue
 
@@ -1242,20 +1251,23 @@ def _extract_bw_soft_shaded_bubbles_cv2(
 def _detect_white_outlined_text_clusters_cv2(
     vis_gray: "np.ndarray",
     vis_chroma: "np.ndarray",
+    is_color: bool = True,
 ) -> list[dict]:
     """
     Pass C fallback (runs ONLY when Passes A1/A2/A3/B find 0 classic enclosed bubbles):
-    Detects white-halo-outlined Japanese dialogue clusters on full-color CG / visual-novel /
-    translucent dark-oval pages (black OR colored dark text with a crisp pure-white outer stroke)
-    so Stage 1 anchors them with exact SoM RED/WHITE badges instead of drifting `box_2d` boxes!
+    Detects white-halo-outlined Japanese dialogue clusters on BOTH full-color CG/VN pages
+    (`is_color=True`) AND pure B&W borderless narration pages (`is_color=False`, e.g. white-outlined
+    vertical narration columns over black panels/speedlines), filtering out hair/eye/chest FPs!
     """
     vh, vw = vis_gray.shape[:2]
-    white_px = (vis_gray >= 225) & (vis_chroma <= 30)
+    white_px = (vis_gray >= (225 if is_color else 218)) & (vis_chroma <= 30)
     dark_any = (vis_gray <= 145)
     if not np.any(white_px) or not np.any(dark_any):
         return []
 
-    white_near = cv2.dilate(white_px.astype(np.uint8), _CV2_K7, iterations=1) > 0
+    ring_k = _CV2_K7 if is_color else _CV2_K5
+    w_thresh = 0.42 if is_color else 0.46
+    white_near = cv2.dilate(white_px.astype(np.uint8), ring_k, iterations=1) > 0
     dark_core_cand = np.where(dark_any & white_near, np.uint8(255), np.uint8(0))
 
     n_cc, lbls, st, _ = cv2.connectedComponentsWithStats(dark_core_cand, connectivity=8)
@@ -1273,10 +1285,10 @@ def _detect_white_outlined_text_clusters_cv2(
             px1, py1 = max(0, x1 - 4), max(0, y1 - 4)
             px2, py2 = min(vw, x1 + gw + 4), min(vh, y1 + gh + 4)
             sub_c = (lbls[py1:py2, px1:px2] == k).astype(np.uint8)
-            ring = cv2.dilate(sub_c, _CV2_K7, iterations=1) - sub_c
+            ring = cv2.dilate(sub_c, ring_k, iterations=1) - sub_c
             ring_cnt = max(1, int(np.count_nonzero(ring)))
             w_ratio = int(np.count_nonzero((ring > 0) & white_px[py1:py2, px1:px2])) / float(ring_cnt)
-            if w_ratio >= 0.42:
+            if w_ratio >= w_thresh:
                 glyph_mask[py1:py2, px1:px2][sub_c > 0] = 255
 
     if not np.any(glyph_mask):
@@ -1290,6 +1302,7 @@ def _detect_white_outlined_text_clusters_cv2(
 
     gn, glbls, gst, _ = cv2.connectedComponentsWithStats(grouped, connectivity=8)
     found: list[dict] = []
+    min_gly_req = 4 if is_color else 8
     for k in range(1, gn):
         gx1 = int(gst[k, cv2.CC_STAT_LEFT])
         gy1 = int(gst[k, cv2.CC_STAT_TOP])
@@ -1299,7 +1312,7 @@ def _detect_white_outlined_text_clusters_cv2(
         sub_g = glyph_mask[gy1:gy2, gx1:gx2] & ((glbls[gy1:gy2, gx1:gx2] == k).astype(np.uint8) * 255)
         n_gly, _ = cv2.connectedComponents(sub_g, connectivity=8)
         n_gly -= 1
-        if n_gly < 4:
+        if n_gly < min_gly_req:
             continue
         ys, xs = np.nonzero(sub_g)
         if ys.size == 0:
@@ -1311,6 +1324,9 @@ def _detect_white_outlined_text_clusters_cv2(
         ty2 = min(vh, gy1 + int(ys.max()) + pad + 1)
         tw, th = tx2 - tx1, ty2 - ty1
         if tw < 24 or th < 24 or (tw * th) > int(vw * vh * 0.35):
+            continue
+        # On pure B&W pages, reject compact square artwork/hair/face clusters; keep real vertical text columns
+        if (not is_color) and (th / float(max(1, tw))) < 1.90:
             continue
 
         # Store compact 64px-max solid mask for crisp SoM red outline drawing
@@ -1725,10 +1741,10 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
                             if sub_ok is not None:
                                 detected.append(sub_ok)
 
-    # Pass C: White-halo-outlined text clusters (runs ONLY on COLOR CG/VN pages when Passes A1-B
-    # found 0 enclosed bubbles; never runs on pure B&W pages where black hair/art/SFX sit on white!)
-    if not detected and page_is_color:
-        detected.extend(_detect_white_outlined_text_clusters_cv2(vis_gray, vis_chroma))
+    # Pass C: White-halo-outlined text clusters (runs ONLY when Passes A1-B found 0 enclosed bubbles;
+    # supports both color CG/VN pages and pure B&W borderless white-halo narration columns!)
+    if not detected:
+        detected.extend(_detect_white_outlined_text_clusters_cv2(vis_gray, vis_chroma, is_color=page_is_color))
     del vis_gray, vis_chroma
 
     # On dense B&W pages, cap to top 24 highest-solidity/largest candidates
@@ -2328,7 +2344,9 @@ def _clean_exact_cv_bubble_and_build_render_slots_cv2(
         sub_g = base_gray[ey1:ey2, ex1:ex2]
         sub_ch = sub_bgr.max(axis=2) - sub_bgr.min(axis=2)
 
-        wp = (sub_g >= 218) & (sub_ch <= 36)
+        is_very_dark_bg = float(np.percentile(sub_g, 25)) < 55.0
+        w_thr_e = 165 if is_very_dark_bg else 218
+        wp = (sub_g >= w_thr_e) & (sub_ch <= 36)
         da = (sub_g <= 158)
         w_near_d = wp & (cv2.dilate(da.astype(np.uint8), _CV2_K7, iterations=1) > 0)
         d_near_w = da & (cv2.dilate(wp.astype(np.uint8), _CV2_K7, iterations=1) > 0)
