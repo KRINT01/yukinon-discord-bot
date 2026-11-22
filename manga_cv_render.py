@@ -24,7 +24,7 @@ except ImportError:
 
 from config import THAI_CHAR_REGEX
 
-MANGA_CV_RENDER_VERSION = "v13"
+MANGA_CV_RENDER_VERSION = "v14"
 SOM_CV_MAX_DIM = 360  # Fast 360px grid derived from single 1024px resize (~1-2.5s for 10 pages with OpenCV+NumPy!)
 # Bundle 2 RAM & Discord upload optimization: quality=90 with standard 4:2:0 subsampling (~50% smaller than 94/4:4:4)
 MANGA_RENDER_JPEG_QUALITY = 90
@@ -72,6 +72,7 @@ _CV2_K3 = np.ones((3, 3), np.uint8) if HAS_CV2 else None
 _CV2_K5 = np.ones((5, 5), np.uint8) if HAS_CV2 else None
 _CV2_K7 = np.ones((7, 7), np.uint8) if HAS_CV2 else None
 _CV2_K9 = np.ones((9, 9), np.uint8) if HAS_CV2 else None
+_CV2_ELLIPSE_7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)) if HAS_CV2 else None
 _CV2_ELLIPSE_13 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)) if HAS_CV2 else None
 
 
@@ -1327,12 +1328,132 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
     # Remove tiny Pass A1 white text-glow halos nested inside larger Pass A3 pastel bubbles!
     detected = _prune_nested_child_bubbles(detected, close_pil=False)
 
-    # Pass B: Enclosed dark speech bubbles / dark caption boxes (strict anti-dark-panel guards!)
+    # Pass B: Enclosed dark speech bubbles / dark caption boxes (supports smoky rims, figure-8 double
+    # dark bubbles, and SFX-touching dark ovals via 7x7 elliptical opening + full-res white glyph checks!)
     dark_bin = np.where(small_gray <= 95, np.uint8(255), np.uint8(0))
     num_d, d_labels, d_stats, _ = cv2.connectedComponentsWithStats(dark_bin, connectivity=4)
     if num_d > 1:
         d_margin = _collect_margin_labels_cv2(d_labels, d_stats, sw, sh, max_area_px, edge_pad=1)
-        max_dw, max_dh = int(sw * 0.50), int(sh * 0.50)
+        max_dw, max_dh = int(sw * 0.55), int(sh * 0.55)
+        vh_d, vw_d = vis_gray.shape[:2]
+
+        def _validate_dark_bubble_crop(
+            f_crop: "np.ndarray",
+            c_crop: "np.ndarray",
+            bx1: int,
+            by1: int,
+            bw_d: int,
+            bh_d: int,
+        ) -> dict | None:
+            bx2, by2 = bx1 + bw_d, by1 + bh_d
+            if bw_d < min_w_px or bh_d < min_h_px or bw_d > max_dw or bh_d > max_dh:
+                return None
+            tl_d, tt_d, tr_d, tb_d = bx1 <= 1, by1 <= 1, bx2 >= sw - 1, by2 >= sh - 1
+            if (int(tl_d) + int(tt_d) + int(tr_d) + int(tb_d)) >= 3 or (tl_d and tr_d) or (tt_d and tb_d):
+                return None
+
+            fa_d = max(1, int(np.count_nonzero(f_crop)))
+            ha_d = int(np.count_nonzero((f_crop > 0) & (c_crop == 0)))
+            rf_d = fa_d / float(max(1, bw_d * bh_d))
+            if fa_d < 200 or fa_d > max_area_px or ha_d < 5 or rf_d < 0.54:
+                return None
+
+            cnts_d, _ = cv2.findContours(f_crop, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not cnts_d:
+                return None
+            mc_d = max(cnts_d, key=cv2.contourArea)
+            sol_d = cv2.contourArea(mc_d) / max(1.0, cv2.contourArea(cv2.convexHull(mc_d)))
+            if sol_d < 0.78:
+                return None
+
+            # Guard 1: Reject dark panels that enclose/overlap already-detected light/pastel speech bubbles!
+            ov_d = int(np.count_nonzero(f_crop & already_covered[by1:by2, bx1:bx2]))
+            if ov_d > 20 or ov_d > fa_d * 0.04:
+                return None
+
+            m_bool = f_crop > 0
+            s_sub = small_sat[by1:by2, bx1:bx2]
+            g_sub = small_gray[by1:by2, bx1:bx2]
+            s_vals = s_sub[m_bool]
+            mean_s = float(s_vals.mean()) if s_vals.size else 255.0
+            sat_ratio = float(np.count_nonzero(s_vals >= 28)) / float(max(1, s_vals.size))
+
+            # Guard 2: True HSV Saturation rejects dark colored artwork (navy clothes, dark brown walls, shadows)
+            if mean_s >= 22.0 or sat_ratio >= 0.16:
+                return None
+
+            inner_core = cv2.erode(f_crop, _CV2_K5, iterations=1)
+            if not np.any(inner_core):
+                inner_core = cv2.erode(f_crop, _CV2_K3, iterations=1)
+
+            # Guard 3: Measure dark interior uniformity EXCLUDING white text + 1px AA fringe
+            # (fixes smoky-rim black bubbles & small dark ovals whose text AA pushed raw std > 24!)
+            br_mask = np.where((g_sub >= 150) & m_bool, np.uint8(255), np.uint8(0))
+            br_fringe = cv2.dilate(br_mask, _CV2_K3, iterations=1) > 0
+            pure_bg = (inner_core > 0) & (~br_fringe) & (g_sub <= 135)
+            if int(np.count_nonzero(pure_bg)) < 12:
+                pure_bg = m_bool & (~br_fringe) & (g_sub <= 135)
+            if int(np.count_nonzero(pure_bg)) < max(12, int(fa_d * 0.15)):
+                return None
+            bg_med_d = float(np.median(g_sub[pure_bg]))
+            bg_std_d = float(np.std(g_sub[pure_bg]))
+            if bg_med_d > 55.0 or bg_std_d > 24.0:
+                return None
+
+            # Guard 4: Bright achromatic text must sit strictly inside the eroded interior
+            inner_bright_px = int(np.count_nonzero((inner_core > 0) & (g_sub >= 195) & (s_sub < 28)))
+            bright_px = int(np.count_nonzero(m_bool & (g_sub >= 195) & (s_sub < 28)))
+            if inner_bright_px < 4 or not (0.018 <= (bright_px / float(fa_d)) <= 0.38):
+                return None
+
+            # Guard 5: Full-res (~1024px) compact white-text glyph verification
+            # (separates crisp white dialogue typography from dark art/collars & pure black SFX blobs!)
+            vy1_d = max(0, int(round((by1 / float(sh)) * vh_d)))
+            vx1_d = max(0, int(round((bx1 / float(sw)) * vw_d)))
+            vy2_d = min(vh_d, int(round((by2 / float(sh)) * vh_d)))
+            vx2_d = min(vw_d, int(round((bx2 / float(sw)) * vw_d)))
+            if (vx2_d - vx1_d) < 12 or (vy2_d - vy1_d) < 12:
+                return None
+            vm_d = cv2.resize(f_crop, (vx2_d - vx1_d, vy2_d - vy1_d), interpolation=cv2.INTER_NEAREST)
+            vin_d = cv2.erode(vm_d, _CV2_K7, iterations=1)
+            if not np.any(vin_d):
+                vin_d = cv2.erode(vm_d, _CV2_K5, iterations=1)
+            vg_d = vis_gray[vy1_d:vy2_d, vx1_d:vx2_d]
+            vc_d = vis_chroma[vy1_d:vy2_d, vx1_d:vx2_d]
+            v_br_d = np.where((vin_d > 0) & (vg_d >= 185) & (vc_d < 35), np.uint8(255), np.uint8(0))
+            vn_cc_d, _, vst_d, _ = cv2.connectedComponentsWithStats(v_br_d, connectivity=8)
+            w_gly = 0
+            w_big = 0
+            for k_d in range(1, vn_cc_d):
+                gw_d = int(vst_d[k_d, cv2.CC_STAT_WIDTH])
+                gh_d = int(vst_d[k_d, cv2.CC_STAT_HEIGHT])
+                ga_d = int(vst_d[k_d, cv2.CC_STAT_AREA])
+                if (3 <= gw_d <= 36 and 3 <= gh_d <= 38 and ga_d >= 8) or (2 <= gw_d <= 5 and 2 <= gh_d <= 5 and 4 <= ga_d <= 16):
+                    w_gly += 1
+                elif max(gw_d, gh_d) > 48 and ga_d > 220:
+                    w_big += 1
+            if w_gly < 3:
+                return None
+            if w_big >= 2 and w_gly < w_big * 3:
+                return None
+
+            already_covered[by1:by2, bx1:bx2] |= f_crop
+            bbox_norm_d = [
+                int(round((by1 / float(sh)) * 1000.0)),
+                int(round((bx1 / float(sw)) * 1000.0)),
+                int(round((by2 / float(sh)) * 1000.0)),
+                int(round((bx2 / float(sw)) * 1000.0)),
+            ]
+            return {
+                "bbox_norm": bbox_norm_d,
+                "mask_np": f_crop,
+                "rect_fill": rf_d,
+                "solidity": sol_d,
+                "glyph_count": w_gly,
+                "is_dark": True,
+                "is_pastel": False,
+            }
+
         for lbl in range(1, num_d):
             if lbl in d_margin:
                 continue
@@ -1342,65 +1463,35 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
             ch = int(d_stats[lbl, cv2.CC_STAT_HEIGHT])
             comp_area = int(d_stats[lbl, cv2.CC_STAT_AREA])
             cx2, cy2 = cx1 + cw, cy1 + ch
-            if comp_area > max_area_px or cw < min_w_px or ch < min_h_px or cw > max_dw or ch > max_dh:
-                continue
-            t_l, t_t, t_r, t_b = cx1 <= 1, cy1 <= 1, cx2 >= sw - 1, cy2 >= sh - 1
-            if (int(t_l) + int(t_t) + int(t_r) + int(t_b)) >= 3 or (t_l and t_r) or (t_t and t_b):
+            if comp_area > max_area_px or cw < min_w_px or ch < min_h_px:
                 continue
 
             comp_crop = np.where(d_labels[cy1:cy2, cx1:cx2] == lbl, np.uint8(255), np.uint8(0))
             filled_crop = _fill_mask_holes_cv2(comp_crop)
-            filled_area = max(1, int(np.count_nonzero(filled_crop)))
-            holes_area = int(np.count_nonzero((filled_crop > 0) & (comp_crop == 0)))
-            rect_fill = filled_area / float(max(1, cw * ch))
-            if filled_area > max_area_px or holes_area < 5 or rect_fill < 0.65:
+            direct_ok = _validate_dark_bubble_crop(filled_crop, comp_crop, cx1, cy1, cw, ch)
+            if direct_ok is not None:
+                detected.append(direct_ok)
                 continue
 
-            # Guard 1: Reject dark panels that enclose/overlap already-detected light/pastel speech bubbles!
-            ov_px = int(np.count_nonzero(filled_crop & already_covered[cy1:cy2, cx1:cx2]))
-            if ov_px > 20 or ov_px > filled_area * 0.04:
-                continue
-
-            mask_bool = filled_crop > 0
-            s_sub = small_sat[cy1:cy2, cx1:cx2]
-            g_sub = small_gray[cy1:cy2, cx1:cx2]
-            s_vals = s_sub[mask_bool]
-            mean_s = float(s_vals.mean()) if s_vals.size else 255.0
-            sat_ratio = float(np.count_nonzero(s_vals >= 28)) / float(max(1, s_vals.size))
-
-            # Guard 2: True HSV Saturation rejects dark colored artwork (navy clothes, dark brown walls, shadows)
-            if mean_s >= 22.0 or sat_ratio >= 0.16:
-                continue
-
-            # Guard 3: Dark bubble background must be uniform (rejects shaded character panels)
-            dark_vals = g_sub[mask_bool & (g_sub <= 135)]
-            if dark_vals.size < max(16, int(filled_area * 0.45)) or float(dark_vals.std()) > 24.0:
-                continue
-
-            # Guard 4: Bright achromatic text must sit strictly inside the eroded interior
-            inner_core = cv2.erode(filled_crop, _CV2_K5, iterations=1)
-            if not np.any(inner_core):
-                inner_core = cv2.erode(filled_crop, _CV2_K3, iterations=1)
-            inner_bright_px = int(np.count_nonzero((inner_core > 0) & (g_sub >= 205) & (s_sub < 28)))
-            bright_px = int(np.count_nonzero(mask_bool & (g_sub >= 210) & (s_sub < 28)))
-
-            if inner_bright_px >= 4 and 0.02 <= (bright_px / float(filled_area)) <= 0.38:
-                already_covered[cy1:cy2, cx1:cx2] |= filled_crop
-                bbox_norm = [
-                    int(round((cy1 / float(sh)) * 1000.0)),
-                    int(round((cx1 / float(sw)) * 1000.0)),
-                    int(round((cy2 / float(sh)) * 1000.0)),
-                    int(round((cx2 / float(sw)) * 1000.0)),
-                ]
-                detected.append({
-                    "bbox_norm": bbox_norm,
-                    "mask_np": filled_crop,
-                    "rect_fill": rect_fill,
-                    "solidity": 0.95,
-                    "glyph_count": max(6, int(inner_bright_px)),
-                    "is_dark": True,
-                    "is_pastel": False,
-                })
+            # SFX / Panel-Edge Detachment Fallback: if a real black speech oval merged with an adjacent
+            # thin black SFX stroke or narrow tail bridge, a 7x7 elliptical MORPH_OPEN shaves off thin
+            # SFX lines cleanly and separates the true dark speech ovals!
+            if int(np.count_nonzero(filled_crop)) >= 600 and cw <= int(sw * 0.72) and ch <= int(sh * 0.72):
+                opened_d = cv2.morphologyEx(filled_crop, cv2.MORPH_OPEN, _CV2_ELLIPSE_7)
+                onl, olbls, ost, _ = cv2.connectedComponentsWithStats(opened_d, connectivity=4)
+                for ol in range(1, onl):
+                    ox1 = int(ost[ol, cv2.CC_STAT_LEFT])
+                    oy1 = int(ost[ol, cv2.CC_STAT_TOP])
+                    ow_d = int(ost[ol, cv2.CC_STAT_WIDTH])
+                    oh_d = int(ost[ol, cv2.CC_STAT_HEIGHT])
+                    oa_d = int(ost[ol, cv2.CC_STAT_AREA])
+                    if oa_d < 220:
+                        continue
+                    sub_f = np.where(olbls[oy1 : oy1 + oh_d, ox1 : ox1 + ow_d] == ol, np.uint8(255), np.uint8(0))
+                    sub_c = comp_crop[oy1 : oy1 + oh_d, ox1 : ox1 + ow_d] & sub_f
+                    sub_ok = _validate_dark_bubble_crop(sub_f, sub_c, cx1 + ox1, cy1 + oy1, ow_d, oh_d)
+                    if sub_ok is not None:
+                        detected.append(sub_ok)
 
     # Pass C: White-halo-outlined text clusters (runs ONLY when Passes A1-B found 0 enclosed bubbles!)
     if not detected:
@@ -1900,7 +1991,11 @@ def _sample_dark_bg_bgr_and_lum_cv2(
 ) -> tuple[tuple[int, int, int], int, float]:
     sub_bgr = img_bgr[y1:y2, x1:x2]
     sub_g = base_gray[y1:y2, x1:x2]
-    bg_bool = sub_g < 145
+    br_mask = np.where(sub_g >= 150, np.uint8(255), np.uint8(0))
+    br_fringe = cv2.dilate(br_mask, _CV2_K5, iterations=1) > 0
+    bg_bool = (sub_g < 145) & (~br_fringe)
+    if int(np.count_nonzero(bg_bool)) < 16:
+        bg_bool = sub_g < 145
     if not np.any(bg_bool):
         bg_bool = np.ones(sub_g.shape, dtype=bool)
     med_bgr = np.median(sub_bgr[bg_bool], axis=0)
@@ -2053,8 +2148,8 @@ def _clean_exact_cv_bubble_and_build_render_slots_cv2(
     eys, exs = np.nonzero(erase_bool)
     erased_bb = (int(exs.min()), int(eys.min()), int(exs.max()) + 1, int(eys.max()) + 1) if eys.size else None
 
-    # 1. Connected figure-8 double bubble -> flow text cleanly across BOTH lobes!
-    if not is_dark and len(trans_text) >= 28:
+    # 1. Connected figure-8 double bubble (light OR dark) -> flow text cleanly across BOTH lobes!
+    if len(trans_text) >= 28:
         lobe_rects = _detect_two_lobe_render_rects_cv2(place_mask, rx1, ry1)
         if lobe_rects:
             r1, r2 = lobe_rects
@@ -2315,8 +2410,8 @@ def _clean_unmarked_open_bubble_and_measure_box_cv2(
         if float(s_band.mean()) >= 22.0 or (float(np.count_nonzero(s_band >= 28)) / float(total_px)) >= 0.16:
             return _fallback_case4()
         dark_bgr, bg_lum, bg_std = _sample_dark_bg_bgr_and_lum_cv2(img_bgr, base_gray, raw_x1, raw_y1, raw_x2, raw_y2)
-        bright_ratio = float(np.count_nonzero(sub_g >= 220)) / float(total_px)
-        if bg_std > 24.0 or not (0.02 <= bright_ratio <= 0.38):
+        bright_ratio = float(np.count_nonzero(sub_g >= 195)) / float(total_px)
+        if bg_lum > 60 or bg_std > 28.0 or not (0.012 <= bright_ratio <= 0.40):
             return _fallback_case4()
 
         pad = 6
