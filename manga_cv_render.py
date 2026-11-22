@@ -24,7 +24,7 @@ except ImportError:
 
 from config import THAI_CHAR_REGEX
 
-MANGA_CV_RENDER_VERSION = "v14"
+MANGA_CV_RENDER_VERSION = "v15"
 SOM_CV_MAX_DIM = 360  # Fast 360px grid derived from single 1024px resize (~1-2.5s for 10 pages with OpenCV+NumPy!)
 # Bundle 2 RAM & Discord upload optimization: quality=90 with standard 4:2:0 subsampling (~50% smaller than 94/4:4:4)
 MANGA_RENDER_JPEG_QUALITY = 90
@@ -74,6 +74,7 @@ _CV2_K7 = np.ones((7, 7), np.uint8) if HAS_CV2 else None
 _CV2_K9 = np.ones((9, 9), np.uint8) if HAS_CV2 else None
 _CV2_ELLIPSE_7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)) if HAS_CV2 else None
 _CV2_ELLIPSE_13 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)) if HAS_CV2 else None
+_CV2_ELLIPSE_17 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)) if HAS_CV2 else None
 
 
 # ==============================================================================
@@ -915,6 +916,148 @@ def _extract_and_filter_white_components_cv2(
     return found
 
 
+def _recover_gutter_merged_white_bubbles_cv2(
+    white_bin_base: "np.ndarray",
+    small_gray: "np.ndarray",
+    small_chroma: "np.ndarray",
+    vis_gray: "np.ndarray",
+    vis_chroma: "np.ndarray",
+    sw: int,
+    sh: int,
+    already_covered: "np.ndarray",
+    max_area_px: int,
+) -> list[dict]:
+    """
+    Pass A4 (Gutter-Detached White Margin Recovery):
+    When a borderless white speech oval inside a dark panel touches a thin white panel gutter
+    (<=14px wide), Pass A1 merges it into the giant white page-margin component (`margin_lbls`).
+    Opening ONLY the margin component with a 17x17 ellipse (after closing 7x7 kanji holes and
+    trimming the 4px page edge) cleanly severs thin panel gutters and recovers the enclosed white
+    oval — verified strictly by high solidity (>=0.88), dark surrounding panel (>=55%), and
+    full-res 1024px black-ink glyph count (>=5).
+    """
+    found: list[dict] = []
+    num_l, labels, stats, _ = cv2.connectedComponentsWithStats(white_bin_base, connectivity=4)
+    if num_l <= 1:
+        return found
+
+    margin_lbls = _collect_margin_labels_cv2(labels, stats, sw, sh, max_area_px, edge_pad=1)
+    margin_ids = [m for m in margin_lbls if m > 0]
+    if not margin_ids:
+        return found
+
+    margin_mask = np.isin(labels, margin_ids).astype(np.uint8) * 255
+    m_filled = cv2.morphologyEx(margin_mask, cv2.MORPH_CLOSE, _CV2_K7)
+    m_filled[:4, :] = 0
+    m_filled[-4:, :] = 0
+    m_filled[:, :4] = 0
+    m_filled[:, -4:] = 0
+    m_open = cv2.morphologyEx(m_filled, cv2.MORPH_OPEN, _CV2_ELLIPSE_17)
+
+    onl, olbls, ost, _ = cv2.connectedComponentsWithStats(m_open, connectivity=4)
+    if onl <= 1:
+        return found
+
+    vh_v, vw_v = vis_gray.shape[:2]
+    max_w = int(sw * 0.55)
+    max_h = int(sh * 0.55)
+
+    for ol in range(1, onl):
+        ox1 = int(ost[ol, cv2.CC_STAT_LEFT])
+        oy1 = int(ost[ol, cv2.CC_STAT_TOP])
+        ow_ = int(ost[ol, cv2.CC_STAT_WIDTH])
+        oh_ = int(ost[ol, cv2.CC_STAT_HEIGHT])
+        oa = int(ost[ol, cv2.CC_STAT_AREA])
+        ox2, oy2 = ox1 + ow_, oy1 + oh_
+
+        if oa < 400 or oa > max_area_px or ow_ > max_w or oh_ > max_h:
+            continue
+
+        sub_m = np.where(olbls[oy1:oy2, ox1:ox2] == ol, np.uint8(255), np.uint8(0))
+        if int(np.count_nonzero(sub_m & already_covered[oy1:oy2, ox1:ox2])) > oa * 0.20:
+            continue
+
+        rf = oa / float(max(1, ow_ * oh_))
+        if rf < 0.68:
+            continue
+        cnts, _ = cv2.findContours(sub_m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            continue
+        mc = max(cnts, key=cv2.contourArea)
+        sol = cv2.contourArea(mc) / max(1.0, cv2.contourArea(cv2.convexHull(mc)))
+        if sol < 0.88:
+            continue
+
+        # Must be white achromatic interior
+        c_sub = small_chroma[oy1:oy2, ox1:ox2]
+        c_vals = c_sub[sub_m > 0]
+        if c_vals.size == 0 or float(c_vals.mean()) >= 16.0:
+            continue
+
+        # Must sit predominantly inside a darker panel (not a blank white margin/corner!)
+        px1, py1 = max(0, ox1 - 4), max(0, oy1 - 4)
+        px2, py2 = min(sw, ox2 + 4), min(sh, oy2 + 4)
+        fm = np.zeros((py2 - py1, px2 - px1), dtype=np.uint8)
+        fm[oy1 - py1 : oy2 - py1, ox1 - px1 : ox2 - px1] = sub_m
+        oring = cv2.dilate(fm, _CV2_K7, iterations=1) - fm
+        dark_border_ratio = float(
+            np.count_nonzero((oring > 0) & (small_gray[py1:py2, px1:px2] < 140))
+        ) / float(max(1, int(np.count_nonzero(oring))))
+        if dark_border_ratio < 0.55:
+            continue
+
+        # Must contain real dark achromatic text ink inside eroded interior
+        inn = cv2.erode(sub_m, _CV2_K5, iterations=1)
+        if not np.any(inn):
+            continue
+        g_sub = small_gray[oy1:oy2, ox1:ox2]
+        blk = int(np.count_nonzero((inn > 0) & (g_sub < 135) & (c_sub < 32)))
+        dens = blk / float(max(1, int(np.count_nonzero(inn))))
+        if blk < 14 or not (0.015 <= dens <= 0.42):
+            continue
+
+        # Full-res (~1024px) compact-glyph count verification
+        vy1_v = max(0, int(round((oy1 / float(sh)) * vh_v)))
+        vx1_v = max(0, int(round((ox1 / float(sw)) * vw_v)))
+        vy2_v = min(vh_v, int(round((oy2 / float(sh)) * vh_v)))
+        vx2_v = min(vw_v, int(round((ox2 / float(sw)) * vw_v)))
+        if (vx2_v - vx1_v) < 16 or (vy2_v - vy1_v) < 16:
+            continue
+        vm_full = cv2.resize(sub_m, (vx2_v - vx1_v, vy2_v - vy1_v), interpolation=cv2.INTER_NEAREST)
+        v_in = cv2.erode(vm_full, _CV2_K7, iterations=1)
+        vg_sub = vis_gray[vy1_v:vy2_v, vx1_v:vx2_v]
+        vc_sub = vis_chroma[vy1_v:vy2_v, vx1_v:vx2_v]
+        v_ink = np.where((v_in > 0) & (vg_sub < 145) & (vc_sub < 38), np.uint8(255), np.uint8(0))
+        vn_cc, _, vcc_st, _ = cv2.connectedComponentsWithStats(v_ink, connectivity=8)
+        gly = sum(
+            1
+            for k_cc in range(1, vn_cc)
+            if (3 <= int(vcc_st[k_cc, cv2.CC_STAT_WIDTH]) <= 40 and 3 <= int(vcc_st[k_cc, cv2.CC_STAT_HEIGHT]) <= 42 and int(vcc_st[k_cc, cv2.CC_STAT_AREA]) >= 8)
+            or (2 <= int(vcc_st[k_cc, cv2.CC_STAT_WIDTH]) <= 5 and 2 <= int(vcc_st[k_cc, cv2.CC_STAT_HEIGHT]) <= 5 and 4 <= int(vcc_st[k_cc, cv2.CC_STAT_AREA]) <= 16)
+        )
+        if gly < 5:
+            continue
+
+        already_covered[oy1:oy2, ox1:ox2] |= sub_m
+        bbox_norm = [
+            int(round((oy1 / float(sh)) * 1000.0)),
+            int(round((ox1 / float(sw)) * 1000.0)),
+            int(round((oy2 / float(sh)) * 1000.0)),
+            int(round((ox2 / float(sw)) * 1000.0)),
+        ]
+        found.append({
+            "bbox_norm": bbox_norm,
+            "mask_np": sub_m,
+            "rect_fill": rf,
+            "solidity": sol,
+            "glyph_count": gly,
+            "is_dark": False,
+            "is_pastel": False,
+        })
+
+    return found
+
+
 def _extract_bw_soft_shaded_bubbles_cv2(
     small_gray: "np.ndarray",
     vis_gray: "np.ndarray",
@@ -1001,8 +1144,10 @@ def _extract_bw_soft_shaded_bubbles_cv2(
         if int(np.count_nonzero(bg_mask)) < int(fa * 0.45):
             continue
         in_bg_lum = float(np.median(g_sub[bg_mask]))
-        # Soft-shaded flashback oval (190..244); rejects pure-white 255 faces & panels!
-        if not (190.0 <= in_bg_lum <= 244.0) or float(np.std(g_sub[bg_mask])) > 26.0:
+        in_bg_p95 = float(np.percentile(g_sub[bg_mask], 95))
+        # Soft-shaded flashback oval (median 190..244 WITH bright white inner core p95 >= 246);
+        # rejects BOTH pure-white 255 faces/panels AND flat gray cobblestone/screentone tiles (p95 <= 242)!
+        if not (190.0 <= in_bg_lum <= 244.0) or in_bg_p95 < 246.0 or float(np.std(g_sub[bg_mask])) > 26.0:
             continue
 
         # Surrounding ring must be significantly darker than the soft-shaded oval
@@ -1325,6 +1470,21 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
         )
     del small_bgr
 
+    # Pass A4: Recover gutter-merged white speech ovals sitting inside dark panels (e.g. アリステラ文明)
+    detected.extend(
+        _recover_gutter_merged_white_bubbles_cv2(
+            white_bin_base,
+            small_gray,
+            small_chroma,
+            vis_gray,
+            vis_chroma,
+            sw,
+            sh,
+            already_covered,
+            max_area_px,
+        )
+    )
+
     # Remove tiny Pass A1 white text-glow halos nested inside larger Pass A3 pastel bubbles!
     detected = _prune_nested_child_bubbles(detected, close_pil=False)
 
@@ -1473,10 +1633,12 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
                 detected.append(direct_ok)
                 continue
 
-            # SFX / Panel-Edge Detachment Fallback: if a real black speech oval merged with an adjacent
-            # thin black SFX stroke or narrow tail bridge, a 7x7 elliptical MORPH_OPEN shaves off thin
-            # SFX lines cleanly and separates the true dark speech ovals!
+            # SFX / Panel-Edge Detachment & Staircase-Valley Splitter Fallback:
+            # 1) 7x7 elliptical MORPH_OPEN shaves off thin SFX strokes merged into dark speech ovals.
+            # 2) If still unsplit (e.g. staircase-connected narrow dark pills bridged by a small oval),
+            #    cut along the deepest vertical or horizontal valley (`min_v <= peak_min * 0.48`)!
             if int(np.count_nonzero(filled_crop)) >= 600 and cw <= int(sw * 0.72) and ch <= int(sh * 0.72):
+                recovered_any = False
                 opened_d = cv2.morphologyEx(filled_crop, cv2.MORPH_OPEN, _CV2_ELLIPSE_7)
                 onl, olbls, ost, _ = cv2.connectedComponentsWithStats(opened_d, connectivity=4)
                 for ol in range(1, onl):
@@ -1492,6 +1654,51 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
                     sub_ok = _validate_dark_bubble_crop(sub_f, sub_c, cx1 + ox1, cy1 + oy1, ow_d, oh_d)
                     if sub_ok is not None:
                         detected.append(sub_ok)
+                        recovered_any = True
+
+                if not recovered_any and cw >= 28 and ch >= 28:
+                    best_v = None
+                    col_cnt = np.count_nonzero(filled_crop, axis=0)
+                    s_lo, s_hi = max(6, int(cw * 0.22)), min(cw - 6, int(cw * 0.78))
+                    if s_hi > s_lo:
+                        mx = s_lo + int(np.argmin(col_cnt[s_lo:s_hi]))
+                        pmin = min(int(col_cnt[:mx].max()), int(col_cnt[mx + 1 :].max()))
+                        if pmin >= 20 and int(col_cnt[mx]) <= pmin * 0.48:
+                            best_v = ("v", mx, int(col_cnt[mx]) / float(pmin))
+
+                    row_cnt = np.count_nonzero(filled_crop, axis=1)
+                    r_lo, r_hi = max(6, int(ch * 0.22)), min(ch - 6, int(ch * 0.78))
+                    if r_hi > r_lo:
+                        my = r_lo + int(np.argmin(row_cnt[r_lo:r_hi]))
+                        pmin_r = min(int(row_cnt[:my].max()), int(row_cnt[my + 1 :].max()))
+                        if pmin_r >= 20 and int(row_cnt[my]) <= pmin_r * 0.48:
+                            rr = int(row_cnt[my]) / float(pmin_r)
+                            if best_v is None or rr < best_v[2]:
+                                best_v = ("h", my, rr)
+
+                    if best_v is not None:
+                        v_axis, v_cut, _ = best_v
+                        halves = (
+                            [(filled_crop[:, :v_cut], comp_crop[:, :v_cut], 0, 0), (filled_crop[:, v_cut:], comp_crop[:, v_cut:], v_cut, 0)]
+                            if v_axis == "v"
+                            else [(filled_crop[:v_cut, :], comp_crop[:v_cut, :], 0, 0), (filled_crop[v_cut:, :], comp_crop[v_cut:, :], 0, v_cut)]
+                        )
+                        for hf, hc, dx_h, dy_h in halves:
+                            ys_h, xs_h = np.nonzero(hf)
+                            if ys_h.size < 200:
+                                continue
+                            hx0, hx1 = int(xs_h.min()), int(xs_h.max()) + 1
+                            hy0, hy1 = int(ys_h.min()), int(ys_h.max()) + 1
+                            sub_ok = _validate_dark_bubble_crop(
+                                hf[hy0:hy1, hx0:hx1],
+                                hc[hy0:hy1, hx0:hx1],
+                                cx1 + dx_h + hx0,
+                                cy1 + dy_h + hy0,
+                                hx1 - hx0,
+                                hy1 - hy0,
+                            )
+                            if sub_ok is not None:
+                                detected.append(sub_ok)
 
     # Pass C: White-halo-outlined text clusters (runs ONLY when Passes A1-B found 0 enclosed bubbles!)
     if not detected:
@@ -1826,6 +2033,35 @@ def _detect_two_lobe_render_rects_cv2(
                     best_split = ("h", min_y, ratio)
 
     if best_split is None:
+        # Diagonal figure-8 double bubble fallback (e.g. top-right + bottom-left overlapping ovals):
+        # Extract the 1st Largest Inscribed Rect, mask it out, and extract the 2nd Largest Inscribed Rect!
+        if mw >= 140 and mh >= 140 and (area / float(max(1, gw * gh))) < 0.68:
+            r_a = _largest_inscribed_rect_in_mask_cv2(place_mask)
+            if r_a is not None:
+                a_w, a_h = r_a[2] - r_a[0], r_a[3] - r_a[1]
+                a_area = a_w * a_h
+                if a_w >= 52 and a_h >= 52:
+                    rem = place_mask.copy()
+                    pad_c = 6
+                    rem[
+                        max(0, r_a[1] - pad_c) : min(mh, r_a[3] + pad_c),
+                        max(0, r_a[0] - pad_c) : min(mw, r_a[2] + pad_c),
+                    ] = 0
+                    r_b = _largest_inscribed_rect_in_mask_cv2(rem)
+                    if r_b is not None:
+                        b_w, b_h = r_b[2] - r_b[0], r_b[3] - r_b[1]
+                        b_area = b_w * b_h
+                        if b_w >= 52 and b_h >= 52 and b_area >= a_area * 0.28:
+                            # Verify distinct 2D centers (not a thin side sliver next to one single oval)
+                            acx, acy = (r_a[0] + r_a[2]) / 2.0, (r_a[1] + r_a[3]) / 2.0
+                            bcx, bcy = (r_b[0] + r_b[2]) / 2.0, (r_b[1] + r_b[3]) / 2.0
+                            if abs(acx - bcx) >= min(a_w, b_w) * 0.55 and abs(acy - bcy) >= min(a_h, b_h) * 0.45:
+                                ra_abs = (offset_x + r_a[0] + 2, offset_y + r_a[1] + 2, offset_x + r_a[2] - 2, offset_y + r_a[3] - 2)
+                                rb_abs = (offset_x + r_b[0] + 2, offset_y + r_b[1] + 2, offset_x + r_b[2] - 2, offset_y + r_b[3] - 2)
+                                # Sort in Manga reading order: Right-to-Left (higher center-X first)
+                                pair = [ra_abs, rb_abs]
+                                pair.sort(key=lambda rr: (-((rr[0] + rr[2]) / 2.0), rr[1]))
+                                return pair
         return None
 
     axis, cut_g, _ = best_split
