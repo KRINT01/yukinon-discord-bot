@@ -17,6 +17,7 @@ from config import (
     PURE_DATETIME_PATTERN,
     api_log,
     get_cached_channel_attachments,
+    load_temp_image_cache,
 )
 from persona import (
     is_owner_user,
@@ -35,6 +36,7 @@ from media_context import (
     extract_pdf_context_async,
     parse_docx_bytes,
     parse_xlsx_bytes_to_markdown,
+    inspect_image_details_deep_async,
 )
 from image_engine import (
     send_chunked_response,
@@ -660,6 +662,37 @@ class GeneralAssistantActionView(AutoDisappearingView):
         await interaction.response.defer(thinking=True)
         cached_ctx = get_cached_channel_attachments(self.channel_id, max_total_chars=25000)
 
+        is_deep_img = (instruction == "__DEEP_IMAGE_INSPECT__")
+        deep_visual_block = ""
+        if is_deep_img:
+            instruction = (
+                "ช่วยเจาะลึกองค์ประกอบภาพ มุมกล้อง แสงเงา ลายเส้น รายละเอียดเครื่องแต่งกาย/อุปกรณ์ "
+                "และจุดน่าสนใจที่ปรากฏจริงในภาพนี้เพิ่มเติมจากคำตอบก่อนหน้า "
+                "(กล่าวถึงเฉพาะสิ่งที่เห็นจริงในกรอบภาพเท่านั้น ห้ามแต่งเติมใบหน้า สีหน้า ดวงตา หรือส่วนที่ถูกครอปออกนอกเฟรมเด็ดขาด)"
+            )
+            candidate_msg_ids: list[int] = []
+            if self.source_message is not None:
+                sm_id = int(getattr(self.source_message, "id", 0) or 0)
+                if sm_id:
+                    candidate_msg_ids.append(sm_id)
+                ref_obj = getattr(self.source_message, "reference", None)
+                ref_id = int(getattr(ref_obj, "message_id", 0) or 0) if ref_obj is not None else 0
+                if ref_id and ref_id not in candidate_msg_ids:
+                    candidate_msg_ids.append(ref_id)
+
+            for cid_msg in candidate_msg_ids:
+                cached_imgs = await asyncio.to_thread(load_temp_image_cache, cid_msg)
+                if cached_imgs and cached_imgs[0]:
+                    imgs_list, meta_secs = cached_imgs
+                    deep_vis = await inspect_image_details_deep_async(
+                        imgs_list,
+                        prev_reply=self.bot_reply,
+                        post_meta_hint="\n".join(meta_secs),
+                    )
+                    if deep_vis:
+                        deep_visual_block = f"\n\n=== Fresh Deep Visual Inspection (Ground Truth) ===\n{deep_vis}"
+                    break
+
         search_hint_tag = ""
         if use_search:
             artist_hint = _extract_clean_artist_or_topic_hint(cached_ctx, self.bot_reply)
@@ -678,12 +711,21 @@ class GeneralAssistantActionView(AutoDisappearingView):
             "complexity_confidence": 0.90,
         }
 
+        extra_grounding_rule = (
+            " และห้ามแต่งเติมรายละเอียดของภาพ (เช่น ใบหน้า สีหน้า ดวงตา หรือส่วนที่ถูกครอปออกนอกเฟรม) "
+            "ที่ไม่ได้ปรากฏจริงในข้อมูลภาพด้านล่างเด็ดขาด"
+            if is_deep_img
+            else ""
+        )
         composed = (
             f"{instruction}{search_hint_tag}\n\n"
-            f"[กฎสำคัญ]: ห้ามคัดลอกหรือเขียนคำตอบเดิมซ้ำ ห้ามสร้างตาราง และห้ามเขียนหัวข้อเมตาของตัวละครเด็ดขาด\n\n"
+            f"[กฎสำคัญ]: ห้ามคัดลอกหรือเขียนคำตอบเดิมซ้ำ ห้ามสร้างตาราง และห้ามเขียนหัวข้อเมตาของตัวละครเด็ดขาด"
+            f"{extra_grounding_rule}\n\n"
             f"[บริบทหัวข้อก่อนหน้า]: {self.user_query}\n"
             f"[สรุปคำตอบก่อนหน้า (ห้ามเขียนซ้ำ)]: {self.bot_reply[:1500]}"
         )
+        if deep_visual_block:
+            composed += deep_visual_block
         if cached_ctx:
             # Always include compact visual/document context so product/model-kit follow-ups know the exact identified entity
             ctx_limit = 18000 if not use_search else 5000
@@ -701,9 +743,9 @@ class GeneralAssistantActionView(AutoDisappearingView):
             model=ACTIVE_FAST_MODEL,
             system_prompt=YUKIPEDIA_SYSTEM_PROMPT if use_search else FAST_SYSTEM_PROMPT,
             channel_id=self.channel_id,
-            temperature=0.45,
+            temperature=0.25 if is_deep_img else 0.45,
             allow_agentic_search=use_search,
-            has_fresh_attachment=bool(cached_ctx),
+            has_fresh_attachment=bool(cached_ctx or deep_visual_block),
             speaker_user=interaction.user,
             decision_plan=dec_plan,
             tool_ctx=tool_ctx,
@@ -873,7 +915,7 @@ def build_contextual_suggestion_view(
                     "ดูรายละเอียดภาพเพิ่ม",
                     "📌",
                     discord.ButtonStyle.primary,
-                    "ช่วยเล่าจุดน่าสนใจ อารมณ์สีหน้า และรายละเอียดเล็กๆ ในภาพนี้เพิ่มเติมจากที่เล่าไปเมื่อครู่ค่ะ",
+                    "__DEEP_IMAGE_INSPECT__",
                     False,
                 )
             )
@@ -1561,7 +1603,8 @@ def register_app_commands(bot: discord.ext.commands.Bot):
 
         class _FakeSourceMsg:
             def __init__(self):
-                self.id = 0
+                # Use interaction.id so /tmp image cache works for Deep Visual & In-Bubble follow-ups too
+                self.id = int(interaction.id)
                 self.content = link.strip()
                 self.attachments = [attachment] if attachment is not None else []
                 self.embeds = []
