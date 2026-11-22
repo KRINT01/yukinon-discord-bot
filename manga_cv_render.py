@@ -24,7 +24,7 @@ except ImportError:
 
 from config import THAI_CHAR_REGEX
 
-MANGA_CV_RENDER_VERSION = "v8"
+MANGA_CV_RENDER_VERSION = "v9"
 SOM_CV_MAX_DIM = 360  # Fast 360px grid derived from single 1024px resize (~1-2.5s for 10 pages with OpenCV+NumPy!)
 # Bundle 2 RAM & Discord upload optimization: quality=90 with standard 4:2:0 subsampling (~50% smaller than 94/4:4:4)
 MANGA_RENDER_JPEG_QUALITY = 90
@@ -840,7 +840,10 @@ def _extract_and_filter_white_components_cv2(
         inner_area = max(1, int(np.count_nonzero(inner_core)))
         black_ink_px = int(np.count_nonzero((inner_core > 0) & (g_sub < 135) & (c_sub < 32)))
         ink_density = black_ink_px / float(inner_area)
-        if black_ink_px < 12 or ink_density < 0.012 or ink_density > 0.45:
+        is_small_clean_oval = (filled_area < 550 and solidity >= 0.92 and rect_fill >= 0.72)
+        min_blk_px = 6 if is_small_clean_oval else 12
+        min_ink_dens = 0.025 if is_small_clean_oval else 0.012
+        if black_ink_px < min_blk_px or ink_density < min_ink_dens or ink_density > 0.45:
             continue
 
         ink_bin = np.where((inner_core > 0) & (g_sub < 145) & (c_sub < 35), np.uint8(255), np.uint8(0))
@@ -867,14 +870,18 @@ def _extract_and_filter_white_components_cv2(
                 vc_sub = vis_chroma[vy1_v:vy2_v, vx1_v:vx2_v]
                 v_ink = np.where((v_in > 0) & (vg_sub < 145) & (vc_sub < 38), np.uint8(255), np.uint8(0))
                 vn_cc, _, vcc_st, _ = cv2.connectedComponentsWithStats(v_ink, connectivity=8)
-                glyph_count = sum(
-                    1
-                    for k_cc in range(1, vn_cc)
-                    if 3 <= int(vcc_st[k_cc, cv2.CC_STAT_WIDTH]) <= 40
-                    and 3 <= int(vcc_st[k_cc, cv2.CC_STAT_HEIGHT]) <= 42
-                    and int(vcc_st[k_cc, cv2.CC_STAT_AREA]) >= 8
-                )
-                min_glyphs = 5 if (rect_fill < 0.62 or solidity < 0.86) else 3
+                reg_glyphs = 0
+                dot_glyphs = 0
+                for k_cc in range(1, vn_cc):
+                    gw_v = int(vcc_st[k_cc, cv2.CC_STAT_WIDTH])
+                    gh_v = int(vcc_st[k_cc, cv2.CC_STAT_HEIGHT])
+                    ga_v = int(vcc_st[k_cc, cv2.CC_STAT_AREA])
+                    if 3 <= gw_v <= 40 and 3 <= gh_v <= 42 and ga_v >= 8:
+                        reg_glyphs += 1
+                    elif 2 <= gw_v <= 5 and 2 <= gh_v <= 5 and 4 <= ga_v <= 16:
+                        dot_glyphs += 1
+                glyph_count = reg_glyphs + dot_glyphs
+                min_glyphs = 6 if (rect_fill < 0.62 or solidity < 0.86) else 3
                 if glyph_count < min_glyphs:
                     continue
 
