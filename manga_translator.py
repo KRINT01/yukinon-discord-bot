@@ -44,7 +44,7 @@ from manga_cv_render import (
     _release_cv_page_masks,
 )
 
-MANGA_TRANSLATOR_VERSION = "v14"
+MANGA_TRANSLATOR_VERSION = "v15"
 MANGA_CV_VER = getattr(_mcr_mod, "MANGA_CV_RENDER_VERSION", "old")
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
 # Bundle 2 dynamic parallel hedge: faster 15s recovery on typical 2-4p X threads, patient 25s on 5-12p batches
@@ -531,7 +531,7 @@ async def _call_gemma_ai_studio_polish_json(
         "contents": [{"role": "user", "parts": [{"text": prompt_text}]}],
         "generationConfig": {
             "temperature": 0.0,
-            "maxOutputTokens": 12288,
+            "maxOutputTokens": 4096,
             "responseMimeType": "application/json",
             "thinkingConfig": {"thinkingLevel": "MINIMAL"},
         },
@@ -656,12 +656,11 @@ async def _polish_single_chunk_gemma_async(
 ) -> tuple[dict[int, str], dict[int, str], str, float]:
     """
     Polishes one <=22-bubble chunk using:
-    1) Google AI Studio Gemma 4 (`gemma-4-26b-a4b-it` -> `gemma-4-31b-it`) first to save
-       Cloudflare Neurons (concurrency-capped at 2 with `thinkingLevel: MINIMAL` & 20s timeout;
-       fails fast in ~0.25s on HTTP 503/429).
-    2) Cloudflare Workers AI Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`) instant fallback with
-       explicit `system` + `user` roles.
-    3) Text-only Gemini Flash-Lite fallback.
+    1) Google AI Studio `gemma-4-26b-a4b-it` (fast 4B-active MoE; saves Cloudflare Neurons,
+       15s timeout, fails in ~0.27s on HTTP 503).
+    2) Cloudflare Workers AI `@cf/google/gemma-4-26b-a4b-it` (~6-8s per chunk).
+    3) Google AI Studio dense `gemma-4-31b-it` (35s timeout fallback if both MoEs fail).
+    4) Text-only Gemini Flash-Lite fallback.
     """
     chunk_bubble_cnt = sum(len(p.get("b") or []) for p in chunk_pages)
     if chunk_bubble_cnt == 0:
@@ -707,23 +706,22 @@ async def _polish_single_chunk_gemma_async(
 
     min_accept = max(1, int(chunk_bubble_cnt * 0.5))
 
-    # Tier 1 & 2: Google AI Studio Gemma 4 first (`gemma-4-26b-a4b-it` -> `gemma-4-31b-it`)
-    # Saves Cloudflare Neurons; chunked <=22 bubbles finishes fast (~7-12s) and fails fast on 503/429!
+    # Tier 1: Google AI Studio `gemma-4-26b-a4b-it` (4B-active MoE — fast when healthy, saves Cloudflare Neurons,
+    # fails in ~0.27s on HTTP 503; never stalls on dense 31B before trying Cloudflare!)
     async with ai_sem:
-        for g_model in ("gemma-4-26b-a4b-it", "gemma-4-31b-it"):
-            raw_out, el = await _call_gemma_ai_studio_polish_json(
-                g_model, combined_prompt, req_id=chunk_tag, timeout_sec=20.0
+        raw_out, el = await _call_gemma_ai_studio_polish_json(
+            "gemma-4-26b-a4b-it", combined_prompt, req_id=chunk_tag, timeout_sec=15.0
+        )
+        if raw_out:
+            s_m, b_m = _parse_polish_json_response(raw_out)
+            if len(b_m) >= min_accept:
+                return s_m, b_m, "gemma-4-26b-a4b-it", el
+            api_log(
+                f"MangaPolish [req={chunk_tag}] -> gemma-4-26b-a4b-it incomplete "
+                f"({len(b_m)}/{chunk_bubble_cnt}); trying Cloudflare Gemma fallback"
             )
-            if raw_out:
-                s_m, b_m = _parse_polish_json_response(raw_out)
-                if len(b_m) >= min_accept:
-                    return s_m, b_m, g_model, el
-                api_log(
-                    f"MangaPolish [req={chunk_tag}] -> {g_model} incomplete "
-                    f"({len(b_m)}/{chunk_bubble_cnt}); trying next tier"
-                )
 
-    # Tier 3: Cloudflare Workers AI Gemma 4 fallback (`@cf/google/gemma-4-26b-a4b-it`)
+    # Tier 2: Cloudflare Workers AI Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`, ~6-8s per chunk!)
     # Passing an explicit `system` role activates `llm.py`'s anti-thinking directive!
     async with cf_sem:
         t_cf = time.monotonic()
@@ -743,10 +741,24 @@ async def _polish_single_chunk_gemma_async(
                     return s_m, b_m, "cf-gemma-4-26b", time.monotonic() - t_cf
                 api_log(
                     f"MangaPolish [req={chunk_tag}] -> cf-gemma-4-26b incomplete "
-                    f"({len(b_m)}/{chunk_bubble_cnt}); trying Flash-Lite fallback"
+                    f"({len(b_m)}/{chunk_bubble_cnt}); trying AI Studio 31B fallback"
                 )
         except Exception as e:
             api_log(f"MangaPolish [req={chunk_tag}] Cloudflare Gemma note ({type(e).__name__})")
+
+    # Tier 3: Google AI Studio dense `gemma-4-31b-it` fallback (realistic 35s timeout for dense 31B)
+    async with ai_sem:
+        raw_out_31, el_31 = await _call_gemma_ai_studio_polish_json(
+            "gemma-4-31b-it", combined_prompt, req_id=chunk_tag, timeout_sec=35.0
+        )
+        if raw_out_31:
+            s_m, b_m = _parse_polish_json_response(raw_out_31)
+            if len(b_m) >= min_accept:
+                return s_m, b_m, "gemma-4-31b-it", el_31
+            api_log(
+                f"MangaPolish [req={chunk_tag}] -> gemma-4-31b-it incomplete "
+                f"({len(b_m)}/{chunk_bubble_cnt}); trying Flash-Lite fallback"
+            )
 
     # Tier 4: Text-only Gemini Flash-Lite fallback (only if all Gemma tiers unavailable)
     if GEMINI_API_KEY:

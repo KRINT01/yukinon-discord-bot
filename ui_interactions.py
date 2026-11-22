@@ -615,8 +615,7 @@ class GeneralAssistantActionView(AutoDisappearingView):
     def _make_in_bubble_manga_callback(self):
         async def _callback(interaction: discord.Interaction):
             await interaction.response.send_message(
-                "เข้าใจแล้วค่ะ เดี๋ยวฉันแปลภาพนี้เป็นภาษาไทยให้ รอสักครู่นะคะ",
-                ephemeral=True,
+                "เดี๋ยวฉันแปลหน้านี้เป็นภาษาไทยให้ รอสักครู่นะคะ"
             )
             target_msg = self.source_message
             if target_msg is None:
@@ -636,7 +635,13 @@ class GeneralAssistantActionView(AutoDisappearingView):
 
                 target_msg = _FallbackLinkMsg(self.user_query, interaction.channel, interaction.user)
 
-            await process_manga_translation_request(target_msg, "แปลมังงะเป็นภาษาไทย")
+            try:
+                await process_manga_translation_request(target_msg, "แปลมังงะเป็นภาษาไทย")
+            finally:
+                try:
+                    await interaction.delete_original_response()
+                except Exception:
+                    pass
 
         return _callback
 
@@ -1645,8 +1650,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
 
         lang_label = "ภาษาไทย" if language.lower() == "thai" else "ภาษาอังกฤษ"
         await interaction.response.send_message(
-            f"เข้าใจแล้วค่ะ เดี๋ยวฉันแปลหน้านี้เป็น**{lang_label}**ให้ รอสักครู่นะคะ",
-            ephemeral=True,
+            f"เดี๋ยวฉันแปลหน้านี้เป็น{lang_label}ให้ รอสักครู่นะคะ"
         )
 
         class _FakeMangaMsg:
@@ -1668,7 +1672,13 @@ def register_app_commands(bot: discord.ext.commands.Bot):
                 self.message = _FakeMangaMsg()
                 self.channel = interaction.channel
 
-        await process_manga_translation_request(_FakeCtx(), f"translate manga to {language}")
+        try:
+            await process_manga_translation_request(_FakeCtx(), f"translate manga to {language}")
+        finally:
+            try:
+                await interaction.delete_original_response()
+            except Exception:
+                pass
 
     # --- Right-Click Message Context Menus (5 max per Discord app) ---
     @bot.tree.context_menu(name="Analyze Code / Stack Trace")
@@ -1828,10 +1838,15 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             )
             return
         await interaction.response.send_message(
-            "เข้าใจแล้วค่ะ เดี๋ยวฉันแปลหน้านี้เป็นภาษาไทยให้ รอสักครู่นะคะ",
-            ephemeral=True,
+            "เดี๋ยวฉันแปลหน้านี้เป็นภาษาไทยให้ รอสักครู่นะคะ"
         )
-        await process_manga_translation_request(message, "แปลมังงะเป็นภาษาไทย")
+        try:
+            await process_manga_translation_request(message, "แปลมังงะเป็นภาษาไทย")
+        finally:
+            try:
+                await interaction.delete_original_response()
+            except Exception:
+                pass
 
     @bot.tree.context_menu(name="Translate Manga Page (EN)")
     async def ctx_translate_manga_en(interaction: discord.Interaction, message: discord.Message):
@@ -1844,7 +1859,12 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             )
             return
         await interaction.response.send_message(
-            "เข้าใจแล้วค่ะ เดี๋ยวฉันแปลหน้านี้เป็นภาษาอังกฤษให้ รอสักครู่นะคะ",
-            ephemeral=True,
+            "เดี๋ยวฉันแปลหน้านี้เป็นภาษาอังกฤษให้ รอสักครู่นะคะ"
         )
-        await process_manga_translation_request(message, "แปลมังงะเป็นภาษาอังกฤษ")
+        try:
+            await process_manga_translation_request(message, "แปลมังงะเป็นภาษาอังกฤษ")
+        finally:
+            try:
+                await interaction.delete_original_response()
+            except Exception:
+                pass
