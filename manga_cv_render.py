@@ -24,7 +24,7 @@ except ImportError:
 
 from config import THAI_CHAR_REGEX
 
-MANGA_CV_RENDER_VERSION = "v16"
+MANGA_CV_RENDER_VERSION = "v17"
 SOM_CV_MAX_DIM = 360  # Fast 360px grid derived from single 1024px resize (~1-2.5s for 10 pages with OpenCV+NumPy!)
 # Bundle 2 RAM & Discord upload optimization: quality=90 with standard 4:2:0 subsampling (~50% smaller than 94/4:4:4)
 MANGA_RENDER_JPEG_QUALITY = 90
@@ -653,15 +653,24 @@ def _fill_mask_holes_cv2(comp_crop: "np.ndarray") -> "np.ndarray":
     return np.where(padded[1:-1, 1:-1] == 128, np.uint8(0), np.uint8(255))
 
 
-def _close_rim_bays_cv2(filled_crop: "np.ndarray", gentle: bool = False) -> "np.ndarray":
+def _close_rim_bays_cv2(
+    filled_crop: "np.ndarray",
+    gentle: bool = False,
+    kernel_size: int | None = None,
+) -> "np.ndarray":
     """
     Seals concave kanji/furigana-to-border bays on validated bubbles (e.g. `技 わざ` touching
     the diagonal right rim of a white bubble, or kanji touching gloom shading lines) using
     elliptical closing strictly inside the bubble's bounding box without bridging figure-8 waists.
     """
     ch, cw = filled_crop.shape
-    kern = _CV2_ELLIPSE_11 if gentle else _CV2_ELLIPSE_13
-    pad = 6 if gentle else 7
+    if kernel_size is not None and kernel_size >= 3:
+        ksz = int(kernel_size) | 1
+        kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz))
+        pad = (ksz // 2) + 1
+    else:
+        kern = _CV2_ELLIPSE_11 if gentle else _CV2_ELLIPSE_13
+        pad = 6 if gentle else 7
     buf = np.zeros((ch + pad * 2, cw + pad * 2), dtype=np.uint8)
     buf[pad:-pad, pad:-pad] = filled_crop
     closed = cv2.morphologyEx(buf, cv2.MORPH_CLOSE, kern)
@@ -856,6 +865,12 @@ def _extract_and_filter_white_components_cv2(
         min_ink_dens = 0.025 if is_small_clean_oval else 0.012
         if black_ink_px < min_blk_px or ink_density < min_ink_dens or ink_density > 0.45:
             continue
+        # Anti-Anime-Face Guard: irregular low-rect_fill/low-solidity white character faces have
+        # sparser ink than real speech bubbles (e.g. P2/5 & P4/5 faces: rf=0.60-0.62, sol=0.81-0.82, dens<=0.035)
+        if (not is_pastel_pass) and rect_fill < 0.65 and solidity < 0.86 and ink_density < 0.038:
+            continue
+        if (not is_pastel_pass) and filled_area > int(sw * sh * 0.035) and (rect_fill < 0.70 or solidity < 0.88) and ink_density < 0.045:
+            continue
 
         ink_bin = np.where((inner_core > 0) & (g_sub < 145) & (c_sub < 35), np.uint8(255), np.uint8(0))
         num_ink_cc, _ = cv2.connectedComponents(ink_bin, connectivity=8)
@@ -894,6 +909,13 @@ def _extract_and_filter_white_components_cv2(
                 glyph_count = reg_glyphs + dot_glyphs
                 min_glyphs = 6 if (rect_fill < 0.62 or solidity < 0.86) else 3
                 if glyph_count < min_glyphs:
+                    continue
+                if (
+                    (not is_pastel_pass)
+                    and filled_area > int(sw * sh * 0.035)
+                    and (rect_fill < 0.70 or solidity < 0.88)
+                    and (glyph_count / float(max(1, filled_area)) * 1000.0) < 8.0
+                ):
                     continue
 
         # Seal concave rim-kanji bays ONLY AFTER passing all validation guards (keeps Page 3 調子乗/思 inside mask!)
@@ -1703,8 +1725,9 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
                             if sub_ok is not None:
                                 detected.append(sub_ok)
 
-    # Pass C: White-halo-outlined text clusters (runs ONLY when Passes A1-B found 0 enclosed bubbles!)
-    if not detected:
+    # Pass C: White-halo-outlined text clusters (runs ONLY on COLOR CG/VN pages when Passes A1-B
+    # found 0 enclosed bubbles; never runs on pure B&W pages where black hair/art/SFX sit on white!)
+    if not detected and page_is_color:
         detected.extend(_detect_white_outlined_text_clusters_cv2(vis_gray, vis_chroma))
     del vis_gray, vis_chroma
 
@@ -2186,7 +2209,22 @@ def _refine_cv_bubble_mask_locally_cv2(
     if (int(t_l) + int(t_t) + int(t_r) + int(t_b)) >= 3 or (t_l and t_r) or (t_t and t_b):
         return _fallback_orig()
 
-    filled_s = _close_rim_bays_cv2(_fill_mask_holes_cv2(comp[cy1:cy2, cx1:cx2]), gentle=True)
+    raw_filled_s = _fill_mask_holes_cv2(comp[cy1:cy2, cx1:cx2])
+    orig_sol_ref = float(cv_obj.get("solidity") or 0.90)
+    # On single ovals (`orig_sol >= 0.84`), scale the rim-notch closing ellipse to the 220px local
+    # bubble width so rim-touching kanji+furigana notches (e.g. `技 わざ`, ~25px at 220px scale)
+    # are 100% sealed, while keeping gentle 11x11 on genuine figure-8 double bubbles!
+    if orig_sol_ref >= 0.84 and orig_fill >= 0.64:
+        adapt_k = min(29, max(13, int(min(cw_s, ch_s) * 0.28))) | 1
+        cand_filled_s = _close_rim_bays_cv2(raw_filled_s, kernel_size=adapt_k)
+        raw_a_cnt = max(1, int(np.count_nonzero(raw_filled_s)))
+        filled_s = (
+            cand_filled_s
+            if int(np.count_nonzero(cand_filled_s)) <= int(raw_a_cnt * 1.28)
+            else _close_rim_bays_cv2(raw_filled_s, gentle=True)
+        )
+    else:
+        filled_s = _close_rim_bays_cv2(raw_filled_s, gentle=True)
     new_area_s = max(1, int(np.count_nonzero(filled_s)))
     new_rect_fill = new_area_s / float(max(1, cw_s * ch_s))
     if (
