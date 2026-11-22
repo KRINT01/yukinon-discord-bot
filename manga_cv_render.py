@@ -24,7 +24,7 @@ except ImportError:
 
 from config import THAI_CHAR_REGEX
 
-MANGA_CV_RENDER_VERSION = "v11"
+MANGA_CV_RENDER_VERSION = "v12"
 SOM_CV_MAX_DIM = 360  # Fast 360px grid derived from single 1024px resize (~1-2.5s for 10 pages with OpenCV+NumPy!)
 # Bundle 2 RAM & Discord upload optimization: quality=90 with standard 4:2:0 subsampling (~50% smaller than 94/4:4:4)
 MANGA_RENDER_JPEG_QUALITY = 90
@@ -350,7 +350,10 @@ def _tokenize_thai_syllables(word: str) -> list[str]:
                     or (len(prev) >= 2 and prev[-1] in ("อ", "ว"))
                     or (
                         any(c in _THAI_CAN_TAKE_CODA_VOWEL for c in prev)
-                        and (prev[-1] in _THAI_OPEN_ENDINGS or (len(prev) == 2 and prev[0] in ("เ", "แ", "โ")))
+                        and (
+                            prev[-1] in _THAI_OPEN_ENDINGS
+                            or (prev[0] in ("เ", "แ", "โ") and (len(prev) == 2 or (len(prev) == 3 and prev[2] in _THAI_CLUSTER_SECOND)))
+                        )
                     )
                 )
             )
@@ -425,7 +428,7 @@ def _split_thai_word_cleanly(
             for ch in ln:
                 t_ch = chunk + ch
                 cb = draw.textbbox((0, 0), t_ch, font=font)
-                is_comb = ("\u0E31" <= ch <= "\u0E3A") or ("\u0E47" <= ch <= "\u0E4E")
+                is_comb = ("\u0E31" <= ch <= "\u0E3A") or ("\u0E47" <= ch <= "\u0E4E") or (ch in _THAI_PUNCT_ATTACH)
                 if (cb[2] - cb[0]) > max_width and chunk and not is_comb:
                     if len(chunk) > 2 and chunk[-1] in _THAI_LEADING_VOWELS:
                         final_lines.append(chunk[:-1])
@@ -953,9 +956,9 @@ def _detect_white_outlined_text_clusters_cv2(
     if not np.any(glyph_mask):
         return []
 
-    outlined_glyphs = cv2.dilate(glyph_mask, _CV2_K5, iterations=1)
-    kw = max(25, int(vw * 0.042)) | 1
-    kh = max(25, int(vh * 0.032)) | 1
+    outlined_glyphs = cv2.dilate(glyph_mask, _CV2_K3, iterations=1)
+    kw = max(15, int(vw * 0.032)) | 1
+    kh = max(15, int(vh * 0.023)) | 1
     kern_grp = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kw, kh))
     grouped = cv2.dilate(outlined_glyphs, kern_grp, iterations=1)
 
@@ -1815,7 +1818,7 @@ def _clean_exact_cv_bubble_and_build_render_slots_cv2(
 
         # Slightly widen vertical JP text bbox horizontally so horizontal Thai fits comfortably in the oval
         bw_c = x2 - x1
-        extra_x = min(26, max(10, int(bw_c * 0.24)))
+        extra_x = min(28, max(16, int(bw_c * 0.28)))
         tx1 = max(4, x1 - extra_x)
         tx2 = min(width - 4, x2 + extra_x)
         hb = (tx1, y1, tx2, y2)

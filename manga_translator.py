@@ -44,7 +44,7 @@ from manga_cv_render import (
     _release_cv_page_masks,
 )
 
-MANGA_TRANSLATOR_VERSION = "v13"
+MANGA_TRANSLATOR_VERSION = "v14"
 MANGA_CV_VER = getattr(_mcr_mod, "MANGA_CV_RENDER_VERSION", "old")
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
 # Bundle 2 dynamic parallel hedge: faster 15s recovery on typical 2-4p X threads, patient 25s on 5-12p batches
@@ -651,13 +651,16 @@ async def _polish_single_chunk_gemma_async(
     target_lang_name: str,
     series_context_hint: str,
     req_id: str,
+    ai_sem: asyncio.Semaphore,
     cf_sem: asyncio.Semaphore,
 ) -> tuple[dict[int, str], dict[int, str], str, float]:
     """
     Polishes one <=22-bubble chunk using:
-    1) Cloudflare Workers AI Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`) with explicit `system`
-       + `user` roles (activates `llm.py`'s anti-thinking guard and finishes in ~9-13s!).
-    2) Google AI Studio Gemma 4 (`gemma-4-26b-a4b-it` -> `gemma-4-31b-it`).
+    1) Google AI Studio Gemma 4 (`gemma-4-26b-a4b-it` -> `gemma-4-31b-it`) first to save
+       Cloudflare Neurons (concurrency-capped at 2 with `thinkingLevel: MINIMAL` & 20s timeout;
+       fails fast in ~0.25s on HTTP 503/429).
+    2) Cloudflare Workers AI Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`) instant fallback with
+       explicit `system` + `user` roles.
     3) Text-only Gemini Flash-Lite fallback.
     """
     chunk_bubble_cnt = sum(len(p.get("b") or []) for p in chunk_pages)
@@ -704,7 +707,23 @@ async def _polish_single_chunk_gemma_async(
 
     min_accept = max(1, int(chunk_bubble_cnt * 0.5))
 
-    # Tier 1: Cloudflare Workers AI Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`)
+    # Tier 1 & 2: Google AI Studio Gemma 4 first (`gemma-4-26b-a4b-it` -> `gemma-4-31b-it`)
+    # Saves Cloudflare Neurons; chunked <=22 bubbles finishes fast (~7-12s) and fails fast on 503/429!
+    async with ai_sem:
+        for g_model in ("gemma-4-26b-a4b-it", "gemma-4-31b-it"):
+            raw_out, el = await _call_gemma_ai_studio_polish_json(
+                g_model, combined_prompt, req_id=chunk_tag, timeout_sec=20.0
+            )
+            if raw_out:
+                s_m, b_m = _parse_polish_json_response(raw_out)
+                if len(b_m) >= min_accept:
+                    return s_m, b_m, g_model, el
+                api_log(
+                    f"MangaPolish [req={chunk_tag}] -> {g_model} incomplete "
+                    f"({len(b_m)}/{chunk_bubble_cnt}); trying next tier"
+                )
+
+    # Tier 3: Cloudflare Workers AI Gemma 4 fallback (`@cf/google/gemma-4-26b-a4b-it`)
     # Passing an explicit `system` role activates `llm.py`'s anti-thinking directive!
     async with cf_sem:
         t_cf = time.monotonic()
@@ -724,24 +743,10 @@ async def _polish_single_chunk_gemma_async(
                     return s_m, b_m, "cf-gemma-4-26b", time.monotonic() - t_cf
                 api_log(
                     f"MangaPolish [req={chunk_tag}] -> cf-gemma-4-26b incomplete "
-                    f"({len(b_m)}/{chunk_bubble_cnt}); trying AI Studio Gemma fallback"
+                    f"({len(b_m)}/{chunk_bubble_cnt}); trying Flash-Lite fallback"
                 )
         except Exception as e:
             api_log(f"MangaPolish [req={chunk_tag}] Cloudflare Gemma note ({type(e).__name__})")
-
-    # Tier 2 & 3: Google AI Studio Gemma 4 fallback (`gemma-4-26b-a4b-it` -> `gemma-4-31b-it`)
-    for g_model in ("gemma-4-26b-a4b-it", "gemma-4-31b-it"):
-        raw_out, el = await _call_gemma_ai_studio_polish_json(
-            g_model, combined_prompt, req_id=chunk_tag, timeout_sec=26.0
-        )
-        if raw_out:
-            s_m, b_m = _parse_polish_json_response(raw_out)
-            if len(b_m) >= min_accept:
-                return s_m, b_m, g_model, el
-            api_log(
-                f"MangaPolish [req={chunk_tag}] -> {g_model} incomplete "
-                f"({len(b_m)}/{chunk_bubble_cnt}); trying next tier"
-            )
 
     # Tier 4: Text-only Gemini Flash-Lite fallback (only if all Gemma tiers unavailable)
     if GEMINI_API_KEY:
@@ -793,7 +798,7 @@ async def _polish_manga_translations_gemma_async(
       28s HTTP timeout on 47-62 bubble batches!
     - Passes a compact cross-page `story_overview` into every chunk so pronouns, character
       continuity, and multi-page punchlines stay consistent across chunk boundaries.
-    - Per-chunk priority: Cloudflare Gemma 4 -> AI Studio Gemma 4 -> Flash-Lite text-only.
+    - Per-chunk priority: AI Studio Gemma 4 (saves CF Neurons) -> Cloudflare Gemma 4 -> Flash-Lite text-only.
     """
     flat_bubbles: list[dict] = []
     compact_pages: list[dict] = []
@@ -826,7 +831,7 @@ async def _polish_manga_translations_gemma_async(
 
     api_log(
         f"MangaPolish [req={req_id}] START -> polishing {len(flat_bubbles)} bubble(s) "
-        f"across {num_pages} page(s) in {total_chunks} parallel chunk(s) via Cloudflare Gemma 4 ({target_lang_name})"
+        f"across {num_pages} page(s) in {total_chunks} parallel chunk(s) via AI Studio Gemma 4 ({target_lang_name})"
     )
     if progress_cb is not None:
         try:
@@ -835,7 +840,8 @@ async def _polish_manga_translations_gemma_async(
             pass
 
     wall_t0 = time.monotonic()
-    # Cap concurrent Cloudflare calls to 3 to stay well inside burst rate limits
+    # Cap concurrent AI Studio Gemma calls to 2 (respects free-tier burst RPM) and Cloudflare fallback to 4
+    ai_sem = asyncio.Semaphore(2)
     cf_sem = asyncio.Semaphore(4)
     chunk_tasks = [
         _polish_single_chunk_gemma_async(
@@ -846,6 +852,7 @@ async def _polish_manga_translations_gemma_async(
             target_lang_name,
             series_context_hint,
             req_id,
+            ai_sem,
             cf_sem,
         )
         for c_idx, c_pages in enumerate(chunks, 1)
@@ -1849,7 +1856,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
     - `manga_semaphore` (`Semaphore(1)`) OOM guard with queue waiting notice
     - Vectorized OpenCV + NumPy CV Set-of-Mark (SoM) detection (white, pastel, corner, dark) & render masking
     - Shared `llm.py` Google AI Studio catalog & cooldowns + dynamic `15s`/`25s` `3.5-flash-lite` -> `3.1-flash-lite` hedge
-    - Always-on Stage 2 Gemma 4 text-only localization polish (Cloudflare Gemma 4 -> AI Studio Gemma 4 -> Flash-Lite)
+    - Always-on Stage 2 Gemma 4 text-only localization polish (AI Studio Gemma 4 -> Cloudflare Gemma 4 -> Flash-Lite)
     - Throttled live Discord progress messages (1/3 -> 2/3 -> 3/3 -> auto-delete)
     """
     from media_context import resolve_referenced_message, collect_embedded_images_and_metadata
