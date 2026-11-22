@@ -61,6 +61,14 @@ MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024  # 25 MB cap (supports standard Discord 
 MAX_EMBED_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB per embedded image cap for 512MB Render container
 MAX_BATCH_IMAGES = 12  # 12-image cap across multi-part threads and batch requests (safe within 512MB RAM)
 
+# Universal Gemini REST safetySettings so anime fanart / battle scenes / swimsuits are not silently blanked on HTTP 200
+_GEMINI_VISION_SAFETY_SETTINGS = [
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+]
+
 TWITTER_STATUS_URL_REGEX = re.compile(
     r"https?://(?:www\.|mobile\.)?(?:x\.com|twitter\.com|fixupx\.com|fxtwitter\.com|vxtwitter\.com|fixvx\.com|twittpr\.com)/([^/\s]+)/status/(\d+)",
     re.IGNORECASE,
@@ -1435,8 +1443,9 @@ def _build_tailored_single_image_ocr_prompt(
 ) -> str:
     """
     Builds a Google Lens–style domain-specific Vision & OCR prompt based on Decision-1 ImageTriage.
-    Prioritizes accurate entity/franchise/product/scale identification and explicit crop boundaries
-    directly from visual cues.
+    Prioritizes accurate entity/franchise/character/product identification from all visible visual
+    cues (including iconic costumes/hair/accessories even when cropped), while recording crop boundaries
+    cleanly so downstream turns never hallucinate off-screen faces or expressions.
     """
     if triage_type == "code_or_error":
         return (
@@ -1480,17 +1489,16 @@ def _build_tailored_single_image_ocr_prompt(
     return (
         f"{context_header}"
         "Act like Google Lens and analyze this image thoroughly so Yukino Yukinoshita understands the exact subject, "
-        "franchise/character identity, visual framing, story, speaker attribution, and source.\n"
+        "franchise/character identity, visual story, speaker attribution, and source.\n"
         "Provide your output in 3 concise, well-structured sections:\n"
         "1. [Identification & Visual Context]:\n"
-        " - Identify the Anime/Game/Manga Series, Character name(s), or iconic mecha/ship/item ONLY if clearly supported by "
-        "unmistakable visual features (hair ornaments, outfits, weapons, insignia, halos/no halos) or the post caption above. "
-        "NEVER mix character names from one franchise with a different franchise title, and write 'Unknown / Unconfirmed Series' if genuinely ambiguous.\n"
+        " - Identify the Anime/VTuber/Game/Manga Series, Character name(s), or iconic mecha/ship/item whenever recognizable "
+        "from unmistakable visual features (hair color/style, signature outfit/costume, ornaments, straps, weapons, insignia, halos/no halos) "
+        "or the post caption above — EVEN IF the character's face is partially or fully cropped out of frame. "
+        "NEVER mix character names from one franchise with a different franchise title, and write 'Unknown / Unconfirmed Series' only if genuinely unrecognizable.\n"
         " - For comics/manga: describe what happens visually in each panel in traditional Japanese reading order (Top-to-Bottom, Right-to-Left).\n"
-        " - For illustrations/fanart: FIRST state the exact camera framing and crop boundaries "
-        "(if the character's head, face, or any body part is cropped out of frame, explicitly write "
-        "'Head/face cropped out of frame; no facial expression visible' — NEVER invent a face or expression not inside the frame). "
-        "Then concisely describe the visible pose, outfit/accessories, lighting/shading, textures, props, and mood.\n"
+        " - For illustrations/fanart: note the camera framing (if the head/face is cropped out of frame, briefly state 'Head/face not in frame' and skip facial expression), "
+        "and concisely describe the visible pose, outfit, accessories, lighting, props, and mood.\n"
         "2. [Ordered Dialogue & Verbatim OCR Text]:\n"
         " - For comics/manga: list the dialogue and key SFX in reading order (Right-to-Left, Top-to-Bottom) tagged with the speaker.\n"
         " - Transcribe ALL visible text (Thai, Japanese, English, code, labels) verbatim, paying close attention to Thai tone marks/vowels.\n"
@@ -1500,11 +1508,35 @@ def _build_tailored_single_image_ocr_prompt(
     )
 
 
+def _extract_gemini_vision_text_with_diag(data: dict, purpose: str) -> str:
+    """Extracts non-thought text from Gemini response and logs exact diagnostics when HTTP 200 yields empty text."""
+    if not isinstance(data, dict):
+        return ""
+    cands = data.get("candidates") or []
+    cand = cands[0] if cands else {}
+    parts = ((cand.get("content") or {}).get("parts")) or []
+    out = "\n".join(
+        p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text") and not p.get("thought", False)
+    ).strip()
+    out = re.sub(r"<think>[\s\S]*?</think>", "", out).strip()
+    if not out:
+        fin = cand.get("finishReason") or "NONE"
+        blk = ((data.get("promptFeedback") or {}).get("blockReason")) or "NONE"
+        usage = data.get("usageMetadata") or {}
+        th_tok = usage.get("thoughtsTokenCount", 0)
+        out_tok = usage.get("candidatesTokenCount", 0)
+        api_log(
+            f"Gemini ({purpose}) -> HTTP 200 EMPTY TEXT "
+            f"(finish={fin}, block={blk}, thoughts={th_tok}, out={out_tok})"
+        )
+    return out
+
+
 async def _call_gemini_multi_image_batch(
     encoded_images: list[tuple[str, str, str]],
     batch_prompt: str,
     timeout_sec: int = 36,
-    max_output_tokens: int = 3072,
+    max_output_tokens: int = 4096,
     triage_header: str = "",
 ) -> str:
     if not GEMINI_API_KEY:
@@ -1514,29 +1546,48 @@ async def _call_gemini_multi_image_batch(
         parts.append({"text": f"=== Image {idx}/{len(encoded_images)} (`{fname}`) ==="})
         parts.append({"inlineData": {"mimeType": mime_type, "data": b64_img}})
 
+    safe_max_tokens = max(4096, int(max_output_tokens))
     payload = {
         "contents": [{"parts": parts}],
+        "safetySettings": _GEMINI_VISION_SAFETY_SETTINGS,
         "generationConfig": {
             "temperature": 0.1,
-            "maxOutputTokens": max_output_tokens,
+            "maxOutputTokens": safe_max_tokens,
             "thinkingConfig": {"thinkingLevel": "MINIMAL"},
         },
     }
+    purpose = f"MultiImageOCR({len(encoded_images)}p)"
     try:
         data = await call_gemini_generate_content_self_healing(
             payload,
             timeout_sec=timeout_sec,
-            purpose=f"MultiImageOCR({len(encoded_images)}p)",
+            purpose=purpose,
             max_models=3,
             max_wall_sec=65.0,
         )
-        if data:
-            resp_parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-            out_txt = "\n".join(p.get("text", "") for p in resp_parts if p.get("text") and not p.get("thought", False)).strip()
-            out_txt = re.sub(r"<think>[\s\S]*?</think>", "", out_txt).strip()
-            if out_txt:
-                prefix = f"{triage_header}\n" if triage_header else ""
-                return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{prefix}{out_txt}"
+        out_txt = _extract_gemini_vision_text_with_diag(data, purpose) if data else ""
+        if not out_txt:
+            # Retry once on fallback Flash models if primary returned HTTP 200 with empty text (e.g. thought/safety blank)
+            retry_payload = {
+                "contents": [{"parts": parts}],
+                "safetySettings": _GEMINI_VISION_SAFETY_SETTINGS,
+                "generationConfig": {
+                    "temperature": 0.1,
+                    "maxOutputTokens": safe_max_tokens,
+                },
+            }
+            data2 = await call_gemini_generate_content_self_healing(
+                retry_payload,
+                timeout_sec=timeout_sec,
+                purpose=f"{purpose}-Retry",
+                max_models=2,
+                max_wall_sec=40.0,
+                preferred_models=["gemini-3.1-flash-lite", "gemini-3-flash-preview"],
+            )
+            out_txt = _extract_gemini_vision_text_with_diag(data2, f"{purpose}-Retry") if data2 else ""
+        if out_txt:
+            prefix = f"{triage_header}\n" if triage_header else ""
+            return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{prefix}{out_txt}"
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -1614,13 +1665,13 @@ async def extract_multi_images_batch_ocr(
 
     n_imgs = len(target_list)
     if n_imgs >= 9:
-        target_dim, target_q, out_tokens = 672, 72, 3072
+        target_dim, target_q, out_tokens = 672, 72, 4096
     elif n_imgs >= 5:
-        target_dim, target_q, out_tokens = 768, 76, 3072
+        target_dim, target_q, out_tokens = 768, 76, 4096
     elif n_imgs >= 3:
-        target_dim, target_q, out_tokens = 832, 80, 2048
+        target_dim, target_q, out_tokens = 832, 80, 4096
     else:
-        target_dim, target_q, out_tokens = 896, 84, 2048
+        target_dim, target_q, out_tokens = 896, 84, 4096
 
     encoded_images: list[tuple[str, str, str]] = []
     for raw_b, fname, _ in target_list:
@@ -1702,7 +1753,7 @@ async def extract_multi_images_batch_ocr(
             "and describe the characters strictly by appearance rather than guessing.\n"
             "2. [Page-by-Page Story, Framing & Panel-by-Panel Dialogue/SFX (Right-to-Left, Top-to-Bottom)]:\n"
             " - For each page (Page 1, Page 2, ...), summarize only what is literally drawn inside the frame "
-            "(explicitly note if a face/head is cropped out — NEVER invent off-screen expressions), "
+            "(note if a face/head is cropped out so off-screen expressions are not invented), "
             "and list all dialogue, thoughts, and key SFX in Japanese reading order tagged with the speaker."
         )
 
@@ -1714,7 +1765,7 @@ async def extract_multi_images_batch_ocr(
     try:
         if not has_gemini and has_cf:
             return await _call_cf_multi_image_batch(
-                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=out_tokens, triage_header=triage_header
+                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=min(3072, out_tokens), triage_header=triage_header
             )
         if has_gemini and not has_cf:
             return await _call_gemini_multi_image_batch(
@@ -1737,13 +1788,13 @@ async def extract_multi_images_batch_ocr(
             except Exception:
                 pass
             return await _call_cf_multi_image_batch(
-                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=out_tokens, triage_header=triage_header
+                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=min(3072, out_tokens), triage_header=triage_header
             )
 
         api_log(f"Hedge (MultiImageOCR {len(encoded_images)}p) -> Gemini >16s; racing Cloudflare batch in parallel")
         cf_task = asyncio.create_task(
             _call_cf_multi_image_batch(
-                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=out_tokens, triage_header=triage_header
+                encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=min(3072, out_tokens), triage_header=triage_header
             )
         )
         tasks = {gemini_task, cf_task}
@@ -1777,35 +1828,62 @@ async def extract_multi_images_batch_ocr(
 async def _call_gemini_single_image_vision(
     ocr_prompt: str, mime_type: str, b64_img: str, purpose: str = "Image OCR Tier 1 Gemini"
 ) -> str:
+    """
+    Calls Gemini Flash Vision with `maxOutputTokens=4096` (prevents Gemini 3.5 hidden thinking
+    tokens from starving visible output on `HTTP 200 OK`) and `BLOCK_NONE` safety settings.
+    If the primary model still returns HTTP 200 with empty visible text, logs exact diagnostics
+    and immediately retries on fallback Flash models (`gemini-3.1-flash-lite` -> `gemini-3-flash-preview`)
+    BEFORE dropping down to Tier 2/3 Gemma 4.
+    """
     if not GEMINI_API_KEY:
         return ""
+    contents_block = [
+        {
+            "parts": [
+                {"text": ocr_prompt},
+                {"inlineData": {"mimeType": mime_type, "data": b64_img}},
+            ]
+        }
+    ]
     payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": ocr_prompt},
-                    {"inlineData": {"mimeType": mime_type, "data": b64_img}},
-                ]
-            }
-        ],
+        "contents": contents_block,
+        "safetySettings": _GEMINI_VISION_SAFETY_SETTINGS,
         "generationConfig": {
             "temperature": 0.1,
-            "maxOutputTokens": 2048,
+            "maxOutputTokens": 4096,
             "thinkingConfig": {"thinkingLevel": "MINIMAL"},
         },
     }
     data = await call_gemini_generate_content_self_healing(
         payload,
-        timeout_sec=14,
+        timeout_sec=16,
         purpose=purpose,
         max_models=3,
-        max_wall_sec=24.0,
+        max_wall_sec=26.0,
     )
-    if not data:
-        return ""
-    parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-    out = "\n".join(p.get("text", "") for p in parts if p.get("text") and not p.get("thought", False)).strip()
-    return re.sub(r"<think>[\s\S]*?</think>", "", out).strip()
+    out = _extract_gemini_vision_text_with_diag(data, purpose) if data else ""
+    if out:
+        return out
+
+    # Self-healing retry on secondary Flash models if primary returned HTTP 200 with empty/thought-only output
+    retry_payload = {
+        "contents": contents_block,
+        "safetySettings": _GEMINI_VISION_SAFETY_SETTINGS,
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 4096,
+        },
+    }
+    retry_purpose = f"{purpose} (Empty-200 Retry)"
+    data2 = await call_gemini_generate_content_self_healing(
+        retry_payload,
+        timeout_sec=14,
+        purpose=retry_purpose,
+        max_models=2,
+        max_wall_sec=22.0,
+        preferred_models=["gemini-3.1-flash-lite", "gemini-3-flash-preview"],
+    )
+    return _extract_gemini_vision_text_with_diag(data2, retry_purpose) if data2 else ""
 
 
 async def inspect_image_details_deep_async(
@@ -1814,24 +1892,32 @@ async def inspect_image_details_deep_async(
     post_meta_hint: str = "",
 ) -> str:
     """
-    Re-inspects cached image(s) from `/tmp` strictly for fine visual details actually inside
-    the frame when the user clicks '📌 ดูรายละเอียดภาพเพิ่ม'. Prevents hallucinating cropped-out
-    faces, expressions, or off-screen anatomy.
+    Re-inspects cached image(s) from `/tmp` when the user clicks '📌 ดูรายละเอียดภาพเพิ่ม':
+    1) Performs Google Lens–style character/series/costume identification from all visible visual
+       cues (hair color/style, signature outfit, straps, accessories, emblems) even when cropped.
+    2) Explicitly records camera framing & crop boundaries so off-screen faces/expressions are
+       never fabricated.
+    3) Extracts fine pixel-grounded visual details not yet mentioned in `prev_reply`.
     """
     if not images_list:
         return ""
 
     deep_prompt = (
-        "Inspect this image closely for fine visual details that were NOT fully covered in the previous summary.\n"
+        "Act like Google Lens and inspect this image closely to identify the character/series/costume "
+        "and extract fine visual details that were NOT fully covered in the previous summary.\n"
         + (f"Post Metadata:\n{post_meta_hint[:600]}\n\n" if post_meta_hint else "")
-        + (f"Previous Summary (add NEW grounded observations only):\n{prev_reply[:900]}\n\n" if prev_reply else "")
-        + "STRICT GROUNDING RULES:\n"
-        "1. [Framing & Crop]: FIRST explicitly state what is inside the frame AND what is cropped out "
-        "(e.g., if the head/face is NOT visible in the image, state 'Head/face is cropped out of frame — DO NOT describe facial expression').\n"
-        "2. [Fine Visual Details]: Describe ONLY details literally visible in the pixels: "
+        + (f"Previous Summary (add NEW grounded observations; also identify the character/series if missed):\n{prev_reply[:900]}\n\n" if prev_reply else "")
+        + "Provide your analysis in 3 concise sections:\n"
+        "1. [Character / Series / Costume Identification]: Identify the Anime/VTuber/Game/Manga character, "
+        "series/agency (e.g., Hololive, Blue Archive, Honkai, etc.), and specific outfit/costume whenever recognizable "
+        "from unmistakable visual cues (hair color/tips, jacket/hoodie design, skirt pattern, straps, ornaments, emblems) — "
+        "EVEN IF the face is cropped out of frame. Write 'Unconfirmed / Original Character' only if genuinely unrecognizable.\n"
+        "2. [Framing & Crop]: Explicitly state what is inside the frame AND what is cropped out "
+        "(e.g., if the head/face is NOT visible in the image, state 'Head/face is cropped out of frame — no facial expression visible').\n"
+        "3. [Fine Visual Details]: Describe ONLY details literally visible in the pixels: "
         "camera angle/composition, lighting/shadows/highlights, color palette, fabric folds/textures, "
-        "outfit accessories/straps/buckles, hair/skin rendering style, visible pose/hands, props, and background elements.\n"
-        "3. NEVER infer, guess, or invent facial expressions, eyes, off-screen body parts, or canon personality traits not drawn in the image."
+        "outfit accessories/straps/buckles/eyelets, hair/skin rendering style, visible pose/hands, props, and background elements.\n"
+        "Rule: NEVER invent facial expressions, eyes, or body parts that are outside the image crop."
     )
 
     if len(images_list) >= 2:
@@ -1848,7 +1934,7 @@ async def inspect_image_details_deep_async(
             out = ""
             if GEMINI_API_KEY:
                 out = await _call_gemini_multi_image_batch(
-                    encoded_batch, deep_prompt, timeout_sec=24, max_output_tokens=2048
+                    encoded_batch, deep_prompt, timeout_sec=24, max_output_tokens=4096
                 )
             if not out:
                 out = await _call_cf_multi_image_batch(
@@ -1939,7 +2025,9 @@ async def extract_image_via_transient_ocr(
         do_tracemoe = bool(run_source_lookup and is_color_img and triage_is_anime_ss)
         do_web_verify = bool(run_source_lookup)
     elif triage_type == "anime_fanart":
-        do_saucenao = bool(run_source_lookup)
+        # Even on X/Pixiv posts where author is known, SauceNAO (when API key exists) runs in parallel
+        # at 0 extra latency and returns character/series tags for cropped fanart!
+        do_saucenao = bool(run_source_lookup or (SAUCENAO_API_KEY and triage_needs_lookup))
         do_iqdb = bool(run_source_lookup)
         do_tracemoe = bool(run_source_lookup and is_color_img and (triage_is_anime_ss or triage_anime_ss_prob >= 0.35))
         do_web_verify = bool(run_source_lookup)
@@ -1968,13 +2056,16 @@ async def extract_image_via_transient_ocr(
     tracemoe_task = asyncio.create_task(_search_tracemoe_async(raw_bytes, mime_type)) if do_tracemoe else None
 
     vision_result = ""
+    used_gemini_tier1 = False
 
     # Tier 1: Google AI Studio Gemini Flash-Lite (`gemini-3.5-flash-lite` -> `3.1-flash-lite` -> `3-flash-preview`)
-    # Fastest (~1.0-1.5s) and strongest Google Lens–grade real-world/model-kit/anime entity recognition!
+    # Fastest (~1.5-2.5s) and strongest Google Lens–grade real-world/model-kit/anime entity recognition!
     if GEMINI_API_KEY:
         vision_result = await _call_gemini_single_image_vision(
             ocr_prompt, mime_type, b64_img, purpose="Image OCR Tier 1 Gemini"
         )
+        if vision_result:
+            used_gemini_tier1 = True
 
     # Tier 2: Google AI Studio Gemma 4 Vision (`gemma-4-26b-a4b-it`)
     if not vision_result and GEMINI_API_KEY:
@@ -2077,15 +2168,30 @@ async def extract_image_via_transient_ocr(
     tracemoe_txt = ""
     pending_rev = [t for t in (saucenao_task, tracemoe_task) if t is not None]
     if pending_rev:
-        await asyncio.gather(*pending_rev, return_exceptions=True)
-        if saucenao_task is not None and not saucenao_task.cancelled() and saucenao_task.exception() is None:
+        try:
+            await asyncio.wait_for(asyncio.gather(*pending_rev, return_exceptions=True), timeout=2.5)
+        except asyncio.TimeoutError:
+            for t_p in pending_rev:
+                if not t_p.done():
+                    t_p.cancel()
+        if saucenao_task is not None and saucenao_task.done() and not saucenao_task.cancelled() and saucenao_task.exception() is None:
             saucenao_txt = saucenao_task.result() or ""
-        if tracemoe_task is not None and not tracemoe_task.cancelled() and tracemoe_task.exception() is None:
+        if tracemoe_task is not None and tracemoe_task.done() and not tracemoe_task.cancelled() and tracemoe_task.exception() is None:
             tracemoe_txt = tracemoe_task.result() or ""
 
+    # If anime_fanart fell back off Gemini Tier 1 OR vision marked it Unknown/Unconfirmed, try keyless IQDB for character tags
+    needs_iqdb_rescue = bool(
+        triage_type == "anime_fanart"
+        and not saucenao_txt
+        and (
+            do_iqdb
+            or not used_gemini_tier1
+            or ("unknown / unconfirmed" in (vision_result or "").lower())
+        )
+    )
     if saucenao_txt:
         out_parts.append(saucenao_txt)
-    elif do_iqdb:
+    elif needs_iqdb_rescue:
         iqdb_txt = await _search_iqdb_keyless_async(raw_bytes, filename)
         if iqdb_txt:
             out_parts.append(iqdb_txt)

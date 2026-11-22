@@ -1,5 +1,6 @@
 import io
 import re
+import time
 import asyncio
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -15,6 +16,7 @@ from config import (
     THAI_MONTHS,
     URL_REGEX,
     PURE_DATETIME_PATTERN,
+    channel_last_attachment,
     api_log,
     get_cached_channel_attachments,
     load_temp_image_cache,
@@ -668,7 +670,8 @@ class GeneralAssistantActionView(AutoDisappearingView):
             instruction = (
                 "ช่วยเจาะลึกองค์ประกอบภาพ มุมกล้อง แสงเงา ลายเส้น รายละเอียดเครื่องแต่งกาย/อุปกรณ์ "
                 "และจุดน่าสนใจที่ปรากฏจริงในภาพนี้เพิ่มเติมจากคำตอบก่อนหน้า "
-                "(กล่าวถึงเฉพาะสิ่งที่เห็นจริงในกรอบภาพเท่านั้น ห้ามแต่งเติมใบหน้า สีหน้า ดวงตา หรือส่วนที่ถูกครอปออกนอกเฟรมเด็ดขาด)"
+                "(หากผลวิเคราะห์ภาพด้านล่างสามารถระบุตัวละคร ซีรีส์ หรือชุดคอสตูมที่คำตอบก่อนหน้ายังไม่ได้พูดถึงได้ชัดเจน ให้ระบุไว้ด้วย "
+                "แต่กล่าวถึงเฉพาะสิ่งที่เห็นจริงในกรอบภาพเท่านั้น ห้ามแต่งเติมใบหน้า สีหน้า ดวงตา หรือส่วนที่ถูกครอปออกนอกเฟรมเด็ดขาด)"
             )
             candidate_msg_ids: list[int] = []
             if self.source_message is not None:
@@ -691,6 +694,14 @@ class GeneralAssistantActionView(AutoDisappearingView):
                     )
                     if deep_vis:
                         deep_visual_block = f"\n\n=== Fresh Deep Visual Inspection (Ground Truth) ===\n{deep_vis}"
+                        # Save fresh deep visual ground truth into channel attachment cache for subsequent chat questions!
+                        if self.channel_id is not None:
+                            channel_last_attachment[self.channel_id].append({
+                                "filenames": [imgs_list[0][1] or "deep_visual_inspect"],
+                                "content": deep_visual_block.strip()[:12000],
+                                "is_code": False,
+                                "timestamp": time.time(),
+                            })
                     break
 
         search_hint_tag = ""
