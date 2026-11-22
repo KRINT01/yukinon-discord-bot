@@ -24,7 +24,7 @@ except ImportError:
 
 from config import THAI_CHAR_REGEX
 
-MANGA_CV_RENDER_VERSION = "v10"
+MANGA_CV_RENDER_VERSION = "v11"
 SOM_CV_MAX_DIM = 360  # Fast 360px grid derived from single 1024px resize (~1-2.5s for 10 pages with OpenCV+NumPy!)
 # Bundle 2 RAM & Discord upload optimization: quality=90 with standard 4:2:0 subsampling (~50% smaller than 94/4:4:4)
 MANGA_RENDER_JPEG_QUALITY = 90
@@ -336,6 +336,8 @@ def _tokenize_thai_syllables(word: str) -> list[str]:
         prev_is_ia_vowel = (prev.startswith("เ") and "\u0E35" in prev and prev.endswith("ย"))
         # Recognize สระอัว (ั+ว like ตัว, ด้วย) — only accepts 'ย' coda (ด้วย/ช่วย/ป่วย), never steals next onset!
         prev_is_ua_vowel = ("\u0E31" in prev and prev.endswith("ว"))
+        # Recognize bare ห-นำ onset with implicit สระโอะลดรูป (e.g. หย+ด -> หยด, หม+ด -> หมด, หล+บ -> หลบ)
+        prev_is_ho_nam_bare = (len(prev) == 2 and prev[0] == "ห" and prev[1] in _THAI_HO_NAM_FOLLOW)
         if prev_is_ua_vowel:
             prev_open_for_coda = (tok == "ย")
         else:
@@ -344,6 +346,7 @@ def _tokenize_thai_syllables(word: str) -> list[str]:
                 and len(prev) <= 6
                 and (
                     prev_is_ia_vowel
+                    or prev_is_ho_nam_bare
                     or (len(prev) >= 2 and prev[-1] in ("อ", "ว"))
                     or (
                         any(c in _THAI_CAN_TAKE_CODA_VOWEL for c in prev)
@@ -907,6 +910,104 @@ def _extract_and_filter_white_components_cv2(
     return found
 
 
+def _detect_white_outlined_text_clusters_cv2(
+    vis_gray: "np.ndarray",
+    vis_chroma: "np.ndarray",
+) -> list[dict]:
+    """
+    Pass C fallback (runs ONLY when Passes A1/A2/A3/B find 0 classic enclosed bubbles):
+    Detects white-halo-outlined Japanese dialogue clusters on full-color CG / visual-novel /
+    translucent dark-oval pages (black OR colored dark text with a crisp pure-white outer stroke)
+    so Stage 1 anchors them with exact SoM RED/WHITE badges instead of drifting `box_2d` boxes!
+    """
+    vh, vw = vis_gray.shape[:2]
+    white_px = (vis_gray >= 225) & (vis_chroma <= 30)
+    dark_any = (vis_gray <= 145)
+    if not np.any(white_px) or not np.any(dark_any):
+        return []
+
+    white_near = cv2.dilate(white_px.astype(np.uint8), _CV2_K7, iterations=1) > 0
+    dark_core_cand = np.where(dark_any & white_near, np.uint8(255), np.uint8(0))
+
+    n_cc, lbls, st, _ = cv2.connectedComponentsWithStats(dark_core_cand, connectivity=8)
+    if n_cc <= 1:
+        return []
+
+    glyph_mask = np.zeros((vh, vw), dtype=np.uint8)
+    for k in range(1, n_cc):
+        gw = int(st[k, cv2.CC_STAT_WIDTH])
+        gh = int(st[k, cv2.CC_STAT_HEIGHT])
+        ga = int(st[k, cv2.CC_STAT_AREA])
+        if 2 <= gw <= 46 and 2 <= gh <= 48 and ga >= 6:
+            x1 = int(st[k, cv2.CC_STAT_LEFT])
+            y1 = int(st[k, cv2.CC_STAT_TOP])
+            px1, py1 = max(0, x1 - 4), max(0, y1 - 4)
+            px2, py2 = min(vw, x1 + gw + 4), min(vh, y1 + gh + 4)
+            sub_c = (lbls[py1:py2, px1:px2] == k).astype(np.uint8)
+            ring = cv2.dilate(sub_c, _CV2_K7, iterations=1) - sub_c
+            ring_cnt = max(1, int(np.count_nonzero(ring)))
+            w_ratio = int(np.count_nonzero((ring > 0) & white_px[py1:py2, px1:px2])) / float(ring_cnt)
+            if w_ratio >= 0.42:
+                glyph_mask[py1:py2, px1:px2][sub_c > 0] = 255
+
+    if not np.any(glyph_mask):
+        return []
+
+    outlined_glyphs = cv2.dilate(glyph_mask, _CV2_K5, iterations=1)
+    kw = max(25, int(vw * 0.042)) | 1
+    kh = max(25, int(vh * 0.032)) | 1
+    kern_grp = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kw, kh))
+    grouped = cv2.dilate(outlined_glyphs, kern_grp, iterations=1)
+
+    gn, glbls, gst, _ = cv2.connectedComponentsWithStats(grouped, connectivity=8)
+    found: list[dict] = []
+    for k in range(1, gn):
+        gx1 = int(gst[k, cv2.CC_STAT_LEFT])
+        gy1 = int(gst[k, cv2.CC_STAT_TOP])
+        gw = int(gst[k, cv2.CC_STAT_WIDTH])
+        gh = int(gst[k, cv2.CC_STAT_HEIGHT])
+        gx2, gy2 = gx1 + gw, gy1 + gh
+        sub_g = glyph_mask[gy1:gy2, gx1:gx2] & ((glbls[gy1:gy2, gx1:gx2] == k).astype(np.uint8) * 255)
+        n_gly, _ = cv2.connectedComponents(sub_g, connectivity=8)
+        n_gly -= 1
+        if n_gly < 4:
+            continue
+        ys, xs = np.nonzero(sub_g)
+        if ys.size == 0:
+            continue
+        pad = 12
+        tx1 = max(0, gx1 + int(xs.min()) - pad)
+        ty1 = max(0, gy1 + int(ys.min()) - pad)
+        tx2 = min(vw, gx1 + int(xs.max()) + pad + 1)
+        ty2 = min(vh, gy1 + int(ys.max()) + pad + 1)
+        tw, th = tx2 - tx1, ty2 - ty1
+        if tw < 24 or th < 24 or (tw * th) > int(vw * vh * 0.35):
+            continue
+
+        # Store compact 64px-max solid mask for crisp SoM red outline drawing
+        ms_w = max(8, min(96, tw // 2))
+        ms_h = max(8, min(96, th // 2))
+        mask_np = np.full((ms_h, ms_w), 255, dtype=np.uint8)
+        bbox_norm = [
+            int(round((ty1 / float(vh)) * 1000.0)),
+            int(round((tx1 / float(vw)) * 1000.0)),
+            int(round((ty2 / float(vh)) * 1000.0)),
+            int(round((tx2 / float(vw)) * 1000.0)),
+        ]
+        found.append({
+            "bbox_norm": bbox_norm,
+            "mask_np": mask_np,
+            "rect_fill": 0.92,
+            "solidity": 0.96,
+            "glyph_count": int(n_gly),
+            "is_dark": False,
+            "is_pastel": False,
+            "is_outlined_text": True,
+        })
+
+    return found
+
+
 def _detect_page_bubbles_and_build_som_b64_cv2_sync(
     raw_bytes: bytes,
     vision_max_dim: int = 1024,
@@ -1048,7 +1149,7 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
                 vis_chroma=vis_chroma,
             )
         )
-    del small_bgr, vis_gray, vis_chroma
+    del small_bgr
 
     # Remove tiny Pass A1 white text-glow halos nested inside larger Pass A3 pastel bubbles!
     detected = _prune_nested_child_bubbles(detected, close_pil=False)
@@ -1127,6 +1228,11 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
                     "is_dark": True,
                     "is_pastel": False,
                 })
+
+    # Pass C: White-halo-outlined text clusters (runs ONLY when Passes A1-B found 0 enclosed bubbles!)
+    if not detected:
+        detected.extend(_detect_white_outlined_text_clusters_cv2(vis_gray, vis_chroma))
+    del vis_gray, vis_chroma
 
     # On dense B&W pages, cap to top 24 highest-solidity/largest candidates
     if len(detected) > 24:
@@ -1666,6 +1772,54 @@ def _clean_exact_cv_bubble_and_build_render_slots_cv2(
 
     is_dark = bool(cv_obj.get("is_dark"))
     is_pastel = bool(cv_obj.get("is_pastel"))
+
+    # Pass C White-Halo Outlined Text Bubble (CG / translucent dark-oval / visual-novel dialogue)
+    if bool(cv_obj.get("is_outlined_text")):
+        pad_e = 8
+        ex1, ey1 = max(0, x1 - pad_e), max(0, y1 - pad_e)
+        ex2, ey2 = min(width, x2 + pad_e), min(height, y2 + pad_e)
+        ebw, ebh = ex2 - ex1, ey2 - ey1
+        sub_bgr = img_bgr[ey1:ey2, ex1:ex2]
+        sub_g = base_gray[ey1:ey2, ex1:ex2]
+        sub_ch = sub_bgr.max(axis=2) - sub_bgr.min(axis=2)
+
+        wp = (sub_g >= 218) & (sub_ch <= 36)
+        da = (sub_g <= 158)
+        w_near_d = wp & (cv2.dilate(da.astype(np.uint8), _CV2_K7, iterations=1) > 0)
+        d_near_w = da & (cv2.dilate(wp.astype(np.uint8), _CV2_K7, iterations=1) > 0)
+        erase_u8 = cv2.dilate(np.where(w_near_d | d_near_w, np.uint8(255), np.uint8(0)), _CV2_K5, iterations=1)
+        erase_u8 = cv2.morphologyEx(erase_u8, cv2.MORPH_CLOSE, _CV2_K5)
+        erase_bool = erase_u8 > 0
+
+        if np.any(erase_bool):
+            inp_scale = min(0.5, 220.0 / float(max(ebw, ebh)))
+            if ebw >= 40 and ebh >= 40 and inp_scale < 1.0:
+                iw, ih = max(16, int(round(ebw * inp_scale))), max(16, int(round(ebh * inp_scale)))
+                sm_bgr = cv2.resize(sub_bgr, (iw, ih), interpolation=cv2.INTER_AREA)
+                sm_m = np.where(cv2.resize(erase_u8, (iw, ih), interpolation=cv2.INTER_LINEAR) >= 32, np.uint8(255), np.uint8(0))
+                sm_inp = cv2.inpaint(sm_bgr, sm_m, 4, cv2.INPAINT_TELEA)
+                full_inp = cv2.resize(sm_inp, (ebw, ebh), interpolation=cv2.INTER_LINEAR)
+                sub_bgr[erase_bool] = full_inp[erase_bool]
+            else:
+                full_inp = cv2.inpaint(sub_bgr, erase_u8, 4, cv2.INPAINT_TELEA)
+                sub_bgr[erase_bool] = full_inp[erase_bool]
+
+        bg_after = img_bgr[y1:y2, x1:x2]
+        bg_lum_after = float(np.median(cv2.cvtColor(bg_after, cv2.COLOR_BGR2GRAY)))
+        if bg_lum_after < 155.0:
+            fg_rgb = (252, 252, 252)
+            stroke_rgb = (16, 16, 16)
+        else:
+            fg_rgb = (15, 15, 15)
+            stroke_rgb = (250, 250, 250)
+
+        # Slightly widen vertical JP text bbox horizontally so horizontal Thai fits comfortably in the oval
+        bw_c = x2 - x1
+        extra_x = min(26, max(10, int(bw_c * 0.24)))
+        tx1 = max(4, x1 - extra_x)
+        tx2 = min(width - 4, x2 + extra_x)
+        hb = (tx1, y1, tx2, y2)
+        return [[hb[0], hb[1], hb[2], hb[3], fg_rgb, stroke_rgb, trans_text, hb]]
     rx1, ry1, rx2, ry2, mask_full, rect_fill = _refine_cv_bubble_mask_locally_cv2(
         img_bgr, cv_obj, x1, y1, x2, y2, other_cv_boxes=other_cv_boxes
     )
@@ -1870,8 +2024,10 @@ def _clean_direct_on_art_box_cv2(
             text_core = np.where(in_box & (w_g >= max(205.0, p50 + 48.0)) & (w_ch <= 62), np.uint8(255), np.uint8(0))
         ink_dil = _fast_dilate_mask_cv2(text_core, kernel_half=5)
         ring = cv2.dilate(ink_dil, _CV2_K5, iterations=1)
-        dark_outline = (ring > 0) & in_box & (w_g < min(95.0, max(45.0, p50 - 25.0)))
+        # Catch both black outlines AND dark-colored (purple/burgundy) white-haloed kanji cores inside the ring!
+        dark_outline = (ring > 0) & in_box & (w_g < min(155.0, max(95.0, p50 + 25.0)))
         erase_u8 = cv2.dilate(np.where((ink_dil > 0) | dark_outline, np.uint8(255), np.uint8(0)), _CV2_K3, iterations=1)
+        erase_u8 = cv2.morphologyEx(erase_u8, cv2.MORPH_CLOSE, _CV2_K5)
         fg_rgb = (252, 252, 252)
         stroke_rgb = (16, 16, 16)
     else:
