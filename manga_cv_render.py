@@ -24,7 +24,7 @@ except ImportError:
 
 from config import THAI_CHAR_REGEX
 
-MANGA_CV_RENDER_VERSION = "v9"
+MANGA_CV_RENDER_VERSION = "v10"
 SOM_CV_MAX_DIM = 360  # Fast 360px grid derived from single 1024px resize (~1-2.5s for 10 pages with OpenCV+NumPy!)
 # Bundle 2 RAM & Discord upload optimization: quality=90 with standard 4:2:0 subsampling (~50% smaller than 94/4:4:4)
 MANGA_RENDER_JPEG_QUALITY = 90
@@ -1773,6 +1773,157 @@ def _clean_exact_cv_bubble_and_build_render_slots_cv2(
     return [[hb[0], hb[1], hb[2], hb[3], fg_rgb, stroke_rgb, trans_text, hb]]
 
 
+def _clean_direct_on_art_box_cv2(
+    img_bgr: "np.ndarray",
+    base_gray: "np.ndarray",
+    raw_x1: int,
+    raw_y1: int,
+    raw_x2: int,
+    raw_y2: int,
+    has_cv_bubbles: bool = False,
+) -> tuple[int, int, int, int, tuple[int, int, int], tuple[int, int, int], tuple[int, int, int, int]] | None:
+    """
+    Case 4 fallback for `box_2d` dialogue that has NO classic white/pastel/black enclosed bubble
+    (e.g. full-color CG/fantasy stories with white/black outlined text directly on dark or colored
+    artwork, semi-transparent visual-novel dialogue bars, or highly saturated colored bubbles):
+    1) Verifies genuine high-contrast text strokes (`p95 - p05 >= 60` + compact glyph CCs) so
+       blank artwork/faces are never overwritten.
+    2) Erases the original text + outline/drop-shadow ring via fast TELEA inpainting.
+    3) If the underlying art is visually busy (`bg_std > 42`), blends a subtle feathered scrim
+       so the translated text remains effortlessly legible without harsh rectangular blocks.
+    """
+    height, width = img_bgr.shape[:2]
+    bw, bh = raw_x2 - raw_x1, raw_y2 - raw_y1
+    if bw < 18 or bh < 16:
+        return None
+
+    sub_g = base_gray[raw_y1:raw_y2, raw_x1:raw_x2]
+    sub_bgr = img_bgr[raw_y1:raw_y2, raw_x1:raw_x2]
+    sub_ch = sub_bgr.max(axis=2) - sub_bgr.min(axis=2)
+    total_px = max(1, sub_g.size)
+
+    p05, p50, p95 = [float(v) for v in np.percentile(sub_g, (5, 50, 95))]
+    if (p95 - p05) < 60.0:
+        return None
+
+    def _count_compact_glyphs(mask_bin: "np.ndarray") -> int:
+        n_cc, _, cc_st, _ = cv2.connectedComponentsWithStats(mask_bin, connectivity=8)
+        max_gw = max(50, int(bw * 0.48))
+        max_gh = max(55, int(bh * 0.48))
+        return sum(
+            1
+            for k in range(1, n_cc)
+            if 2 <= int(cc_st[k, cv2.CC_STAT_WIDTH]) <= max_gw
+            and 2 <= int(cc_st[k, cv2.CC_STAT_HEIGHT]) <= max_gh
+            and int(cc_st[k, cv2.CC_STAT_AREA]) >= 4
+        )
+
+    # First check standard achromatic white/black text; if 0-CV-bubble CG page, also allow colored text!
+    bright_achrom = (sub_g >= max(208.0, p50 + 50.0)) & (sub_ch <= 60)
+    dark_achrom = (sub_g <= min(110.0, p50 - 45.0)) & (sub_ch <= 68)
+    bright_ratio = float(np.count_nonzero(bright_achrom)) / float(total_px)
+    dark_ratio = float(np.count_nonzero(dark_achrom)) / float(total_px)
+
+    # Pick natural text polarity from background luminance
+    if p50 >= 140.0:
+        primary_white = False if dark_ratio >= 0.012 else (bright_ratio > dark_ratio * 1.5)
+    else:
+        primary_white = True if bright_ratio >= 0.008 else (bright_ratio >= dark_ratio)
+
+    min_req_glyphs = 3 if has_cv_bubbles else 2
+    use_white_text = primary_white
+    colored_text_mode = False
+
+    prim_mask = np.where(bright_achrom if primary_white else dark_achrom, np.uint8(255), np.uint8(0))
+    if _count_compact_glyphs(prim_mask) < min_req_glyphs:
+        alt_mask = np.where(dark_achrom if primary_white else bright_achrom, np.uint8(255), np.uint8(0))
+        if _count_compact_glyphs(alt_mask) >= min_req_glyphs:
+            use_white_text = not primary_white
+        elif not has_cv_bubbles:
+            # Luminance-only fallback for colored text (e.g. yellow/pink/cyan text on dark CG, red/blue on light)
+            bright_lum = np.where(sub_g >= max(195.0, p50 + 55.0), np.uint8(255), np.uint8(0))
+            dark_lum = np.where(sub_g <= min(115.0, p50 - 50.0), np.uint8(255), np.uint8(0))
+            gb = _count_compact_glyphs(bright_lum)
+            gd = _count_compact_glyphs(dark_lum)
+            if max(gb, gd) < min_req_glyphs:
+                return None
+            use_white_text = (p50 < 140.0 and gb >= min_req_glyphs) or (gb > gd)
+            colored_text_mode = True
+        else:
+            return None
+
+    pad = 6
+    wx1, wy1 = max(0, raw_x1 - pad), max(0, raw_y1 - pad)
+    wx2, wy2 = min(width, raw_x2 + pad), min(height, raw_y2 + pad)
+    ww, wh = wx2 - wx1, wy2 - wy1
+    w_bgr = img_bgr[wy1:wy2, wx1:wx2]
+    w_g = base_gray[wy1:wy2, wx1:wx2]
+    w_ch = w_bgr.max(axis=2) - w_bgr.min(axis=2)
+
+    in_box = np.zeros((wh, ww), dtype=bool)
+    in_box[raw_y1 - wy1 : raw_y2 - wy1, raw_x1 - wx1 : raw_x2 - wx1] = True
+
+    if use_white_text:
+        if colored_text_mode:
+            text_core = np.where(in_box & (w_g >= max(195.0, p50 + 52.0)), np.uint8(255), np.uint8(0))
+        else:
+            text_core = np.where(in_box & (w_g >= max(205.0, p50 + 48.0)) & (w_ch <= 62), np.uint8(255), np.uint8(0))
+        ink_dil = _fast_dilate_mask_cv2(text_core, kernel_half=5)
+        ring = cv2.dilate(ink_dil, _CV2_K5, iterations=1)
+        dark_outline = (ring > 0) & in_box & (w_g < min(95.0, max(45.0, p50 - 25.0)))
+        erase_u8 = cv2.dilate(np.where((ink_dil > 0) | dark_outline, np.uint8(255), np.uint8(0)), _CV2_K3, iterations=1)
+        fg_rgb = (252, 252, 252)
+        stroke_rgb = (16, 16, 16)
+    else:
+        if colored_text_mode:
+            text_core = np.where(in_box & (w_g <= min(115.0, p50 - 45.0)), np.uint8(255), np.uint8(0))
+        else:
+            text_core = np.where(in_box & (w_g <= min(115.0, p50 - 40.0)) & (w_ch <= 70), np.uint8(255), np.uint8(0))
+        ink_dil = _fast_dilate_mask_cv2(text_core, kernel_half=5)
+        ring = cv2.dilate(ink_dil, _CV2_K5, iterations=1)
+        white_outline = (ring > 0) & in_box & (w_g >= max(220.0, p50 + 25.0)) & (w_ch <= 34)
+        erase_u8 = cv2.dilate(np.where((ink_dil > 0) | white_outline, np.uint8(255), np.uint8(0)), _CV2_K3, iterations=1)
+        fg_rgb = (15, 15, 15)
+        stroke_rgb = (250, 250, 250)
+
+    erase_bool = (erase_u8 > 0) & in_box
+    if np.any(erase_bool):
+        inp_mask = np.where(erase_bool, np.uint8(255), np.uint8(0))
+        inp_scale = min(0.5, 220.0 / float(max(ww, wh)))
+        if ww >= 40 and wh >= 40 and inp_scale < 1.0:
+            iw, ih = max(16, int(round(ww * inp_scale))), max(16, int(round(wh * inp_scale)))
+            sm_bgr = cv2.resize(w_bgr, (iw, ih), interpolation=cv2.INTER_AREA)
+            sm_m = np.where(cv2.resize(inp_mask, (iw, ih), interpolation=cv2.INTER_LINEAR) >= 32, np.uint8(255), np.uint8(0))
+            sm_inp = cv2.inpaint(sm_bgr, sm_m, 4, cv2.INPAINT_TELEA)
+            full_inp = cv2.resize(sm_inp, (ww, wh), interpolation=cv2.INTER_LINEAR)
+            w_bgr[erase_bool] = full_inp[erase_bool]
+        else:
+            full_inp = cv2.inpaint(w_bgr, inp_mask, 4, cv2.INPAINT_TELEA)
+            w_bgr[erase_bool] = full_inp[erase_bool]
+
+    # If the background art is busy after inpainting, blend a soft feathered translucent scrim
+    bg_after = w_bgr[raw_y1 - wy1 : raw_y2 - wy1, raw_x1 - wx1 : raw_x2 - wx1]
+    bg_std_after = float(np.std(bg_after, axis=(0, 1)).mean())
+    if bg_std_after > 42.0:
+        scrim_col = (
+            np.array([18, 18, 22], dtype=np.float32)
+            if use_white_text
+            else np.array([248, 248, 252], dtype=np.float32)
+        )
+        alpha = 0.42 if use_white_text else 0.52
+        m_pill = np.zeros((bh, bw), dtype=np.float32)
+        rad = max(6, min(18, min(bw, bh) // 5))
+        cv2.rectangle(m_pill, (rad, 2), (bw - rad - 1, bh - 3), 1.0, -1)
+        cv2.rectangle(m_pill, (2, rad), (bw - 3, bh - rad - 1), 1.0, -1)
+        for cx_c, cy_c in ((rad, rad), (bw - rad - 1, rad), (rad, bh - rad - 1), (bw - rad - 1, bh - rad - 1)):
+            cv2.circle(m_pill, (cx_c, cy_c), max(1, rad - 2), 1.0, -1)
+        m_pill = cv2.GaussianBlur(m_pill, (0, 0), sigmaX=4.0) * alpha
+        blended = bg_after.astype(np.float32) * (1.0 - m_pill[:, :, None]) + scrim_col * m_pill[:, :, None]
+        img_bgr[raw_y1:raw_y2, raw_x1:raw_x2] = np.clip(blended, 0, 255).astype(np.uint8)
+
+    return raw_x1, raw_y1, raw_x2, raw_y2, fg_rgb, stroke_rgb, (raw_x1, raw_y1, raw_x2, raw_y2)
+
+
 def _clean_unmarked_open_bubble_and_measure_box_cv2(
     img_bgr: "np.ndarray",
     base_gray: "np.ndarray",
@@ -1780,6 +1931,7 @@ def _clean_unmarked_open_bubble_and_measure_box_cv2(
     raw_y1: int,
     raw_x2: int,
     raw_y2: int,
+    has_cv_bubbles: bool = False,
 ) -> tuple[int, int, int, int, tuple[int, int, int], tuple[int, int, int], tuple[int, int, int, int]] | None:
     height, width = img_bgr.shape[:2]
     bw, bh = raw_x2 - raw_x1, raw_y2 - raw_y1
@@ -1795,17 +1947,22 @@ def _clean_unmarked_open_bubble_and_measure_box_cv2(
     mean_chroma = float(ch_band.mean())
     chroma_ratio = float(np.count_nonzero(ch_band >= 28)) / float(total_px)
 
+    def _fallback_case4():
+        return _clean_direct_on_art_box_cv2(
+            img_bgr, base_gray, raw_x1, raw_y1, raw_x2, raw_y2, has_cv_bubbles=has_cv_bubbles
+        )
+
     # Case 1: Dark speech bubble (strictly achromatic uniform dark background + bright text)
     if median_lum < 125.0:
         if mean_chroma >= 18.0 or chroma_ratio >= 0.18:
-            return None
+            return _fallback_case4()
         s_band = cv2.cvtColor(sub_bgr_chk, cv2.COLOR_BGR2HSV)[:, :, 1]
         if float(s_band.mean()) >= 22.0 or (float(np.count_nonzero(s_band >= 28)) / float(total_px)) >= 0.16:
-            return None
+            return _fallback_case4()
         dark_bgr, bg_lum, bg_std = _sample_dark_bg_bgr_and_lum_cv2(img_bgr, base_gray, raw_x1, raw_y1, raw_x2, raw_y2)
         bright_ratio = float(np.count_nonzero(sub_g >= 220)) / float(total_px)
         if bg_std > 24.0 or not (0.02 <= bright_ratio <= 0.38):
-            return None
+            return _fallback_case4()
 
         pad = 6
         wx1, wy1 = max(0, raw_x1 - pad), max(0, raw_y1 - pad)
@@ -1824,21 +1981,21 @@ def _clean_unmarked_open_bubble_and_measure_box_cv2(
     # Case 2: Pastel / colored light bubble (`box_2d` fallback for borderless pastel bubbles)
     if is_pastel_open:
         if median_lum < 170.0:
-            return None
+            return _fallback_case4()
         s_band = cv2.cvtColor(sub_bgr_chk, cv2.COLOR_BGR2HSV)[:, :, 1]
         mean_s = float(s_band.mean())
         high_sat_ratio = float(np.count_nonzero(s_band >= 100)) / float(total_px)
         if mean_s >= 85.0 or high_sat_ratio >= 0.30:
-            return None
+            return _fallback_case4()
 
         light_bool = sub_g >= 170
         light_ratio = float(np.count_nonzero(light_bool)) / float(total_px)
         ink_ratio = float(np.count_nonzero((sub_g < 155) & (ch_band < 36))) / float(total_px)
         if light_ratio < 0.42 or ink_ratio < 0.010:
-            return None
+            return _fallback_case4()
         bg_std = float(np.std(sub_bgr_chk[light_bool], axis=0).mean())
         if bg_std > 32.0:
-            return None
+            return _fallback_case4()
 
         pad_x, pad_y = 6, 8
         wx1, wy1 = max(0, raw_x1 - pad_x), max(0, raw_y1 - pad_y)
@@ -1851,7 +2008,7 @@ def _clean_unmarked_open_bubble_and_measure_box_cv2(
         p_zone = _fast_dilate_mask_cv2(p_seed, kernel_half=5)
         erase_bool, bg_bgr = _inpaint_pastel_bubble_region_cv2(s_bgr, sg, p_zone)
         if not np.any(erase_bool):
-            return None
+            return _fallback_case4()
         stroke_rgb = (bg_bgr[2], bg_bgr[1], bg_bgr[0])
         return raw_x1, raw_y1, raw_x2, raw_y2, (15, 15, 15), stroke_rgb, (raw_x1, raw_y1, raw_x2, raw_y2)
 
@@ -1859,7 +2016,7 @@ def _clean_unmarked_open_bubble_and_measure_box_cv2(
     white_ratio = float(np.count_nonzero(sub_g >= 220)) / float(total_px)
     ink_ratio = float(np.count_nonzero(sub_g < 155)) / float(total_px)
     if white_ratio < 0.38 or ink_ratio < 0.010:
-        return None
+        return _fallback_case4()
 
     pad_x, pad_y = 8, 12
     wx1, wy1 = max(0, raw_x1 - pad_x), max(0, raw_y1 - pad_y)
@@ -1876,7 +2033,7 @@ def _clean_unmarked_open_bubble_and_measure_box_cv2(
 
     erase_bool = (ink_dil > 0) & (w_zone > 0) & (non_chroma > 0)
     if not np.any(erase_bool):
-        return None
+        return _fallback_case4()
 
     bg_bgr = _sample_light_bg_bgr_cv2(img_bgr, base_gray, raw_x1, raw_y1, raw_x2, raw_y2)
     s_bgr[erase_bool] = bg_bgr
@@ -2027,7 +2184,7 @@ def _render_translated_manga_image_cv2_sync(
         if is_dup:
             continue
 
-        cleaned_open = _clean_unmarked_open_bubble_and_measure_box_cv2(img_bgr, base_gray, rx1, ry1, rx2, ry2)
+        cleaned_open = _clean_unmarked_open_bubble_and_measure_box_cv2(img_bgr, base_gray, rx1, ry1, rx2, ry2, has_cv_bubbles=bool(cv_map))
         if cleaned_open is None:
             continue
         lx1, ly1, lx2, ly2, fg_text, stroke_col, hard_bounds = cleaned_open
@@ -2071,12 +2228,13 @@ def _render_translated_manga_image_cv2_sync(
                 lbbox = draw.textbbox((0, 0), ln, font=chosen_font)
                 lw = lbbox[2] - lbbox[0]
                 curr_x = tx1 + max(0, (box_w - lw) // 2) - lbbox[0]
+                s_width = 3 if (fg_text == (252, 252, 252) or stroke_col == (250, 250, 250)) else 2
                 draw.text(
                     (curr_x, curr_y - ref_top),
                     ln,
                     font=chosen_font,
                     fill=fg_text,
-                    stroke_width=2,
+                    stroke_width=s_width,
                     stroke_fill=stroke_col,
                 )
                 curr_y += line_height

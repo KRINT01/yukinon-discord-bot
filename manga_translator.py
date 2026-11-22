@@ -44,7 +44,7 @@ from manga_cv_render import (
     _release_cv_page_masks,
 )
 
-MANGA_TRANSLATOR_VERSION = "v12"
+MANGA_TRANSLATOR_VERSION = "v13"
 MANGA_CV_VER = getattr(_mcr_mod, "MANGA_CV_RENDER_VERSION", "old")
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
 # Bundle 2 dynamic parallel hedge: faster 15s recovery on typical 2-4p X threads, patient 25s on 5-12p batches
@@ -2075,6 +2075,11 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
                                     io.BytesIO(rendered_jpg),
                                     filename=f"translated_p{page_idx}_{base_name}.jpg",
                                 )
+                            )
+                        else:
+                            api_log(
+                                f"MangaRender [req={req_id}] page {page_idx}/{num_pages} ({fname}) returned None "
+                                f"(cv={len(page_cv)}, llm={len(bubbles)})"
                             )
                     except Exception as e:
                         api_log(f"MangaRender [req={req_id}] page {page_idx} fallback to text-only: {e}")
