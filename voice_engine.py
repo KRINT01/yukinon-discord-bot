@@ -8,7 +8,6 @@ import wave
 import array
 import base64
 import logging
-import tempfile
 import threading
 import asyncio
 import subprocess
@@ -48,7 +47,6 @@ from config import (
     GEMINI_TRANSCRIBE_LIVE_MODEL,
     GROQ_API_KEY,
     GROQ_STT_MODEL,
-    ACTIVE_FAST_MODEL,
     VOICE_WAKE_WORDS,
     THAI_CHAR_REGEX,
     URL_REGEX,
@@ -72,8 +70,7 @@ from persona import (
     VOICE_SYSTEM_PROMPT,
 )
 from llm import (
-    query_local_ollama_chat,
-    orchestrate_message_with_decision_1,
+    query_ai_chat,
     orchestrate_voice_utterance_with_decision_1,
     check_voice_scribe_stop_with_decision_1,
 )
@@ -85,7 +82,8 @@ logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.ERROR)
 logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.ERROR)
 
 OPUS_SILENCE_FRAME = b"\xf8\xff\xfe"
-PCM_SILENCE_20MS = b"\x00" * 3840
+PCM_FRAME_BYTES = 3840  # 20ms @ 48kHz stereo 16-bit PCM
+PCM_SILENCE_20MS = b"\x00" * PCM_FRAME_BYTES
 
 # Hard 18-second cap per continuous utterance (~3.45 MB @ 48kHz stereo 16-bit) to protect 512MB Render RAM
 MAX_UTTERANCE_BYTES = 192000 * 18
@@ -110,6 +108,22 @@ _ACTIVE_VOICE_SINKS: dict[int, "SilenceGatedVoiceSink"] = {}
 # Phase 3: Rolling per-guild multi-speaker voice room history (last 8 turns) & last bot reply timestamp
 _VOICE_ROOM_HISTORY: dict[int, deque] = defaultdict(lambda: deque(maxlen=8))
 _VOICE_LAST_BOT_REPLY_TS: dict[int, float] = {}
+
+
+def _build_decim_lp_kernel(num_taps: int = 21, fc_hz: float = 6800.0, fs_hz: float = 48000.0):
+    """Precomputes a 21-tap Blackman-windowed sinc anti-aliasing low-pass FIR kernel for 48kHz -> 16kHz decimation."""
+    if not _HAS_NUMPY:
+        return None
+    n = np.arange(num_taps, dtype=np.float32) - (num_taps - 1) / 2.0
+    fc = fc_hz / fs_hz
+    h = np.sinc(2.0 * fc * n).astype(np.float32)
+    win = np.blackman(num_taps).astype(np.float32)
+    h *= win
+    h /= np.sum(h)
+    return h
+
+
+_DECIM_LP_KERNEL = _build_decim_lp_kernel()
 
 
 def _calc_pcm16_rms(pcm_bytes: bytes) -> float:
@@ -639,16 +653,46 @@ def _split_tts_chunks(text: str, max_len: int = 195) -> list[str]:
     return chunks
 
 
+def _pad_pcm_to_opus_frame(pcm_bytes: bytes) -> bytes:
+    """Zero-pads raw 48kHz stereo 16-bit PCM to a 3840-byte (20ms) frame boundary so PCMAudio never drops the tail."""
+    if not pcm_bytes:
+        return b""
+    rem = len(pcm_bytes) % PCM_FRAME_BYTES
+    if rem:
+        return pcm_bytes + (b"\x00" * (PCM_FRAME_BYTES - rem))
+    return pcm_bytes
+
+
+def _decode_audio_to_pcm48k_sync(audio_bytes: bytes) -> bytes:
+    """Plain fallback decode to raw 48kHz stereo 16-bit PCM if Yukino mastering filter fails."""
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-threads", "1", "-i", "pipe:0",
+            "-ac", "2", "-ar", "48000",
+            "-f", "s16le", "pipe:1", "-loglevel", "error"
+        ],
+        input=audio_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=True,
+    )
+    return _pad_pcm_to_opus_frame(proc.stdout)
+
+
 def _master_tts_audio_sync(
     mp3_bytes: bytes,
     extra_af: str = "",
     trim_internal_pauses: bool = True,
+    output_format: str = "pcm",
 ) -> bytes:
     """
-    Audio mastering chain tuned for Yukino's calm, cool kuudere voice:
+    Single-pass FFmpeg audio mastering chain tuned for Yukino's calm, cool kuudere voice:
     - `silenceremove`: tightens dead gaps >160ms (including chunk seams) down to a natural 70ms breath
     - `adelay=220:all=1`: prevents Discord Opus from clipping opening syllables
     - Subtle warmth (+1.5dB @ 240Hz) + de-harshing (-3.0dB @ 3.2kHz) + gentle compression
+    - `output_format="pcm"` emits raw 48kHz stereo `s16le` directly for `discord.PCMAudio` (1 ffmpeg spawn total, zero disk I/O).
+    - `output_format="mp3"` emits 128kbps MP3 for text-channel fallback file attachments.
     """
     stages = []
     if extra_af:
@@ -665,44 +709,58 @@ def _master_tts_audio_sync(
         "volume=1.35",
     ])
     full_af = ",".join(stages)
+    if output_format == "mp3":
+        out_args = ["-ac", "2", "-ar", "48000", "-b:a", "128k", "-write_xing", "0", "-f", "mp3", "pipe:1"]
+    else:
+        out_args = ["-ac", "2", "-ar", "48000", "-f", "s16le", "pipe:1"]
+
     proc = subprocess.run(
-        [
-            "ffmpeg", "-threads", "1", "-i", "pipe:0",
-            "-af", full_af,
-            "-ac", "2", "-ar", "48000", "-b:a", "128k",
-            "-write_xing", "0",
-            "-f", "mp3", "pipe:1", "-loglevel", "error"
-        ],
+        ["ffmpeg", "-threads", "1", "-i", "pipe:0", "-af", full_af, *out_args, "-loglevel", "error"],
         input=mp3_bytes,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=30,
         check=True,
     )
-    return proc.stdout
+    return _pad_pcm_to_opus_frame(proc.stdout) if output_format != "mp3" else proc.stdout
 
 
-async def _google_tts_with_yukino_filter(spoken_text: str, lang_code: str) -> bytes:
-    raw_mp3_parts = bytearray()
+async def _google_tts_with_yukino_filter(
+    spoken_text: str, lang_code: str, output_format: str = "pcm"
+) -> bytes:
+    chunks = _split_tts_chunks(spoken_text, max_len=195)
     headers = {"User-Agent": "Mozilla/5.0"}
     session = get_http_session()
-    for chunk in _split_tts_chunks(spoken_text, max_len=195):
+
+    async def _fetch_chunk(chunk_str: str) -> bytes:
         tts_url = (
             f"{HTTPS}{GTRANS_HOST}/translate_tts"
-            f"?ie=UTF-8&client=tw-ob&tl={lang_code}&q={quote_plus(chunk)}"
+            f"?ie=UTF-8&client=tw-ob&tl={lang_code}&q={quote_plus(chunk_str)}"
         )
         try:
             async with session.get(
                 tts_url, headers=headers, timeout=aiohttp.ClientTimeout(total=12)
             ) as resp:
                 if resp.status == 200:
-                    raw_mp3_parts.extend(await resp.read())
+                    return await resp.read()
         except Exception as e:
             api_log(f"Google TTS chunk warning: {type(e).__name__}: {str(e)[:80]}")
+        return b""
+
+    if len(chunks) == 1:
+        part_list = [await _fetch_chunk(chunks[0])]
+    else:
+        part_list = list(await asyncio.gather(*(_fetch_chunk(c) for c in chunks)))
+
+    raw_mp3_parts = bytearray()
+    for part in part_list:
+        if part:
+            raw_mp3_parts.extend(part)
 
     if not raw_mp3_parts:
         return b""
 
+    raw_mp3 = bytes(raw_mp3_parts)
     # Cooler Yukino pitch (default 0.97 vs old 1.04) & slightly brisker smooth speed (default 1.24x)
     pitch = max(0.85, min(1.15, float(TTS_GOOGLE_PITCH)))
     speed = max(0.85, min(1.60, float(TTS_GOOGLE_SPEED)))
@@ -711,20 +769,26 @@ async def _google_tts_with_yukino_filter(spoken_text: str, lang_code: str) -> by
     try:
         return await asyncio.to_thread(
             _master_tts_audio_sync,
-            bytes(raw_mp3_parts),
+            raw_mp3,
             steady_af,
             True,
+            output_format,
         )
     except Exception:
-        return bytes(raw_mp3_parts)
+        if output_format == "mp3":
+            return raw_mp3
+        try:
+            return await asyncio.to_thread(_decode_audio_to_pcm48k_sync, raw_mp3)
+        except Exception:
+            return b""
 
 
-async def _edge_tts_with_mastering(spoken_text: str, is_thai: bool) -> bytes:
+async def _edge_tts_with_mastering(
+    spoken_text: str, is_thai: bool, output_format: str = "pcm"
+) -> bytes:
     if time.time() < state.edge_tts_cooldown_until:
         return b""
     voice_name = TTS_VOICE_TH if is_thai else TTS_VOICE_EN
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
-        mp3_path = tmp_mp3.name
     try:
         comm_kwargs = {"text": spoken_text, "voice": voice_name, "proxy": DDGS_PROXY}
         if TTS_RATE and TTS_RATE not in ("+0%", "-0%", "0%"):
@@ -733,31 +797,39 @@ async def _edge_tts_with_mastering(spoken_text: str, is_thai: bool) -> bytes:
             comm_kwargs["pitch"] = TTS_PITCH
 
         communicate = edge_tts.Communicate(**comm_kwargs)
-        await asyncio.wait_for(communicate.save(mp3_path), timeout=4.5)
-        if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 256:
-            with open(mp3_path, "rb") as f:
-                raw_edge_mp3 = f.read()
+
+        async def _collect_stream() -> bytes:
+            buf = bytearray()
+            async for chunk in communicate.stream():
+                if isinstance(chunk, dict) and chunk.get("type") == "audio" and chunk.get("data"):
+                    buf.extend(chunk["data"])
+            return bytes(buf)
+
+        raw_edge_mp3 = await asyncio.wait_for(_collect_stream(), timeout=4.5)
+        if len(raw_edge_mp3) > 256:
             try:
-                return await asyncio.to_thread(_master_tts_audio_sync, raw_edge_mp3, "", True)
+                return await asyncio.to_thread(_master_tts_audio_sync, raw_edge_mp3, "", True, output_format)
             except Exception:
-                return raw_edge_mp3
+                if output_format == "mp3":
+                    return raw_edge_mp3
+                try:
+                    return await asyncio.to_thread(_decode_audio_to_pcm48k_sync, raw_edge_mp3)
+                except Exception:
+                    return b""
     except Exception as e:
         state.edge_tts_cooldown_until = time.time() + 1800
         print(f"edge-tts unavailable ({e}); cooling down for 30m...", flush=True)
-    finally:
-        try:
-            os.remove(mp3_path)
-        except OSError:
-            pass
     return b""
 
 
-async def synthesize_tts_mp3_bytes(text: str) -> bytes:
+async def synthesize_tts_audio_bytes(text: str, output_format: str = "pcm") -> bytes:
     """
-    Consistent voice synthesis:
-    - Default (`TTS_PRIMARY_ENGINE=google`): Google TTS + tuned cool Yukino filter for every turn
-      (including join greeting), falling back to Edge-TTS only if Google TTS fails.
+    Consistent in-memory voice synthesis (zero temp files):
+    - Default (`TTS_PRIMARY_ENGINE=google`): Google TTS (parallel chunks) + tuned cool Yukino filter,
+      falling back to Edge-TTS only if Google TTS fails.
     - Optional (`TTS_PRIMARY_ENGINE=edge`): Edge-TTS primary with Google TTS fallback.
+    - `output_format="pcm"` returns 48kHz stereo 16-bit PCM ready for `discord.PCMAudio`.
+    - `output_format="mp3"` returns 128kbps MP3 for Discord text-channel attachments.
     """
     spoken_text = clean_text_for_speech(text)
     if not spoken_text:
@@ -766,15 +838,20 @@ async def synthesize_tts_mp3_bytes(text: str) -> bytes:
     lang_code = "th" if is_thai else "en"
 
     if TTS_PRIMARY_ENGINE == "edge":
-        edge_bytes = await _edge_tts_with_mastering(spoken_text, is_thai)
+        edge_bytes = await _edge_tts_with_mastering(spoken_text, is_thai, output_format=output_format)
         if edge_bytes:
             return edge_bytes
-        return await _google_tts_with_yukino_filter(spoken_text, lang_code)
+        return await _google_tts_with_yukino_filter(spoken_text, lang_code, output_format=output_format)
 
-    google_bytes = await _google_tts_with_yukino_filter(spoken_text, lang_code)
+    google_bytes = await _google_tts_with_yukino_filter(spoken_text, lang_code, output_format=output_format)
     if google_bytes:
         return google_bytes
-    return await _edge_tts_with_mastering(spoken_text, is_thai)
+    return await _edge_tts_with_mastering(spoken_text, is_thai, output_format=output_format)
+
+
+async def synthesize_tts_mp3_bytes(text: str) -> bytes:
+    """Backward-compatible helper returning mastered MP3 bytes."""
+    return await synthesize_tts_audio_bytes(text, output_format="mp3")
 
 
 async def speak_in_voice_channel(guild: discord.Guild, text: str, fallback_channel=None):
@@ -782,50 +859,55 @@ async def speak_in_voice_channel(guild: discord.Guild, text: str, fallback_chann
     if not spoken_text:
         return
 
-    mp3_bytes = await synthesize_tts_mp3_bytes(spoken_text)
-    if not mp3_bytes:
+    vc_connected = bool(guild and guild.voice_client and guild.voice_client.is_connected())
+    if not vc_connected:
+        if fallback_channel:
+            mp3_bytes = await synthesize_tts_mp3_bytes(spoken_text)
+            if mp3_bytes:
+                await fallback_channel.send(
+                    file=discord.File(io.BytesIO(mp3_bytes), filename="yukinon_voice.mp3")
+                )
+            else:
+                print("TTS synthesis returned empty audio bytes.", flush=True)
+        return
+
+    # Single-pass in-memory PCM synthesis -> zero temp files, zero 2nd FFmpeg decode spawn!
+    pcm_bytes = await synthesize_tts_audio_bytes(spoken_text, output_format="pcm")
+    if not pcm_bytes:
         print("TTS synthesis returned empty audio bytes.", flush=True)
         return
 
-    if not guild or not guild.voice_client or not guild.voice_client.is_connected():
-        if fallback_channel:
-            await fallback_channel.send(
-                file=discord.File(io.BytesIO(mp3_bytes), filename="yukinon_voice.mp3")
-            )
-        return
-
     async with tts_lock:
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
-            tmp_mp3.write(mp3_bytes)
-            mp3_path = tmp_mp3.name
+        pcm_stream = io.BytesIO(pcm_bytes)
         try:
             vc = guild.voice_client
             while vc and vc.is_connected() and vc.is_playing():
                 await asyncio.sleep(0.2)
             if not vc or not vc.is_connected():
+                pcm_stream.close()
                 return
             done_event = asyncio.Event()
             loop = asyncio.get_running_loop()
 
             def _after_play(err):
                 if err:
-                    print(f"FFmpeg voice playback error: {err}", flush=True)
+                    print(f"Voice PCM playback error: {err}", flush=True)
                 try:
-                    os.remove(mp3_path)
-                except OSError:
+                    pcm_stream.close()
+                except Exception:
                     pass
                 loop.call_soon_threadsafe(done_event.set)
 
-            print(f"[Voice TTS] Playing {len(mp3_bytes)} bytes in '{vc.channel.name}'...", flush=True)
-            audio_source = discord.FFmpegPCMAudio(mp3_path, options="-vn -loglevel error")
+            print(f"[Voice TTS] Playing {len(pcm_bytes)} PCM bytes in '{vc.channel.name}' (in-memory)...", flush=True)
+            audio_source = discord.PCMAudio(pcm_stream)
             vc.play(audio_source, after=_after_play)
             await asyncio.wait_for(done_event.wait(), timeout=60)
             _VOICE_LAST_BOT_REPLY_TS[int(guild.id)] = time.time()
         except Exception as e:
             print(f"TTS voice channel playback error: {e}", flush=True)
             try:
-                os.remove(mp3_path)
-            except OSError:
+                pcm_stream.close()
+            except Exception:
                 pass
 
 
@@ -939,7 +1021,7 @@ async def start_voice_scribe_session(
             f"📝 **[เริ่มโหมดจดบันทึกการสนทนา (Voice Scribe)]**\n"
             f"- **ห้องเสียง:** `{vc_name}` | **เริ่มเวลา:** `{now_th.strftime('%H:%M')} น.`{topic_line}\n"
             f"- ระหว่างนี้ฉันจะตั้งใจฟังและจดให้เงียบๆ โดยไม่พิมพ์รบกวนในแชทและไม่พูดแทรกนะคะ\n"
-            f"- คุยเสร็จแล้วพิมพ์ `!stopscribe` / `!หยุดจด` / `!leave` หรือพูดว่า **\"ยูกิโนะ หยุดจด\"** / **\"สรุปการประชุม\"** ได้เลยค่ะ"
+            f'- คุยเสร็จแล้วพิมพ์ `!stopscribe` / `!หยุดจด` / `!leave` หรือพูดว่า **"ยูกิโนะ หยุดจด"** / **"สรุปการประชุม"** ได้เลยค่ะ'
         )
     if speak_ack and vc and vc.is_connected():
         await speak_in_voice_channel(
@@ -1087,10 +1169,10 @@ async def stop_voice_scribe_session(
             f"=== บันทึกบทสนทนา (Voice Transcript) ===\n{full_transcript_text[:95000]}"
         )
 
-        summary_answer, _ = await query_local_ollama_chat(
+        summary_answer, _ = await query_ai_chat(
             summary_prompt,
-            model=ACTIVE_FAST_MODEL,
             system_prompt=FAST_SYSTEM_PROMPT,
+            mode="general",
             channel_id=target_channel.id if target_channel else None,
             temperature=0.25,
             allow_agentic_search=False,
@@ -1513,9 +1595,8 @@ async def transcribe_wav_bytes_hybrid(wav_bytes: bytes) -> str:
 
 def convert_audio_bytes_to_wav_sync(raw_bytes: bytes) -> bytes:
     """
-    Converts raw 48kHz stereo Discord PCM/audio to 16kHz mono WAV with fan-hum rejection
-    (180Hz high-pass cuts PC/UPS/switch fan rumble) and capped gentle normalization (m=3)
-    so ambient fan noise is never over-amplified into phantom STT hallucinations.
+    FFmpeg audio converter for uploaded audio attachments (.ogg/.mp3/.m4a/.flac -> 16kHz mono WAV)
+    with fan-hum rejection (180Hz high-pass) and capped gentle normalization (m=3).
     """
     proc = subprocess.run(
         [
@@ -1530,6 +1611,79 @@ def convert_audio_bytes_to_wav_sync(raw_bytes: bytes) -> bytes:
         check=True,
     )
     return proc.stdout
+
+
+def convert_pcm48k_stereo_to_wav16k_sync(pcm_bytes: bytes) -> bytes:
+    """
+    Zero-subprocess in-memory NumPy DSP converter for live 48kHz stereo Discord PCM -> 16kHz mono WAV:
+    1. Stereo-to-mono float32 averaging.
+    2. Anti-aliased 3:1 decimation via zero-copy strided 21-tap Blackman-sinc FIR (`fc=6800Hz`).
+    3. Zero-phase FFT bandpass (`180Hz` high-pass cuts PC/UPS/switch fan rumble; `6800Hz` low-pass).
+    4. Capped gentle RMS/peak normalization (`max_gain <= 3.0`, peak <= 0.88 FS).
+    Falls back automatically to FFmpeg (`convert_audio_bytes_to_wav_sync`) if NumPy is unavailable.
+    """
+    if not _HAS_NUMPY or _DECIM_LP_KERNEL is None:
+        raw_wav_io = io.BytesIO()
+        with wave.open(raw_wav_io, "wb") as wf:
+            wf.setnchannels(2)
+            wf.setsampwidth(2)
+            wf.setframerate(48000)
+            wf.writeframes(pcm_bytes)
+        return convert_audio_bytes_to_wav_sync(raw_wav_io.getvalue())
+
+    n_bytes = len(pcm_bytes) - (len(pcm_bytes) % 4)
+    if n_bytes < 12:
+        return b""
+
+    stereo = np.frombuffer(pcm_bytes[:n_bytes], dtype=np.int16).reshape(-1, 2)
+    mono = (stereo[:, 0].astype(np.float32) + stereo[:, 1].astype(np.float32)) * 0.5
+
+    taps = _DECIM_LP_KERNEL.size
+    half = taps // 2
+    n_out = mono.size // 3
+    if n_out < 16:
+        return b""
+
+    padded = np.pad(mono, (half, half), mode="edge")
+    decim = np.zeros(n_out, dtype=np.float32)
+    end_base = n_out * 3
+    for k in range(taps):
+        w = float(_DECIM_LP_KERNEL[k])
+        if w != 0.0:
+            decim += w * padded[k : k + end_base : 3]
+
+    # Zero-phase FFT bandpass (smooth raised-cosine roll-offs at 120-220Hz & 6500-7200Hz)
+    n_fft = decim.size
+    spec = np.fft.rfft(decim)
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / 16000.0)
+
+    hp = np.ones_like(freqs, dtype=np.float32)
+    hp[freqs <= 120.0] = 0.0
+    trans_hp = (freqs > 120.0) & (freqs < 220.0)
+    hp[trans_hp] = 0.5 * (1.0 - np.cos(np.pi * (freqs[trans_hp] - 120.0) / 100.0))
+
+    lp = np.ones_like(freqs, dtype=np.float32)
+    lp[freqs >= 7200.0] = 0.0
+    trans_lp = (freqs > 6500.0) & (freqs < 7200.0)
+    lp[trans_lp] = 0.5 * (1.0 + np.cos(np.pi * (freqs[trans_lp] - 6500.0) / 700.0))
+
+    filtered = np.fft.irfft(spec * (hp * lp), n=n_fft).astype(np.float32)
+
+    peak = float(np.max(np.abs(filtered))) if filtered.size else 0.0
+    rms = float(np.sqrt(np.mean(filtered * filtered))) if filtered.size else 0.0
+    if rms > 1.0 and peak > 1.0:
+        target_gain = min(3.0, 3200.0 / rms, (0.88 * 32767.0) / peak)
+        if target_gain > 1.02 or peak > (0.88 * 32767.0):
+            filtered *= target_gain
+
+    pcm16 = np.clip(np.rint(filtered), -32768.0, 32767.0).astype(np.int16)
+    out_io = io.BytesIO()
+    with wave.open(out_io, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(pcm16.tobytes())
+    return out_io.getvalue()
 
 
 def _strip_wake_word_prefix(text: str) -> str:
@@ -1641,7 +1795,7 @@ async def handle_spoken_voice_command(
                     speak_ack=True,
                     reason="ถึงขีดจำกัดระยะเวลาหรือจำนวนข้อความสูงสุดอัตโนมัติ",
                 )
-            return
+        return
 
     human_count_in_vc = _count_humans_in_voice_channel(guild)
     explicit_wake = _has_wake_word_prefix_or_near_start(cleaned)
@@ -1654,7 +1808,7 @@ async def handle_spoken_voice_command(
     # 1. Instant Voice-Test Trigger (Always replies in chat even if wakeword is on)
     if VOICE_TEST_PHRASE_REGEX.search(cleaned):
         test_reply = (
-            f"ฉันได้ยินเสียงพูดในห้องเสียงชัดเจนแล้วค่ะ (ข้อความที่ได้ยินคือ: **\"{cleaned}\"**) "
+            f'ฉันได้ยินเสียงพูดในห้องเสียงชัดเจนแล้วค่ะ (ข้อความที่ได้ยินคือ: **"{cleaned}"**) '
             "ไม่ต้องพูดย้ำหลายรอบหรอกนะคะ"
         )
         test_reply = sanitize_yukino_output(test_reply, cleaned, speaker_user, speaker_name)
@@ -1827,10 +1981,10 @@ async def handle_spoken_voice_command(
         if group_ctx_block:
             voice_prompt = f"{voice_prompt}\n\n{group_ctx_block}"
 
-    answer, _ = await query_local_ollama_chat(
+    answer, _ = await query_ai_chat(
         voice_prompt,
-        model=ACTIVE_FAST_MODEL,
         system_prompt=VOICE_SYSTEM_PROMPT,
+        mode="voice",
         channel_id=text_channel.id if text_channel else None,
         temperature=0.45,
         allow_agentic_search=True,
@@ -1848,11 +2002,12 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
     """
     Adaptive Noise-Floor Multi-Speaker VAD Sink tuned for rooms with steady fan noise:
     - Python 3.13+ safe NumPy int16->float64 RMS calculation (zero `audioop` dependency).
+    - Zero-subprocess NumPy 48kHz->16kHz anti-aliased decimation + 180Hz fan-hum bandpass for STT.
     - Mode-aware silence flush: snappier `0.85s` in interactive voice chat, patient `1.20s` in Voice Scribe Mode.
     - Tracks a slow per-speaker ambient noise floor EMA so steady fan hum (rms 30-65) never triggers STT.
     - Preserves per-speaker utterance start timestamps so overlapping multi-speaker conversations
       sort in exact chronological order during Voice Scribe Mode.
-    - Caps concurrent FFmpeg/STT tasks via `voice_stt_semaphore` (`Semaphore(2)`).
+    - Caps concurrent STT tasks via `voice_stt_semaphore` (`Semaphore(2)`).
     """
 
     BASE_SPEECH_RMS_MIN = 110.0
@@ -1956,13 +2111,13 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
                     self.noise_floors[speaker] = max(15.0, min(95.0, updated_floor))
                 self.pre_roll_buffers[speaker].append(data.pcm)
 
-            if frame_rms > 25.0 and (now - self._last_rms_log > 5.0):
-                self._last_rms_log = now
-                print(
-                    f"[Voice Mic Level] speaker={speaker.display_name}, "
-                    f"rms={int(frame_rms)}, floor={int(self.noise_floors[speaker])}, thresh={int(start_thresh)}",
-                    flush=True,
-                )
+        if frame_rms > 25.0 and (now - self._last_rms_log > 5.0):
+            self._last_rms_log = now
+            print(
+                f"[Voice Mic Level] speaker={speaker.display_name}, "
+                f"rms={int(frame_rms)}, floor={int(self.noise_floors[speaker])}, thresh={int(start_thresh)}",
+                flush=True,
+            )
 
     def _spawn_pcm_task(self, user, pcm_bytes: bytes, utterance_ts: float) -> asyncio.Task:
         task = self._loop.create_task(self._process_user_pcm(user, pcm_bytes, utterance_ts))
@@ -2052,13 +2207,9 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
     async def _process_user_pcm(self, user, pcm_bytes: bytes, utterance_ts: float):
         try:
             async with voice_stt_semaphore:
-                raw_wav_io = io.BytesIO()
-                with wave.open(raw_wav_io, "wb") as wf:
-                    wf.setnchannels(2)
-                    wf.setsampwidth(2)
-                    wf.setframerate(48000)
-                    wf.writeframes(pcm_bytes)
-                compact_wav = await asyncio.to_thread(convert_audio_bytes_to_wav_sync, raw_wav_io.getvalue())
+                compact_wav = await asyncio.to_thread(convert_pcm48k_stereo_to_wav16k_sync, pcm_bytes)
+                if not compact_wav:
+                    return
                 spoken_text = await transcribe_wav_bytes_hybrid(compact_wav)
                 if spoken_text:
                     await handle_spoken_voice_command(
@@ -2072,4 +2223,4 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
                 else:
                     print(f"[Voice STT] Audio captured from {user.display_name}, but STT returned empty text.", flush=True)
         except Exception as e:
-            print(f"Voice PCM processing error ({getattr(user, 'display_name', '?')}): {type(e).__name__}: {e}", flush=True)
+            print(f"Voice PCM processing error ({getattr(user, 'display_name', '?')}): {e}", flush=True)

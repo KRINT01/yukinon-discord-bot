@@ -39,9 +39,8 @@ def _configure_glibc_low_ram_allocator():
 
 _configure_glibc_low_ram_allocator()
 
-# Constructed protocol prefixes so chat/markdown renderers never auto-link URLs in code blocks
+# Constructed protocol prefix so chat/markdown renderers never auto-link URLs in code blocks
 HTTPS = "https" + "://"
-HTTP = "http" + "://"
 
 
 def clean_url(url: str) -> str:
@@ -67,13 +66,12 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 OWNER_USER_ID = os.getenv("OWNER_USER_ID", "").strip()
 
-# Modal Serverless GPU Ollama Endpoint & Bearer Auth Key
-OLLAMA_BASE_URL = clean_url(os.getenv("OLLAMA_BASE_URL", f"{HTTP}127.0.0.1:11434")).rstrip("/")
-MODAL_API_KEY = os.getenv("MODAL_API_KEY", "").strip()
-
-ACTIVE_FAST_MODEL = os.getenv("OLLAMA_FAST_MODEL", "scb10x/typhoon2.5-qwen3-4b")
-ACTIVE_CODE_MODEL = os.getenv("OLLAMA_CODE_MODEL", "qwen2.5-coder:7b")
-ACTIVE_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "scb10x/typhoon-ocr1.5-3b")
+# Hardware & Concurrency Scaling (defaults tuned for Render 512 MB / 0.1 vCPU; scale via env on VPS/ARM64 hosts)
+CONTAINER_RAM_LIMIT_MB = max(128, int(os.getenv("CONTAINER_RAM_LIMIT_MB", "512") or "512"))
+OPENCV_THREADS = max(1, int(os.getenv("OPENCV_THREADS", "1") or "1"))
+MANGA_CONCURRENCY = max(1, int(os.getenv("MANGA_CONCURRENCY", "1") or "1"))
+VOICE_STT_CONCURRENCY = max(1, int(os.getenv("VOICE_STT_CONCURRENCY", "2") or "2"))
+MAX_CACHED_CHANNELS = max(8, int(os.getenv("MAX_CACHED_CHANNELS", "64") or "64"))
 
 # Groq Free LPU API Settings
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
@@ -147,13 +145,65 @@ intents.guilds = True
 intents.voice_states = True
 
 # Concurrency locks & boot timestamp
-ollama_lock = asyncio.Lock()
 tts_lock = asyncio.Lock()
-# Global OOM guard: serializes heavy multi-page Pillow/OpenCV jobs on 512 MB Render containers
-manga_semaphore = asyncio.Semaphore(1)
-# Caps concurrent multi-speaker FFmpeg/STT tasks so 0.1 vCPU stays responsive to Discord voice heartbeats
-voice_stt_semaphore = asyncio.Semaphore(2)
+# Global OOM guard: defaults to Semaphore(1) on 512 MB containers; scales via MANGA_CONCURRENCY on multi-core VPS hosts
+manga_semaphore = asyncio.Semaphore(MANGA_CONCURRENCY)
+# Caps concurrent multi-speaker STT tasks; scales via VOICE_STT_CONCURRENCY
+voice_stt_semaphore = asyncio.Semaphore(VOICE_STT_CONCURRENCY)
 BOOT_TIME = time.time()
+
+
+class BoundedChannelDict(dict):
+    """
+    LRU-bounded per-channel dictionary capped at `MAX_CACHED_CHANNELS` (default 64)
+    so multi-server channel caches never grow unbounded over long uptimes.
+    Uses Python 3.7+ insertion-ordered `dict` (zero `OrderedDict.pop` quirks);
+    read-only `.get()` avoids mutating order during iteration, while `__getitem__`
+    and `__setitem__` refresh recency and evict oldest entries beyond `maxsize`.
+    """
+
+    def __init__(self, maxsize: int = MAX_CACHED_CHANNELS):
+        super().__init__()
+        self._maxsize = max(1, int(maxsize))
+
+    def __getitem__(self, key):
+        val = super().__getitem__(key)
+        if len(self) > 1:
+            super().__delitem__(key)
+            super().__setitem__(key, val)
+        return val
+
+    def __setitem__(self, key, value):
+        if key in self:
+            super().__delitem__(key)
+        super().__setitem__(key, value)
+        while len(self) > self._maxsize:
+            super().__delitem__(next(iter(self)))
+
+    def setdefault(self, key, default=None):
+        if key in self:
+            return self[key]
+        self[key] = default
+        return default
+
+    def update(self, *args, **kwargs):
+        for k, v in dict(*args, **kwargs).items():
+            self[k] = v
+
+
+class BoundedChannelDefaultDict(BoundedChannelDict):
+    """Drop-in LRU-bounded replacement for `defaultdict(factory)` keyed by Discord channel_id."""
+
+    def __init__(self, default_factory, maxsize: int = MAX_CACHED_CHANNELS):
+        super().__init__(maxsize=maxsize)
+        self._default_factory = default_factory
+
+    def __missing__(self, key):
+        if self._default_factory is None:
+            raise KeyError(key)
+        val = self._default_factory()
+        self[key] = val
+        return val
 
 
 class RuntimeState:
@@ -191,7 +241,6 @@ class RuntimeState:
             "gemma_ai_studio": 0,
             "groq": 0,
             "cloudflare": 0,
-            "modal": 0,
         }
 
     def record_decision_stat(self, elapsed_sec: float, ok: bool = True) -> None:
@@ -258,21 +307,16 @@ async def close_http_session():
         await state.http_session.close()
 
 
-def get_modal_headers() -> dict:
-    headers = {"Content-Type": "application/json"}
-    if MODAL_API_KEY:
-        headers["Authorization"] = f"Bearer {MODAL_API_KEY}"
-    return headers
-
-
-# Rolling per-channel conversation memory (stores last 6 user/assistant turns = 12 messages)
-channel_memory = defaultdict(lambda: deque(maxlen=12))
-# Stores the primary topic/subject anchor per channel so shortened names (e.g., 'PSO2 NGS' -> 'NGS') never lose context
-channel_active_topic = {}
-# Multi-file rolling attachment buffer per channel (stores up to 4 recent files/logs within 30-min TTL)
-channel_last_attachment: dict[int, deque] = defaultdict(lambda: deque(maxlen=4))
-# Stores the most recent live weather report per channel (30-min TTL) for follow-up questions
-channel_last_weather = {}
+# Rolling per-channel conversation memory (LRU-capped at MAX_CACHED_CHANNELS; 12 messages per channel)
+channel_memory = BoundedChannelDefaultDict(lambda: deque(maxlen=12), maxsize=MAX_CACHED_CHANNELS)
+# Primary topic/subject anchor per channel (LRU-capped at MAX_CACHED_CHANNELS)
+channel_active_topic = BoundedChannelDict(maxsize=MAX_CACHED_CHANNELS)
+# Multi-file rolling attachment buffer per channel (LRU-capped; up to 4 recent files/logs within 30-min TTL)
+channel_last_attachment: BoundedChannelDefaultDict = BoundedChannelDefaultDict(
+    lambda: deque(maxlen=4), maxsize=MAX_CACHED_CHANNELS
+)
+# Most recent live weather report per channel (LRU-capped; 30-min TTL) for follow-up questions
+channel_last_weather = BoundedChannelDict(maxsize=MAX_CACHED_CHANNELS)
 # False = reply to all speech in voice channel; True = require wake word ("ยูกิโนะ", etc.)
 voice_wake_word_enabled = defaultdict(lambda: False)
 # Active in-RAM passive Voice Scribe sessions keyed by guild_id (cleared on stop/leave/disconnect)
@@ -283,7 +327,7 @@ voice_scribe_sessions: dict[int, dict] = {}
 # ==============================================================================
 TEMP_IMG_CACHE_DIR = os.path.join(tempfile.gettempdir(), "yukinon_img_cache")
 TEMP_IMG_CACHE_TTL_SEC = 300
-TEMP_IMG_CACHE_MAX_BYTES = 30 * 1024 * 1024
+TEMP_IMG_CACHE_MAX_BYTES = max(10, int(os.getenv("TEMP_IMG_CACHE_MAX_MB", "30") or "30")) * 1024 * 1024
 
 
 def _dir_size_bytes(path: str) -> int:
@@ -298,7 +342,7 @@ def _dir_size_bytes(path: str) -> int:
 
 
 def prune_temp_image_cache(ttl_sec: int = TEMP_IMG_CACHE_TTL_SEC):
-    """Evicts expired (>ttl_sec) or oldest /tmp image cache buckets beyond 30 MB."""
+    """Evicts expired (>ttl_sec) or oldest /tmp image cache buckets beyond TEMP_IMG_CACHE_MAX_BYTES."""
     if not os.path.isdir(TEMP_IMG_CACHE_DIR):
         return
     now = time.time()
@@ -686,6 +730,31 @@ OWNER_NAME_STRIP_REGEX = re.compile(
 URL_REGEX = re.compile(r"https?://[^\s<>'\"]+")
 AGENTIC_SEARCH_TAG_REGEX = re.compile(r"\[SEARCH:\s*(.+?)\]", re.IGNORECASE)
 AGENTIC_IMAGE_TAG_REGEX = re.compile(r"^\s*\[IMAGE:\s*(.+?)\]", re.IGNORECASE)
+
+# Canonical Compound-Intent & Native Tool Routing Regexes (shared by bot.py & chat_pipeline.py)
+COMPOUND_CONNECTOR_REGEX = re.compile(
+    r"(แล้ว(?:ก็)?|พร้อม(?:กับ|ทั้ง)?|และ(?:ช่วย)?|กับ|แถม|\band\s+(?:also|then)?\b|\bplus\b|,)",
+    re.IGNORECASE,
+)
+_MATH_EXPR_CUE_PAT = (
+    r"\d+\s*[\+\-\*/x×^%]\s*\d+|คำนวณ|แปลงค่าเงิน|กี่บาท|กี่เยน|กี่ดอลลาร์|\bcalculate\b|\bconvert\b"
+)
+_MEMORY_INLINE_CUE_PAT = (
+    r"จำไว้ว่า|ช่วยจำว่า|ปักหมุดความจำ|บันทึกความจำ|\bremember\s+that\b"
+)
+_OT_INLINE_CUE_PAT = (
+    r"(?:จด|บันทึก|สรุป|ลบ)\s*(?:เวลา\s*)?ot\b"
+)
+MATH_EXPR_CUE_REGEX = re.compile(rf"({_MATH_EXPR_CUE_PAT})", re.IGNORECASE)
+MEMORY_INLINE_CUE_REGEX = re.compile(rf"({_MEMORY_INLINE_CUE_PAT})", re.IGNORECASE)
+OT_INLINE_CUE_REGEX = re.compile(rf"({_OT_INLINE_CUE_PAT})", re.IGNORECASE)
+NATIVE_TOOL_CUE_REGEX = re.compile(
+    rf"({_MATH_EXPR_CUE_PAT}|{_MEMORY_INLINE_CUE_PAT}|{_OT_INLINE_CUE_PAT}|"
+    r"ช่วยจำ|ความจำ|บันทึกไว้|\bot\b|โอที|"
+    r"วาดรูป|สร้างภาพ|เจนรูป|draw\s+a|generate\s+an?\s+image|"
+    r"อากาศ|ฝนตก|พยากรณ์|\bweather\b|\bforecast\b)",
+    re.IGNORECASE,
+)
 
 # Enterprise & Full-Stack Engineering Intent Pattern + Stack Trace Signatures
 CODE_INTENT_PATTERN = re.compile(

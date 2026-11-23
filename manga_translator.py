@@ -4,6 +4,8 @@ import re
 import json
 import time
 import uuid
+import shutil
+import tempfile
 import asyncio
 from urllib.parse import quote_plus
 
@@ -44,16 +46,25 @@ from manga_cv_render import (
     _release_cv_page_masks,
 )
 
-MANGA_TRANSLATOR_VERSION = "v15"
+MANGA_TRANSLATOR_VERSION = "v16"
 MANGA_CV_VER = getattr(_mcr_mod, "MANGA_CV_RENDER_VERSION", "old")
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
 # Bundle 2 dynamic parallel hedge: faster 15s recovery on typical 2-4p X threads, patient 25s on 5-12p batches
 MANGA_BATCH_HEDGE_DELAY_SMALL_SEC = 15.0
 MANGA_BATCH_HEDGE_DELAY_LARGE_SEC = 25.0
 
+# Batch 3: Adaptive Stage 2 polish threshold & disk-backed /tmp streaming root
+MAX_ADAPTIVE_SKIP_POLISH_BUBBLES = 4
+MANGA_STREAM_TMP_ROOT = os.path.join(tempfile.gettempdir(), "yukinon_manga_jobs")
+_MANGA_JOB_STALE_SEC = 1200.0  # 20-minute orphan cleanup guard
+
 _FLASH_LITE_EXCLUDED = ("2.5", "2.0", "1.5", "latest", "image", "tts", "audio", "live", "embedding")
 _HANGUL_REGEX = re.compile(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF]")
 _SOURCE_EAST_ASIAN_REGEX = re.compile(r"[\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]")
+_ASCII_LATIN_WORD_REGEX = re.compile(r"[A-Za-z]{2,}")
+_COMMON_SAFE_THAI_LOAN_ABBREVS = frozenset({
+    "ok", "dm", "hp", "mp", "xp", "tv", "pc", "ai", "sns", "id", "ng", "vr", "gps", "rpg", "npc", "bgm", "op", "ed",
+})
 
 # Set-of-Mark (SoM) JSON responseSchema with explicit `propertyOrdering`:
 # - Every numbered CV bubble `[k]` maps 1-to-1 via `"bubble_id": k` (zero coordinate drift!).
@@ -158,6 +169,95 @@ MANGA_SINGLE_SOM_SCHEMA = {
     "propertyOrdering": ["summary", "bubbles"],
     "required": ["summary", "bubbles"],
 }
+
+
+# ==============================================================================
+# BATCH 3: DISK-BACKED /tmp PAGE STREAMING HELPERS (ZERO RAW-PAGE RAM RESIDENCY)
+# ==============================================================================
+def _create_manga_job_dir_sync(req_id: str) -> str:
+    """Creates an isolated `/tmp` job directory and opportunistically prunes stale orphan jobs."""
+    os.makedirs(MANGA_STREAM_TMP_ROOT, exist_ok=True)
+    now = time.time()
+    try:
+        for entry in os.scandir(MANGA_STREAM_TMP_ROOT):
+            if entry.is_dir():
+                try:
+                    if (now - entry.stat().st_mtime) > _MANGA_JOB_STALE_SEC:
+                        shutil.rmtree(entry.path, ignore_errors=True)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+    safe_req = re.sub(r"[^A-Za-z0-9_-]+", "", req_id or "")[:24] or uuid.uuid4().hex[:8]
+    job_dir = os.path.join(MANGA_STREAM_TMP_ROOT, f"{safe_req}_{uuid.uuid4().hex[:6]}")
+    os.makedirs(job_dir, exist_ok=True)
+    return job_dir
+
+
+def _write_manga_page_to_job_dir_sync(job_dir: str, page_idx: int, raw_bytes: bytes) -> str:
+    out_path = os.path.join(job_dir, f"in_p{page_idx:02d}.bin")
+    with open(out_path, "wb") as f:
+        f.write(raw_bytes)
+    return out_path
+
+
+def _spill_pages_to_job_dir_sync(
+    pages_bytes: list[tuple[bytes, str]], req_id: str
+) -> tuple[str, list[tuple[str, str]]]:
+    """Spills in-memory `(raw_bytes, fname)` pages into an isolated `/tmp` job directory."""
+    job_dir = _create_manga_job_dir_sync(req_id)
+    disk_pages: list[tuple[str, str]] = []
+    for idx, (raw_b, fname) in enumerate(pages_bytes, 1):
+        p_path = _write_manga_page_to_job_dir_sync(job_dir, idx, raw_b)
+        disk_pages.append((p_path, fname))
+    return job_dir, disk_pages
+
+
+def _read_page_bytes_sync(page_source: bytes | str) -> bytes:
+    """Reads raw image bytes from either a `/tmp` file path (`str`) or an in-memory `bytes` buffer."""
+    if isinstance(page_source, (bytes, bytearray)):
+        return bytes(page_source)
+    if isinstance(page_source, str) and page_source and os.path.exists(page_source):
+        with open(page_source, "rb") as f:
+            return f.read()
+    return b""
+
+
+def _detect_page_bubbles_from_source_sync(
+    page_source: bytes | str, max_dim: int, quality: int
+) -> tuple[str, list[dict]]:
+    raw_b = _read_page_bytes_sync(page_source)
+    if not raw_b:
+        return "", []
+    return _detect_page_bubbles_and_build_som_b64_sync(raw_b, max_dim, quality)
+
+
+def _render_manga_page_to_disk_sync(
+    page_source: bytes | str,
+    bubbles: list[dict],
+    page_cv: list[dict],
+    out_jpg_path: str,
+) -> bool:
+    """
+    Streams one manga page from `/tmp` (or raw bytes), renders translated bubbles,
+    and writes the finished JPEG directly to `out_jpg_path` so rendered buffers
+    never accumulate simultaneously in container RAM across 1-12 pages.
+    """
+    raw_b = _read_page_bytes_sync(page_source)
+    if not raw_b:
+        return False
+    rendered_jpg = render_translated_manga_image_sync(raw_b, bubbles, page_cv)
+    if not rendered_jpg:
+        return False
+    with open(out_jpg_path, "wb") as f:
+        f.write(rendered_jpg)
+    return True
+
+
+def _cleanup_manga_job_dir_sync(job_dir: str) -> None:
+    if job_dir and os.path.isdir(job_dir):
+        shutil.rmtree(job_dir, ignore_errors=True)
 
 
 def _is_gemini_model_on_cooldown(model_id: str) -> bool:
@@ -295,6 +395,57 @@ def _is_valid_target_script(tr_text: str, src_text: str, target_lang_name: str) 
     return True
 
 
+def _should_skip_gemma_polish_for_simple_page(
+    batch_results: list[tuple[list[dict], str]],
+    target_lang_name: str,
+) -> bool:
+    """
+    Adaptive Stage 2 Proofreading Gate:
+    Auto-skips the extra Gemma 4 polish round (~6-12s) ONLY on simple 1-page strips
+    (`<= MAX_ADAPTIVE_SKIP_POLISH_BUBBLES` bubbles) when every bubble and the scene summary
+    already pass strict script, cleanliness, length-proportionality, and zero-leak checks.
+    Multi-page batches (`> 1` page) and denser pages (`> 4` bubbles) ALWAYS run Gemma 4 polish.
+    """
+    if len(batch_results) != 1:
+        return False
+    bubbles, summary = batch_results[0]
+    if not (1 <= len(bubbles) <= MAX_ADAPTIVE_SKIP_POLISH_BUBBLES):
+        return False
+
+    is_thai = target_lang_name.lower() == "thai"
+
+    if summary:
+        if not _is_valid_target_script(summary, "", target_lang_name):
+            return False
+        if _SOURCE_EAST_ASIAN_REGEX.search(summary):
+            return False
+
+    for b in bubbles:
+        # If sanitizer had to strip emojis/Hangul/CJK/malformed tone marks, polish it properly
+        if b.get("_raw_translated_text"):
+            return False
+        src_txt = str(b.get("source_text") or "").strip()
+        tr_txt = str(b.get("translated_text") or "").strip()
+        if len(tr_txt) < 2:
+            return False
+        if not _is_valid_target_script(tr_txt, src_txt, target_lang_name):
+            return False
+        if _SOURCE_EAST_ASIAN_REGEX.search(tr_txt):
+            return False
+        # Suspiciously truncated translation compared to a long Japanese source sentence
+        if len(src_txt) >= 16 and len(tr_txt) < 5:
+            return False
+        if is_thai:
+            # Flag mixed English/romanized syllables inside Thai unless verbatim in source_text or safe abbrev
+            src_lower = src_txt.lower()
+            for tok in _ASCII_LATIN_WORD_REGEX.findall(tr_txt):
+                tl = tok.lower()
+                if tl not in _COMMON_SAFE_THAI_LOAN_ABBREVS and tl not in src_lower:
+                    return False
+
+    return True
+
+
 def _dedupe_hallucinated_page_bubbles(
     batch_results: list[tuple[list[dict], str]],
     cv_bubbles_per_page: list[list[dict]],
@@ -363,7 +514,7 @@ def _dedupe_hallucinated_page_bubbles(
 
 
 async def _recover_omitted_pages_async(
-    pages_input: list[tuple[bytes, str]],
+    pages_input: list[tuple[bytes | str, str]],
     batch_results: list[tuple[list[dict], str]],
     cv_bubbles_per_page: list[list[dict]],
     target_lang_name: str,
@@ -408,7 +559,7 @@ async def _recover_omitted_pages_async(
 
     recovered_pages = 0
     for p_idx, missing_ids in suspect_indices[:max_pages_to_recover]:
-        raw_b, fname = pages_input[p_idx]
+        page_src, fname = pages_input[p_idx]
         old_bubbles, old_summary = batch_results[p_idx]
         api_log(
             f"MangaPageRecover [req={req_id}] -> Page {p_idx + 1}/{num_pages} ({fname}) "
@@ -416,7 +567,7 @@ async def _recover_omitted_pages_async(
         )
         try:
             new_bubbles, new_summary, new_cv = await extract_and_translate_manga_bubbles(
-                raw_b,
+                page_src,
                 fname,
                 target_lang_name,
                 series_context_hint=series_context_hint,
@@ -516,8 +667,7 @@ async def _call_gemma_ai_studio_polish_json(
 ) -> tuple[str, float]:
     """
     Calls a Google AI Studio Gemma 4 model (`gemma-4-31b-it` or `gemma-4-26b-a4b-it`) for
-    Stage 2 text-only proofreading with generous `maxOutputTokens=12288` (prevents thinking-token
-    starvation) and automatic HTTP 400 fallback if `responseMimeType` is rejected.
+    Stage 2 text-only proofreading with automatic HTTP 400 fallback if `responseMimeType` is rejected.
     """
     if not GEMINI_API_KEY or _is_gemini_model_on_cooldown(model_id):
         return "", 0.0
@@ -712,14 +862,14 @@ async def _polish_single_chunk_gemma_async(
         raw_out, el = await _call_gemma_ai_studio_polish_json(
             "gemma-4-26b-a4b-it", combined_prompt, req_id=chunk_tag, timeout_sec=15.0
         )
-        if raw_out:
-            s_m, b_m = _parse_polish_json_response(raw_out)
-            if len(b_m) >= min_accept:
-                return s_m, b_m, "gemma-4-26b-a4b-it", el
-            api_log(
-                f"MangaPolish [req={chunk_tag}] -> gemma-4-26b-a4b-it incomplete "
-                f"({len(b_m)}/{chunk_bubble_cnt}); trying Cloudflare Gemma fallback"
-            )
+    if raw_out:
+        s_m, b_m = _parse_polish_json_response(raw_out)
+        if len(b_m) >= min_accept:
+            return s_m, b_m, "gemma-4-26b-a4b-it", el
+        api_log(
+            f"MangaPolish [req={chunk_tag}] -> gemma-4-26b-a4b-it incomplete "
+            f"({len(b_m)}/{chunk_bubble_cnt}); trying Cloudflare Gemma fallback"
+        )
 
     # Tier 2: Cloudflare Workers AI Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`, ~6-8s per chunk!)
     # Passing an explicit `system` role activates `llm.py`'s anti-thinking directive!
@@ -751,14 +901,14 @@ async def _polish_single_chunk_gemma_async(
         raw_out_31, el_31 = await _call_gemma_ai_studio_polish_json(
             "gemma-4-31b-it", combined_prompt, req_id=chunk_tag, timeout_sec=35.0
         )
-        if raw_out_31:
-            s_m, b_m = _parse_polish_json_response(raw_out_31)
-            if len(b_m) >= min_accept:
-                return s_m, b_m, "gemma-4-31b-it", el_31
-            api_log(
-                f"MangaPolish [req={chunk_tag}] -> gemma-4-31b-it incomplete "
-                f"({len(b_m)}/{chunk_bubble_cnt}); trying Flash-Lite fallback"
-            )
+    if raw_out_31:
+        s_m, b_m = _parse_polish_json_response(raw_out_31)
+        if len(b_m) >= min_accept:
+            return s_m, b_m, "gemma-4-31b-it", el_31
+        api_log(
+            f"MangaPolish [req={chunk_tag}] -> gemma-4-31b-it incomplete "
+            f"({len(b_m)}/{chunk_bubble_cnt}); trying Flash-Lite fallback"
+        )
 
     # Tier 4: Text-only Gemini Flash-Lite fallback (only if all Gemma tiers unavailable)
     if GEMINI_API_KEY:
@@ -804,14 +954,25 @@ async def _polish_manga_translations_gemma_async(
     progress_cb=None,
 ) -> list[tuple[list[dict], str]]:
     """
-    Always-On Stage 2 Text-Only Proofreading & Localization Polish (Parallel-Chunked Gemma 4):
-    - Splits large batches (>22 bubbles) into concurrent chunks of <=22 bubbles (~700-850 output
-      tokens each) so Cloudflare Gemma 4 finishes in ~9-13s wall time instead of hitting its
-      28s HTTP timeout on 47-62 bubble batches!
-    - Passes a compact cross-page `story_overview` into every chunk so pronouns, character
-      continuity, and multi-page punchlines stay consistent across chunk boundaries.
+    Adaptive Stage 2 Text-Only Proofreading & Localization Polish (Parallel-Chunked Gemma 4):
+    - Auto-skips cleanly on tiny 1-page strips (`<= 4` bubbles) when every bubble already passes
+      strict script, cleanliness, and zero-leak checks (saves ~6-12s on quick single-panel strips).
+    - Always runs on multi-page batches (`> 1` page) and denser 1-page strips (`> 4` bubbles),
+      splitting >22 bubbles into balanced concurrent chunks with cross-page `story_overview`.
     - Per-chunk priority: AI Studio Gemma 4 (saves CF Neurons) -> Cloudflare Gemma 4 -> Flash-Lite text-only.
     """
+    if _should_skip_gemma_polish_for_simple_page(batch_results, target_lang_name):
+        bubbles_p0, sum_p0 = batch_results[0]
+        for b in bubbles_p0:
+            b["translated_text"] = _sanitize_text_for_manga_font(b.get("translated_text") or "")
+            b.pop("_raw_translated_text", None)
+        clean_sum = _sanitize_text_for_manga_font(sum_p0 or "")
+        api_log(
+            f"MangaPolish [req={req_id}] ADAPTIVE_SKIP -> 1p ({len(bubbles_p0)} clean bubble(s)) "
+            f"passed script/leak checks; skipped Gemma 4 pass ({target_lang_name})"
+        )
+        return [(bubbles_p0, clean_sum)]
+
     flat_bubbles: list[dict] = []
     compact_pages: list[dict] = []
     overview_lines: list[str] = []
@@ -1394,7 +1555,7 @@ async def _invoke_manga_batch_single_model(
 
 
 async def extract_and_translate_manga_pages_batch(
-    pages_input: list[tuple[bytes, str]],
+    pages_input: list[tuple[bytes | str, str]],
     target_lang_name: str,
     series_context_hint: str = "",
     req_id: str = "",
@@ -1402,8 +1563,9 @@ async def extract_and_translate_manga_pages_batch(
 ) -> tuple[list[tuple[list[dict], str]], list[list[dict]], bool]:
     """
     Set-of-Mark (SoM) CV-Anchored Multi-Page Manga Batch Pipeline:
-    1) Detects enclosed speech bubbles (white, pastel/colored, corner-clipped, and dark) via
-       vectorized OpenCV+NumPy (or lazy PIL fallback) and stamps high-contrast BLACK/YELLOW badges.
+    1) Streams each page from `/tmp` (or raw `bytes`) 1-at-a-time to detect enclosed speech bubbles
+       (white, pastel/colored, corner-clipped, and dark) via vectorized OpenCV+NumPy and stamps
+       high-contrast BLACK/YELLOW badges without keeping raw page buffers in RAM.
     2) Calls `MangaBatch` across:
        `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> (newer >3.5 `flash-lite`)
        -> `gemma-4-31b-it` -> `gemma-4-26b-a4b-it`
@@ -1447,9 +1609,9 @@ async def extract_and_translate_manga_pages_batch(
     som_t0 = time.monotonic()
     b64_pages: list[tuple[str, str, int]] = []
     cv_bubbles_per_page: list[list[dict]] = []
-    for raw_b, fname in pages_input:
+    for page_src, fname in pages_input:
         b64_str, cv_bubbles = await asyncio.to_thread(
-            _detect_page_bubbles_and_build_som_b64_sync, raw_b, batch_dim, batch_q
+            _detect_page_bubbles_from_source_sync, page_src, batch_dim, batch_q
         )
         b64_pages.append((b64_str, fname, len(cv_bubbles)))
         cv_bubbles_per_page.append(cv_bubbles)
@@ -1641,7 +1803,7 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
 
 
 async def extract_and_translate_manga_bubbles(
-    raw_bytes: bytes,
+    page_source: bytes | str,
     filename: str,
     target_lang_name: str,
     series_context_hint: str = "",
@@ -1651,9 +1813,12 @@ async def extract_and_translate_manga_bubbles(
     req_id = req_id or f"ms-{uuid.uuid4().hex[:6]}"
     cv_t0 = time.monotonic()
     b64_img, cv_bubbles = await asyncio.to_thread(
-        _detect_page_bubbles_and_build_som_b64_sync, raw_bytes, 1280, 90
+        _detect_page_bubbles_from_source_sync, page_source, 1280, 90
     )
     cv_el = time.monotonic() - cv_t0
+    if not b64_img:
+        return [], "", cv_bubbles
+
     if progress_cb is not None:
         try:
             await progress_cb(
@@ -1711,7 +1876,7 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
 
     if GEMINI_API_KEY:
         api_log(
-            f"MangaSingle [req={req_id}] REQUEST -> Tier 1 Gemini ({filename}, {len(cv_bubbles)} CV bubbles, "
+            f"MangaSingle/{MANGA_TRANSLATOR_VERSION} [req={req_id}] REQUEST -> Tier 1 Gemini ({filename}, {len(cv_bubbles)} CV bubbles, "
             f"engine={'cv2' if HAS_CV2 else 'pil'}, cv={cv_el:.2f}s)"
         )
         gemini_payload = {
@@ -1866,9 +2031,12 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
     Discord attachments, zero-RAM `/tmp` image cache (instant on In-Bubble follow-ups!), OR
     embedded links using:
     - `manga_semaphore` (`Semaphore(1)`) OOM guard with queue waiting notice
+    - Disk-backed `/tmp` job page streaming (input & rendered output pages stay on disk, keeping
+      raw 1-12p buffers out of container RAM during 20-60s Vision API waits and Stage 3 uploads)
     - Vectorized OpenCV + NumPy CV Set-of-Mark (SoM) detection (white, pastel, corner, dark) & render masking
     - Shared `llm.py` Google AI Studio catalog & cooldowns + dynamic `15s`/`25s` `3.5-flash-lite` -> `3.1-flash-lite` hedge
-    - Always-on Stage 2 Gemma 4 text-only localization polish (AI Studio Gemma 4 -> Cloudflare Gemma 4 -> Flash-Lite)
+    - Adaptive Stage 2 Gemma 4 text-only localization polish (auto-skips on clean <=4-bubble 1p strips;
+      always-on parallel-chunked for multi-page batches & dense pages)
     - Throttled live Discord progress messages (1/3 -> 2/3 -> 3/3 -> auto-delete)
     """
     from media_context import resolve_referenced_message, collect_embedded_images_and_metadata
@@ -1878,275 +2046,289 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
     channel = ctx_or_message.channel
     ref_msg = await resolve_referenced_message(msg) if getattr(msg, "reference", None) else None
 
-    pages_input: list[tuple[bytes, str]] = []
+    job_dir = ""
+    disk_pages: list[tuple[str, str]] = []
     embed_meta_sections: list[str] = []
+    cv_bubbles_per_page: list[list[dict]] = []
+    discord_files: list[discord.File] = []
 
-    # 1. Check zero-RAM `/tmp` image cache first (instant hit when clicking 'แปลลงภาพ (In-Bubble)'!)
-    cached_hit = None
-    for candidate_m in (msg, ref_msg):
-        m_id = getattr(candidate_m, "id", 0) if candidate_m is not None else 0
-        if m_id:
-            cached_hit = await asyncio.to_thread(load_temp_image_cache, m_id)
-            if cached_hit:
-                break
+    try:
+        job_seed_id = f"mjob-{uuid.uuid4().hex[:6]}"
+        # 1. Check zero-RAM `/tmp` image cache first (instant hit when clicking 'แปลลงภาพ (In-Bubble)'!)
+        cached_hit = None
+        for candidate_m in (msg, ref_msg):
+            m_id = getattr(candidate_m, "id", 0) if candidate_m is not None else 0
+            if m_id:
+                cached_hit = await asyncio.to_thread(load_temp_image_cache, m_id)
+                if cached_hit:
+                    break
 
-    if cached_hit:
-        pages_input, embed_meta_sections = cached_hit
-        api_log(f"MangaCache HIT -> loaded {len(pages_input)} page(s) from /tmp (skipped re-download)")
-    else:
-        image_attachments = [
-            a for a in (getattr(msg, "attachments", None) or [])
-            if a.filename.lower().endswith(IMAGE_EXTENSIONS)
-        ]
-        if not image_attachments and ref_msg:
+        if cached_hit:
+            raw_pages, embed_meta_sections = cached_hit
+            raw_pages = raw_pages[:MAX_MANGA_BATCH_PAGES]
+            job_dir, disk_pages = await asyncio.to_thread(_spill_pages_to_job_dir_sync, raw_pages, job_seed_id)
+            raw_pages.clear()
+            api_log(f"MangaCache HIT -> streamed {len(disk_pages)} page(s) to job /tmp (skipped re-download)")
+        else:
             image_attachments = [
-                a for a in ref_msg.attachments
+                a for a in (getattr(msg, "attachments", None) or [])
                 if a.filename.lower().endswith(IMAGE_EXTENSIONS)
             ]
+            if not image_attachments and ref_msg:
+                image_attachments = [
+                    a for a in ref_msg.attachments
+                    if a.filename.lower().endswith(IMAGE_EXTENSIONS)
+                ]
 
-        for att in image_attachments[:MAX_MANGA_BATCH_PAGES]:
-            raw_b = await att.read()
-            pages_input.append((raw_b, att.filename))
-        image_attachments.clear()
+            if image_attachments:
+                job_dir = await asyncio.to_thread(_create_manga_job_dir_sync, job_seed_id)
+                for p_i, att in enumerate(image_attachments[:MAX_MANGA_BATCH_PAGES], 1):
+                    raw_b = await att.read()
+                    p_path = await asyncio.to_thread(_write_manga_page_to_job_dir_sync, job_dir, p_i, raw_b)
+                    disk_pages.append((p_path, att.filename))
+                    raw_b = None
+                image_attachments.clear()
 
-        if not pages_input:
-            embedded_imgs, embed_meta_sections, _ = await collect_embedded_images_and_metadata(
-                msg, ref_msg=ref_msg, max_images=MAX_MANGA_BATCH_PAGES
+            if not disk_pages:
+                embedded_imgs, embed_meta_sections, _ = await collect_embedded_images_and_metadata(
+                    msg, ref_msg=ref_msg, max_images=MAX_MANGA_BATCH_PAGES
+                )
+                if embedded_imgs:
+                    raw_embed_pairs = [(emb_bytes, emb_fname) for emb_bytes, emb_fname, _ in embedded_imgs[:MAX_MANGA_BATCH_PAGES]]
+                    embedded_imgs.clear()
+                    job_dir, disk_pages = await asyncio.to_thread(_spill_pages_to_job_dir_sync, raw_embed_pairs, job_seed_id)
+                    raw_embed_pairs.clear()
+
+        if not disk_pages:
+            await channel.send(
+                "แนบรูปหน้ามังงะหรือวางลิงก์ (X/Twitter, Pixiv/phixiv หรือลิงก์รูปภาพ) มาด้วยสิคะ "
+                "แนบหลายหน้าพร้อมกันได้เลย เช่น พิมพ์ `!manga en` หรือ `!manga th` ค่ะ"
             )
-            for emb_bytes, emb_fname, _ in embedded_imgs:
-                pages_input.append((emb_bytes, emb_fname))
-            embedded_imgs.clear()
-
-    if not pages_input:
-        await channel.send(
-            "แนบรูปหน้ามังงะหรือวางลิงก์ (X/Twitter, Pixiv/phixiv หรือลิงก์รูปภาพ) มาด้วยสิคะ "
-            "แนบหลายหน้าพร้อมกันได้เลย เช่น พิมพ์ `!manga en` หรือ `!manga th` ค่ะ"
-        )
-        return
-
-    context_hints = []
-    if embed_meta_sections:
-        context_hints.append("\n".join(embed_meta_sections)[:800])
-    if channel and getattr(channel, "id", None):
-        cached_ocr = get_cached_channel_attachments(channel.id, ttl_sec=1800, max_total_chars=4000)
-        if cached_ocr:
-            id_match = re.search(
-                r"(1\.\s*\[Series\s*/\s*Franchise[\s\S]{0,700})", cached_ocr
-            )
-            if id_match:
-                context_hints.append(id_match.group(1).strip())
-    series_context_hint = "\n\n".join(context_hints)[:1400]
-
-    _, target_lang_name = _detect_target_translation_lang(user_prompt)
-    pages_input = pages_input[:MAX_MANGA_BATCH_PAGES]
-    num_pages = len(pages_input)
-    req_id = f"mb-{uuid.uuid4().hex[:6]}" if num_pages > 1 else f"ms-{uuid.uuid4().hex[:6]}"
-
-    queue_notice_msg = None
-    if manga_semaphore.locked():
-        api_log(f"MangaQueue [req={req_id}] -> waiting for active manga job to finish (OOM protection)")
-        try:
-            queue_notice_msg = await _send_or_reply(
-                channel,
-                msg,
-                content="-# ⏳ ตอนนี้ฉันติดแปลอีกชุดอยู่นะคะ เสร็จแล้วจะรีบจัดการหน้านี้ให้ต่อเลยค่ะ",
-            )
-        except Exception:
-            queue_notice_msg = None
-
-    cv_bubbles_per_page: list[list[dict]] = []
-    progress_prefix = f"❄️ **[แปลมังงะ {num_pages} หน้า → {target_lang_name}]**"
-    status_msg: discord.Message | None = None
-    last_edit_ts = 0.0
-
-    async def _update_progress(detail_text: str, force: bool = False):
-        nonlocal status_msg, last_edit_ts
-        now = time.monotonic()
-        if not force and status_msg is not None and (now - last_edit_ts) < 2.2:
             return
-        full_text = f"{progress_prefix} {detail_text}"
-        try:
-            if status_msg is None:
-                status_msg = await _send_or_reply(channel, msg, content=full_text)
-            else:
-                await status_msg.edit(content=full_text)
-            last_edit_ts = time.monotonic()
-        except Exception:
-            pass
 
-    async def _cleanup_status(replace_with: str | None = None):
-        nonlocal status_msg
-        if status_msg is None:
-            return
-        try:
-            if replace_with:
-                await status_msg.edit(content=replace_with)
-            else:
-                await status_msg.delete()
-        except Exception:
-            if replace_with:
-                await _send_or_reply(channel, msg, content=replace_with)
-        finally:
-            status_msg = None
+        # Reclaim upload/download buffers immediately before entering queued API waits
+        release_unused_memory()
 
-    async with manga_semaphore:
-        if queue_notice_msg is not None:
+        context_hints = []
+        if embed_meta_sections:
+            context_hints.append("\n".join(embed_meta_sections)[:800])
+        if channel and getattr(channel, "id", None):
+            cached_ocr = get_cached_channel_attachments(channel.id, ttl_sec=1800, max_total_chars=4000)
+            if cached_ocr:
+                id_match = re.search(
+                    r"(1\.\s*\[Series\s*/\s*Franchise[\s\S]{0,700})", cached_ocr
+                )
+                if id_match:
+                    context_hints.append(id_match.group(1).strip())
+        series_context_hint = "\n\n".join(context_hints)[:1400]
+
+        _, target_lang_name = _detect_target_translation_lang(user_prompt)
+        disk_pages = disk_pages[:MAX_MANGA_BATCH_PAGES]
+        num_pages = len(disk_pages)
+        req_id = f"mb-{uuid.uuid4().hex[:6]}" if num_pages > 1 else f"ms-{uuid.uuid4().hex[:6]}"
+
+        queue_notice_msg = None
+        if manga_semaphore.locked():
+            api_log(f"MangaQueue [req={req_id}] -> waiting for active manga job to finish (OOM protection)")
             try:
-                await queue_notice_msg.delete()
+                queue_notice_msg = await _send_or_reply(
+                    channel,
+                    msg,
+                    content="-# ⏳ ตอนนี้ฉันติดแปลอีกชุดอยู่นะคะ เสร็จแล้วจะรีบจัดการหน้านี้ให้ต่อเลยค่ะ",
+                )
+            except Exception:
+                queue_notice_msg = None
+
+        progress_prefix = f"❄️ **[แปลมังงะ {num_pages} หน้า → {target_lang_name}]**"
+        status_msg: discord.Message | None = None
+        last_edit_ts = 0.0
+
+        async def _update_progress(detail_text: str, force: bool = False):
+            nonlocal status_msg, last_edit_ts
+            now = time.monotonic()
+            if not force and status_msg is not None and (now - last_edit_ts) < 2.2:
+                return
+            full_text = f"{progress_prefix} {detail_text}"
+            try:
+                if status_msg is None:
+                    status_msg = await _send_or_reply(channel, msg, content=full_text)
+                else:
+                    await status_msg.edit(content=full_text)
+                last_edit_ts = time.monotonic()
             except Exception:
                 pass
-            queue_notice_msg = None
 
-        async with channel.typing():
+        async def _cleanup_status(replace_with: str | None = None):
+            nonlocal status_msg
+            if status_msg is None:
+                return
             try:
-                await _update_progress(
-                    "🔍 **1/3** กำลังหาช่องคำพูด...",
-                    force=True,
-                )
-
-                batch_results, cv_bubbles_per_page, is_unavailable = await extract_and_translate_manga_pages_batch(
-                    pages_input,
-                    target_lang_name,
-                    series_context_hint=series_context_hint,
-                    req_id=req_id,
-                    progress_cb=lambda txt: _update_progress(txt, force=False),
-                )
-
-                if is_unavailable:
-                    await _cleanup_status(
-                        replace_with="ตอนนี้ฝั่งแปลหลายหน้าขัดข้องชั่วคราวค่ะ ลองใหม่อีกสักครู่นะคะ"
-                    )
-                    return
-
-                if not any(bubbles or summary for bubbles, summary in batch_results):
-                    await _cleanup_status(
-                        replace_with="อ่านข้อความในภาพไม่ได้เลยค่ะ ลองเช็คดูหน่อยนะคะว่าภาพชัดพอไหม"
-                    )
-                    return
-
-                batch_results = _dedupe_hallucinated_page_bubbles(
-                    batch_results, cv_bubbles_per_page, req_id=req_id
-                )
-                batch_results, cv_bubbles_per_page = await _recover_omitted_pages_async(
-                    pages_input,
-                    batch_results,
-                    cv_bubbles_per_page,
-                    target_lang_name,
-                    series_context_hint=series_context_hint,
-                    req_id=req_id,
-                )
-                batch_results = await _polish_manga_translations_gemma_async(
-                    batch_results,
-                    target_lang_name,
-                    series_context_hint=series_context_hint,
-                    req_id=req_id,
-                    progress_cb=lambda txt: _update_progress(txt, force=True),
-                )
-
-                header_title = (
-                    f"**📖 คำแปลมังงะ {num_pages} หน้า ตามลำดับช่องอ่าน ขวาไปซ้าย ({target_lang_name}):**"
-                    if num_pages > 1
-                    else f"**📖 คำแปลมังงะตามลำดับช่องอ่าน ขวาไปซ้าย ({target_lang_name}):**"
-                )
-                transcript_lines = [header_title]
-                discord_files = []
-                render_t0 = time.monotonic()
-                api_log(
-                    f"MangaRender [req={req_id}] START ({'cv2' if HAS_CV2 else 'pil'}/{MANGA_CV_VER}) -> rendering {num_pages} page(s)..."
-                )
-                await _update_progress(
-                    f"🎨 **3/3** กำลังใส่คำแปลลงภาพ (`0/{num_pages}` หน้า)...",
-                    force=True,
-                )
-
-                for page_idx in range(1, num_pages + 1):
-                    raw_bytes, fname = pages_input[page_idx - 1]
-                    bubbles, scene_summary = batch_results[page_idx - 1]
-                    page_cv = cv_bubbles_per_page[page_idx - 1] if (page_idx - 1) < len(cv_bubbles_per_page) else []
-
-                    if num_pages > 1:
-                        transcript_lines.append(f"\n__**📄 หน้าที่ {page_idx}/{num_pages} (`{fname}`)**__")
-                    if scene_summary:
-                        clean_sum = re.sub(r"\s+", " ", scene_summary).strip()
-                        transcript_lines.append(f"-# *บริบทของฉาก: {clean_sum}*")
-
-                    if not bubbles:
-                        transcript_lines.append("*(ไม่พบช่องคำพูดในหน้านี้)*")
-                        pages_input[page_idx - 1] = (b"", fname)
-                        _release_cv_page_masks(page_cv)
-                        continue
-
-                    for idx, b in enumerate(bubbles, 1):
-                        speaker = re.sub(r"\s+", " ", (b.get("speaker_or_note") or f"ช่องคำพูด {idx}")).strip()
-                        src_txt = re.sub(r"\s+", " ", (b.get("source_text") or "")).strip()
-                        tr_txt = re.sub(r"\s+", " ", (b.get("translated_text") or "")).strip()
-                        if tr_txt:
-                            transcript_lines.append(f"**[#{idx} | {speaker}]** `{src_txt}`\n ↳ **{tr_txt}**")
-
-                    try:
-                        rendered_jpg = await asyncio.to_thread(
-                            render_translated_manga_image_sync, raw_bytes, bubbles, page_cv
-                        )
-                        if rendered_jpg:
-                            base_name = os.path.splitext(fname)[0]
-                            discord_files.append(
-                                discord.File(
-                                    io.BytesIO(rendered_jpg),
-                                    filename=f"translated_p{page_idx}_{base_name}.jpg",
-                                )
-                            )
-                        else:
-                            api_log(
-                                f"MangaRender [req={req_id}] page {page_idx}/{num_pages} ({fname}) returned None "
-                                f"(cv={len(page_cv)}, llm={len(bubbles)})"
-                            )
-                    except Exception as e:
-                        api_log(f"MangaRender [req={req_id}] page {page_idx} fallback to text-only: {e}")
-                    finally:
-                        pages_input[page_idx - 1] = (b"", fname)
-                        raw_bytes = None
-                        rendered_jpg = None
-                        _release_cv_page_masks(page_cv)
-
-                    if num_pages > 1 and page_idx < num_pages:
-                        await _update_progress(
-                            f"🎨 **3/3** กำลังใส่คำแปลลงภาพ (`{page_idx}/{num_pages}` หน้า)...",
-                            force=False,
-                        )
-                        await asyncio.sleep(0.05)
-
-                render_elapsed = time.monotonic() - render_t0
-                api_log(
-                    f"MangaRender [req={req_id}] DONE ({'cv2' if HAS_CV2 else 'pil'}) -> "
-                    f"rendered {len(discord_files)}/{num_pages} page(s) in {render_elapsed:.2f}s"
-                )
-                transcript_text = "\n".join(transcript_lines)
-
-                await _cleanup_status()
-
-                if discord_files:
-                    file_chunks = [discord_files[i : i + 10] for i in range(0, len(discord_files), 10)]
-                    if len(transcript_text) <= 1950:
-                        await _send_or_reply(channel, msg, content=transcript_text, files=file_chunks[0])
-                        for extra_files in file_chunks[1:]:
-                            await _send_or_reply(channel, None, files=extra_files)
-                    else:
-                        for idx_fc, fc in enumerate(file_chunks):
-                            await _send_or_reply(channel, msg if idx_fc == 0 else None, files=fc)
-                        await send_chunked_response(channel, transcript_text, reply_to=None)
+                if replace_with:
+                    await status_msg.edit(content=replace_with)
                 else:
-                    await send_chunked_response(channel, transcript_text, reply_to=msg)
-
-                for df in discord_files:
-                    try:
-                        df.close()
-                    except Exception:
-                        pass
-                discord_files.clear()
+                    await status_msg.delete()
+            except Exception:
+                if replace_with:
+                    await _send_or_reply(channel, msg, content=replace_with)
             finally:
-                await _cleanup_status()
-                for page_cv in cv_bubbles_per_page:
-                    _release_cv_page_masks(page_cv)
-                cv_bubbles_per_page.clear()
-                pages_input.clear()
-                release_unused_memory()
+                status_msg = None
+
+        async with manga_semaphore:
+            if queue_notice_msg is not None:
+                try:
+                    await queue_notice_msg.delete()
+                except Exception:
+                    pass
+                queue_notice_msg = None
+
+            async with channel.typing():
+                try:
+                    await _update_progress(
+                        "🔍 **1/3** กำลังหาช่องคำพูด...",
+                        force=True,
+                    )
+
+                    batch_results, cv_bubbles_per_page, is_unavailable = await extract_and_translate_manga_pages_batch(
+                        disk_pages,
+                        target_lang_name,
+                        series_context_hint=series_context_hint,
+                        req_id=req_id,
+                        progress_cb=lambda txt: _update_progress(txt, force=False),
+                    )
+
+                    if is_unavailable:
+                        await _cleanup_status(
+                            replace_with="ตอนนี้ฝั่งแปลหลายหน้าขัดข้องชั่วคราวค่ะ ลองใหม่อีกสักครู่นะคะ"
+                        )
+                        return
+
+                    if not any(bubbles or summary for bubbles, summary in batch_results):
+                        await _cleanup_status(
+                            replace_with="อ่านข้อความในภาพไม่ได้เลยค่ะ ลองเช็คดูหน่อยนะคะว่าภาพชัดพอไหม"
+                        )
+                        return
+
+                    batch_results = _dedupe_hallucinated_page_bubbles(
+                        batch_results, cv_bubbles_per_page, req_id=req_id
+                    )
+                    batch_results, cv_bubbles_per_page = await _recover_omitted_pages_async(
+                        disk_pages,
+                        batch_results,
+                        cv_bubbles_per_page,
+                        target_lang_name,
+                        series_context_hint=series_context_hint,
+                        req_id=req_id,
+                    )
+                    batch_results = await _polish_manga_translations_gemma_async(
+                        batch_results,
+                        target_lang_name,
+                        series_context_hint=series_context_hint,
+                        req_id=req_id,
+                        progress_cb=lambda txt: _update_progress(txt, force=True),
+                    )
+
+                    header_title = (
+                        f"**📖 คำแปลมังงะ {num_pages} หน้า ตามลำดับช่องอ่าน ขวาไปซ้าย ({target_lang_name}):**"
+                        if num_pages > 1
+                        else f"**📖 คำแปลมังงะตามลำดับช่องอ่าน ขวาไปซ้าย ({target_lang_name}):**"
+                    )
+                    transcript_lines = [header_title]
+                    render_t0 = time.monotonic()
+                    api_log(
+                        f"MangaRender [req={req_id}] START ({'cv2' if HAS_CV2 else 'pil'}/{MANGA_CV_VER}, disk-stream) -> rendering {num_pages} page(s)..."
+                    )
+                    await _update_progress(
+                        f"🎨 **3/3** กำลังใส่คำแปลลงภาพ (`0/{num_pages}` หน้า)...",
+                        force=True,
+                    )
+
+                    for page_idx in range(1, num_pages + 1):
+                        page_path, fname = disk_pages[page_idx - 1]
+                        bubbles, scene_summary = batch_results[page_idx - 1]
+                        page_cv = cv_bubbles_per_page[page_idx - 1] if (page_idx - 1) < len(cv_bubbles_per_page) else []
+
+                        if num_pages > 1:
+                            transcript_lines.append(f"\n__**📄 หน้าที่ {page_idx}/{num_pages} (`{fname}`)**__")
+                        if scene_summary:
+                            clean_sum = re.sub(r"\s+", " ", scene_summary).strip()
+                            transcript_lines.append(f"-# *บริบทของฉาก: {clean_sum}*")
+
+                        if not bubbles:
+                            transcript_lines.append("*(ไม่พบช่องคำพูดในหน้านี้)*")
+                            _release_cv_page_masks(page_cv)
+                            continue
+
+                        for idx, b in enumerate(bubbles, 1):
+                            speaker = re.sub(r"\s+", " ", (b.get("speaker_or_note") or f"ช่องคำพูด {idx}")).strip()
+                            src_txt = re.sub(r"\s+", " ", (b.get("source_text") or "")).strip()
+                            tr_txt = re.sub(r"\s+", " ", (b.get("translated_text") or "")).strip()
+                            if tr_txt:
+                                transcript_lines.append(f"**[#{idx} | {speaker}]** `{src_txt}`\n  ↳ **{tr_txt}**")
+
+                        try:
+                            out_jpg_path = os.path.join(job_dir, f"out_p{page_idx:02d}.jpg")
+                            rendered_ok = await asyncio.to_thread(
+                                _render_manga_page_to_disk_sync, page_path, bubbles, page_cv, out_jpg_path
+                            )
+                            if rendered_ok:
+                                base_name = os.path.splitext(fname)[0]
+                                discord_files.append(
+                                    discord.File(
+                                        out_jpg_path,
+                                        filename=f"translated_p{page_idx}_{base_name}.jpg",
+                                    )
+                                )
+                            else:
+                                api_log(
+                                    f"MangaRender [req={req_id}] page {page_idx}/{num_pages} ({fname}) returned None "
+                                    f"(cv={len(page_cv)}, llm={len(bubbles)})"
+                                )
+                        except Exception as e:
+                            api_log(f"MangaRender [req={req_id}] page {page_idx} fallback to text-only: {e}")
+                        finally:
+                            _release_cv_page_masks(page_cv)
+
+                        if num_pages > 1 and page_idx < num_pages:
+                            await _update_progress(
+                                f"🎨 **3/3** กำลังใส่คำแปลลงภาพ (`{page_idx}/{num_pages}` หน้า)...",
+                                force=False,
+                            )
+                            await asyncio.sleep(0.05)
+
+                    render_elapsed = time.monotonic() - render_t0
+                    api_log(
+                        f"MangaRender [req={req_id}] DONE ({'cv2' if HAS_CV2 else 'pil'}) -> "
+                        f"rendered {len(discord_files)}/{num_pages} page(s) in {render_elapsed:.2f}s"
+                    )
+                    transcript_text = "\n".join(transcript_lines)
+
+                    await _cleanup_status()
+
+                    if discord_files:
+                        file_chunks = [discord_files[i : i + 10] for i in range(0, len(discord_files), 10)]
+                        if len(transcript_text) <= 1950:
+                            await _send_or_reply(channel, msg, content=transcript_text, files=file_chunks[0])
+                            for extra_files in file_chunks[1:]:
+                                await _send_or_reply(channel, None, files=extra_files)
+                        else:
+                            for idx_fc, fc in enumerate(file_chunks):
+                                await _send_or_reply(channel, msg if idx_fc == 0 else None, files=fc)
+                            await send_chunked_response(channel, transcript_text, reply_to=None)
+                    else:
+                        await send_chunked_response(channel, transcript_text, reply_to=msg)
+                finally:
+                    await _cleanup_status()
+    finally:
+        for df in discord_files:
+            try:
+                df.close()
+            except Exception:
+                pass
+        discord_files.clear()
+        for page_cv in cv_bubbles_per_page:
+            _release_cv_page_masks(page_cv)
+        cv_bubbles_per_page.clear()
+        disk_pages.clear()
+        if job_dir:
+            await asyncio.to_thread(_cleanup_manga_job_dir_sync, job_dir)
+        release_unused_memory()

@@ -102,8 +102,8 @@ def get_speaker_identity_context(
             "### [กฎการเรียกคู่สนทนาปัจจุบัน (Current Speaker Rules — OWNER / PARTNER)]:\n"
             "- ผู้ที่กำลังคุยกับคุณคือ **คู่หูคนคุ้นเคยของคุณในชมรมบริการ (และผู้สร้างของคุณเอง)** ไม่ใช่คนแปลกหน้า\n"
             "- **ห้ามเรียกหรือพิมพ์ชื่อของเขาในคำตอบเด็ดขาดไม่ว่ากรณีใดๆ!**\n"
-            "- สรรพนามบุรุษที่ 2: โดยปกติให้ใช้คำว่า **\"นาย\"** (ภาษาไทย) หรือ **\"you\"** (ภาษาอังกฤษ) เท่านั้น (และห้ามเติมคำว่า `, นายค่ะ?` ต่อท้ายประโยค)\n"
-            "- **ข้อยกเว้นเชิงวาทศิลป์**: หากอยู่ในบริบทที่ต้องการประชดประชัน เหน็บแนม หรือสร้างระยะห่างอย่างเย็นชา สามารถใช้คำว่า **\"คุณ\"** เดี่ยวๆ ด้วยน้ำเสียงห่างเหินได้ แต่ **ห้ามใช้คำว่า \"คุณ\" นำหน้าชื่อใครเด็ดขาด**"
+            '- สรรพนามบุรุษที่ 2: โดยปกติให้ใช้คำว่า **"นาย"** (ภาษาไทย) หรือ **"you"** (ภาษาอังกฤษ) เท่านั้น (และห้ามเติมคำว่า `, นายค่ะ?` ต่อท้ายประโยค)\n'
+            '- **ข้อยกเว้นเชิงวาทศิลป์**: หากอยู่ในบริบทที่ต้องการประชดประชัน เหน็บแนม หรือสร้างระยะห่างอย่างเย็นชา สามารถใช้คำว่า **"คุณ"** เดี่ยวๆ ด้วยน้ำเสียงห่างเหินได้ แต่ **ห้ามใช้คำว่า "คุณ" นำหน้าชื่อใครเด็ดขาด**'
             f"{mem_section}{memo_instruction}"
         ).strip()
 
@@ -113,8 +113,8 @@ def get_speaker_identity_context(
         return (
             "### [กฎการเรียกคู่สนทนาปัจจุบัน (Current Speaker Rules — SERVER MEMBER)]:\n"
             f"- ผู้ที่กำลังคุยกับคุณคือสมาชิกในเซิร์ฟเวอร์ชื่อ: **{clean_name}** (ไม่ใช่คู่หูเจ้าของบอท แต่เป็นสมาชิกที่มาใช้บริการชมรม)\n"
-            f"- การเรียกชื่อ: ให้เรียกชื่อเขาตรงๆ ว่า **\"{clean_name}\"** (หรือใช้สรรพนาม \"นาย\" / \"เธอ\") โดย **ห้ามใส่คำว่า \"คุณ\" นำหน้าชื่อเด็ดขาด** (เช่น ห้ามพูดว่า \"คุณ {clean_name}\")\n"
-            "- **ข้อยกเว้นเชิงวาทศิลป์**: หากต้องการประชดประชันหรือเหน็บแนมด้วยน้ำเสียงห่างเหิน สามารถใช้คำสรรพนาม **\"คุณ\"** เดี่ยวๆ (โดยไม่มีชื่อตามหลัง) ได้"
+            f'- การเรียกชื่อ: ให้เรียกชื่อเขาตรงๆ ว่า **"{clean_name}"** (หรือใช้สรรพนาม "นาย" / "เธอ") โดย **ห้ามใส่คำว่า "คุณ" นำหน้าชื่อเด็ดขาด** (เช่น ห้ามพูดว่า "คุณ {clean_name}")\n'
+            '- **ข้อยกเว้นเชิงวาทศิลป์**: หากต้องการประชดประชันหรือเหน็บแนมด้วยน้ำเสียงห่างเหิน สามารถใช้คำสรรพนาม **"คุณ"** เดี่ยวๆ (โดยไม่มีชื่อตามหลัง) ได้'
             f"{mem_section}{memo_instruction}"
         ).strip()
     return ""
@@ -199,7 +199,7 @@ def _sanitize_prose_segment(
 
     s = _KHUN_BEFORE_LATIN_NAME_REGEX.sub(_strip_khun_preserving_space, s)
 
-    # 5. Strip awkward openings, meta-persona headings, 4B repetition tics, and out-of-character emojis
+    # 5. Strip awkward openings, meta-persona headings, repetition tics, and out-of-character emojis
     s = re.sub(r"^สวัสดีค่ะ\s*(?:คุณ|นาย)?\s*(?=\n|\r|\d+\.)", "", s)
     s = re.sub(r"สวัสดีค่ะ\s*คุณ\s*(?=\n|\r)", "สวัสดีค่ะ\n", s)
     s = re.sub(r"(?:^|\n)\s*\*\*\s*ความคิดเห็น(?:ส่วนตัว)?ในสไตล์ยูกิโนะ\s*:?\s*\*\*\s*\n+", "\n\n", s)
@@ -458,22 +458,4 @@ CODE_SYSTEM_PROMPT = """
 4. การจัดรูปแบบและภาษาสำหรับ Discord:
    - ตอบเป็นภาษาไทยที่สุภาพ สุขุม เฉียบคม (แทนตัวเองว่า "ฉัน" เรียกคู่สนทนาว่า "นาย" หรือชื่อตรงๆ โดยไม่ใช้คำว่า "คุณ" นำหน้าชื่อ หรือใช้คำว่า "คุณ" เดี่ยวๆ เมื่อต้องการประชดประชัน ลงท้ายด้วย "ค่ะ"/"นะคะ") ห้ามใช้คำราชการอย่าง "รับทราบ"/"ดำเนินการ"/"กรุณา" ห้ามใช้ "จ้า"/"จ๊ะ" และห้ามหลุดตัวอักษรภาษาจีนเด็ดขาด
    - ห้ามใช้ตาราง Markdown (`|---|---|`) เด็ดขาด ให้สรุปสาเหตุและขั้นตอนการแก้ไขเป็นหัวข้อย่อย (Bullet points) ตามด้วยบล็อกโค้ด (```) เท่านั้น
-""".strip()
-
-TYPHOON_OCR_PROMPT = """Extract all text from the image.
-
-Instructions:
-- Only return the clean Markdown.
-- Do not include any explanation or extra text.
-- You must include all information on the page.
-
-Formatting Rules:
-- Tables: Render tables using <table>...</table> in clean HTML format.
-- Equations: Render equations using LaTeX syntax with inline ($...$) and block ($$...$$).
-- Images/Charts/Diagrams: Wrap any clearly defined visual areas (e.g. charts, diagrams, pictures) in:
-<figure>
-Describe in Thai.
-</figure>
-- Page Numbers: Wrap page numbers in <page_number>...</page_number> tags.
-- Checkboxes: Use ☐ for unchecked and ☑ for checked boxes.
 """.strip()

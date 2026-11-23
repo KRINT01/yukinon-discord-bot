@@ -10,8 +10,6 @@ from discord import app_commands
 
 from config import (
     ALLOWED_GUILD_IDS,
-    ACTIVE_FAST_MODEL,
-    ACTIVE_CODE_MODEL,
     IMAGE_EXTENSIONS,
     THAI_MONTHS,
     URL_REGEX,
@@ -28,7 +26,7 @@ from persona import (
     YUKIPEDIA_SYSTEM_PROMPT,
 )
 from llm import (
-    query_local_ollama_chat,
+    query_ai_chat,
     orchestrate_message_with_decision_1,
 )
 from media_context import (
@@ -394,10 +392,10 @@ class CodeReviewActionView(AutoDisappearingView):
             speaker_user=interaction.user,
             mode="code",
         )
-        answer, _ = await query_local_ollama_chat(
+        answer, _ = await query_ai_chat(
             composed,
-            model=ACTIVE_CODE_MODEL,
             system_prompt=CODE_SYSTEM_PROMPT,
+            mode="code",
             channel_id=self.channel_id,
             temperature=0.2,
             allow_agentic_search=False,
@@ -749,10 +747,10 @@ class GeneralAssistantActionView(AutoDisappearingView):
             speaker_user=interaction.user,
             mode="general",
         )
-        answer, _ = await query_local_ollama_chat(
+        answer, _ = await query_ai_chat(
             composed,
-            model=ACTIVE_FAST_MODEL,
             system_prompt=YUKIPEDIA_SYSTEM_PROMPT if use_search else FAST_SYSTEM_PROMPT,
+            mode="general",
             channel_id=self.channel_id,
             temperature=0.25 if is_deep_img else 0.45,
             allow_agentic_search=use_search,
@@ -1478,10 +1476,10 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             speaker_user=interaction.user,
             mode="code",
         )
-        answer, _ = await query_local_ollama_chat(
+        answer, _ = await query_ai_chat(
             full_prompt,
-            model=ACTIVE_CODE_MODEL,
             system_prompt=CODE_SYSTEM_PROMPT,
+            mode="code",
             channel_id=interaction.channel_id,
             temperature=0.2,
             allow_agentic_search=False,
@@ -1570,10 +1568,10 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             speaker_user=interaction.user,
             mode="general",
         )
-        answer, did_search = await query_local_ollama_chat(
+        answer, did_search = await query_ai_chat(
             query,
-            model=ACTIVE_FAST_MODEL,
             system_prompt=YUKIPEDIA_SYSTEM_PROMPT,
+            mode="general",
             channel_id=interaction.channel_id,
             temperature=0.3,
             allow_agentic_search=True,
@@ -1647,10 +1645,10 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             speaker_user=interaction.user,
             mode="general",
         )
-        answer, did_search = await query_local_ollama_chat(
+        answer, did_search = await query_ai_chat(
             f"{user_q}\n\n{extracted_ctx}",
-            model=ACTIVE_FAST_MODEL,
             system_prompt=FAST_SYSTEM_PROMPT,
+            mode="general",
             channel_id=interaction.channel_id,
             temperature=0.2,
             allow_agentic_search=True,
@@ -1750,10 +1748,10 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             message=message,
             mode="code",
         )
-        answer, _ = await query_local_ollama_chat(
+        answer, _ = await query_ai_chat(
             full_prompt,
-            model=ACTIVE_CODE_MODEL,
             system_prompt=CODE_SYSTEM_PROMPT,
+            mode="code",
             channel_id=interaction.channel_id,
             temperature=0.2,
             allow_agentic_search=False,
@@ -1792,10 +1790,10 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             message=message,
             mode="general",
         )
-        answer, did_search = await query_local_ollama_chat(
+        answer, did_search = await query_ai_chat(
             full_prompt,
-            model=ACTIVE_FAST_MODEL,
             system_prompt=YUKIPEDIA_SYSTEM_PROMPT,
+            mode="general",
             channel_id=interaction.channel_id,
             temperature=0.3,
             allow_agentic_search=True,
@@ -1851,10 +1849,10 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             message=message,
             mode="general",
         )
-        answer, did_search = await query_local_ollama_chat(
+        answer, did_search = await query_ai_chat(
             f"{user_q}\n\n{extracted_ctx}",
-            model=ACTIVE_FAST_MODEL,
             system_prompt=FAST_SYSTEM_PROMPT,
+            mode="general",
             channel_id=interaction.channel_id,
             temperature=0.2,
             allow_agentic_search=True,

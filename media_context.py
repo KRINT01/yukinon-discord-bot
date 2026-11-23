@@ -20,8 +20,6 @@ from config import (
     CF_API_TOKEN,
     CF_VISION_MODEL,
     SAUCENAO_API_KEY,
-    OLLAMA_BASE_URL,
-    ACTIVE_VISION_MODEL,
     AUDIO_EXTENSIONS,
     CODE_AND_LOG_EXTENSIONS,
     PLAIN_TEXT_EXTENSIONS,
@@ -29,18 +27,15 @@ from config import (
     CUSTOM_EMOJI_REGEX,
     URL_REGEX,
     STACK_TRACE_SIGNATURE_REGEX,
-    ollama_lock,
     channel_last_attachment,
     state,
     clean_url,
     api_log,
     get_http_session,
-    get_modal_headers,
     prune_stale_attachments,
     release_unused_memory,
     save_temp_image_cache,
 )
-from persona import TYPHOON_OCR_PROMPT
 from search_engine import (
     fetch_webpage_async,
     run_safe_web_search_async,
@@ -116,6 +111,23 @@ _BLIND_VERIFY_QUERY_REGEX = re.compile(
     re.IGNORECASE,
 )
 _EMBEDDED_SOCIAL_STATUS_ID_REGEX = re.compile(r"\b\d{15,22}\b")
+
+
+def get_batch_ocr_encode_params(n_imgs: int) -> tuple[int, int, int]:
+    """
+    Canonical `(max_dim, jpeg_quality, max_output_tokens)` shared between `bot.py` PreRoute
+    pre-encoding and `media_context.py` single/multi-image Vision OCR so uploaded images
+    are decoded only ONCE per request.
+    """
+    if n_imgs >= 9:
+        return 672, 72, 4096
+    if n_imgs >= 5:
+        return 768, 76, 4096
+    if n_imgs >= 3:
+        return 832, 80, 4096
+    if n_imgs >= 2:
+        return 896, 84, 4096
+    return 1280, 90, 4096
 
 
 def _extract_x_page_range_bounds(text: str) -> tuple[int, int] | None:
@@ -630,21 +642,14 @@ def _collect_tweet_dicts_from_fxembed_v2_payload(payload, depth: int = 0) -> lis
     return found
 
 
-async def _fetch_x_thread_candidates_from_fxembed_v2(tweet_id: str, author_handle: str) -> list[dict]:
-    if not tweet_id:
+async def _fetch_fxembed_v2_endpoints(endpoints: list[str], author_handle: str) -> list[dict]:
+    if not endpoints:
         return []
     session = get_http_session()
     req_headers = {
         "User-Agent": "YukinonDiscordBot/2.0 (FxEmbed Client)",
         "Accept": "application/json",
     }
-    endpoints = [
-        f"{HTTPS}api.fxtwitter.com/2/thread/{tweet_id}",
-        f"{HTTPS}api.fxtwitter.com/2/conversation/{tweet_id}",
-    ]
-    if author_handle:
-        endpoints.append(f"{HTTPS}api.fxtwitter.com/2/profile/{author_handle}/statuses")
-        endpoints.append(f"{HTTPS}api.fxtwitter.com/2/profile/{author_handle}/media")
 
     async def _fetch_ep(url: str) -> list[dict]:
         try:
@@ -670,8 +675,86 @@ async def _fetch_x_thread_candidates_from_fxembed_v2(tweet_id: str, author_handl
                     normalized_by_id[nt["id"]] = nt
             except Exception:
                 continue
-
     return list(normalized_by_id.values())
+
+
+async def _fetch_x_thread_candidates_from_fxembed_v2(
+    tweet_id: str,
+    author_handle: str,
+    include_profile_scan: bool = False,
+) -> list[dict]:
+    """
+    Fetches thread/conversation candidates for `tweet_id`.
+    Heavy `/profile/{handle}/statuses` and `/media` endpoints are strictly opt-in
+    (`include_profile_scan=True`) so ordinary single-image tweets with replies never
+    trigger wasted author-timeline scrapes.
+    """
+    if not tweet_id:
+        return []
+    endpoints = [
+        f"{HTTPS}api.fxtwitter.com/2/thread/{tweet_id}",
+        f"{HTTPS}api.fxtwitter.com/2/conversation/{tweet_id}",
+    ]
+    if include_profile_scan and author_handle:
+        endpoints.append(f"{HTTPS}api.fxtwitter.com/2/profile/{author_handle}/statuses")
+        endpoints.append(f"{HTTPS}api.fxtwitter.com/2/profile/{author_handle}/media")
+    return await _fetch_fxembed_v2_endpoints(endpoints, author_handle)
+
+
+async def _fetch_x_author_profile_candidates_from_fxembed_v2(author_handle: str) -> list[dict]:
+    if not author_handle:
+        return []
+    endpoints = [
+        f"{HTTPS}api.fxtwitter.com/2/profile/{author_handle}/statuses",
+        f"{HTTPS}api.fxtwitter.com/2/profile/{author_handle}/media",
+    ]
+    return await _fetch_fxembed_v2_endpoints(endpoints, author_handle)
+
+
+def _find_next_x_thread_children(
+    thread_pool: list[dict],
+    curr_tail: dict,
+    visited_ids: set[str],
+    author_handle: str,
+    root_conv_id: str,
+) -> list[dict]:
+    direct_children = [
+        cand for cand in thread_pool
+        if cand["id"] not in visited_ids
+        and (not author_handle or cand["author_handle"].lower() == author_handle.lower())
+        and cand.get("replying_to_status") == curr_tail["id"]
+        and (len(cand["photos"]) >= 1 or _X_NEXT_PART_CAPTION_REGEX.search(cand["text"]))
+    ]
+    if direct_children:
+        return direct_children
+
+    curr_ts = curr_tail.get("created_timestamp") or 0
+    for cand in thread_pool:
+        if cand["id"] in visited_ids:
+            continue
+        if author_handle and cand["author_handle"].lower() != author_handle.lower():
+            continue
+        cand_parent = cand.get("replying_to_status") or ""
+        if cand_parent and cand_parent not in visited_ids:
+            continue
+
+        same_conv_self_reply = bool(
+            root_conv_id
+            and cand.get("conversation_id") == root_conv_id
+            and (not cand.get("replying_to") or cand.get("replying_to", "").lower() == author_handle.lower())
+            and (len(cand["photos"]) >= 1 or _X_NEXT_PART_CAPTION_REGEX.search(cand["text"]))
+        )
+        cand_has_marker = bool(_X_NEXT_PART_CAPTION_REGEX.search(cand["text"]))
+        cand_is_img_only = _is_image_only_or_minimal_reply(cand)
+
+        if not (same_conv_self_reply or cand_has_marker or cand_is_img_only):
+            continue
+
+        cand_ts = cand.get("created_timestamp") or 0
+        if curr_ts and cand_ts and not (0 <= cand_ts - curr_ts <= 86400):
+            continue
+        direct_children.append(cand)
+    return direct_children
 
 
 async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[str, list[str]]:
@@ -705,15 +788,22 @@ async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[s
 
     tail_tweet = ordered_tweets[-1]
     has_explicit_part_marker = any(_X_PART_1_SIGNAL_REGEX.search(t["text"]) for t in ordered_tweets)
+    has_4_photo_manga_cue = (len(tail_tweet["photos"]) >= 4 and tail_tweet["replies_count"] > 0)
     has_forward_signal = bool(
         has_explicit_part_marker
         or (tail_tweet["replies_count"] > 0 and len(tail_tweet["photos"]) >= 1)
     )
+    did_profile_scan = False
 
     if has_forward_signal and len(ordered_tweets) < 6:
-        thread_pool = await _fetch_x_thread_candidates_from_fxembed_v2(tail_tweet["id"], author_handle)
+        # Stage 1: Lightweight thread + conversation lookup ONLY (never hits author /profile yet!)
+        thread_pool = await _fetch_x_thread_candidates_from_fxembed_v2(
+            tail_tweet["id"], author_handle, include_profile_scan=False
+        )
         if ordered_tweets[0]["id"] != tail_tweet["id"] and len(thread_pool) <= 1:
-            root_pool = await _fetch_x_thread_candidates_from_fxembed_v2(ordered_tweets[0]["id"], author_handle)
+            root_pool = await _fetch_x_thread_candidates_from_fxembed_v2(
+                ordered_tweets[0]["id"], author_handle, include_profile_scan=False
+            )
             existing_ids = {x["id"] for x in thread_pool}
             for item in root_pool:
                 if item["id"] not in existing_ids:
@@ -721,48 +811,27 @@ async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[s
 
         root_conv_id = ordered_tweets[0].get("conversation_id") or ordered_tweets[0]["id"]
 
+        # Stage 2: Targeted profile scan ONLY when explicit continuation markers (1/N, 1~3, つづく)
+        # or a 4-photo manga post had zero continuation children in the thread/conversation endpoints.
+        if (has_explicit_part_marker or has_4_photo_manga_cue) and author_handle:
+            if not _find_next_x_thread_children(
+                thread_pool, ordered_tweets[-1], visited_ids, author_handle, root_conv_id
+            ):
+                did_profile_scan = True
+                profile_pool = await _fetch_x_author_profile_candidates_from_fxembed_v2(author_handle)
+                existing_ids = {x["id"] for x in thread_pool}
+                for item in profile_pool:
+                    if item["id"] not in existing_ids:
+                        thread_pool.append(item)
+
         for _ in range(5):
             if len(ordered_tweets) >= 6:
                 break
             curr_tail = ordered_tweets[-1]
             curr_range = _extract_x_page_range_bounds(curr_tail["text"])
-
-            direct_children = [
-                cand for cand in thread_pool
-                if cand["id"] not in visited_ids
-                and (not author_handle or cand["author_handle"].lower() == author_handle.lower())
-                and cand.get("replying_to_status") == curr_tail["id"]
-                and (len(cand["photos"]) >= 1 or _X_NEXT_PART_CAPTION_REGEX.search(cand["text"]))
-            ]
-
-            if not direct_children:
-                curr_ts = curr_tail.get("created_timestamp") or 0
-                for cand in thread_pool:
-                    if cand["id"] in visited_ids:
-                        continue
-                    if author_handle and cand["author_handle"].lower() != author_handle.lower():
-                        continue
-                    cand_parent = cand.get("replying_to_status") or ""
-                    if cand_parent and cand_parent not in visited_ids:
-                        continue
-
-                    same_conv_self_reply = bool(
-                        root_conv_id
-                        and cand.get("conversation_id") == root_conv_id
-                        and (not cand.get("replying_to") or cand.get("replying_to", "").lower() == author_handle.lower())
-                        and (len(cand["photos"]) >= 1 or _X_NEXT_PART_CAPTION_REGEX.search(cand["text"]))
-                    )
-                    cand_has_marker = bool(_X_NEXT_PART_CAPTION_REGEX.search(cand["text"]))
-                    cand_is_img_only = _is_image_only_or_minimal_reply(cand)
-
-                    if not (same_conv_self_reply or cand_has_marker or cand_is_img_only):
-                        continue
-
-                    cand_ts = cand.get("created_timestamp") or 0
-                    if curr_ts and cand_ts and not (0 <= cand_ts - curr_ts <= 86400):
-                        continue
-                    direct_children.append(cand)
-
+            direct_children = _find_next_x_thread_children(
+                thread_pool, curr_tail, visited_ids, author_handle, root_conv_id
+            )
             if not direct_children:
                 break
 
@@ -835,7 +904,7 @@ async def _fetch_x_twitter_post_info(screen_name: str, tweet_id: str) -> tuple[s
 
     api_log(
         f"Embed Link (FxTwitter) -> tweet={tweet_id}, parts={len(ordered_tweets)}, "
-        f"photos={len(merged_photo_urls)} ({time.monotonic() - t0:.2f}s)"
+        f"photos={len(merged_photo_urls)}, profile_scan={did_profile_scan} ({time.monotonic() - t0:.2f}s)"
     )
     return "\n".join(lines), merged_photo_urls
 
@@ -990,7 +1059,7 @@ def _extract_native_discord_embeds_data(embeds: list[discord.Embed]) -> tuple[li
                 if clean_img and dkey not in seen_dedup_keys:
                     seen_dedup_keys.add(dkey)
                     image_urls.append(clean_img)
-                break
+                    break
 
         if parts:
             meta_blocks.append(f"[Discord Embed #{idx}]\n" + "\n".join(parts))
@@ -1045,8 +1114,8 @@ async def collect_embedded_images_and_metadata(
             if tw_meta:
                 resolved_social_api_post = True
                 metadata_sections.append(f"=== Embedded X (Twitter) Post Metadata & Caption ===\n{tw_meta}")
-            for p_url in tw_photos:
-                _queue_img(p_url)
+                for p_url in tw_photos:
+                    _queue_img(p_url)
             continue
 
         px_m = PIXIV_ILLUST_URL_REGEX.search(url)
@@ -1057,8 +1126,8 @@ async def collect_embedded_images_and_metadata(
             if px_meta:
                 resolved_social_api_post = True
                 metadata_sections.append(f"=== Embedded Pixiv Artwork Metadata & Caption ===\n{px_meta}")
-            for p_url in px_photos:
-                _queue_img(p_url, referer=f"{HTTPS}www.pixiv.net/artworks/{illust_id}")
+                for p_url in px_photos:
+                    _queue_img(p_url, referer=f"{HTTPS}www.pixiv.net/artworks/{illust_id}")
             continue
 
         bsky_m = BSKY_POST_URL_REGEX.search(url)
@@ -1068,8 +1137,8 @@ async def collect_embedded_images_and_metadata(
             if b_meta:
                 resolved_social_api_post = True
                 metadata_sections.append(f"=== Embedded Bluesky Post Metadata & Caption ===\n{b_meta}")
-            for p_url in b_photos:
-                _queue_img(p_url)
+                for p_url in b_photos:
+                    _queue_img(p_url)
             continue
 
         if DIRECT_IMAGE_URL_REGEX.match(url):
@@ -1273,42 +1342,42 @@ async def _search_saucenao_async(raw_bytes: bytes, filename: str) -> str:
                 return ""
             data = await resp.json(content_type=None)
 
-            results = data.get("results") or []
-            matches = []
-            for item in results:
-                hdr = item.get("header") or {}
-                sim = float(hdr.get("similarity") or 0.0)
-                if sim < 68.0:
-                    continue
-                d = item.get("data") or {}
-                title = d.get("title") or d.get("source") or d.get("eng_name") or d.get("jp_name") or ""
-                part = d.get("part") or ""
-                author = d.get("member_name") or d.get("author") or d.get("creator") or ""
-                if isinstance(author, list):
-                    author = ", ".join(str(x) for x in author)
-                characters = d.get("characters") or ""
-                material = d.get("material") or ""
-                pixiv_id = d.get("pixiv_id")
-                ext_urls = d.get("ext_urls") or []
-                if pixiv_id and not any("pixiv.net" in u for u in ext_urls):
-                    ext_urls.insert(0, f"{HTTPS}www.pixiv.net/artworks/{pixiv_id}")
+        results = data.get("results") or []
+        matches = []
+        for item in results:
+            hdr = item.get("header") or {}
+            sim = float(hdr.get("similarity") or 0.0)
+            if sim < 68.0:
+                continue
+            d = item.get("data") or {}
+            title = d.get("title") or d.get("source") or d.get("eng_name") or d.get("jp_name") or ""
+            part = d.get("part") or ""
+            author = d.get("member_name") or d.get("author") or d.get("creator") or ""
+            if isinstance(author, list):
+                author = ", ".join(str(x) for x in author)
+            characters = d.get("characters") or ""
+            material = d.get("material") or ""
+            pixiv_id = d.get("pixiv_id")
+            ext_urls = d.get("ext_urls") or []
+            if pixiv_id and not any("pixiv.net" in u for u in ext_urls):
+                ext_urls.insert(0, f"{HTTPS}www.pixiv.net/artworks/{pixiv_id}")
 
-                info_parts = [f"Similarity: {sim:.1f}%"]
-                if title:
-                    info_parts.append(f"Title/Source: {title}{f' ({part})' if part else ''}")
-                if material:
-                    info_parts.append(f"Series/Material: {material}")
-                if characters:
-                    info_parts.append(f"Character(s): {characters}")
-                if author:
-                    info_parts.append(f"Artist/Author: {author}")
-                if ext_urls:
-                    info_parts.append(f"URLs: {' | '.join(ext_urls[:2])}")
-                matches.append("- " + " | ".join(info_parts))
+            info_parts = [f"Similarity: {sim:.1f}%"]
+            if title:
+                info_parts.append(f"Title/Source: {title}{f' ({part})' if part else ''}")
+            if material:
+                info_parts.append(f"Series/Material: {material}")
+            if characters:
+                info_parts.append(f"Character(s): {characters}")
+            if author:
+                info_parts.append(f"Artist/Author: {author}")
+            if ext_urls:
+                info_parts.append(f"URLs: {' | '.join(ext_urls[:2])}")
+            matches.append("- " + " | ".join(info_parts))
 
-            if matches:
-                api_log(f"ReverseImage (SauceNAO) -> {len(matches)} match(es) ({time.monotonic() - t0:.2f}s)")
-                return "=== SauceNAO Reverse Image Matches (Pixiv / Manga / Art) ===\n" + "\n".join(matches[:3])
+        if matches:
+            api_log(f"ReverseImage (SauceNAO) -> {len(matches)} match(es) ({time.monotonic() - t0:.2f}s)")
+            return "=== SauceNAO Reverse Image Matches (Pixiv / Manga / Art) ===\n" + "\n".join(matches[:3])
     except Exception as e:
         api_log(f"ReverseImage (SauceNAO) -> skipped ({type(e).__name__})")
     return ""
@@ -1341,31 +1410,31 @@ async def _search_iqdb_keyless_async(raw_bytes: bytes, filename: str) -> str:
                 return ""
             html_text = await resp.text()
 
-            if "Best match" not in html_text:
-                return ""
-            sim_m = re.search(r"(\d+)%\s*similarity", html_text)
-            if not sim_m or int(sim_m.group(1)) < 72:
-                return ""
-            sim_pct = int(sim_m.group(1))
+        if "Best match" not in html_text:
+            return ""
+        sim_m = re.search(r"(\d+)%\s*similarity", html_text)
+        if not sim_m or int(sim_m.group(1)) < 72:
+            return ""
+        sim_pct = int(sim_m.group(1))
 
-            link_m = re.search(
-                r'Best match.*?href=["\']((?:https?:)?//[^"\']+)["\'][^>]*>\s*<img[^>]*alt=["\']([^"\']*)["\']',
-                html_text,
-                re.DOTALL | re.IGNORECASE,
-            )
-            if not link_m:
-                return ""
-            match_url = link_m.group(1)
-            if match_url.startswith("//"):
-                match_url = "https:" + match_url
-            alt_tags = link_m.group(2).strip()
+        link_m = re.search(
+            r'Best match.*?href=["\']((?:https?:)?//[^"\']+)["\'][^>]*>\s*<img[^>]*alt=["\']([^"\']*)["\']',
+            html_text,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if not link_m:
+            return ""
+        match_url = link_m.group(1)
+        if match_url.startswith("//"):
+            match_url = "https:" + match_url
+        alt_tags = link_m.group(2).strip()
 
-            api_log(f"ReverseImage (IQDB Keyless) -> {sim_pct}% match ({time.monotonic() - t0:.2f}s)")
-            return (
-                f"=== IQDB Reverse Illustration Match ===\n"
-                f"- Similarity: {sim_pct}% | Source Archive URL: {match_url}\n"
-                f"- Detected Tags / Character / Series: {alt_tags}"
-            )
+        api_log(f"ReverseImage (IQDB Keyless) -> {sim_pct}% match ({time.monotonic() - t0:.2f}s)")
+        return (
+            f"=== IQDB Reverse Illustration Match ===\n"
+            f"- Similarity: {sim_pct}% | Source Archive URL: {match_url}\n"
+            f"- Detected Tags / Character / Series: {alt_tags}"
+        )
     except Exception:
         return ""
 
@@ -1385,38 +1454,38 @@ async def _search_tracemoe_async(raw_bytes: bytes, mime_type: str) -> str:
                 return ""
             data = await resp.json()
 
-            docs = data.get("result") or []
-            if not docs:
-                return ""
-            top = docs[0]
-            sim = float(top.get("similarity") or 0.0) * 100.0
-            if sim < 87.0:
-                return ""
+        docs = data.get("result") or []
+        if not docs:
+            return ""
+        top = docs[0]
+        sim = float(top.get("similarity") or 0.0) * 100.0
+        if sim < 87.0:
+            return ""
 
-            anilist = top.get("anilist") or {}
-            title_obj = anilist.get("title") if isinstance(anilist, dict) else {}
-            romaji = (title_obj or {}).get("romaji") or ""
-            english = (title_obj or {}).get("english") or ""
-            native = (title_obj or {}).get("native") or ""
-            mal_id = anilist.get("idMal") if isinstance(anilist, dict) else None
-            ani_id = anilist.get("id") if isinstance(anilist, dict) else None
+        anilist = top.get("anilist") or {}
+        title_obj = anilist.get("title") if isinstance(anilist, dict) else {}
+        romaji = (title_obj or {}).get("romaji") or ""
+        english = (title_obj or {}).get("english") or ""
+        native = (title_obj or {}).get("native") or ""
+        mal_id = anilist.get("idMal") if isinstance(anilist, dict) else None
+        ani_id = anilist.get("id") if isinstance(anilist, dict) else None
 
-            ep = top.get("episode") or "Movie/OVA"
-            from_sec = int(float(top.get("from") or 0))
-            mm, ss = divmod(from_sec, 60)
-            hh, mm = divmod(mm, 60)
-            ts_str = f"{hh:02d}:{mm:02d}:{ss:02d}" if hh > 0 else f"{mm:02d}:{ss:02d}"
+        ep = top.get("episode") or "Movie/OVA"
+        from_sec = int(float(top.get("from") or 0))
+        mm, ss = divmod(from_sec, 60)
+        hh, mm = divmod(mm, 60)
+        ts_str = f"{hh:02d}:{mm:02d}:{ss:02d}" if hh > 0 else f"{mm:02d}:{ss:02d}"
 
-            mal_link = f"{HTTPS}myanimelist.net/anime/{mal_id}" if mal_id else (
-                f"{HTTPS}anilist.co/anime/{ani_id}" if ani_id else ""
-            )
-            api_log(f"ReverseImage (trace.moe) -> '{romaji or native}' Ep.{ep} at {ts_str} ({sim:.1f}%, {time.monotonic() - t0:.2f}s)")
-            return (
-                f"=== trace.moe Anime Screenshot Match ===\n"
-                f"- Anime Title: {romaji} / {english} ({native})\n"
-                f"- Episode: {ep} | Exact Scene Timestamp: {ts_str} | Similarity: {sim:.1f}%\n"
-                + (f"- Reference Link: {mal_link}" if mal_link else "")
-            ).strip()
+        mal_link = f"{HTTPS}myanimelist.net/anime/{mal_id}" if mal_id else (
+            f"{HTTPS}anilist.co/anime/{ani_id}" if ani_id else ""
+        )
+        api_log(f"ReverseImage (trace.moe) -> '{romaji or native}' Ep.{ep} at {ts_str} ({sim:.1f}%, {time.monotonic() - t0:.2f}s)")
+        return (
+            f"=== trace.moe Anime Screenshot Match ===\n"
+            f"- Anime Title: {romaji} / {english} ({native})\n"
+            f"- Episode: {ep} | Exact Scene Timestamp: {ts_str} | Similarity: {sim:.1f}%\n"
+            + (f"- Reference Link: {mal_link}" if mal_link else "")
+        ).strip()
     except Exception as e:
         api_log(f"ReverseImage (trace.moe) -> skipped ({type(e).__name__})")
     return ""
@@ -1425,16 +1494,56 @@ async def _search_tracemoe_async(raw_bytes: bytes, mime_type: str) -> str:
 def _compress_image_for_vision_ocr_sync(raw_bytes: bytes, max_dim: int = 1280, quality: int = 90) -> tuple[str, str, bool]:
     from PIL import Image, ImageStat
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-    img.thumbnail((max_dim, max_dim), Image.Resampling.BILINEAR)
+    try:
+        img.thumbnail((max_dim, max_dim), Image.Resampling.BILINEAR)
 
-    hsv_stat = ImageStat.Stat(img.convert("HSV"))
-    mean_saturation = hsv_stat.mean[1] if len(hsv_stat.mean) > 1 else 0.0
-    is_color_image = (mean_saturation >= 14.0)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality)
+        ocr_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=quality)
-    img.close()
-    return base64.b64encode(buf.getvalue()).decode("utf-8"), "image/jpeg", is_color_image
+        if max(img.size) > 512:
+            img.thumbnail((512, 512), Image.Resampling.BILINEAR)
+        hsv_stat = ImageStat.Stat(img.convert("HSV"))
+        mean_saturation = hsv_stat.mean[1] if len(hsv_stat.mean) > 1 else 0.0
+        is_color_image = (mean_saturation >= 14.0)
+        return ocr_b64, "image/jpeg", is_color_image
+    finally:
+        img.close()
+
+
+def encode_ocr_and_decision_thumb_sync(
+    raw_bytes: bytes,
+    ocr_max_dim: int = 1280,
+    ocr_quality: int = 90,
+    thumb_max_dim: int = 512,
+    thumb_quality: int = 72,
+) -> tuple[str, str, bool, str]:
+    """
+    Single-decode Pillow helper shared by `bot.py` PreRoute and `media_context.py` OCR:
+    Decodes an uploaded image ONCE to produce BOTH the OCR JPEG (`ocr_max_dim`, `ocr_quality`)
+    and the 512px low-res `PreRoute` thumbnail (`thumb_max_dim`, `thumb_quality`) + `is_color_image`.
+    """
+    from PIL import Image, ImageStat
+    img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    try:
+        img.thumbnail((ocr_max_dim, ocr_max_dim), Image.Resampling.BILINEAR)
+        ocr_buf = io.BytesIO()
+        img.save(ocr_buf, format="JPEG", quality=ocr_quality)
+        ocr_b64 = base64.b64encode(ocr_buf.getvalue()).decode("utf-8")
+
+        if max(img.size) > thumb_max_dim:
+            img.thumbnail((thumb_max_dim, thumb_max_dim), Image.Resampling.BILINEAR)
+
+        hsv_stat = ImageStat.Stat(img.convert("HSV"))
+        mean_saturation = hsv_stat.mean[1] if len(hsv_stat.mean) > 1 else 0.0
+        is_color_image = (mean_saturation >= 14.0)
+
+        thumb_buf = io.BytesIO()
+        img.save(thumb_buf, format="JPEG", quality=thumb_quality)
+        thumb_b64 = base64.b64encode(thumb_buf.getvalue()).decode("utf-8")
+        return ocr_b64, "image/jpeg", is_color_image, thumb_b64
+    finally:
+        img.close()
 
 
 def _build_tailored_single_image_ocr_prompt(
@@ -1472,17 +1581,17 @@ def _build_tailored_single_image_ocr_prompt(
             f"{context_header}"
             "Act like Google Lens and identify this real-world object, scale model kit, collectible figure, or product with high precision:\n"
             "1. [Subject / Franchise / Product Identification]:\n"
-            " - If it is a scale model kit, plastic model, mecha, starship, statue, or anime/game figure: identify the EXACT subject name "
+            "   - If it is a scale model kit, plastic model, mecha, starship, statue, or anime/game figure: identify the EXACT subject name "
             "and originating franchise/series/installment (e.g., Space Battleship Yamato from Yamato 2199/2202/3199, Gundam MS designation, character name) "
             "whenever recognizable from unmistakable design cues, plus likely manufacturer (e.g., Bandai Spirits, Tamashii Nations, Good Smile, Kotobukiya).\n"
-            " - If it is consumer hardware, coffee gear, audio gear, or everyday product: identify the exact Brand, Product Line, and Model Name/Number.\n"
+            "   - If it is consumer hardware, coffee gear, audio gear, or everyday product: identify the exact Brand, Product Line, and Model Name/Number.\n"
             "2. [Visual Cues & Possible Product Lines / Scales]:\n"
-            " - List the concrete distinguishing visual features (colors, hull/armor silhouette, weapons/markings, crest/emblem, display stand, paint/finish, ports).\n"
-            " - If multiple releases or scales share this design (e.g., 1/1000 plastic model kit vs. Mecha Collection vs. pre-painted Kikan-Taizen / Soul of Chogokin figure), "
+            "   - List the concrete distinguishing visual features (colors, hull/armor silhouette, weapons/markings, crest/emblem, display stand, paint/finish, ports).\n"
+            "   - If multiple releases or scales share this design (e.g., 1/1000 plastic model kit vs. Mecha Collection vs. pre-painted Kikan-Taizen / Soul of Chogokin figure), "
             "name the top likely candidates AND note clearly if the exact scale or release cannot be confirmed from this angle alone.\n"
             "3. [Verbatim Visible Text]: Transcribe ALL visible text, decals, labels, or model stickers verbatim (if none, write 'None').\n"
             "4. [WEB_VERIFY_QUERY]: On the very last line, ONLY if you identified a concrete subject/product/model name (NEVER a Twitter @handle, account name, URL, or numeric ID!), output:\n"
-            " `[WEB_VERIFY_QUERY: <exact identified subject/franchise or brand + model name>]`"
+            "   `[WEB_VERIFY_QUERY: <exact identified subject/franchise or brand + model name>]`"
         )
 
     # Default / manga_comic / anime_fanart / meme_casual prompt
@@ -1492,19 +1601,19 @@ def _build_tailored_single_image_ocr_prompt(
         "franchise/character identity, visual story, speaker attribution, and source.\n"
         "Provide your output in 3 concise, well-structured sections:\n"
         "1. [Identification & Visual Context]:\n"
-        " - Identify the Anime/VTuber/Game/Manga Series, Character name(s), or iconic mecha/ship/item whenever recognizable "
+        "   - Identify the Anime/VTuber/Game/Manga Series, Character name(s), or iconic mecha/ship/item whenever recognizable "
         "from unmistakable visual features (hair color/style, signature outfit/costume, ornaments, straps, weapons, insignia, halos/no halos) "
         "or the post caption above — EVEN IF the character's face is partially or fully cropped out of frame. "
         "NEVER mix character names from one franchise with a different franchise title, and write 'Unknown / Unconfirmed Series' only if genuinely unrecognizable.\n"
-        " - For comics/manga: describe what happens visually in each panel in traditional Japanese reading order (Top-to-Bottom, Right-to-Left).\n"
-        " - For illustrations/fanart: note the camera framing (if the head/face is cropped out of frame, briefly state 'Head/face not in frame' and skip facial expression), "
+        "   - For comics/manga: describe what happens visually in each panel in traditional Japanese reading order (Top-to-Bottom, Right-to-Left).\n"
+        "   - For illustrations/fanart: note the camera framing (if the head/face is cropped out of frame, briefly state 'Head/face not in frame' and skip facial expression), "
         "and concisely describe the visible pose, outfit, accessories, lighting, props, and mood.\n"
         "2. [Ordered Dialogue & Verbatim OCR Text]:\n"
-        " - For comics/manga: list the dialogue and key SFX in reading order (Right-to-Left, Top-to-Bottom) tagged with the speaker.\n"
-        " - Transcribe ALL visible text (Thai, Japanese, English, code, labels) verbatim, paying close attention to Thai tone marks/vowels.\n"
+        "   - For comics/manga: list the dialogue and key SFX in reading order (Right-to-Left, Top-to-Bottom) tagged with the speaker.\n"
+        "   - Transcribe ALL visible text (Thai, Japanese, English, code, labels) verbatim, paying close attention to Thai tone marks/vowels.\n"
         "3. [WEB_VERIFY_QUERY]: On the very last line, ONLY if the image contains actual spoken dialogue or a clearly identified subject/product name "
         "(NEVER pure comic SFX like タッ/ドシッ, NEVER a raw Twitter @handle, URL, or numeric status ID!), output:\n"
-        " `[WEB_VERIFY_QUERY: <exact verbatim dialogue quote or identified subject/series name>]`"
+        "   `[WEB_VERIFY_QUERY: <exact verbatim dialogue quote or identified subject/series name>]`"
     )
 
 
@@ -1658,23 +1767,24 @@ async def extract_multi_images_batch_ocr(
     images_list: list[tuple[bytes, str, str]],
     post_meta_hint: str = "",
     pre_triage: dict | None = None,
+    preencoded_first: tuple[str, str, bool, int, int] | None = None,
 ) -> str:
     target_list = images_list[:MAX_BATCH_IMAGES]
     if len(target_list) < 2:
         return ""
 
-    n_imgs = len(target_list)
-    if n_imgs >= 9:
-        target_dim, target_q, out_tokens = 672, 72, 4096
-    elif n_imgs >= 5:
-        target_dim, target_q, out_tokens = 768, 76, 4096
-    elif n_imgs >= 3:
-        target_dim, target_q, out_tokens = 832, 80, 4096
-    else:
-        target_dim, target_q, out_tokens = 896, 84, 4096
+    target_dim, target_q, out_tokens = get_batch_ocr_encode_params(len(target_list))
 
     encoded_images: list[tuple[str, str, str]] = []
-    for raw_b, fname, _ in target_list:
+    for idx_i, (raw_b, fname, _) in enumerate(target_list):
+        if (
+            idx_i == 0
+            and preencoded_first is not None
+            and preencoded_first[3] == target_dim
+            and preencoded_first[4] == target_q
+        ):
+            encoded_images.append((preencoded_first[0], preencoded_first[1], fname))
+            continue
         try:
             b64_str, mime_type, _ = await asyncio.to_thread(
                 _compress_image_for_vision_ocr_sync, raw_b, target_dim, target_q
@@ -1719,14 +1829,14 @@ async def extract_multi_images_batch_ocr(
             f"You are analyzing {len(encoded_images)} sequential software/code/terminal/log screenshots.\n"
             + (f"User/Post Context:\n{post_meta_hint[:1000]}\n\n" if post_meta_hint else "")
             + "For each image (Image 1, Image 2, ...), transcribe ALL visible code, SQL queries, error messages, "
-            "stack traces, config values, and terminal outputs verbatim, connecting how the screenshots relate to each other."
+              "stack traces, config values, and terminal outputs verbatim, connecting how the screenshots relate to each other."
         )
     elif triage_type == "document_table":
         batch_prompt = (
             f"You are analyzing {len(encoded_images)} sequential document/table/slide pages.\n"
             + (f"User/Post Context:\n{post_meta_hint[:1000]}\n\n" if post_meta_hint else "")
             + "For each page (Image 1, Image 2, ...), transcribe ALL visible headings, body text, numbers, dates, "
-            "and table rows verbatim in their original language (Thai/English/Japanese)."
+              "and table rows verbatim in their original language (Thai/English/Japanese)."
         )
     elif triage_type == "real_world_product":
         batch_prompt = (
@@ -1734,9 +1844,9 @@ async def extract_multi_images_batch_ocr(
             "scale model kit, collectible figure, or hardware item.\n"
             + (f"User/Post Context:\n{post_meta_hint[:1000]}\n\n" if post_meta_hint else "")
             + "1. [Subject / Franchise / Product Identification]: Identify the exact subject, franchise/series, brand/manufacturer, "
-            "and likely product line(s) or scale(s) across all angles (note clearly if exact scale/release cannot be confirmed).\n"
-            "2. [Angle-by-Angle Details & Visible Text]: Summarize distinguishing visual details, craftsmanship/modifications, "
-            "and any visible text/decals/labels across Images 1..N."
+              "and likely product line(s) or scale(s) across all angles (note clearly if exact scale/release cannot be confirmed).\n"
+              "2. [Angle-by-Angle Details & Visible Text]: Summarize distinguishing visual details, craftsmanship/modifications, "
+              "and any visible text/decals/labels across Images 1..N."
         )
     else:
         batch_prompt = (
@@ -1744,15 +1854,15 @@ async def extract_multi_images_batch_ocr(
             + (f"Post Metadata / Caption Context:\n{post_meta_hint[:1400]}\n\n" if post_meta_hint else "")
             + "Examine ALL pages together in sequence so you maintain strict character & franchise consistency across every page:\n"
             "1. [Series / Franchise & Character Identification — STRICT EVIDENCE RULE]:\n"
-            " - Verify concrete visual traits (hair/eye color, signature hair accessories/ornaments, outfits, presence or absence of floating halos) "
+            "   - Verify concrete visual traits (hair/eye color, signature hair accessories/ornaments, outfits, presence or absence of floating halos) "
             "and cross-check with the post caption/tags before naming ANY franchise or character.\n"
-            " - NEVER mix characters from one franchise with the title/protagonist of a different franchise! "
+            "   - NEVER mix characters from one franchise with the title/protagonist of a different franchise! "
             "(For example: do NOT label a post as 'Blue Archive' or call a male character 'Sensei' unless floating halos above characters' heads "
             "or explicit Blue Archive names are actually visible; if characters are Firefly/Hotaru and Caelus, the franchise is 'Honkai: Star Rail').\n"
-            " - If the franchise or character names are not 100% certain from the visuals or caption, write 'Unknown / Unconfirmed Series' "
+            "   - If the franchise or character names are not 100% certain from the visuals or caption, write 'Unknown / Unconfirmed Series' "
             "and describe the characters strictly by appearance rather than guessing.\n"
             "2. [Page-by-Page Story, Framing & Panel-by-Panel Dialogue/SFX (Right-to-Left, Top-to-Bottom)]:\n"
-            " - For each page (Page 1, Page 2, ...), summarize only what is literally drawn inside the frame "
+            "   - For each page (Page 1, Page 2, ...), summarize only what is literally drawn inside the frame "
             "(note if a face/head is cropped out so off-screen expressions are not invented), "
             "and list all dialogue, thoughts, and key SFX in Japanese reading order tagged with the speaker."
         )
@@ -1975,15 +2085,19 @@ async def extract_image_via_transient_ocr(
     page_label: str = "",
     skip_triage: bool = False,
     pre_triage: dict | None = None,
+    preencoded_ocr: tuple[str, str, bool, int, int] | None = None,
 ) -> str:
-    try:
-        b64_img, mime_type, is_color_img = await asyncio.to_thread(
-            _compress_image_for_vision_ocr_sync, raw_bytes
-        )
-    except Exception:
-        b64_img = base64.b64encode(raw_bytes).decode("utf-8")
-        mime_type = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
-        is_color_img = True
+    if preencoded_ocr is not None and preencoded_ocr[3] == 1280 and preencoded_ocr[4] == 90:
+        b64_img, mime_type, is_color_img = preencoded_ocr[0], preencoded_ocr[1], preencoded_ocr[2]
+    else:
+        try:
+            b64_img, mime_type, is_color_img = await asyncio.to_thread(
+                _compress_image_for_vision_ocr_sync, raw_bytes
+            )
+        except Exception:
+            b64_img = base64.b64encode(raw_bytes).decode("utf-8")
+            mime_type = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
+            is_color_img = True
 
     # Bundle 2: Reuse PreRoute's merged multimodal ImageTriage when available (0 extra Decision-1 latency!)
     triage = None
@@ -2122,41 +2236,9 @@ async def extract_image_via_transient_ocr(
                             api_log(f"Image OCR (Tier 4 Groq) -> {g_mod} 200 OK ({elapsed:.2f}s)")
                             vision_result = content
                             break
-                    api_log(f"Image OCR (Tier 4 Groq) -> {g_mod} HTTP {resp.status}; fallback to Tier 5")
+                    api_log(f"Image OCR (Tier 4 Groq) -> {g_mod} HTTP {resp.status}; trying next candidate")
             except Exception as e:
-                api_log(f"Image OCR (Tier 4 Groq) -> {g_mod} failed ({type(e).__name__}); fallback to Tier 5")
-
-    # Tier 5: Modal T4 GPU
-    if not vision_result:
-        payload = {
-            "model": ACTIVE_VISION_MODEL,
-            "messages": [
-                {"role": "user", "content": TYPHOON_OCR_PROMPT, "images": [b64_img]}
-            ],
-            "stream": False,
-            "keep_alive": "5m",
-            "options": {"temperature": 0.1, "top_p": 0.6, "repeat_penalty": 1.1},
-        }
-        t0 = time.monotonic()
-        try:
-            async with ollama_lock:
-                session = get_http_session()
-                async with session.post(
-                    clean_url(f"{OLLAMA_BASE_URL}/api/chat"),
-                    headers=get_modal_headers(),
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=120),
-                ) as resp:
-                    elapsed = time.monotonic() - t0
-                    if resp.status == 200:
-                        data = await resp.json()
-                        content = data.get("message", {}).get("content", "").strip()
-                        if content:
-                            state.record_provider_call("modal")
-                            api_log(f"Image OCR (Tier 5 Modal) -> {ACTIVE_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
-                            vision_result = content
-        except Exception as e:
-            api_log(f"Image OCR (Tier 5 Modal) -> {ACTIVE_VISION_MODEL} failed ({type(e).__name__})")
+                api_log(f"Image OCR (Tier 4 Groq) -> {g_mod} failed ({type(e).__name__}); trying next candidate")
 
     out_parts = []
     if triage_type:
@@ -2237,6 +2319,7 @@ async def extract_all_context(
     message: discord.Message,
     preloaded_attachments: dict[int, bytes] | None = None,
     pre_triage: dict | None = None,
+    preencoded_ocr: dict[int, tuple[str, str, bool, int, int]] | None = None,
 ) -> tuple[str, str]:
     from voice_engine import convert_audio_bytes_to_wav_sync, transcribe_wav_bytes_hybrid
 
@@ -2252,6 +2335,7 @@ async def extract_all_context(
         target_attachments = list(ref_msg.attachments)
 
     image_att_batch: list[tuple[bytes, str, str]] = []
+    image_att_ids: list[int] = []
 
     for att in target_attachments:
         if att.size > MAX_ATTACHMENT_BYTES:
@@ -2304,6 +2388,7 @@ async def extract_all_context(
                 )
             elif fname.endswith(IMAGE_EXTENSIONS) and len(image_att_batch) < MAX_BATCH_IMAGES:
                 image_att_batch.append((raw_bytes, att.filename, ""))
+                image_att_ids.append(int(att.id))
             raw_bytes = None
         except Exception as e:
             blocks.append(f"[Error reading `{att.filename}`: {e}]")
@@ -2312,11 +2397,17 @@ async def extract_all_context(
         # Spill raw attachment bytes to /tmp (zero RAM cost) for instant In-Bubble & Deep Visual follow-ups
         if getattr(message, "id", 0):
             await asyncio.to_thread(save_temp_image_cache, message.id, image_att_batch, [])
+        first_preencoded = (
+            preencoded_ocr.get(image_att_ids[0])
+            if (preencoded_ocr and image_att_ids)
+            else None
+        )
         if len(image_att_batch) >= 2:
             batch_vis = await extract_multi_images_batch_ocr(
                 image_att_batch,
                 post_meta_hint=message.content or "",
                 pre_triage=pre_triage,
+                preencoded_first=first_preencoded,
             )
             if batch_vis:
                 processed_image_count += len(image_att_batch)
@@ -2327,7 +2418,7 @@ async def extract_all_context(
             total_att_imgs = len(image_att_batch)
             sem = asyncio.Semaphore(2)
 
-            async def _ocr_att_item(idx: int, img_b: bytes, img_fn: str) -> tuple[int, str, str]:
+            async def _ocr_att_item(idx: int, img_b: bytes, img_fn: str, att_id: int) -> tuple[int, str, str]:
                 async with sem:
                     ocr_out = await extract_image_via_transient_ocr(
                         img_b,
@@ -2336,12 +2427,13 @@ async def extract_all_context(
                         post_meta_hint=message.content or "",
                         page_label=f"Page {idx} of {total_att_imgs}" if total_att_imgs > 1 else "",
                         pre_triage=(pre_triage if idx == 1 else None),
+                        preencoded_ocr=(preencoded_ocr.get(att_id) if preencoded_ocr else None),
                     )
                     return idx, img_fn, ocr_out
 
             att_tasks = [
-                _ocr_att_item(idx, img_b, img_fn)
-                for idx, (img_b, img_fn, _) in enumerate(image_att_batch, 1)
+                _ocr_att_item(idx, img_b, img_fn, att_id)
+                for idx, ((img_b, img_fn, _), att_id) in enumerate(zip(image_att_batch, image_att_ids), 1)
             ]
             for idx, img_fn, ocr_out in await asyncio.gather(*att_tasks):
                 processed_image_count += 1
@@ -2349,6 +2441,7 @@ async def extract_all_context(
                     has_code_file = True
                 blocks.append(f"=== Image #{idx} Inspection & Source Lookup (`{img_fn}`) ===\n{ocr_out}")
         image_att_batch.clear()
+        image_att_ids.clear()
 
     embed_images, embed_meta_sections, handled_social_urls = await collect_embedded_images_and_metadata(
         message, ref_msg=ref_msg, max_images=max(1, MAX_BATCH_IMAGES - processed_image_count)

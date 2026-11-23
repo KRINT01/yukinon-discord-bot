@@ -15,7 +15,6 @@ from config import (
     CF_IMAGE_MODEL,
     GROQ_API_KEY,
     GROQ_CHAT_FALLBACK_MODEL,
-    ACTIVE_FAST_MODEL,
     THAI_CHAR_REGEX,
     CAT_TOPIC_REGEX,
     state,
@@ -25,7 +24,6 @@ from config import (
 from llm import (
     call_gemma_ai_studio_chat,
     call_cloudflare_gemma_chat,
-    call_modal_ollama_chat,
     call_groq_chat,
 )
 
@@ -65,7 +63,7 @@ EXPLICIT_FILENAME_COMMENT_REGEX = re.compile(
 )
 
 _THAI_LEADING_VOWELS = frozenset("เแโใไ")
-_THAI_ATTACH_NEXT_CHARS = frozenset("ๆฯ?!.,:;'\")]-~")
+_THAI_ATTACH_NEXT_CHARS = frozenset("ๆฯ?!.,:;'\"')]-~")
 
 
 def _is_thai_combining_char(ch: str) -> bool:
@@ -332,20 +330,10 @@ async def translate_prompt_to_english_for_flux(raw_prompt: str, is_anime_style: 
         except Exception:
             pass
 
-    try:
-        res = await call_modal_ollama_chat(
-            trans_messages, ACTIVE_FAST_MODEL, 0.0, purpose="Prompt Translate Tier 3"
-        )
-        if res and not THAI_CHAR_REGEX.search(res):
-            clean_res = res.strip(' "\'\n\r\t')
-            return f"{prefix}{clean_res}"
-    except Exception:
-        pass
-
     if GROQ_API_KEY:
         try:
             res = await call_groq_chat(
-                trans_messages, GROQ_CHAT_FALLBACK_MODEL, 0.0, is_coding=False, purpose="Prompt Translate Tier 4"
+                trans_messages, GROQ_CHAT_FALLBACK_MODEL, 0.0, is_coding=False, purpose="Prompt Translate Tier 3"
             )
             if res and not THAI_CHAR_REGEX.search(res):
                 clean_res = res.strip(' "\'\n\r\t')

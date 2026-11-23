@@ -6,13 +6,15 @@ import functools
 
 from PIL import Image, ImageDraw, ImageFont
 
+OPENCV_THREADS = max(1, int(os.getenv("OPENCV_THREADS", "1") or "1"))
+
 try:
     import numpy as np
     import cv2
 
     try:
-        # Lock OpenCV to 1 thread so Render 0.1 vCPU / 512MB RAM containers avoid thread-pool RSS bloat
-        cv2.setNumThreads(1)
+        # Default 1 thread on Render 0.1 vCPU / 512MB RAM; scales via OPENCV_THREADS on multi-core VPS hosts
+        cv2.setNumThreads(OPENCV_THREADS)
         cv2.ocl.setUseOpenCL(False)
     except Exception:
         pass
@@ -24,7 +26,7 @@ except ImportError:
 
 from config import THAI_CHAR_REGEX
 
-MANGA_CV_RENDER_VERSION = "v18"
+MANGA_CV_RENDER_VERSION = "v19"
 SOM_CV_MAX_DIM = 360  # Fast 360px grid derived from single 1024px resize (~1-2.5s for 10 pages with OpenCV+NumPy!)
 # Bundle 2 RAM & Discord upload optimization: quality=90 with standard 4:2:0 subsampling (~50% smaller than 94/4:4:4)
 MANGA_RENDER_JPEG_QUALITY = 90
@@ -76,6 +78,19 @@ _CV2_ELLIPSE_7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)) if HAS_CV2
 _CV2_ELLIPSE_11 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)) if HAS_CV2 else None
 _CV2_ELLIPSE_13 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)) if HAS_CV2 else None
 _CV2_ELLIPSE_17 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)) if HAS_CV2 else None
+
+
+def _coerce_image_bytes_sync(raw_bytes_or_path: bytes | str | os.PathLike) -> bytes:
+    """Loads raw image bytes from a `/tmp` disk path or returns `bytes` directly (streaming-safe)."""
+    if isinstance(raw_bytes_or_path, (bytes, bytearray, memoryview)):
+        return bytes(raw_bytes_or_path)
+    if isinstance(raw_bytes_or_path, (str, os.PathLike)):
+        path_str = os.fspath(raw_bytes_or_path)
+        if not path_str or not os.path.exists(path_str):
+            return b""
+        with open(path_str, "rb") as f:
+            return f.read()
+    return b""
 
 
 # ==============================================================================
@@ -635,7 +650,7 @@ def _release_cv_page_masks(page_cv: list[dict]) -> None:
                 m.close()
             except Exception:
                 pass
-        c_obj["mask_small"] = None
+            c_obj["mask_small"] = None
         c_obj["mask_np"] = None
     page_cv.clear()
 
@@ -1815,10 +1830,13 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
 
 
 def _detect_page_bubbles_and_build_som_b64_sync(
-    raw_bytes: bytes,
+    raw_bytes_or_path: bytes | str | os.PathLike,
     vision_max_dim: int = 1024,
     vision_quality: int = 84,
 ) -> tuple[str, list[dict]]:
+    raw_bytes = _coerce_image_bytes_sync(raw_bytes_or_path)
+    if not raw_bytes:
+        return "", []
     if HAS_CV2:
         return _detect_page_bubbles_and_build_som_b64_cv2_sync(raw_bytes, vision_max_dim, vision_quality)
     from manga_pil_fallback import _detect_page_bubbles_and_build_som_b64_pil_sync
@@ -3007,14 +3025,16 @@ def _render_translated_manga_image_cv2_sync(
 
 
 def render_translated_manga_image_sync(
-    raw_bytes: bytes,
+    raw_bytes_or_path: bytes | str | os.PathLike,
     bubbles: list[dict],
     cv_bubbles: list[dict] | None = None,
 ) -> bytes | None:
     """
     Renders translated dialogue at FULL ORIGINAL RESOLUTION using vectorized OpenCV + NumPy
-    masking when available, falling back lazily to pure Pillow (`manga_pil_fallback.py`) otherwise.
+    masking when available (accepts either raw `bytes` or a `/tmp` disk path for low-RAM
+    streaming), falling back lazily to slim pure-Pillow (`manga_pil_fallback.py`) otherwise.
     """
+    raw_bytes = _coerce_image_bytes_sync(raw_bytes_or_path)
     if not raw_bytes or not bubbles:
         return None
     if HAS_CV2:

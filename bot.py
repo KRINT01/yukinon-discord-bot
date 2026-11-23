@@ -3,7 +3,6 @@ import io
 import re
 import time
 import signal
-import base64
 import asyncio
 import platform
 from datetime import datetime
@@ -23,11 +22,13 @@ from config import (
     DISCORD_TOKEN,
     PORT,
     BOOT_TIME,
+    CONTAINER_RAM_LIMIT_MB,
+    OPENCV_THREADS,
+    MANGA_CONCURRENCY,
+    VOICE_STT_CONCURRENCY,
+    MAX_CACHED_CHANNELS,
     ALLOWED_GUILD_IDS,
     AI_CHANNEL_IDS,
-    OLLAMA_BASE_URL,
-    ACTIVE_FAST_MODEL,
-    ACTIVE_CODE_MODEL,
     GROQ_API_KEY,
     GROQ_CODE_MODEL,
     CF_API_TOKEN,
@@ -50,6 +51,10 @@ from config import (
     IMAGE_GEN_INTENT_PATTERN,
     AGENTIC_IMAGE_TAG_REGEX,
     WEATHER_INTENT_PATTERN,
+    COMPOUND_CONNECTOR_REGEX,
+    MATH_EXPR_CUE_REGEX,
+    MEMORY_INLINE_CUE_REGEX,
+    OT_INLINE_CUE_REGEX,
     URL_REGEX,
     CODE_AND_LOG_EXTENSIONS,
     intents,
@@ -90,10 +95,16 @@ from user_memory import (
 )
 from search_engine import detect_coding_intent, run_safe_web_search_async
 from llm import (
-    query_local_ollama_chat,
+    query_ai_chat,
     orchestrate_message_with_decision_1,
 )
-from media_context import extract_all_context, resolve_referenced_message
+from media_context import (
+    MAX_BATCH_IMAGES,
+    extract_all_context,
+    resolve_referenced_message,
+    get_batch_ocr_encode_params,
+    encode_ocr_and_decision_thumb_sync,
+)
 from image_engine import (
     _send_or_reply,
     send_chunked_response,
@@ -126,23 +137,6 @@ from ui_interactions import (
 from tools import ToolExecutionContext, TOOL_SPECS
 
 OT_REPORT_CHANNEL_ID = int(os.getenv("OT_REPORT_CHANNEL_ID", "0") or "0")
-
-_COMPOUND_CONNECTOR_REGEX = re.compile(
-    r"(แล้ว(?:ก็)?|พร้อม(?:กับ|ทั้ง)?|และ(?:ช่วย)?|กับ|แถม|\band\s+(?:also|then)?\b|\bplus\b|,)",
-    re.IGNORECASE,
-)
-_MATH_EXPR_CUE_REGEX = re.compile(
-    r"(\d+\s*[\+\-\*/x×^%]\s*\d+|คำนวณ|แปลงค่าเงิน|กี่บาท|กี่เยน|กี่ดอลลาร์|\bcalculate\b|\bconvert\b)",
-    re.IGNORECASE,
-)
-_MEMORY_INLINE_CUE_REGEX = re.compile(
-    r"(จำไว้ว่า|ช่วยจำว่า|ปักหมุดความจำ|บันทึกความจำ|\bremember\s+that\b)",
-    re.IGNORECASE,
-)
-_OT_INLINE_CUE_REGEX = re.compile(
-    r"((?:จด|บันทึก|สรุป|ลบ)\s*(?:เวลา\s*)?ot\b)",
-    re.IGNORECASE,
-)
 
 
 class _HeavyStatusTracker:
@@ -192,17 +186,17 @@ def _looks_like_compound_request(text: str) -> bool:
     """
     if not text or len(text.strip()) < 14:
         return False
-    if not _COMPOUND_CONNECTOR_REGEX.search(text):
+    if not COMPOUND_CONNECTOR_REGEX.search(text):
         return False
 
     hit_domains = 0
     if WEATHER_INTENT_PATTERN.search(text):
         hit_domains += 1
-    if _MATH_EXPR_CUE_REGEX.search(text):
+    if MATH_EXPR_CUE_REGEX.search(text):
         hit_domains += 1
-    if _MEMORY_INLINE_CUE_REGEX.search(text):
+    if MEMORY_INLINE_CUE_REGEX.search(text):
         hit_domains += 1
-    if _OT_INLINE_CUE_REGEX.search(text):
+    if OT_INLINE_CUE_REGEX.search(text):
         hit_domains += 1
     if IMAGE_GEN_INTENT_PATTERN.search(text):
         hit_domains += 1
@@ -222,24 +216,21 @@ def _format_uptime(seconds: int) -> str:
     return f"{mins}m {secs}s"
 
 
-def _encode_low_res_decision_thumb_sync(raw_bytes: bytes) -> str:
-    from PIL import Image
-    img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-    img.thumbnail((512, 512), Image.Resampling.BILINEAR)
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=72)
-    img.close()
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
-
-
 async def _preload_image_attachments_and_thumb(
     all_msg_atts: list[discord.Attachment],
-) -> tuple[dict[int, bytes], list[tuple[str, str]]]:
+) -> tuple[dict[int, bytes], list[tuple[str, str]], dict[int, tuple[str, str, bool, int, int]]]:
+    """
+    Preloads up to 4 image attachments and decodes the first image ONCE via
+    `encode_ocr_and_decision_thumb_sync` to produce BOTH the 512px PreRoute thumbnail
+    and the OCR-ready JPEG reused directly by `extract_all_context` (zero duplicate decode).
+    """
     preloaded: dict[int, bytes] = {}
-    img_atts = [
+    all_valid_imgs = [
         a for a in all_msg_atts
         if a.filename.lower().endswith(IMAGE_EXTENSIONS) and a.size <= 8 * 1024 * 1024
-    ][:4]
+    ]
+    total_img_count = min(MAX_BATCH_IMAGES, len(all_valid_imgs))
+    img_atts = all_valid_imgs[:4]
     for att in img_atts:
         try:
             preloaded[att.id] = await att.read()
@@ -247,15 +238,26 @@ async def _preload_image_attachments_and_thumb(
             continue
 
     low_res_imgs: list[tuple[str, str]] = []
+    preencoded_ocr: dict[int, tuple[str, str, bool, int, int]] = {}
     if preloaded and GEMINI_API_KEY and time.time() >= state.gemini_decision_cooldown_until:
         try:
-            first_bytes = next(iter(preloaded.values()))
-            b64_thumb = await asyncio.to_thread(_encode_low_res_decision_thumb_sync, first_bytes)
+            first_att_id = next(iter(preloaded))
+            first_bytes = preloaded[first_att_id]
+            ocr_dim, ocr_q, _ = get_batch_ocr_encode_params(max(1, total_img_count))
+            ocr_b64, ocr_mime, is_col, b64_thumb = await asyncio.to_thread(
+                encode_ocr_and_decision_thumb_sync,
+                first_bytes,
+                ocr_dim,
+                ocr_q,
+                512,
+                72,
+            )
             low_res_imgs.append((b64_thumb, "image/jpeg"))
+            preencoded_ocr[first_att_id] = (ocr_b64, ocr_mime, is_col, ocr_dim, ocr_q)
         except Exception:
             pass
 
-    return preloaded, low_res_imgs
+    return preloaded, low_res_imgs, preencoded_ocr
 
 
 def _collect_health_metrics() -> dict:
@@ -263,7 +265,8 @@ def _collect_health_metrics() -> dict:
     now = time.time()
     proc = psutil.Process(os.getpid())
     rss_mb = round(proc.memory_info().rss / (1024 ** 2), 1)
-    ram_pct = round((rss_mb / 512.0) * 100, 1)
+    ram_limit_f = float(CONTAINER_RAM_LIMIT_MB)
+    ram_pct = round((rss_mb / ram_limit_f) * 100.0, 1)
     uptime_sec = int(now - BOOT_TIME)
 
     ws_ping_ms = (
@@ -281,7 +284,7 @@ def _collect_health_metrics() -> dict:
     telemetry = state.get_telemetry_summary()
 
     return {
-        "status": "ok" if rss_mb < 480 else "warning_high_memory",
+        "status": "ok" if rss_mb < (ram_limit_f * 0.90) else "warning_high_memory",
         "system_time_th": get_current_thai_datetime_str(),
         "uptime_sec": uptime_sec,
         "uptime_human": _format_uptime(uptime_sec),
@@ -296,19 +299,26 @@ def _collect_health_metrics() -> dict:
         },
         "memory": {
             "bot_ram_mb": rss_mb,
-            "render_limit_mb": 512,
+            "ram_limit_mb": CONTAINER_RAM_LIMIT_MB,
+            "render_limit_mb": CONTAINER_RAM_LIMIT_MB,
             "ram_usage_pct": ram_pct,
             "active_chat_channels": len(channel_memory),
+            "max_cached_channels": MAX_CACHED_CHANNELS,
             "cached_attachments": cached_files_count,
             "stored_user_profiles": len(user_profiles),
+        },
+        "runtime_limits": {
+            "ram_limit_mb": CONTAINER_RAM_LIMIT_MB,
+            "opencv_threads": OPENCV_THREADS,
+            "manga_concurrency": MANGA_CONCURRENCY,
+            "voice_stt_concurrency": VOICE_STT_CONCURRENCY,
+            "max_cached_channels": MAX_CACHED_CHANNELS,
         },
         "telemetry": telemetry,
         "ai_backends": {
             "native_function_calling": True,
             "registered_tools": [s["name"] for s in TOOL_SPECS],
-            "modal_ollama_configured": bool(OLLAMA_BASE_URL),
-            "fast_model": ACTIVE_FAST_MODEL,
-            "code_model": GROQ_CODE_MODEL if GROQ_API_KEY else ACTIVE_CODE_MODEL,
+            "code_model": GROQ_CODE_MODEL if GROQ_API_KEY else CF_CODE_MODEL,
             "groq_enabled": bool(GROQ_API_KEY),
             "groq_search_model": state.active_groq_search_model if GROQ_API_KEY else None,
             "groq_vision_model": state.active_groq_vision_model if GROQ_API_KEY else None,
@@ -337,6 +347,7 @@ async def handle_root(request: web.Request) -> web.Response:
     m = _collect_health_metrics()
     d = m["discord"]
     mem = m["memory"]
+    rl = m["runtime_limits"]
     ai = m["ai_backends"]
     tel = m["telemetry"]
     pc = tel["provider_calls"]
@@ -362,17 +373,17 @@ async def handle_root(request: web.Request) -> web.Response:
         <p><b>Discord Gateway:</b> {gw_status}</p>
         <p><b>Native Tools:</b> {len(ai['registered_tools'])} active (<code>{', '.join(ai['registered_tools'])}</code>)</p>
         <p><b>Voice &amp; Scribe:</b> {d['active_voice_sessions']} voice session(s), {d['active_scribe_sessions']} active scribe(s) | DAVE Ready: {d['dave_e2ee_ready']} | Live STT: <code>{ai['gemini_transcribe_live_model']}</code>{tts_note}</p>
-        <p><b>Container RAM:</b> {mem['bot_ram_mb']} MB / {mem['render_limit_mb']} MB ({mem['ram_usage_pct']}%) |
-           <b>Cached Contexts:</b> {mem['active_chat_channels']} chat(s), {mem['cached_attachments']} file(s), {mem['stored_user_profiles']} profile(s)</p>
+        <p><b>Container RAM:</b> {mem['bot_ram_mb']} MB / {mem['ram_limit_mb']} MB ({mem['ram_usage_pct']}%) |
+           <b>Cached Contexts:</b> {mem['active_chat_channels']}/{mem['max_cached_channels']} chat(s), {mem['cached_attachments']} file(s), {mem['stored_user_profiles']} profile(s)</p>
+        <p><b>Runtime Limits:</b> OpenCV <code>{rl['opencv_threads']}</code> thread(s) | Manga Concurrency <code>{rl['manga_concurrency']}</code> | Voice STT Concurrency <code>{rl['voice_stt_concurrency']}</code> | Channel LRU Cap <code>{rl['max_cached_channels']}</code></p>
         <p><b>Runtime Telemetry:</b> Decision-1 <code>{tel['decision_calls']}</code> calls (avg <code>{tel['decision_avg_ms']}ms</code>, errs <code>{tel['decision_errors']}</code>) |
            SearchFilter dropped <code>{tel['search_filter_dropped']}</code> (<code>{tel['search_filter_drop_pct']}%</code>) |
            Gemini Implicit Cache: <code>{tel['gemini_cache_hits']}</code> hit(s), <code>{tel['gemini_cached_tokens_total']:,}</code> tokens</p>
-        <p><b>Provider Calls:</b> Flash <code>{pc.get('gemini_flash', 0)}</code> | Hydrogen <code>{pc.get('gemini_hydrogen', 0)}</code> | Gemma <code>{pc.get('gemma_ai_studio', 0)}</code> | Groq <code>{pc.get('groq', 0)}</code> | CF <code>{pc.get('cloudflare', 0)}</code> | Modal <code>{pc.get('modal', 0)}</code></p>
+        <p><b>Provider Calls:</b> Flash <code>{pc.get('gemini_flash', 0)}</code> | Hydrogen <code>{pc.get('gemini_hydrogen', 0)}</code> | Gemma <code>{pc.get('gemma_ai_studio', 0)}</code> | Groq <code>{pc.get('groq', 0)}</code> | CF <code>{pc.get('cloudflare', 0)}</code></p>
         <hr style="border: 0; border-top: 1px solid #e5e7eb; margin: 16px 0;">
         <p><b>Google AI Studio:</b> {"Enabled (Orchestrator: <code>" + str(ai['gemini_decision_orchestrator']) + "</code> | Heavy Specialist: <code>" + str(ai['gemini_heavy_specialist']) + "</code> | Live STT: <code>" + str(ai['gemini_transcribe_live_model']) + "</code> | Gemma 4: <code>" + str(ai['gemma_active_model']) + "</code> | Flash-Lite: <code>" + str(ai['gemini_active_model']) + "</code>)" + gemini_cd_note if ai['gemini_enabled'] else "Disabled"}</p>
         <p><b>Cloudflare Workers AI:</b> {"Enabled (Code: <code>" + CF_CODE_MODEL + "</code> | Fast: <code>" + CF_CHAT_FAST_MODEL + "</code> | Vision/Gemma: <code>" + str(ai['cloudflare_gemma_model']) + "</code> | Image: <code>" + str(ai['cloudflare_image_model']) + "</code>)" if ai['cloudflare_enabled'] else "Disabled"}</p>
         <p><b>Groq LPU Acceleration:</b> {"Enabled (Code: <code>" + GROQ_CODE_MODEL + "</code> | Search: <code>" + str(ai['groq_search_model']) + "</code> | Vision: <code>" + str(ai['groq_vision_model']) + "</code>)" if ai['groq_enabled'] else "Disabled"}</p>
-        <p><b>Modal GPU Ollama:</b> {"Configured" if ai['modal_ollama_configured'] else "Not Configured"} (Fallback: <code>{ai['fast_model']}</code>)</p>
         <p><b>Uptime:</b> {m['uptime_human']} ({m['uptime_sec']}s)</p>
     </body>
     </html>
@@ -765,10 +776,10 @@ async def process_yukipedia_request(ctx_or_message, raw_prompt: str = ""):
         )
         heavy_tracker = _HeavyStatusTracker(channel, reply_to=msg)
         try:
-            answer, did_search = await query_local_ollama_chat(
+            answer, did_search = await query_ai_chat(
                 composed_prompt,
-                model=ACTIVE_FAST_MODEL,
                 system_prompt=YUKIPEDIA_SYSTEM_PROMPT,
+                mode="general",
                 channel_id=channel.id,
                 temperature=0.3,
                 allow_agentic_search=True,
@@ -909,8 +920,8 @@ async def on_message(message: discord.Message):
             return
 
     # 1. Single-Pass vs PreRoute Decision-1 Orchestration (context-aware with last 2 turns of channel_memory!)
-    # Bundle 2: When an image is uploaded, PreRoute also evaluates ImageTriage in the SAME pass so
-    # `extract_all_context(..., pre_triage=...)` reuses it directly without a second multimodal Decision-1 call!
+    # Bundle 2: When an image is uploaded, PreRoute also evaluates ImageTriage in the SAME pass AND
+    # decodes the first image ONCE to produce both the 512px PreRoute thumb & OCR JPEG!
     text_without_urls = URL_REGEX.sub("", clean_prompt).strip()
     is_bare_link_only = bool(has_embedded_media_or_link and not text_without_urls and not all_msg_atts)
     has_ambiguous_action_cue = bool(
@@ -924,10 +935,10 @@ async def on_message(message: discord.Message):
         or (has_embedded_media_or_link and not has_ambiguous_action_cue)
     )
 
-    preloaded_att_bytes, low_res_imgs = (
+    preloaded_att_bytes, low_res_imgs, preencoded_ocr = (
         await _preload_image_attachments_and_thumb(all_msg_atts)
         if (has_image_att and not skip_preroute)
-        else ({}, [])
+        else ({}, [], {})
     )
     pre_plan = (
         None
@@ -946,6 +957,7 @@ async def on_message(message: discord.Message):
 
     if pre_route == "ot_log" and pre_conf >= 0.82:
         preloaded_att_bytes.clear()
+        preencoded_ocr.clear()
         ot_reply = await process_ot_request(message, clean_prompt)
         rec_date, rec_slot, rec_detail = parse_ot_record_metadata(ot_reply)
         ot_view = (
@@ -958,11 +970,13 @@ async def on_message(message: discord.Message):
 
     if (has_image_att or has_embedded_media_or_link) and pre_route == "manga_translate" and pre_conf >= 0.78:
         preloaded_att_bytes.clear()
+        preencoded_ocr.clear()
         await process_manga_translation_request(message, clean_prompt)
         return
 
     if not message.attachments and pre_route == "image_gen" and pre_conf >= 0.82:
         preloaded_att_bytes.clear()
+        preencoded_ocr.clear()
         async with message.channel.typing():
             await send_generated_image_to_channel(message.channel, clean_prompt, reply_to=message)
         return
@@ -972,8 +986,10 @@ async def on_message(message: discord.Message):
             message,
             preloaded_attachments=preloaded_att_bytes,
             pre_triage=pre_image_triage,
+            preencoded_ocr=preencoded_ocr,
         )
         preloaded_att_bytes.clear()
+        preencoded_ocr.clear()
 
         if is_compound_prompt:
             # Still run Decision-1 once for complexity, tone, guardrails, and passive memory (forcing compound route)
@@ -1044,7 +1060,7 @@ async def on_message(message: discord.Message):
 
         extra_blocks = "\n\n".join(b for b in (mentioned_dossier, extracted_ctx) if b)
         full_prompt = f"{user_request}\n\n{extra_blocks}" if extra_blocks else user_request
-        model = ACTIVE_CODE_MODEL if use_coder else ACTIVE_FAST_MODEL
+        chat_mode = "code" if use_coder else "general"
         sys_prompt = CODE_SYSTEM_PROMPT if use_coder else FAST_SYSTEM_PROMPT
 
         tool_ctx = ToolExecutionContext(
@@ -1053,14 +1069,14 @@ async def on_message(message: discord.Message):
             channel=message.channel,
             speaker_user=message.author,
             message=message,
-            mode="code" if use_coder else "general",
+            mode=chat_mode,
         )
         heavy_tracker = _HeavyStatusTracker(message.channel, reply_to=message)
         try:
-            answer, did_search = await query_local_ollama_chat(
+            answer, did_search = await query_ai_chat(
                 full_prompt,
-                model=model,
                 system_prompt=sys_prompt,
+                mode=chat_mode,
                 channel_id=message.channel.id,
                 temperature=0.2 if use_coder else 0.55,
                 allow_agentic_search=(not use_coder),
@@ -1406,11 +1422,11 @@ async def ask_fast(ctx, *, prompt: str = ""):
         )
         heavy_tracker = _HeavyStatusTracker(ctx.channel, reply_to=ctx.message)
         try:
-            answer, did_search = await query_local_ollama_chat(
+            answer, did_search = await query_ai_chat(
                 f"{effective_prompt}\n\n{ctx_text}" if ctx_text else effective_prompt,
-                ACTIVE_FAST_MODEL,
-                FAST_SYSTEM_PROMPT,
-                ctx.channel.id,
+                system_prompt=FAST_SYSTEM_PROMPT,
+                mode="general",
+                channel_id=ctx.channel.id,
                 has_fresh_attachment=bool(ctx_text),
                 speaker_user=ctx.author,
                 decision_plan=dec_plan,
@@ -1460,11 +1476,11 @@ async def ask_code(ctx, *, prompt: str = "วิเคราะห์โค้�
         )
         heavy_tracker = _HeavyStatusTracker(ctx.channel, reply_to=ctx.message)
         try:
-            answer, _ = await query_local_ollama_chat(
+            answer, _ = await query_ai_chat(
                 f"{prompt}\n\n{ctx_text}" if ctx_text else prompt,
-                ACTIVE_CODE_MODEL,
-                CODE_SYSTEM_PROMPT,
-                ctx.channel.id,
+                system_prompt=CODE_SYSTEM_PROMPT,
+                mode="code",
+                channel_id=ctx.channel.id,
                 temperature=0.2,
                 allow_agentic_search=False,
                 has_fresh_attachment=bool(ctx_text),
@@ -1516,10 +1532,10 @@ async def source_command(ctx, *, question: str = ""):
         )
         heavy_tracker = _HeavyStatusTracker(ctx.channel, reply_to=ctx.message)
         try:
-            answer, did_search = await query_local_ollama_chat(
+            answer, did_search = await query_ai_chat(
                 f"{user_q}\n\n{ctx_text}",
-                model=ACTIVE_FAST_MODEL,
                 system_prompt=FAST_SYSTEM_PROMPT,
+                mode="general",
                 channel_id=ctx.channel.id,
                 temperature=0.2,
                 allow_agentic_search=True,
@@ -1555,6 +1571,7 @@ async def status_command(ctx):
     m = _collect_health_metrics()
     d = m["discord"]
     mem = m["memory"]
+    rl = m["runtime_limits"]
     ai = m["ai_backends"]
     tel = m["telemetry"]
     pc = tel["provider_calls"]
@@ -1568,8 +1585,9 @@ async def status_command(ctx):
         f"- **Uptime:** `{m['uptime_human']}` | **Ping:** `{ping_str}`\n"
         f"- **Voice & Scribe:** `{d['active_voice_sessions']}` ห้องเสียง | `{d['active_scribe_sessions']}` จดบันทึก | TTS `{ai['tts_google_pitch']}p / {ai['tts_google_speed']}x`\n"
         f"- **Native Tools:** `{len(ai['registered_tools'])}` เครื่องมือ (`{', '.join(ai['registered_tools'])}`)\n"
-        f"- **Container RAM:** `{mem['bot_ram_mb']} MB / {mem['render_limit_mb']} MB ({mem['ram_usage_pct']}%)`\n"
-        f"- **Cached Contexts:** `{mem['active_chat_channels']}` แชท | "
+        f"- **Container RAM:** `{mem['bot_ram_mb']} MB / {mem['ram_limit_mb']} MB ({mem['ram_usage_pct']}%)`\n"
+        f"- **Runtime Limits:** OpenCV `{rl['opencv_threads']}t` | Manga `{rl['manga_concurrency']}` | STT `{rl['voice_stt_concurrency']}` | Channel LRU `{rl['max_cached_channels']}`\n"
+        f"- **Cached Contexts:** `{mem['active_chat_channels']}/{mem['max_cached_channels']}` แชท | "
         f"`{mem['cached_attachments']}` ไฟล์แนบ | "
         f"`{active_topics_count}` หัวข้อสนทนา | "
         f"`{mem['stored_user_profiles']}` โปรไฟล์ผู้ใช้\n"
@@ -1577,7 +1595,7 @@ async def status_command(ctx):
         f"SearchFilter drop `{tel['search_filter_dropped']}` (`{tel['search_filter_drop_pct']}%`) | "
         f"Cache `{tel['gemini_cache_hits']}` hits (`{tel['gemini_cached_tokens_total']:,}` tok)\n"
         f"- **Provider Calls:** Flash `{pc.get('gemini_flash', 0)}` | H2 `{pc.get('gemini_hydrogen', 0)}` | "
-        f"Gemma `{pc.get('gemma_ai_studio', 0)}` | Groq `{pc.get('groq', 0)}` | CF `{pc.get('cloudflare', 0)}` | Modal `{pc.get('modal', 0)}`"
+        f"Gemma `{pc.get('gemma_ai_studio', 0)}` | Groq `{pc.get('groq', 0)}` | CF `{pc.get('cloudflare', 0)}`"
     )
 
 
@@ -1601,7 +1619,7 @@ async def clear_memory(ctx, scope: str = ""):
     ram_note = (
         f"คืนพื้นที่ RAM `{before_mb} MB` -> `{after_mb} MB` (ลดลง `{freed_mb} MB`)"
         if freed_mb > 0
-        else f"RAM ปัจจุบัน: `{after_mb} MB / 512 MB`"
+        else f"RAM ปัจจุบัน: `{after_mb} MB / {CONTAINER_RAM_LIMIT_MB} MB`"
     )
     await ctx.send(
         f"🧹 ล้างประวัติคุยกับไฟล์แนบของ**{scope_label}**ให้เรียบร้อยแล้วค่ะ ({ram_note})"

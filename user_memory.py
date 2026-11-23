@@ -4,6 +4,7 @@ import io
 import json
 import time
 import asyncio
+import threading
 import discord
 
 from datetime import datetime, timedelta
@@ -32,6 +33,7 @@ user_profiles: dict[str, dict] = {}
 _DIRTY_SINCE_LAST_BACKUP = False
 _LAST_CLOUD_BACKUP_TS = 0.0
 _CLOUD_BACKUP_LOCK: asyncio.Lock | None = None
+_LOCAL_SAVE_THREAD_LOCK = threading.Lock()
 _CONSOLIDATION_COOLDOWN: dict[str, float] = {}
 _CONSOLIDATION_IN_PROGRESS: set[str] = set()
 
@@ -121,20 +123,45 @@ def load_user_profiles_local():
             print(f"[User Memory] Local load warning: {e}", flush=True)
 
 
-def save_user_profiles_local():
-    """Atomically saves user_profiles.json via temp-file + os.replace so restarts never corrupt JSON."""
+def _write_profiles_json_atomic_sync(serialized_json: str) -> None:
+    """Thread-safe atomic disk flush via temp-file + os.replace so restarts never corrupt JSON."""
     tmp_path = f"{USER_PROFILES_FILE}.tmp"
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(user_profiles, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, USER_PROFILES_FILE)
-    except Exception as e:
-        print(f"[User Memory] Local save warning: {e}", flush=True)
+    with _LOCAL_SAVE_THREAD_LOCK:
         try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except OSError:
-            pass
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(serialized_json)
+            os.replace(tmp_path, USER_PROFILES_FILE)
+        except Exception as e:
+            print(f"[User Memory] Local save warning: {e}", flush=True)
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def save_user_profiles_local():
+    """Synchronous backward-compatible atomic save of user_profiles.json."""
+    try:
+        payload_str = json.dumps(user_profiles, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[User Memory] Local serialize warning: {e}", flush=True)
+        return
+    _write_profiles_json_atomic_sync(payload_str)
+
+
+async def save_user_profiles_local_async():
+    """
+    Non-blocking atomic save of user_profiles.json:
+    serializes an immutable JSON snapshot on the event loop (zero dict-mutation races),
+    then offloads file write + `os.replace` to a worker thread so active voice streams never stall.
+    """
+    try:
+        payload_str = json.dumps(user_profiles, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[User Memory] Local serialize warning: {e}", flush=True)
+        return
+    await asyncio.to_thread(_write_profiles_json_atomic_sync, payload_str)
 
 
 def _find_backup_channel(bot: discord.Client):
@@ -156,7 +183,7 @@ async def restore_user_profiles_from_discord(bot: discord.Client):
     to recover any OT logs so records survive Render redeploys.
     """
     global user_profiles, _DIRTY_SINCE_LAST_BACKUP
-    load_user_profiles_local()
+    await asyncio.to_thread(load_user_profiles_local)
     ch = _find_backup_channel(bot)
     if ch:
         try:
@@ -169,7 +196,7 @@ async def restore_user_profiles_from_discord(bot: discord.Client):
                             data = json.loads(raw.decode("utf-8"))
                             if isinstance(data, dict) and data:
                                 user_profiles.update(data)
-                                save_user_profiles_local()
+                                await save_user_profiles_local_async()
                                 print(
                                     f"[User Memory] Restored {len(user_profiles)} user profile(s) "
                                     f"from Discord channel #{ch.name}",
@@ -190,7 +217,7 @@ async def restore_user_profiles_from_discord(bot: discord.Client):
             scrubbed_any = True
     if scrubbed_any:
         _DIRTY_SINCE_LAST_BACKUP = True
-        save_user_profiles_local()
+        await save_user_profiles_local_async()
         print("[User Memory] Auto-scrubbed polluted Discord names/noise from favorite_topics.", flush=True)
         await backup_user_profiles_to_discord(force=True)
 
@@ -378,7 +405,7 @@ async def consolidate_user_memory_async(uid_str: str):
             prof["pinned_facts"] = _dedupe_clean_list(new_pinned, max_items=15, max_item_len=150)
             prof["custom_notes"] = _dedupe_clean_list(new_notes, max_items=8, max_item_len=150)
             _DIRTY_SINCE_LAST_BACKUP = True
-            save_user_profiles_local()
+            await save_user_profiles_local_async()
             api_log(
                 f"MemoryConsolidate -> uid={uid_str[-4:]} consolidated "
                 f"(pinned={len(prof['pinned_facts'])}, rolling={len(prof['custom_notes'])})"
@@ -390,12 +417,16 @@ async def consolidate_user_memory_async(uid_str: str):
         _CONSOLIDATION_IN_PROGRESS.discard(uid_str)
 
 
-def _schedule_bg_task(coro):
+def _schedule_bg_task(coro) -> bool:
     try:
         asyncio.get_running_loop().create_task(coro)
+        return True
     except RuntimeError:
-        if state.bot and getattr(state.bot, "loop", None):
+        if state.bot and getattr(state.bot, "loop", None) and state.bot.loop.is_running():
             state.bot.loop.create_task(coro)
+            return True
+    coro.close()
+    return False
 
 
 def record_user_interaction(
@@ -459,7 +490,10 @@ def record_user_interaction(
 
     user_profiles[uid_str] = profile
     _DIRTY_SINCE_LAST_BACKUP = True
-    save_user_profiles_local()
+
+    # Offload local disk flush to worker thread when inside an active event loop (zero voice jitter)
+    if not _schedule_bg_task(save_user_profiles_local_async()):
+        save_user_profiles_local()
 
     if len(profile.get("custom_notes") or []) > 10:
         _schedule_bg_task(consolidate_user_memory_async(uid_str))
@@ -644,7 +678,7 @@ async def update_user_memory_fields(
     custom_notes: list[str] | None = None,
     recent_topics: list[str] | None = None,
 ) -> dict:
-    """Updates specified fields on `user_profiles[target_uid]`, saves atomically, and force-syncs `#yukinon-memory`."""
+    """Updates specified fields on `user_profiles[target_uid]`, saves atomically off-thread, and force-syncs `#yukinon-memory`."""
     global _DIRTY_SINCE_LAST_BACKUP
     prof = ensure_user_profile_exists(target_uid)
     if display_name is not None and display_name.strip():
@@ -663,7 +697,7 @@ async def update_user_memory_fields(
     prof["last_seen"] = get_current_thai_datetime_str()
     user_profiles[target_uid] = prof
     _DIRTY_SINCE_LAST_BACKUP = True
-    save_user_profiles_local()
+    await save_user_profiles_local_async()
     await backup_user_profiles_to_discord(force=True)
     return prof
 
@@ -1351,7 +1385,7 @@ async def recover_ot_logs_from_work_channels(bot: discord.Client):
         for prof in user_profiles.values():
             if "ot_logs" in prof:
                 prof["ot_logs"].sort(key=lambda x: _parse_stored_ot_date(x.get("date", "")) or (0, 0, 0))
-        save_user_profiles_local()
+        await save_user_profiles_local_async()
         print(f"[OT Tracker] Recovered {recovered_count} OT record(s) from #work channel history.", flush=True)
 
 
@@ -1408,7 +1442,7 @@ async def _save_and_format_ot_entry(
     if channel_id:
         prof["ot_channel_id"] = int(channel_id)
     _DIRTY_SINCE_LAST_BACKUP = True
-    save_user_profiles_local()
+    await save_user_profiles_local_async()
     await backup_user_profiles_to_discord(force=True)
 
     month_total = 0.0
@@ -1580,7 +1614,7 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
         ]
         prof["ot_logs"] = ot_logs
         _DIRTY_SINCE_LAST_BACKUP = True
-        save_user_profiles_local()
+        await save_user_profiles_local_async()
         await backup_user_profiles_to_discord(force=True)
 
         if len(ot_logs) < before_len:
