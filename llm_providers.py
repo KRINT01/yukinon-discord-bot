@@ -858,6 +858,7 @@ async def call_gemini_chat_messages(
     thinking_level: str = "LOW",
     tool_ctx: ToolExecutionContext | None = None,
     max_tool_rounds: int = 3,
+    preferred_models: list[str] | None = None,
 ) -> str:
     """
     Gemini Flash-Lite/Preview chat with native multi-round parallel function calling
@@ -896,6 +897,7 @@ async def call_gemini_chat_messages(
             purpose=f"{purpose}[r{r_idx+1}]" if r_idx > 0 else purpose,
             max_models=3,
             max_wall_sec=36.0,
+            preferred_models=preferred_models,
         )
         if not data:
             return ""
@@ -960,7 +962,7 @@ async def call_cloudflare_gemma_chat(
     try:
         session = get_http_session()
         async with session.post(
-            cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=28)
+            cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=36)
         ) as resp:
             elapsed = time.monotonic() - t0
             if resp.status == 200:

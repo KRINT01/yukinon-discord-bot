@@ -63,6 +63,7 @@ STOPWORD_ENTITIES = {
 }
 _MARKUP_NOISE_WORDS = {"markdown", "json", "html", "in-bubble", "ocr", "sfx", "error", "extraction", "readable"}
 _USER_TAG_REGEX = re.compile(r"^user_\d+$", re.IGNORECASE)
+_ARTIST_SOCIAL_SEARCH_REGEX = re.compile(r"\b(?:pixiv|fanbox|skeb|booth|fantia|twitter|artist|illustrator)\b", re.IGNORECASE)
 
 # Bounded 5-minute in-memory TTL cache for search results (eliminates redundant lookups on follow-up buttons)
 _SEARCH_CACHE: dict[str, tuple[float, str]] = {}
@@ -653,20 +654,20 @@ async def _search_google_news_rss_async(query: str, is_thai: bool, max_results: 
             if resp.status != 200:
                 return []
             xml_bytes = await resp.read()
-            root = ET.fromstring(xml_bytes)
-            for item in root.findall("./channel/item")[:max_results]:
-                title = (item.findtext("title") or "").strip()
-                link = (item.findtext("link") or "").strip()
-                pub_date = (item.findtext("pubDate") or "").strip()
-                source = (item.findtext("source") or "").strip()
-                results.append({
-                    "title": f"[{source}] {title}" if source else title,
-                    "href": link,
-                    "body": f"สำนักข่าว (Source): {source or 'Unknown'} | วันที่เผยแพร่: {pub_date} | พาดหัวข่าว: {title}",
-                    "skip_scrape": True,
-                })
-            if results:
-                api_log(f"Search (Google News RSS) -> {len(results)} hits ({time.monotonic() - t0:.2f}s)")
+        root = ET.fromstring(xml_bytes)
+        for item in root.findall("./channel/item")[:max_results]:
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            pub_date = (item.findtext("pubDate") or "").strip()
+            source = (item.findtext("source") or "").strip()
+            results.append({
+                "title": f"[{source}] {title}" if source else title,
+                "href": link,
+                "body": f"สำนักข่าว (Source): {source or 'Unknown'} | วันที่เผยแพร่: {pub_date} | พาดหัวข่าว: {title}",
+                "skip_scrape": True,
+            })
+        if results:
+            api_log(f"Search (Google News RSS) -> {len(results)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception as e:
         api_log(f"Search (Google News RSS) -> failed ({type(e).__name__})")
     return results
@@ -703,36 +704,36 @@ async def _search_wikipedia_full_extract_async(query: str, is_thai: bool, max_re
                 if resp.status != 200:
                     continue
                 data = await resp.json()
-                search_items = ((data.get("query") or {}).get("search")) or []
-                titles = [item.get("title", "") for item in search_items[:max_results] if item.get("title")]
-                if not titles:
-                    continue
+            search_items = ((data.get("query") or {}).get("search")) or []
+            titles = [item.get("title", "") for item in search_items[:max_results] if item.get("title")]
+            if not titles:
+                continue
 
-                # Batch-fetch all matched Wikipedia page extracts in ONE HTTP request (instead of N serial requests!)
-                titles_param = "|".join(titles)
-                ext_url = clean_url(
-                    f"{HTTPS}{lang_host}.wikipedia.org/w/api.php"
-                    f"?action=query&prop=extracts&explaintext=1&exchars=3800"
-                    f"&titles={quote_plus(titles_param)}&format=json"
-                )
-                async with session.get(
-                    ext_url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)
-                ) as e_resp:
-                    if e_resp.status != 200:
-                        continue
-                    e_data = await e_resp.json()
-                    pages = ((e_data.get("query") or {}).get("pages")) or {}
-                    for _, p_obj in pages.items():
-                        title = p_obj.get("title") or ""
-                        extract = (p_obj.get("extract") or "").strip()
-                        if title and extract:
-                            page_url = f"{HTTPS}{lang_host}.wikipedia.org/wiki/{quote_plus(title.replace(' ', '_'))}"
-                            hits.append({
-                                "title": f"[Wikipedia {lang_host.upper()}] {title}",
-                                "href": page_url,
-                                "body": extract[:3800],
-                                "skip_scrape": True,
-                            })
+            # Batch-fetch all matched Wikipedia page extracts in ONE HTTP request (instead of N serial requests!)
+            titles_param = "|".join(titles)
+            ext_url = clean_url(
+                f"{HTTPS}{lang_host}.wikipedia.org/w/api.php"
+                f"?action=query&prop=extracts&explaintext=1&exchars=3800"
+                f"&titles={quote_plus(titles_param)}&format=json"
+            )
+            async with session.get(
+                ext_url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)
+            ) as e_resp:
+                if e_resp.status != 200:
+                    continue
+                e_data = await e_resp.json()
+            pages = ((e_data.get("query") or {}).get("pages")) or {}
+            for _, p_obj in pages.items():
+                title = p_obj.get("title") or ""
+                extract = (p_obj.get("extract") or "").strip()
+                if title and extract:
+                    page_url = f"{HTTPS}{lang_host}.wikipedia.org/wiki/{quote_plus(title.replace(' ', '_'))}"
+                    hits.append({
+                        "title": f"[Wikipedia {lang_host.upper()}] {title}",
+                        "href": page_url,
+                        "body": extract[:3800],
+                        "skip_scrape": True,
+                    })
             if hits:
                 api_log(f"Search (Wikipedia:{lang_host} q='{q_for_wiki[:35]}') -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
         except Exception:
@@ -762,25 +763,25 @@ async def _search_jikan_anime_manga_async(query: str, max_results: int = 2) -> l
             if resp.status != 200:
                 return []
             data = await resp.json()
-            for item in (data.get("data") or [])[:max_results]:
-                title = item.get("title") or "Unknown"
-                title_jp = item.get("title_japanese") or ""
-                score = item.get("score") or "N/A"
-                status = item.get("status") or "Unknown"
-                episodes_or_ch = item.get("episodes") or item.get("chapters") or "?"
-                synopsis = (item.get("synopsis") or "").strip()[:1200]
-                mal_url = item.get("url") or ""
-                hits.append({
-                    "title": f"[MyAnimeList {media_type.upper()}] {title} ({title_jp})",
-                    "href": mal_url,
-                    "body": (
-                        f"Type: {item.get('type')} | Score: {score}/10 | Status: {status} | "
-                        f"Episodes/Chapters: {episodes_or_ch}\nSynopsis: {synopsis}"
-                    ),
-                    "skip_scrape": True,
-                })
-            if hits:
-                api_log(f"Search (Jikan MAL:{media_type}) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
+        for item in (data.get("data") or [])[:max_results]:
+            title = item.get("title") or "Unknown"
+            title_jp = item.get("title_japanese") or ""
+            score = item.get("score") or "N/A"
+            status = item.get("status") or "Unknown"
+            episodes_or_ch = item.get("episodes") or item.get("chapters") or "?"
+            synopsis = (item.get("synopsis") or "").strip()[:1200]
+            mal_url = item.get("url") or ""
+            hits.append({
+                "title": f"[MyAnimeList {media_type.upper()}] {title} ({title_jp})",
+                "href": mal_url,
+                "body": (
+                    f"Type: {item.get('type')} | Score: {score}/10 | Status: {status} | "
+                    f"Episodes/Chapters: {episodes_or_ch}\nSynopsis: {synopsis}"
+                ),
+                "skip_scrape": True,
+            })
+        if hits:
+            api_log(f"Search (Jikan MAL:{media_type}) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception:
         pass
     return hits
@@ -808,21 +809,21 @@ async def _search_steam_games_async(query: str, max_results: int = 2) -> list[di
             if resp.status != 200:
                 return []
             data = await resp.json()
-            for item in (data.get("items") or [])[:max_results]:
-                gid = item.get("id")
-                name = item.get("name") or "Unknown Game"
-                price_info = item.get("price") or {}
-                final_thb = (price_info.get("final", 0) / 100.0) if price_info else 0
-                price_str = f"{final_thb:,.2f} THB" if final_thb > 0 else "Free-to-Play / TBA"
-                store_url = f"{HTTPS}store.steampowered.com/app/{gid}" if gid else ""
-                hits.append({
-                    "title": f"[Steam Store TH] {name}",
-                    "href": store_url,
-                    "body": f"Game: {name} | Steam Thailand Price: {price_str} | AppID: {gid}",
-                    "skip_scrape": True,
-                })
-            if hits:
-                api_log(f"Search (Steam Store) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
+        for item in (data.get("items") or [])[:max_results]:
+            gid = item.get("id")
+            name = item.get("name") or "Unknown Game"
+            price_info = item.get("price") or {}
+            final_thb = (price_info.get("final", 0) / 100.0) if price_info else 0
+            price_str = f"{final_thb:,.2f} THB" if final_thb > 0 else "Free-to-Play / TBA"
+            store_url = f"{HTTPS}store.steampowered.com/app/{gid}" if gid else ""
+            hits.append({
+                "title": f"[Steam Store TH] {name}",
+                "href": store_url,
+                "body": f"Game: {name} | Steam Thailand Price: {price_str} | AppID: {gid}",
+                "skip_scrape": True,
+            })
+        if hits:
+            api_log(f"Search (Steam Store) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception:
         pass
     return hits
@@ -843,14 +844,14 @@ async def _search_tavily_async(query: str, max_results: int = 5) -> list[dict]:
             if resp.status != 200:
                 return []
             t_data = await resp.json()
-            for r in t_data.get("results", []):
-                hits.append({
-                    "title": r.get("title", ""),
-                    "href": r.get("url", ""),
-                    "body": r.get("content", ""),
-                })
-            if hits:
-                api_log(f"Search (Tavily) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
+        for r in t_data.get("results", []):
+            hits.append({
+                "title": r.get("title", ""),
+                "href": r.get("url", ""),
+                "body": r.get("content", ""),
+            })
+        if hits:
+            api_log(f"Search (Tavily) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception as e:
         api_log(f"Search (Tavily) -> failed ({type(e).__name__})")
     return hits
@@ -930,6 +931,7 @@ async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
     is_recency = bool(RECENCY_INTENT_REGEX.search(clean_q))
     is_anime_manga = bool(ANIME_MANGA_QUERY_REGEX.search(clean_q))
     is_game = bool(GAME_QUERY_REGEX.search(clean_q))
+    is_artist_social = bool(_ARTIST_SOCIAL_SEARCH_REGEX.search(clean_q))
 
     dated_q = clean_q
     if is_news and not re.search(r"\b202\d\b|\b256\d\b", clean_q):
@@ -937,8 +939,10 @@ async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
 
     # Phase 1: Parallel fan-out across fast domain-matched async APIs + soft-capped DDGS
     fast_tasks = []
-    if is_news or is_recency:
-        fast_tasks.append(_search_google_ai_studio_grounded_async(dated_q))
+    ran_grounding = False
+    if is_news or is_recency or is_artist_social:
+        fast_tasks.append(_search_google_ai_studio_grounded_async(dated_q if is_news else clean_q))
+        ran_grounding = True
     if is_news:
         fast_tasks.append(_search_google_news_rss_async(dated_q, is_thai=is_thai, max_results=3))
     if is_anime_manga:
@@ -947,7 +951,7 @@ async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
     elif is_game:
         fast_tasks.append(_search_wikipedia_full_extract_async(clean_q, is_thai=is_thai, max_results=2))
         fast_tasks.append(_search_steam_games_async(clean_q, max_results=1))
-    elif not is_news:
+    elif not is_news and not is_artist_social:
         fast_tasks.append(_search_wikipedia_full_extract_async(clean_q, is_thai=is_thai, max_results=2))
 
     if TAVILY_API_KEY:
@@ -993,13 +997,15 @@ async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
             # Attach silent done callback so background thread exception is never logged as unhandled
             ddgs_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
-    # Last-resort fallback if everything above returned empty
+    # Last-resort fallback if everything above returned empty (includes Gemini Grounding if not tried yet)
     if not hits:
-        fallback_batches = await asyncio.gather(
+        fb_coros = [
             _search_wikipedia_full_extract_async(clean_q, is_thai=is_thai, max_results=2),
             _search_google_news_rss_async(clean_q, is_thai=is_thai, max_results=max_results),
-            return_exceptions=True,
-        )
+        ]
+        if not ran_grounding:
+            fb_coros.insert(0, _search_google_ai_studio_grounded_async(clean_q))
+        fallback_batches = await asyncio.gather(*fb_coros, return_exceptions=True)
         for batch in fallback_batches:
             if isinstance(batch, list):
                 hits.extend(batch)

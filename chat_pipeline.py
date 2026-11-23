@@ -461,12 +461,17 @@ async def query_ai_chat(
         or (bool(active_topic) and not is_voice_mode)
     )
 
+    is_button_followup = bool(plan.get("is_button_followup"))
+    isolate_context = bool(plan.get("isolate_context"))
+
     flash_thinking_level = (
         "MINIMAL"
         if (
             not is_coding
             and not active_tool_ctx
             and not is_compound
+            and not is_japanese_or_social_media
+            and not is_button_followup
             and (complexity_score is not None and complexity_score < 1.50)
         )
         else "LOW"
@@ -475,7 +480,7 @@ async def query_ai_chat(
     async def _run_inference_pass(user_content: str) -> str:
         messages = [{"role": "system", "content": static_system_prompt}]
         raw_history = []
-        if channel_id is not None:
+        if channel_id is not None and not isolate_context:
             raw_history = list(channel_memory[channel_id])
             if is_user_correction or did_search:
                 sanitized_history = []
@@ -549,6 +554,7 @@ async def query_ai_chat(
         use_hydrogen_heavy = (
             not is_coding
             and not is_voice_mode
+            and not is_button_followup
             and (
                 len(user_content) > 12500
                 or (complexity_score is not None and complexity_score >= 2.55 and complexity_conf >= 0.65)
@@ -573,12 +579,18 @@ async def query_ai_chat(
             # Compound multi-intent, Voice tool/factual queries, & Japanese/social-media prioritize Gemini Flash-Lite first!
             prefer_gemini_first = bool(is_compound or is_japanese_or_social_media or is_voice_mode)
             if prefer_gemini_first and GEMINI_API_KEY:
+                manga_prose_models = (
+                    ["gemini-3-flash-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+                    if (is_japanese_or_social_media and not is_voice_mode and not is_compound)
+                    else None
+                )
                 ans = await call_gemini_chat_messages(
                     messages,
                     temperature=target_temp,
                     purpose="CompoundTools" if is_compound else ("VoiceTools" if is_voice_mode else "MangaSocialChat"),
                     thinking_level="MINIMAL" if (is_voice_mode and not active_tool_ctx) else flash_thinking_level,
                     tool_ctx=active_tool_ctx,
+                    preferred_models=manga_prose_models,
                 )
                 if ans:
                     return ans
@@ -724,13 +736,25 @@ async def query_ai_chat(
     memo_match = AGENTIC_MEMO_TAG_REGEX.search(raw_answer or "")
     learned_memo = memo_match.group(1).strip() if memo_match else ""
 
-    answer = sanitize_yukino_output(raw_answer, raw_user_query, speaker_user, speaker_name)
+    answer = sanitize_yukino_output(
+        raw_answer,
+        raw_user_query,
+        speaker_user,
+        speaker_name,
+        allow_cjk_override=is_japanese_or_social_media,
+    )
 
     if not answer.strip():
         retry_raw = await _run_inference_pass(
             f"{working_prompt}\n\n(ตอบคำถามโดยตรงตามข้อมูลที่มีในบริบท ห้ามใช้แท็ก [SEARCH: ...] เด็ดขาด)"
         )
-        answer = sanitize_yukino_output(retry_raw, raw_user_query, speaker_user, speaker_name)
+        answer = sanitize_yukino_output(
+            retry_raw,
+            raw_user_query,
+            speaker_user,
+            speaker_name,
+            allow_cjk_override=is_japanese_or_social_media,
+        )
 
     if speaker_user is not None:
         record_user_interaction(

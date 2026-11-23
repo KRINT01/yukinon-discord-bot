@@ -82,6 +82,15 @@ _IMAGE_TRIAGE_TAG_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+_AUTHOR_LINE_REGEX = re.compile(
+    r"(?:Author\s*/\s*Artist|Artist\s*/\s*Illustrator|Author)\s*:\s*([^\n]+)",
+    re.IGNORECASE,
+)
+_X_HANDLE_URL_REGEX = re.compile(
+    r"https?://(?:www\.|mobile\.)?(?:x\.com|twitter\.com|fixupx\.com|fxtwitter\.com|vxtwitter\.com)/([A-Za-z0-9_]{2,30})/status/\d+",
+    re.IGNORECASE,
+)
+
 
 def _parse_image_triage_metadata(extracted_ctx: str) -> tuple[str, float, bool | None]:
     """Extracts `(image_type, confidence, has_japanese_dialogue)` from `[ImageTriage: ...]` if present."""
@@ -114,18 +123,87 @@ def _strip_internal_prompt_hints(text: str) -> str:
     return cleaned
 
 
-def _extract_clean_artist_or_topic_hint(cached_ctx: str, bot_reply: str) -> str:
-    """Extracts clean artist handle/name from metadata or reply for follow-up searches."""
-    for src in (cached_ctx or "", bot_reply or ""):
-        m_auth = re.search(r"Author / Artist:\s*([^\n(|]+)(?:\(@([A-Za-z0-9_]+)\))?", src)
-        if m_auth:
-            name_part = m_auth.group(1).strip()
-            handle_part = (m_auth.group(2) or "").strip()
-            if name_part or handle_part:
-                return f"{name_part} {handle_part} Pixiv X".strip()
-        m_at = re.search(r"@([A-Za-z0-9_]{3,30})", src)
-        if m_at:
-            return f"{m_at.group(1)} Pixiv X".strip()
+def _parse_artist_line_to_query(raw_line: str) -> str:
+    """
+    Parses a metadata author line such as:
+    - 'すぴかふ (Spicafu) (@spicafu)' -> 'すぴかふ (Spicafu) spicafu Pixiv X'
+    - 'Rain (@Rain_Lambda)' -> 'Rain Rain_Lambda Pixiv X'
+    - 'すぴかふ (Pixiv User ID: 12345)' -> 'すぴかふ Pixiv X'
+    """
+    line = (raw_line or "").split("|", 1)[0].strip()
+    if not line:
+        return ""
+    h_match = re.search(r"\(@([A-Za-z0-9_]{2,30})\)", line)
+    handle_part = h_match.group(1).strip() if h_match else ""
+    name_part = re.sub(r"\s*\(@[A-Za-z0-9_]{2,30}\)", "", line)
+    name_part = re.sub(r"\s*\(Pixiv User ID:\s*\d+\)", "", name_part, flags=re.IGNORECASE).strip()
+
+    tokens: list[str] = []
+    if name_part:
+        tokens.append(name_part)
+    if handle_part and handle_part.lower() not in name_part.lower():
+        tokens.append(handle_part)
+    if not tokens:
+        return ""
+    return f"{' '.join(tokens)} Pixiv X".strip()
+
+
+def _extract_clean_artist_or_topic_hint(
+    primary_ctx: str,
+    bot_reply: str = "",
+    fallback_cached_ctx: str = "",
+    user_query: str = "",
+) -> str:
+    """
+    Extracts clean artist name/@handle strictly for the CURRENT post/view first:
+    1) `primary_ctx` (bound directly to this message's GeneralAssistantActionView)
+    2) X/Twitter handle in `user_query` + artist mentions in `bot_reply`
+    3) Last (most recent) author entry in `fallback_cached_ctx` (never oldest!)
+    """
+    # 1. Exact context bound to this message
+    if primary_ctx:
+        matches = _AUTHOR_LINE_REGEX.findall(primary_ctx)
+        if matches:
+            parsed = _parse_artist_line_to_query(matches[-1])
+            if parsed:
+                return parsed
+
+    # 2. Current message URL handle + current bot reply
+    url_h_m = _X_HANDLE_URL_REGEX.search(user_query or "")
+    url_handle = url_h_m.group(1).strip() if url_h_m else ""
+    if bot_reply:
+        m_auth_rep = _AUTHOR_LINE_REGEX.findall(bot_reply)
+        if m_auth_rep:
+            parsed = _parse_artist_line_to_query(m_auth_rep[-1])
+            if parsed:
+                return parsed
+        m_at_rep = re.findall(r"@([A-Za-z0-9_]{3,30})", bot_reply)
+        if m_at_rep:
+            return f"{m_at_rep[-1]} Pixiv X".strip()
+        m_th_artist = re.search(
+            r"(?:ศิลปิน(?:ที่ชื่อว่า|ชื่อ|เจ้าของผลงาน)?|ผู้วาด(?:ชื่อ)?)\s*[\*\`\"\']*\s*([^\n\*\`\"'.,()]{2,36}(?:\s*\([A-Za-z0-9_ .-]{2,30}\))?)",
+            bot_reply,
+        )
+        if m_th_artist:
+            art_name = m_th_artist.group(1).strip()
+            if url_handle and url_handle.lower() not in art_name.lower():
+                return f"{art_name} {url_handle} Pixiv X".strip()
+            return f"{art_name} Pixiv X".strip()
+
+    if url_handle and url_handle.lower() not in ("i", "web", "home"):
+        return f"{url_handle} Pixiv X".strip()
+
+    # 3. Last-resort fallback: ALWAYS take the LAST (newest) entry in chronological channel cache
+    if fallback_cached_ctx:
+        matches = _AUTHOR_LINE_REGEX.findall(fallback_cached_ctx)
+        if matches:
+            parsed = _parse_artist_line_to_query(matches[-1])
+            if parsed:
+                return parsed
+        m_at_all = re.findall(r"@([A-Za-z0-9_]{3,30})", fallback_cached_ctx)
+        if m_at_all:
+            return f"{m_at_all[-1]} Pixiv X".strip()
+
     return ""
 
 
@@ -220,6 +298,8 @@ class AutoDisappearingView(discord.ui.View):
         self.message = None
         if hasattr(self, "source_message"):
             self.source_message = None
+        if hasattr(self, "source_ctx"):
+            self.source_ctx = ""
         if msg is None:
             return
         try:
@@ -383,7 +463,7 @@ class CodeReviewActionView(AutoDisappearingView):
             f"คำตอบที่วิเคราะห์ไว้: {self.original_answer[:2500]}\n"
         )
         if cached_files:
-            composed += f"\n### [ไฟล์โค้ด/Log ที่แนบไว้ในห้องแชท]:\n{cached_files[:35000]}"
+            composed += f"\n### [ไฟล์โค้ด/Log ที่แนบไว้ในห้องแชท]:\n{cached_files[-35000:]}"
 
         tool_ctx = ToolExecutionContext(
             channel_id=self.channel_id,
@@ -410,6 +490,7 @@ class CodeReviewActionView(AutoDisappearingView):
                 "tool_confidence": 0.90,
                 "complexity_score": 2.0,
                 "complexity_confidence": 0.90,
+                "is_button_followup": True,
             },
             tool_ctx=tool_ctx,
         )
@@ -599,12 +680,16 @@ class GeneralAssistantActionView(AutoDisappearingView):
         bot_reply: str,
         button_specs: list[tuple[str, str, discord.ButtonStyle, str, bool]],
         source_message: discord.Message | None = None,
+        source_ctx: str = "",
     ):
         super().__init__(timeout=300.0)
         self.channel_id = channel_id
         self.user_query = _strip_internal_prompt_hints(user_query)[:1200]
         self.bot_reply = bot_reply[:2500]
         self.source_message = source_message
+        # Bind this message's exact extracted context (metadata + OCR) directly to the View
+        # so multi-post channels never mix up Artist #1 with Artist #2!
+        self.source_ctx = (source_ctx or "")[:12000]
 
         for label, emoji, style, action_spec, use_search in button_specs[:3]:
             btn = discord.ui.Button(label=label[:34], emoji=emoji, style=style)
@@ -660,9 +745,14 @@ class GeneralAssistantActionView(AutoDisappearingView):
         use_search: bool = True,
     ):
         await interaction.response.defer(thinking=True)
-        cached_ctx = get_cached_channel_attachments(self.channel_id, max_total_chars=25000)
+
+        # Prefer THIS message's bound `source_ctx`; only fall back to channel attachment cache if absent
+        fallback_cached_ctx = ""
+        if not self.source_ctx:
+            fallback_cached_ctx = get_cached_channel_attachments(self.channel_id, max_total_chars=12000)
 
         is_deep_img = (instruction == "__DEEP_IMAGE_INSPECT__")
+        is_artist_btn = ("ศิลปิน" in btn_label) or ("ผลงาน" in btn_label)
         deep_visual_block = ""
         if is_deep_img:
             instruction = (
@@ -700,15 +790,30 @@ class GeneralAssistantActionView(AutoDisappearingView):
                                 "is_code": False,
                                 "timestamp": time.time(),
                             })
-                    break
+                        break
 
         search_hint_tag = ""
-        if use_search:
-            artist_hint = _extract_clean_artist_or_topic_hint(cached_ctx, self.bot_reply)
-            if artist_hint and ("ศิลปิน" in btn_label or "ผลงาน" in btn_label):
+        effective_instruction = instruction
+        if use_search and is_artist_btn:
+            artist_hint = _extract_clean_artist_or_topic_hint(
+                self.source_ctx,
+                self.bot_reply,
+                fallback_cached_ctx=fallback_cached_ctx,
+                user_query=self.user_query,
+            )
+            if artist_hint:
                 search_hint_tag = f"\n[SEARCH_HINT: {artist_hint}]"
+                clean_artist_label = re.sub(r"\s+Pixiv\s+X$", "", artist_hint, flags=re.IGNORECASE).strip()
+                effective_instruction = (
+                    f"{instruction}\n"
+                    f"(ศิลปินเป้าหมายของโพสต์นี้คือ: **{clean_artist_label}** — "
+                    "ให้ค้นหาและตอบเฉพาะข้อมูลของศิลปินและโพสต์นี้เท่านั้น ห้ามนำข้อมูลศิลปินอื่นจากข้อความก่อนหน้าในห้องแชทมาปะปนเด็ดขาด)"
+                )
 
-        # Deterministic button plan — skips redundant ~350ms Decision-1 `ButtonFollowup` round-trip!
+        # Deterministic button plan:
+        # - `complexity_score=1.6` keeps Gemini thinking at `LOW` (prevents Thai prose glitches at MINIMAL)
+        # - `is_button_followup=True` prevents slow 32s `HeavyDoc` Hydrogen escalation on 8p manga follow-ups
+        # - `isolate_context=True` prevents earlier posts/artists in `channel_memory` from polluting THIS button's post
         dec_plan = {
             "route": "web_search" if use_search else "chat",
             "route_confidence": 0.95,
@@ -716,8 +821,10 @@ class GeneralAssistantActionView(AutoDisappearingView):
             "search_confidence": 0.95,
             "needs_tool_use": use_search,
             "tool_confidence": 0.95,
-            "complexity_score": 1.6 if use_search else 1.3,
+            "complexity_score": 1.6,
             "complexity_confidence": 0.90,
+            "is_button_followup": True,
+            "isolate_context": bool(self.source_ctx or is_artist_btn or is_deep_img),
         }
 
         extra_grounding_rule = (
@@ -727,7 +834,7 @@ class GeneralAssistantActionView(AutoDisappearingView):
             else ""
         )
         composed = (
-            f"{instruction}{search_hint_tag}\n\n"
+            f"{effective_instruction}{search_hint_tag}\n\n"
             f"[กฎสำคัญ]: ห้ามคัดลอกหรือเขียนคำตอบเดิมซ้ำ ห้ามสร้างตาราง และห้ามเขียนหัวข้อเมตาของตัวละครเด็ดขาด"
             f"{extra_grounding_rule}\n\n"
             f"[บริบทหัวข้อก่อนหน้า]: {self.user_query}\n"
@@ -735,10 +842,20 @@ class GeneralAssistantActionView(AutoDisappearingView):
         )
         if deep_visual_block:
             composed += deep_visual_block
-        if cached_ctx:
-            # Always include compact visual/document context so product/model-kit follow-ups know the exact identified entity
-            ctx_limit = 18000 if not use_search else 5000
-            composed += f"\n\n[เนื้อหาอ้างอิงจากไฟล์/ลิงก์ในห้องแชท]:\n{cached_ctx[:ctx_limit]}"
+
+        # Keep composed prompt cleanly bounded (<12K chars) and strictly anchored to THIS post
+        ctx_limit = 4500 if use_search else 9500
+        if self.source_ctx:
+            # Bound `source_ctx` starts with THIS post's exact metadata header (`Author / Artist: ...`), so slice head
+            ref_ctx_slice = self.source_ctx[:ctx_limit]
+        elif fallback_cached_ctx:
+            # Chronological fallback cache has newest post at the tail, so slice tail!
+            ref_ctx_slice = fallback_cached_ctx[-ctx_limit:]
+        else:
+            ref_ctx_slice = ""
+
+        if ref_ctx_slice:
+            composed += f"\n\n[เนื้อหาอ้างอิงจากไฟล์/ลิงก์ของโพสต์นี้]:\n{ref_ctx_slice}"
 
         tool_ctx = ToolExecutionContext(
             channel_id=self.channel_id,
@@ -752,9 +869,9 @@ class GeneralAssistantActionView(AutoDisappearingView):
             system_prompt=YUKIPEDIA_SYSTEM_PROMPT if use_search else FAST_SYSTEM_PROMPT,
             mode="general",
             channel_id=self.channel_id,
-            temperature=0.25 if is_deep_img else 0.45,
+            temperature=0.25 if is_deep_img else 0.30,
             allow_agentic_search=use_search,
-            has_fresh_attachment=bool(cached_ctx or deep_visual_block),
+            has_fresh_attachment=bool(ref_ctx_slice or deep_visual_block),
             speaker_user=interaction.user,
             decision_plan=dec_plan,
             tool_ctx=tool_ctx,
@@ -838,7 +955,12 @@ def build_contextual_suggestion_view(
     )
     if dynamic_specs:
         return GeneralAssistantActionView(
-            channel_id, user_query, bot_reply, dynamic_specs, source_message=source_message
+            channel_id,
+            user_query,
+            bot_reply,
+            dynamic_specs,
+            source_message=source_message,
+            source_ctx=extracted_ctx,
         )
 
     # Fallback static domain-tailored specs (when Decision-1 was unavailable or on cooldown)
@@ -868,7 +990,9 @@ def build_contextual_suggestion_view(
                 False,
             ),
         ]
-        return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs, source_message=source_message)
+        return GeneralAssistantActionView(
+            channel_id, user_query, bot_reply, specs, source_message=source_message, source_ctx=extracted_ctx
+        )
 
     if domain == "document":
         specs = [
@@ -894,7 +1018,9 @@ def build_contextual_suggestion_view(
                 False,
             ),
         ]
-        return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs, source_message=source_message)
+        return GeneralAssistantActionView(
+            channel_id, user_query, bot_reply, specs, source_message=source_message, source_ctx=extracted_ctx
+        )
 
     if domain == "social_art":
         specs = []
@@ -938,7 +1064,9 @@ def build_contextual_suggestion_view(
                 True,
             )
         )
-        return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs, source_message=source_message)
+        return GeneralAssistantActionView(
+            channel_id, user_query, bot_reply, specs, source_message=source_message, source_ctx=extracted_ctx
+        )
 
     if domain == "game":
         specs = [
@@ -964,7 +1092,9 @@ def build_contextual_suggestion_view(
                 False,
             ),
         ]
-        return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs, source_message=source_message)
+        return GeneralAssistantActionView(
+            channel_id, user_query, bot_reply, specs, source_message=source_message, source_ctx=extracted_ctx
+        )
 
     if domain == "news":
         specs = [
@@ -990,7 +1120,9 @@ def build_contextual_suggestion_view(
                 True,
             ),
         ]
-        return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs, source_message=source_message)
+        return GeneralAssistantActionView(
+            channel_id, user_query, bot_reply, specs, source_message=source_message, source_ctx=extracted_ctx
+        )
 
     specs = [
         (
@@ -1015,7 +1147,9 @@ def build_contextual_suggestion_view(
             False,
         ),
     ]
-    return GeneralAssistantActionView(channel_id, user_query, bot_reply, specs, source_message=source_message)
+    return GeneralAssistantActionView(
+        channel_id, user_query, bot_reply, specs, source_message=source_message, source_ctx=extracted_ctx
+    )
 
 
 # ==============================================================================

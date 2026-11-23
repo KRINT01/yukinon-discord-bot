@@ -32,6 +32,7 @@ _KATAKANA_IN_THAI_MAP = {
 _THAI_GLUED_KATAKANA_REGEX = re.compile(
     r"(?<=[\u0E00-\u0E7F])([\u30A1-\u30F6])|([\u30A1-\u30F6])(?=[\u0E00-\u0E7F])"
 )
+_JP_KANA_CHAR_REGEX = re.compile(r"[\u3040-\u30FF]")
 _CODE_FENCE_SPLIT_REGEX = re.compile(r"(```[\s\S]*?```)")
 # Strip honorific 'คุณ' before third-party Latin names OR lowercase/uppercase @handles
 # (e.g. 'ผลงานจากคุณ Rain' -> 'ผลงานจาก Rain', 'คุณ @akina_murasame' -> '@akina_murasame')
@@ -58,6 +59,30 @@ _AWKWARD_TRANSLIT_FIXES = (
     (re.compile(r"แอตโมสเฟียร์"), "บรรยากาศ"),
     (re.compile(r"ซิลลูเอต"), "โครงร่าง"),
 )
+
+
+def _strip_stray_cjk_preserving_japanese(text: str) -> str:
+    """
+    Strips isolated Chinese-character leaks (e.g. 才行, 呢) from Thai/English prose
+    while preserving genuine Japanese Kanji embedded next to Hiragana/Katakana
+    (e.g. 'お兄さん', '可愛い', '彼女') or inside Japanese corner quotes (「...」/『...』).
+    """
+    if not text or not CJK_LEAK_REGEX.search(text):
+        return text
+
+    def _repl(m: re.Match) -> str:
+        start, end = m.span()
+        prev_window = text[max(0, start - 2) : start]
+        next_window = text[end : min(len(text), end + 2)]
+        # Preserve Kanji directly adjacent to Japanese Hiragana/Katakana (e.g. お兄さん)
+        if _JP_KANA_CHAR_REGEX.search(prev_window) or _JP_KANA_CHAR_REGEX.search(next_window):
+            return m.group(0)
+        # Preserve Kanji enclosed inside Japanese quotation marks 「...」 / 『...』
+        if prev_window.endswith(("「", "『")) or next_window.startswith(("」", "』")):
+            return m.group(0)
+        return ""
+
+    return CJK_LEAK_REGEX.sub(_repl, text)
 
 
 def is_owner_user(user) -> bool:
@@ -145,9 +170,9 @@ def _sanitize_prose_segment(
     s = _THAI_BROKEN_COMBINING_NL_REGEX.sub("", s)
     s = _THAI_BROKEN_LEADING_VOWEL_NL_REGEX.sub("", s)
 
-    # 2. Strip stray CJK characters unless user prompt contains CJK, and fix Katakana glued to Thai words
+    # 2. Strip stray Chinese CJK leaks while preserving Japanese Kanji embedded in Kana words (e.g. お兄さん)
     if not allow_cjk:
-        s = CJK_LEAK_REGEX.sub("", s)
+        s = _strip_stray_cjk_preserving_japanese(s)
 
     def _replace_glued_katakana(m: re.Match) -> str:
         ch = m.group(1) or m.group(2) or ""
@@ -162,15 +187,15 @@ def _sanitize_prose_segment(
     # 3. Fix out-of-character male particles & casual endings
     s = re.sub(r"(?:ครับ\s*/\s*ค่ะ|ค่ะ\s*/\s*ครับ)", "ค่ะ", s)
     s = re.sub(r"(?:นะครับ\s*/\s*นะคะ|นะคะ\s*/\s*นะครับ)", "นะคะ", s)
-    s = re.sub(r"นะครับ(?=$|[\s\n\r.!?)\"'|\]])", "นะคะ", s)
-    s = re.sub(r"ครับผม(?=$|[\s\n\r.!?)\"'|\]])", "ค่ะ", s)
-    s = re.sub(r"(?:ครับ|คับ)(?=$|[\s\n\r.!?)\"'|\]])", "ค่ะ", s)
+    s = re.sub(r"นะครับ(?=$|[\s\n\r.!?) \"'|\]])", "นะคะ", s)
+    s = re.sub(r"ครับผม(?=$|[\s\n\r.!?) \"'|\]])", "ค่ะ", s)
+    s = re.sub(r"(?:ครับ|คับ)(?=$|[\s\n\r.!?) \"'|\]])", "ค่ะ", s)
     s = re.sub(r"โอเคคะ", "เข้าใจแล้วค่ะ", s)
     s = re.sub(r"เบื่ออ่ะ", "รำคาญใจนะคะ", s)
     s = re.sub(r"นะคะ\s*(?:จ๊ะ|จ้า|จ้ะ)", "นะคะ", s)
     s = re.sub(r"นะ\s*(?:จ๊ะ|จ้า|จ้ะ)", "นะคะ", s)
     s = re.sub(r"เลย\s*(?:จ้า|จ๊ะ|จ้ะ)", "เลยค่ะ", s)
-    s = re.sub(r"(?:จ้า|จ๊ะ|จ้ะ)(?=$|[\s\n\r.!?)\"'|\]])", "ค่ะ", s)
+    s = re.sub(r"(?:จ้า|จ๊ะ|จ้ะ)(?=$|[\s\n\r.!?) \"'|\]])", "ค่ะ", s)
 
     # 4. Enforce pronoun & name rules (strip trailing vocatives cleanly BEFORE owner-name replacement!)
     if is_owner_context:
@@ -216,7 +241,13 @@ def _sanitize_prose_segment(
     return s
 
 
-def sanitize_yukino_output(text: str, user_prompt: str = "", speaker_user=None, speaker_name: str = "") -> str:
+def sanitize_yukino_output(
+    text: str,
+    user_prompt: str = "",
+    speaker_user=None,
+    speaker_name: str = "",
+    allow_cjk_override: bool = False,
+) -> str:
     """
     Sanitizes prose segments strictly OUTSIDE fenced code blocks (```...```) so Python, YAML,
     Java, SQL, and React indentation/strings are preserved 100% verbatim while enforcing Yukino's
@@ -225,7 +256,7 @@ def sanitize_yukino_output(text: str, user_prompt: str = "", speaker_user=None, 
     if not text:
         return ""
 
-    allow_cjk = bool(CJK_LEAK_REGEX.search(user_prompt or ""))
+    allow_cjk = bool(allow_cjk_override or CJK_LEAK_REGEX.search(user_prompt or ""))
     is_owner_ctx = bool(
         is_owner_user(speaker_user)
         or "krint" in (speaker_name or "").lower()
@@ -457,5 +488,5 @@ CODE_SYSTEM_PROMPT = """
    - หากคำถามเกี่ยวกับเวอร์ชันล่าสุดของ Library, Release Notes หรือรหัส Error เฉพาะทางที่ต้องยืนยันกับเอกสารทางการ ให้เรียกใช้เครื่องมือ `web_search` หรือ `read_webpage` ได้ทันที
 4. การจัดรูปแบบและภาษาสำหรับ Discord:
    - ตอบเป็นภาษาไทยที่สุภาพ สุขุม เฉียบคม (แทนตัวเองว่า "ฉัน" เรียกคู่สนทนาว่า "นาย" หรือชื่อตรงๆ โดยไม่ใช้คำว่า "คุณ" นำหน้าชื่อ หรือใช้คำว่า "คุณ" เดี่ยวๆ เมื่อต้องการประชดประชัน ลงท้ายด้วย "ค่ะ"/"นะคะ") ห้ามใช้คำราชการอย่าง "รับทราบ"/"ดำเนินการ"/"กรุณา" ห้ามใช้ "จ้า"/"จ๊ะ" และห้ามหลุดตัวอักษรภาษาจีนเด็ดขาด
-   - ห้ามใช้ตาราง Markdown (`|---|---|`) เด็ดขาด ให้สรุปสาเหตุและขั้นตอนการแก้ไขเป็นหัวข้อย่อย (Bullet points) ตามด้วยบล็อกโค้ด (```) เท่านั้น
+   - ห้ามใช้ตาราง Markdown (`|---|---|`) เด็ดขาด ให้สรุปสาเหตุและขั้นตอนการแก้ไขเป็นหัวข้อย่อย (Bullet points)
 """.strip()
