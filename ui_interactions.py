@@ -300,6 +300,8 @@ class AutoDisappearingView(discord.ui.View):
             self.source_message = None
         if hasattr(self, "source_ctx"):
             self.source_ctx = ""
+        if hasattr(self, "followup_findings"):
+            self.followup_findings.clear()
         if msg is None:
             return
         try:
@@ -688,8 +690,10 @@ class GeneralAssistantActionView(AutoDisappearingView):
         self.bot_reply = bot_reply[:2500]
         self.source_message = source_message
         # Bind this message's exact extracted context (metadata + OCR) directly to the View
-        # so multi-post channels never mix up Artist #1 with Artist #2!
+        # so multi-post channels never mix up Artist #1 with Artist #2, while `followup_findings`
+        # carries discoveries (e.g. character ID from Deep Visual Inspect) across buttons on THIS post!
         self.source_ctx = (source_ctx or "")[:12000]
+        self.followup_findings: list[str] = []
 
         for label, emoji, style, action_spec, use_search in button_specs[:3]:
             btn = discord.ui.Button(label=label[:34], emoji=emoji, style=style)
@@ -782,6 +786,14 @@ class GeneralAssistantActionView(AutoDisappearingView):
                     )
                     if deep_vis:
                         deep_visual_block = f"\n\n=== Fresh Deep Visual Inspection (Ground Truth) ===\n{deep_vis}"
+                        # Persist deep visual ground truth onto THIS View so subsequent buttons (e.g. artist search)
+                        # on the same post retain character/outfit identifications discovered here!
+                        if "=== Fresh Deep Visual Inspection" not in self.source_ctx:
+                            self.source_ctx = (
+                                f"{self.source_ctx}{deep_visual_block}"
+                                if self.source_ctx
+                                else deep_visual_block.strip()
+                            )[:14000]
                         # Save fresh deep visual ground truth into channel attachment cache for subsequent chat questions!
                         if self.channel_id is not None:
                             channel_last_attachment[self.channel_id].append({
@@ -793,7 +805,6 @@ class GeneralAssistantActionView(AutoDisappearingView):
                         break
 
         search_hint_tag = ""
-        effective_instruction = instruction
         if use_search and is_artist_btn:
             artist_hint = _extract_clean_artist_or_topic_hint(
                 self.source_ctx,
@@ -803,12 +814,6 @@ class GeneralAssistantActionView(AutoDisappearingView):
             )
             if artist_hint:
                 search_hint_tag = f"\n[SEARCH_HINT: {artist_hint}]"
-                clean_artist_label = re.sub(r"\s+Pixiv\s+X$", "", artist_hint, flags=re.IGNORECASE).strip()
-                effective_instruction = (
-                    f"{instruction}\n"
-                    f"(ศิลปินเป้าหมายของโพสต์นี้คือ: **{clean_artist_label}** — "
-                    "ให้ค้นหาและตอบเฉพาะข้อมูลของศิลปินและโพสต์นี้เท่านั้น ห้ามนำข้อมูลศิลปินอื่นจากข้อความก่อนหน้าในห้องแชทมาปะปนเด็ดขาด)"
-                )
 
         # Deterministic button plan:
         # - `complexity_score=1.6` keeps Gemini thinking at `LOW` (prevents Thai prose glitches at MINIMAL)
@@ -834,20 +839,31 @@ class GeneralAssistantActionView(AutoDisappearingView):
             else ""
         )
         composed = (
-            f"{effective_instruction}{search_hint_tag}\n\n"
+            f"{instruction}{search_hint_tag}\n\n"
             f"[กฎสำคัญ]: ห้ามคัดลอกหรือเขียนคำตอบเดิมซ้ำ ห้ามสร้างตาราง และห้ามเขียนหัวข้อเมตาของตัวละครเด็ดขาด"
             f"{extra_grounding_rule}\n\n"
             f"[บริบทหัวข้อก่อนหน้า]: {self.user_query}\n"
             f"[สรุปคำตอบก่อนหน้า (ห้ามเขียนซ้ำ)]: {self.bot_reply[:1500]}"
         )
+        if self.followup_findings:
+            composed += (
+                "\n\n[ข้อมูลเพิ่มเติมที่วิเคราะห์พบแล้วจากปุ่มก่อนหน้าของโพสต์นี้ (ใช้อ้างอิงให้สอดคล้องกัน ห้ามขัดแย้ง)]:\n"
+                + "\n".join(self.followup_findings[-2:])
+            )
         if deep_visual_block:
             composed += deep_visual_block
 
         # Keep composed prompt cleanly bounded (<12K chars) and strictly anchored to THIS post
-        ctx_limit = 4500 if use_search else 9500
+        ctx_limit = 5500 if use_search else 9500
         if self.source_ctx:
-            # Bound `source_ctx` starts with THIS post's exact metadata header (`Author / Artist: ...`), so slice head
-            ref_ctx_slice = self.source_ctx[:ctx_limit]
+            # Bound `source_ctx` starts with THIS post's exact metadata header (`Author / Artist: ...`),
+            # and if a Deep Visual block was appended near the end, preserve both metadata head & deep tail!
+            if len(self.source_ctx) > ctx_limit and "=== Fresh Deep Visual Inspection" in self.source_ctx:
+                head_cap = min(2200, ctx_limit // 2)
+                tail_cap = max(1200, ctx_limit - head_cap - 40)
+                ref_ctx_slice = f"{self.source_ctx[:head_cap]}\n...\n{self.source_ctx[-tail_cap:]}"
+            else:
+                ref_ctx_slice = self.source_ctx[:ctx_limit]
         elif fallback_cached_ctx:
             # Chronological fallback cache has newest post at the tail, so slice tail!
             ref_ctx_slice = fallback_cached_ctx[-ctx_limit:]
@@ -869,13 +885,17 @@ class GeneralAssistantActionView(AutoDisappearingView):
             system_prompt=YUKIPEDIA_SYSTEM_PROMPT if use_search else FAST_SYSTEM_PROMPT,
             mode="general",
             channel_id=self.channel_id,
-            temperature=0.25 if is_deep_img else 0.30,
+            temperature=0.25 if is_deep_img else 0.45,
             allow_agentic_search=use_search,
             has_fresh_attachment=bool(ref_ctx_slice or deep_visual_block),
             speaker_user=interaction.user,
             decision_plan=dec_plan,
             tool_ctx=tool_ctx,
         )
+        if answer and not is_failure_or_refusal_reply(answer):
+            compact_note = re.sub(r"\s+", " ", answer).strip()[:750]
+            self.followup_findings.append(f"- [{btn_label}]: {compact_note}")
+            self.followup_findings = self.followup_findings[-2:]
         await _deliver_button_followup_cleanly(interaction, answer)
 
 

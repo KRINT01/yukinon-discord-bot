@@ -63,7 +63,6 @@ STOPWORD_ENTITIES = {
 }
 _MARKUP_NOISE_WORDS = {"markdown", "json", "html", "in-bubble", "ocr", "sfx", "error", "extraction", "readable"}
 _USER_TAG_REGEX = re.compile(r"^user_\d+$", re.IGNORECASE)
-_ARTIST_SOCIAL_SEARCH_REGEX = re.compile(r"\b(?:pixiv|fanbox|skeb|booth|fantia|twitter|artist|illustrator)\b", re.IGNORECASE)
 
 # Bounded 5-minute in-memory TTL cache for search results (eliminates redundant lookups on follow-up buttons)
 _SEARCH_CACHE: dict[str, tuple[float, str]] = {}
@@ -605,8 +604,7 @@ async def _search_google_ai_studio_grounded_async(query: str) -> list[dict]:
         },
     }
     session = get_http_session()
-    saw_429_all = True
-    for model_id in ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3-flash-preview"):
+    for model_id in ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite"):
         url = clean_url(
             f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
             f"{model_id}:generateContent?key={GEMINI_API_KEY}"
@@ -650,16 +648,11 @@ async def _search_google_ai_studio_grounded_async(query: str) -> list[dict]:
                             "skip_scrape": True,
                         }]
                 elif resp.status == 429:
-                    api_log(f"Search (Gemini Grounding) -> {model_id} HTTP 429; trying next model")
-                    continue
-                else:
-                    saw_429_all = False
+                    state.gemini_grounding_cooldown_until = time.time() + 1800.0
+                    api_log(f"Search (Gemini Grounding) -> {model_id} HTTP 429 (cooldown 30m)")
+                    return []
         except Exception as e:
-            saw_429_all = False
             api_log(f"Search (Gemini Grounding) -> {model_id} skipped ({type(e).__name__})")
-    if saw_429_all:
-        state.gemini_grounding_cooldown_until = time.time() + 1800.0
-        api_log("Search (Gemini Grounding) -> all models HTTP 429 (cooldown 30m)")
     return []
 
 
@@ -885,12 +878,12 @@ def _search_ddgs_sync(query: str, region_code: str, timelimit: str | None, max_r
     t0 = time.monotonic()
     hits = []
     try:
-        with DDGS(proxy=DDGS_PROXY, timeout=5) as ddgs:
+        with DDGS(proxy=DDGS_PROXY, timeout=8) as ddgs:
             timelimit_passes = [timelimit, None] if timelimit else [None]
             for tl in timelimit_passes:
                 if hits:
                     break
-                for backend_choice in ("bing", "brave", "auto", "google", "yahoo"):
+                for backend_choice in ("auto", "brave", "bing", "google", "wikipedia", "yahoo"):
                     try:
                         ddg_hits = list(
                             ddgs.text(
@@ -955,7 +948,6 @@ async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
     is_recency = bool(RECENCY_INTENT_REGEX.search(clean_q))
     is_anime_manga = bool(ANIME_MANGA_QUERY_REGEX.search(clean_q))
     is_game = bool(GAME_QUERY_REGEX.search(clean_q))
-    is_artist_social = bool(_ARTIST_SOCIAL_SEARCH_REGEX.search(clean_q))
 
     dated_q = clean_q
     if is_news and not re.search(r"\b202\d\b|\b256\d\b", clean_q):
@@ -963,10 +955,8 @@ async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
 
     # Phase 1: Parallel fan-out across fast domain-matched async APIs + soft-capped DDGS
     fast_tasks = []
-    ran_grounding = False
-    if is_news or is_recency or is_artist_social:
-        fast_tasks.append(_search_google_ai_studio_grounded_async(dated_q if is_news else clean_q))
-        ran_grounding = True
+    if is_news or is_recency:
+        fast_tasks.append(_search_google_ai_studio_grounded_async(dated_q))
     if is_news:
         fast_tasks.append(_search_google_news_rss_async(dated_q, is_thai=is_thai, max_results=3))
     if is_anime_manga:
@@ -975,7 +965,7 @@ async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
     elif is_game:
         fast_tasks.append(_search_wikipedia_full_extract_async(clean_q, is_thai=is_thai, max_results=2))
         fast_tasks.append(_search_steam_games_async(clean_q, max_results=1))
-    elif not is_news and not is_artist_social:
+    elif not is_news:
         fast_tasks.append(_search_wikipedia_full_extract_async(clean_q, is_thai=is_thai, max_results=2))
 
     if TAVILY_API_KEY:
@@ -1004,7 +994,7 @@ async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
             pass
     else:
         elapsed_ddgs = time.monotonic() - ddgs_start
-        ddgs_budget = max(0.25, _DDGS_SOFT_WAIT_SEC - elapsed_ddgs) if hits else max(1.0, 10.5 - elapsed_ddgs)
+        ddgs_budget = max(0.25, _DDGS_SOFT_WAIT_SEC - elapsed_ddgs) if hits else max(1.0, 8.5 - elapsed_ddgs)
         done_set, _ = await asyncio.wait({ddgs_task}, timeout=ddgs_budget)
         if ddgs_task in done_set:
             try:
@@ -1021,15 +1011,13 @@ async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
             # Attach silent done callback so background thread exception is never logged as unhandled
             ddgs_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
-    # Last-resort fallback if everything above returned empty (includes Gemini Grounding if not tried yet)
+    # Last-resort fallback if everything above returned empty
     if not hits:
-        fb_coros = [
+        fallback_batches = await asyncio.gather(
             _search_wikipedia_full_extract_async(clean_q, is_thai=is_thai, max_results=2),
             _search_google_news_rss_async(clean_q, is_thai=is_thai, max_results=max_results),
-        ]
-        if not ran_grounding:
-            fb_coros.insert(0, _search_google_ai_studio_grounded_async(clean_q))
-        fallback_batches = await asyncio.gather(*fb_coros, return_exceptions=True)
+            return_exceptions=True,
+        )
         for batch in fallback_batches:
             if isinstance(batch, list):
                 hits.extend(batch)
