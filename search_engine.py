@@ -63,6 +63,7 @@ STOPWORD_ENTITIES = {
 }
 _MARKUP_NOISE_WORDS = {"markdown", "json", "html", "in-bubble", "ocr", "sfx", "error", "extraction", "readable"}
 _USER_TAG_REGEX = re.compile(r"^user_\d+$", re.IGNORECASE)
+_ARTIST_SOCIAL_SKIP_WIKI_REGEX = re.compile(r"\b(?:pixiv|fanbox|skeb|booth|fantia|twitter|artist|illustrator)\b", re.IGNORECASE)
 
 # Bounded 5-minute in-memory TTL cache for search results (eliminates redundant lookups on follow-up buttons)
 _SEARCH_CACHE: dict[str, tuple[float, str]] = {}
@@ -878,7 +879,7 @@ def _search_ddgs_sync(query: str, region_code: str, timelimit: str | None, max_r
     t0 = time.monotonic()
     hits = []
     try:
-        with DDGS(proxy=DDGS_PROXY, timeout=8) as ddgs:
+        with DDGS(proxy=DDGS_PROXY, timeout=6) as ddgs:
             timelimit_passes = [timelimit, None] if timelimit else [None]
             for tl in timelimit_passes:
                 if hits:
@@ -965,7 +966,7 @@ async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
     elif is_game:
         fast_tasks.append(_search_wikipedia_full_extract_async(clean_q, is_thai=is_thai, max_results=2))
         fast_tasks.append(_search_steam_games_async(clean_q, max_results=1))
-    elif not is_news:
+    elif not is_news and not _ARTIST_SOCIAL_SKIP_WIKI_REGEX.search(clean_q):
         fast_tasks.append(_search_wikipedia_full_extract_async(clean_q, is_thai=is_thai, max_results=2))
 
     if TAVILY_API_KEY:
@@ -994,7 +995,7 @@ async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
             pass
     else:
         elapsed_ddgs = time.monotonic() - ddgs_start
-        ddgs_budget = max(0.25, _DDGS_SOFT_WAIT_SEC - elapsed_ddgs) if hits else max(1.0, 8.5 - elapsed_ddgs)
+        ddgs_budget = max(0.25, _DDGS_SOFT_WAIT_SEC - elapsed_ddgs) if hits else max(1.0, 10.0 - elapsed_ddgs)
         done_set, _ = await asyncio.wait({ddgs_task}, timeout=ddgs_budget)
         if ddgs_task in done_set:
             try:

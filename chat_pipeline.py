@@ -42,6 +42,7 @@ from search_engine import (
 from tools import ToolExecutionContext
 from llm_providers import (
     _can_use_gemini_hydrogen,
+    is_google_ai_studio_congested,
     call_gemini_hydrogen_chat,
     get_groq_search_and_chat_candidates,
     call_gemma_ai_studio_chat,
@@ -237,7 +238,18 @@ async def query_ai_chat(
     )
 
     is_button_followup = bool(plan.get("is_button_followup"))
-    isolate_context = bool(plan.get("isolate_context"))
+    # Auto-isolate brand-new X/Pixiv/Bluesky posts from older unrelated channel posts/artists
+    # unless the user explicitly compares/references an earlier post!
+    is_fresh_social_embed = bool(
+        has_fresh_attachment
+        and re.search(r"=== Embedded (?:X \(Twitter\)|Pixiv|Bluesky)", prompt)
+        and not re.search(
+            r"(เทียบกับ|อันก่อน|โพสต์ก่อน|รูปก่อน|เมื่อกี้|ก่อนหน้านี้|\b(?:compare|previous|earlier)\b)",
+            raw_user_query,
+            re.IGNORECASE,
+        )
+    )
+    isolate_context = bool(plan.get("isolate_context") or is_fresh_social_embed)
     active_topic = "" if isolate_context else update_and_get_channel_topic(raw_user_query, channel_id=channel_id)
     live_clock_str = get_current_thai_datetime_str()
 
@@ -607,23 +619,44 @@ async def query_ai_chat(
                 except Exception as e:
                     print(f"Gemini {b_purpose} fallback warning: {e}")
 
-            # 2. Gemma 4 AI Studio (`gemma-4-31b-it` -> `gemma-4-26b-a4b-it`) with native systemInstruction + tools
-            if GEMINI_API_KEY:
+            def _build_fallback_msgs_with_obs() -> tuple[list, bool]:
+                """Carries any tool/search results already fetched by an earlier provider into fallback turns."""
+                obs_pairs = getattr(active_tool_ctx, "_collected_observations", None) if active_tool_ctx else None
+                if not obs_pairs:
+                    return messages, False
+                obs_joined = "\n\n".join(obs for _, obs in obs_pairs)[:8500]
+                fb_msgs = [dict(m) for m in messages]
+                fb_msgs[-1]["content"] = (
+                    f"{fb_msgs[-1]['content']}\n\n"
+                    f"=== Already-Fetched Live Tool / Search Results (Use Directly — Do Not Re-Search) ===\n"
+                    f"{obs_joined}"
+                )
+                return fb_msgs, True
+
+            fb_messages, has_collected_obs = _build_fallback_msgs_with_obs()
+            # If Gemini already fetched search hits before Round-2 503, disable redundant tool loops for synthesis
+            fb_tool_ctx = None if (has_collected_obs and active_tool_ctx and active_tool_ctx.did_search) else active_tool_ctx
+
+            # 2. Gemma 4 AI Studio (`gemma-4-31b-it` -> `gemma-4-26b-a4b-it`), skipped if AI Studio is in a 503 storm
+            if GEMINI_API_KEY and not is_google_ai_studio_congested():
                 ans = await call_gemma_ai_studio_chat(
-                    messages,
+                    fb_messages,
                     temperature=target_temp,
                     max_output_tokens=2048,
                     purpose=b_purpose,
-                    tool_ctx=active_tool_ctx,
+                    tool_ctx=fb_tool_ctx,
                     prefer_fast_26b=is_voice_mode,
                 )
                 if ans:
                     return ans
+                fb_messages, has_collected_obs = _build_fallback_msgs_with_obs()
+                fb_tool_ctx = None if (has_collected_obs and active_tool_ctx and active_tool_ctx.did_search) else active_tool_ctx
 
-            # 3. Cloudflare Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`) before Groq/gpt-oss for strong Thai Yukino persona
-            if not active_tool_ctx:
+            # 3. Cloudflare Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`) when no live tools remain needed
+            #    (including right after Gemini fetched search hits before failing on Round 2!)
+            if not fb_tool_ctx:
                 ans = await _call_cf_gemma_hedged_with_groq(
-                    messages,
+                    fb_messages,
                     temperature=target_temp,
                     max_tokens=2048,
                     purpose=b_purpose,
@@ -637,23 +670,26 @@ async def query_ai_chat(
                 groq_search_candidates = await get_groq_search_and_chat_candidates()
                 for g_mod in groq_search_candidates:
                     try:
+                        fb_messages, has_collected_obs = _build_fallback_msgs_with_obs()
+                        fb_tool_ctx = None if (has_collected_obs and active_tool_ctx and active_tool_ctx.did_search) else active_tool_ctx
                         ans = await call_groq_chat(
-                            messages,
+                            fb_messages,
                             g_mod,
                             target_temp,
                             is_coding=False,
                             purpose=b_purpose,
-                            tool_ctx=active_tool_ctx,
+                            tool_ctx=fb_tool_ctx,
                         )
                         if ans:
                             return ans
                     except Exception:
                         continue
 
-            # 5. Cloudflare Gemma 4 final persona fallback (if skipped earlier because tools were enabled)
-            if active_tool_ctx:
+            # 5. Cloudflare Gemma 4 final persona fallback (with any tool results gathered so far)
+            fb_messages, _ = _build_fallback_msgs_with_obs()
+            if fb_tool_ctx is not None:
                 ans = await call_cloudflare_gemma_chat(
-                    messages,
+                    fb_messages,
                     temperature=target_temp,
                     max_tokens=2048,
                     purpose=b_purpose,
@@ -661,14 +697,14 @@ async def query_ai_chat(
                 if ans:
                     return ans
 
-            # 6. Cloudflare GPT-OSS-20B (last resort only, with persona lock)
+            # 6. Cloudflare GPT-OSS-20B (last resort only, with persona lock & carried tool results)
             ans = await call_cloudflare_gpt_oss(
-                messages,
+                fb_messages,
                 cf_model=CF_CHAT_FAST_MODEL,
                 temperature=target_temp,
                 is_coding=False,
                 purpose=b_purpose,
-                tool_ctx=active_tool_ctx,
+                tool_ctx=fb_tool_ctx,
             )
             if ans:
                 return ans

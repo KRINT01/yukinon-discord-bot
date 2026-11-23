@@ -69,6 +69,45 @@ def set_google_model_cooldown(model_id: str, duration_sec: float):
     _GEMINI_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + max(1.0, float(duration_sec))
 
 
+def is_google_ai_studio_congested() -> bool:
+    """True when all 3 primary Gemini Flash endpoints are simultaneously in cooldown (503/429/Timeout storm)."""
+    now = time.time()
+    return all(
+        now < _GEMINI_MODEL_COOLDOWN_UNTIL.get(m, 0.0)
+        for m in ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3-flash-preview")
+    )
+
+
+def _record_tool_observations_on_ctx(
+    tool_ctx: ToolExecutionContext | None,
+    fn_calls: list[tuple[str, object]],
+    obs_list: list[str],
+) -> None:
+    """
+    Persists successful tool observations on `tool_ctx._collected_observations` so that
+    if a provider succeeds in Round 1 (executing web_search/tools) and then fails in Round 2
+    with HTTP 503/429, downstream fallback providers reuse those results instead of losing them.
+    """
+    if tool_ctx is None:
+        return
+    store = getattr(tool_ctx, "_collected_observations", None)
+    if store is None:
+        store = []
+        setattr(tool_ctx, "_collected_observations", store)
+    seen = {k for k, _ in store}
+    for (fn_name, fn_args), obs_text in zip(fn_calls, obs_list):
+        obs_s = str(obs_text or "").strip()
+        if not obs_s or obs_s.startswith(("[Tool ", "[No ", "[Could not")):
+            continue
+        arg_preview = str(fn_args)[:80]
+        key = f"{fn_name}:{arg_preview}"
+        if key not in seen:
+            seen.add(key)
+            store.append((key, obs_s[:4500]))
+    if len(store) > 6:
+        del store[:-6]
+
+
 def _record_gemini_usage_cache(data: dict) -> str:
     """
     Safely inspects `usageMetadata.cachedContentTokenCount` (omitted by REST API when 0)
@@ -93,18 +132,34 @@ def _estimate_messages_tokens(messages: list) -> int:
 
 
 def _compact_messages_for_token_budget(messages: list, max_est_tokens: int = 4800) -> list:
+    """
+    Compacts chat messages to fit token budgets WITHOUT sacrificing the current user turn
+    to stale conversation history:
+    1) Drops oldest middle turns (`compacted[1:-1]`) FIRST while preserving system + current turn.
+    2) Only trims the middle of the current turn (`compacted[-1]`) if `[system, current_user]`
+       alone still exceeds `max_est_tokens`.
+    """
     if _estimate_messages_tokens(messages) <= max_est_tokens:
         return messages
 
     compacted = [dict(m) for m in messages]
+    while len(compacted) > 2 and _estimate_messages_tokens(compacted) > max_est_tokens:
+        compacted.pop(1)
+    # Keep role alternation clean (avoid starting history with an orphaned assistant turn)
+    while len(compacted) > 2 and compacted[1].get("role") == "assistant":
+        compacted.pop(1)
+
+    if _estimate_messages_tokens(compacted) <= max_est_tokens:
+        return compacted
+
     max_total_chars = int(max_est_tokens * 2.2)
     non_user_chars = sum(len(str(m.get("content") or "")) for m in compacted[:-1])
-    allowed_user_chars = max(2400, max_total_chars - non_user_chars)
+    allowed_user_chars = max(3200, max_total_chars - non_user_chars)
 
     last_content = str(compacted[-1].get("content") or "")
     if len(last_content) > allowed_user_chars:
-        keep_head = min(1800, allowed_user_chars // 3)
-        keep_tail = max(800, allowed_user_chars - keep_head - 80)
+        keep_head = min(2800, int(allowed_user_chars * 0.55))
+        keep_tail = max(1000, allowed_user_chars - keep_head - 80)
         compacted[-1]["content"] = (
             f"{last_content[:keep_head]}\n\n"
             f"... [ trimmed middle context to fit model token limit ] ...\n\n"
@@ -477,6 +532,7 @@ async def call_gemini_hydrogen_chat(
         if fn_calls and allow_tools_now and tool_ctx is not None:
             contents.append({"role": "model", "parts": raw_parts})
             obs_list = await execute_tool_calls_parallel(fn_calls, tool_ctx)
+            _record_tool_observations_on_ctx(tool_ctx, fn_calls, obs_list)
             fn_resp_parts = [
                 {
                     "functionResponse": {
@@ -749,6 +805,7 @@ async def call_gemma_ai_studio_chat(
                 if fn_calls and allow_tools_now and tool_ctx is not None:
                     contents.append({"role": "model", "parts": raw_parts})
                     obs_list = await execute_tool_calls_parallel(fn_calls, tool_ctx)
+                    _record_tool_observations_on_ctx(tool_ctx, fn_calls, obs_list)
                     fn_resp_parts = [
                         {
                             "functionResponse": {
@@ -1048,6 +1105,7 @@ async def call_gemini_chat_messages(
         if fn_calls and allow_tools_now and tool_ctx is not None:
             contents.append({"role": "model", "parts": raw_parts})
             obs_list = await execute_tool_calls_parallel(fn_calls, tool_ctx)
+            _record_tool_observations_on_ctx(tool_ctx, fn_calls, obs_list)
             fn_resp_parts = [
                 {
                     "functionResponse": {
@@ -1343,6 +1401,7 @@ async def call_cloudflare_gpt_oss(
                             for tc in tool_calls
                         ]
                         obs_list = await execute_tool_calls_parallel(parsed_calls, tool_ctx)
+                        _record_tool_observations_on_ctx(tool_ctx, parsed_calls, obs_list)
                         for tc, obs_text in zip(tool_calls, obs_list):
                             work_msgs.append({
                                 "role": "tool",
@@ -1408,7 +1467,7 @@ async def call_cloudflare_vision_chat(
             else "Respond directly and concisely with the requested output. Do NOT output internal thinking steps."
         )
         eff_max_tokens = max(max_tokens, 3072) if think_flag else max_tokens
-        req_timeout = 26 if think_flag else 18
+        req_timeout = 16 if think_flag else 18
         payload = {
             "model": CF_VISION_MODEL,
             "messages": [
@@ -1539,6 +1598,7 @@ async def call_groq_chat(
                         for tc in tool_calls
                     ]
                     obs_list = await execute_tool_calls_parallel(parsed_calls, tool_ctx)
+                    _record_tool_observations_on_ctx(tool_ctx, parsed_calls, obs_list)
                     for tc, obs_text in zip(tool_calls, obs_list):
                         work_msgs.append({
                             "role": "tool",
