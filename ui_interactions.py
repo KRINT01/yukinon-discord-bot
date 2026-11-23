@@ -51,7 +51,7 @@ from user_memory import (
     process_ot_request,
     build_monthly_ot_summary_markdown,
     _parse_stored_ot_date,
-    save_user_profiles_local,
+    save_user_profiles_local_async,
     backup_user_profiles_to_discord,
 )
 from tools import ToolExecutionContext
@@ -181,7 +181,7 @@ def _extract_clean_artist_or_topic_hint(
         if m_at_rep:
             return f"{m_at_rep[-1]} Pixiv X".strip()
         m_th_artist = re.search(
-            r"(?:ศิลปิน(?:ที่ชื่อว่า|ชื่อ|เจ้าของผลงาน)?|ผู้วาด(?:ชื่อ)?)\s*[\*\`\"\']*\s*([^\n\*\`\"'.,()]{2,36}(?:\s*\([A-Za-z0-9_ .-]{2,30}\))?)",
+            r"(?:ศิลปิน(?:ที่ชื่อว่า|ชื่อ|เจ้าของผลงาน)?|ผู้วาด(?:ชื่อ)?)\s*[\*\`\"\']*\s*([^\n\*\`\"'.,()]{2,32}?(?:\s*\([A-Za-z0-9_ .-]{2,28}\))?)(?=\s*(?:ค่ะ|นะคะ|บน|ที่|ซึ่ง|ชื่อเรื่อง|[\n\*\`\"'.,]|$))",
             bot_reply,
         )
         if m_th_artist:
@@ -1425,7 +1425,7 @@ class OTActionView(AutoDisappearingView):
         new_logs = [e for e in ot_logs if _parse_stored_ot_date(e.get("date", "")) != target_key]
         if len(new_logs) < len(ot_logs):
             prof["ot_logs"] = new_logs
-            save_user_profiles_local()
+            await save_user_profiles_local_async()
             await backup_user_profiles_to_discord(force=True)
             self.stop()
             self.message = None

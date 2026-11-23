@@ -113,6 +113,66 @@ def _compact_messages_for_token_budget(messages: list, max_est_tokens: int = 480
     return compacted
 
 
+def _adapt_messages_for_oss_fallback(
+    messages: list,
+    model_id: str,
+    has_tools: bool,
+    is_coding: bool = False,
+    is_voice: bool = False,
+) -> list:
+    """
+    Adapts system instructions specifically for `openai/gpt-oss-*` models across all 3 paths:
+    1) Strips `## [Native Tools ...]` when `has_tools=False` so Groq never raises HTTP 400
+       ("Tool choice is none, but model called a tool").
+    2) Applies a mode-aware Yukino persona lock (Coding bullet architecture vs Voice 35-word TTS
+       vs General/MangaSocial natural Thai conversational paragraphs) with zero cross-mode conflicts.
+    """
+    low_m = (model_id or "").lower()
+    if "gpt-oss" not in low_m:
+        return messages
+
+    adapted = [dict(m) for m in messages]
+    if adapted and adapted[0].get("role") == "system":
+        sys_txt = str(adapted[0].get("content") or "")
+        if not has_tools:
+            sys_txt = re.sub(
+                r"## \[Native Tools & Multi-Intent Execution\][\s\S]*?(?=\n## \[|\Z)",
+                "",
+                sys_txt,
+            )
+            sys_txt = re.sub(
+                r"\n- การจดจำข้อมูลผู้ใช้ระยะยาว:[^\n]+",
+                "",
+                sys_txt,
+            )
+
+        if is_coding:
+            lock_note = (
+                "\n\n[CRITICAL PERSONA & ENGINEERING LOCK]: ตอบในบุคลิก 'ยูกิโนะชิตะ ยูกิโนะ' "
+                "ในฐานะ Principal Enterprise Software Architect (แทนตัวเองว่า 'ฉัน' เรียกคู่สนทนาว่า 'นาย' "
+                "ลงท้ายด้วย 'ค่ะ'/'นะคะ' เสมอ ห้ามใช้คำราชการแข็งทื่ออย่าง 'รับทราบ'/'ดำเนินการ'/'กรุณา') "
+                "วิเคราะห์จุดบกพร่องและ Root Cause อย่างเฉียบคมตรงไปตรงมา สรุปขั้นตอนแก้ไขเป็นหัวข้อย่อย (Bullet points) "
+                "ที่กระชับชัดเจน และห้ามสร้างตาราง Markdown เด็ดขาด"
+            )
+        elif is_voice:
+            lock_note = (
+                "\n\n[CRITICAL VOICE PERSONA LOCK]: ตอบเป็นภาษาพูดของ 'ยูกิโนะชิตะ ยูกิโนะ' "
+                "(แทนตัวเองว่า 'ฉัน' เรียกคู่สนทนาว่า 'นาย' ลงท้ายด้วย 'ค่ะ'/'นะคะ' เสมอ) "
+                "สั้นกระชับที่สุดเพียง 1 ถึง 2 ประโยค (ไม่เกิน 35 คำ) สำหรับอ่านออกเสียง TTS "
+                "ห้ามใส่วงเล็บ ห้ามใช้สัญลักษณ์พิเศษ (*, #, `) และห้ามใส่บล็อกโค้ด"
+            )
+        else:
+            lock_note = (
+                "\n\n[CRITICAL PERSONA & STYLE LOCK]: ตอบเป็นภาษาไทยที่ลื่นไหลในบุคลิก 'ยูกิโนะชิตะ ยูกิโนะ' "
+                "(แทนตัวเองว่า 'ฉัน' เรียกคู่สนทนาว่า 'นาย' ลงท้ายด้วย 'ค่ะ'/'นะคะ' เสมอ "
+                "ห้ามใช้คำราชการอย่าง 'รับทราบ'/'ดำเนินการ'/'กรุณา') เขียนเป็นย่อหน้าสนทนาที่เป็นธรรมชาติเหมือนคุยกันในห้องชมรมบริการ "
+                "ห้ามเขียนหัวข้อแบบรายงาน AI เช่น 'รายละเอียดเครื่องแต่งกาย:' 'จุดน่าสนใจ:' หรือ 'โดยสรุปภาพนี้...' "
+                "ห้ามสร้างตาราง Markdown และห้ามแปลศัพท์เสื้อผ้า/ภาพวาดแบบแข็งทื่อตรงตัวเด็ดขาด"
+            )
+        adapted[0]["content"] = sys_txt.strip() + lock_note
+    return adapted
+
+
 def _convert_messages_to_gemini_contents(
     messages: list,
     embed_system_in_first_user: bool = False,
@@ -508,10 +568,10 @@ async def discover_available_groq_models(force_refresh: bool = False) -> list[st
 async def get_groq_search_and_chat_candidates() -> list[str]:
     live_models = await discover_available_groq_models()
     preferred_order = [
+        "qwen/qwen3.8-27b",
         state.active_groq_search_model,
         GROQ_SEARCH_MODEL,
         "openai/gpt-oss-20b",
-        "qwen/qwen3.8-27b",
         GROQ_CHAT_FALLBACK_MODEL,
     ]
     candidates = []
@@ -596,20 +656,37 @@ async def _discover_active_gemini_flash_model(force_remote: bool = False) -> lis
 # GOOGLE AI STUDIO GEMMA 4 & GEMINI FLASH-LITE (SELF-HEALING + NATIVE TOOLS)
 # ==============================================================================
 async def call_gemma_ai_studio_chat(
-    messages: list, temperature: float = 0.4, max_output_tokens: int = 1024, purpose: str = "GemmaChat"
+    messages: list,
+    temperature: float = 0.4,
+    max_output_tokens: int = 2048,
+    purpose: str = "GemmaChat",
+    tool_ctx: ToolExecutionContext | None = None,
+    max_tool_rounds: int = 3,
+    prefer_fast_26b: bool = False,
 ) -> str:
+    """
+    Google AI Studio Gemma 4 chat (`gemma-4-31b-it` / `gemma-4-26b-a4b-it`):
+    Uses native `systemInstruction` (256K context) and native parallel function calling
+    so Yukino's persona and Thai prose stay natural and consistent with Gemini 3.
+    Automatically falls back to embedded system instructions or plain chat on HTTP 400.
+    """
     if not GEMINI_API_KEY:
         return ""
 
-    safe_messages = _compact_messages_for_token_budget(messages, max_est_tokens=4500)
-    _, contents = _convert_messages_to_gemini_contents(
-        safe_messages, embed_system_in_first_user=True, max_turn_chars=18000
+    sys_parts, base_contents = _convert_messages_to_gemini_contents(
+        messages, embed_system_in_first_user=False, max_turn_chars=60000
     )
-    if not contents:
+    if not base_contents:
         return ""
 
     discovered = await discover_active_gemma_models(vision_required=False)
-    candidates = sorted(discovered, key=lambda x: (0 if "26b" in x else 1))
+    # Prefer dense 31B for rich Yukino persona/prose; 26B MoE first only for latency-sensitive/background utility calls
+    if prefer_fast_26b or purpose in ("PassiveMemoryExtract", "MemoryConsolidate", "VoiceChat"):
+        candidates = sorted(discovered, key=lambda x: (0 if "26b" in x else 1))
+    else:
+        candidates = sorted(discovered, key=lambda x: (0 if "31b" in x else (1 if "26b" in x else 2)))
+
+    tool_decls = GEMINI_TOOLS_BY_MODE.get(tool_ctx.mode, []) if tool_ctx is not None else []
     session = get_http_session()
 
     for model_id in candidates:
@@ -620,42 +697,98 @@ async def call_gemma_ai_studio_chat(
             f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
             f"{model_id}:generateContent?key={GEMINI_API_KEY}"
         )
-        payload = {
-            "contents": contents,
-            "generationConfig": {
-                "temperature": temperature,
-                "maxOutputTokens": max_output_tokens,
-            },
-        }
+        contents = [dict(c, parts=list(c.get("parts") or [])) for c in base_contents]
+        use_native_sys = True
+        use_tools = bool(tool_decls)
+        rounds = (max_tool_rounds + 1) if use_tools else 1
+        r_idx = 0
+        retry_400_budget = 2
 
-        t0 = time.monotonic()
-        try:
-            async with session.post(
-                url, json=payload, timeout=aiohttp.ClientTimeout(total=20)
-            ) as resp:
-                status = resp.status
-                body_text = await resp.text()
-                elapsed = time.monotonic() - t0
+        while r_idx < rounds:
+            allow_tools_now = use_tools and (r_idx < max_tool_rounds)
+            payload: dict = {
+                "contents": contents,
+                "generationConfig": {
+                    "temperature": temperature,
+                    "maxOutputTokens": max_output_tokens,
+                },
+            }
+            if use_native_sys and sys_parts:
+                payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(sys_parts)}]}
+            if allow_tools_now:
+                payload["tools"] = [{"functionDeclarations": tool_decls}]
+                payload["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
 
-                if status == 200:
-                    data = json.loads(body_text)
-                    out, _, _ = _extract_gemini_text_and_calls(data)
-                    if out:
-                        state.active_gemma_model = model_id
-                        state.record_provider_call("gemma_ai_studio")
-                        api_log(f"Gemma AI Studio ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s)")
-                        return out
+            t0 = time.monotonic()
+            try:
+                async with session.post(
+                    url, json=payload, timeout=aiohttp.ClientTimeout(total=24)
+                ) as resp:
+                    status = resp.status
+                    body_text = await resp.text()
+                    elapsed = time.monotonic() - t0
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 120.0
+                api_log(f"Gemma AI Studio ({purpose}) -> {model_id} failed ({type(e).__name__})")
+                break
 
-                if status == 429:
-                    _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 60.0
-                elif status in (404, 500, 503):
-                    _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 180.0
-                api_log(f"Gemma AI Studio ({purpose}) -> {model_id} HTTP {status} ({elapsed:.2f}s)")
-        except Exception as e:
-            _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 120.0
-            api_log(f"Gemma AI Studio ({purpose}) -> {model_id} failed ({type(e).__name__})")
-            if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
-                return ""
+            if status == 200:
+                data = json.loads(body_text)
+                out, fn_calls, raw_parts = _extract_gemini_text_and_calls(data)
+                if fn_calls and allow_tools_now and tool_ctx is not None:
+                    contents.append({"role": "model", "parts": raw_parts})
+                    obs_list = await execute_tool_calls_parallel(fn_calls, tool_ctx)
+                    fn_resp_parts = [
+                        {
+                            "functionResponse": {
+                                "name": fn_name,
+                                "response": {"result": obs_text},
+                            }
+                        }
+                        for (fn_name, _), obs_text in zip(fn_calls, obs_list)
+                    ]
+                    contents.append({"role": "user", "parts": fn_resp_parts})
+                    r_idx += 1
+                    continue
+
+                if out:
+                    state.active_gemma_model = model_id
+                    state.record_provider_call("gemma_ai_studio")
+                    cache_note = _record_gemini_usage_cache(data)
+                    api_log(
+                        f"Gemma AI Studio ({purpose}) -> {model_id} 200 OK ({elapsed:.2f}s{cache_note}"
+                        + (f", tools={len(tool_ctx.tools_used)}" if (tool_ctx and tool_ctx.tools_used) else "")
+                        + ")"
+                    )
+                    return out
+                break
+
+            if status == 400 and retry_400_budget > 0:
+                retry_400_budget -= 1
+                low_err = body_text.lower()
+                changed = False
+                if use_tools and ("tool" in low_err or "function" in low_err):
+                    use_tools = False
+                    rounds = 1
+                    changed = True
+                if use_native_sys and ("system_instruction" in low_err or "systeminstruction" in low_err or "developer instruction" in low_err):
+                    use_native_sys = False
+                    _, contents = _convert_messages_to_gemini_contents(
+                        messages, embed_system_in_first_user=True, max_turn_chars=36000
+                    )
+                    changed = True
+                if changed:
+                    api_log(f"Gemma AI Studio ({purpose}) -> {model_id} HTTP 400; adapting payload and retrying")
+                    continue
+
+            if status == 429:
+                _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 60.0
+            elif status in (404, 500, 503):
+                _AI_STUDIO_MODEL_COOLDOWN_UNTIL[model_id] = time.time() + 120.0
+            api_log(f"Gemma AI Studio ({purpose}) -> {model_id} HTTP {status} ({elapsed:.2f}s)")
+            break
 
     return ""
 
@@ -946,7 +1079,10 @@ async def call_cloudflare_gemma_chat(
         if idx == 0 and m.get("role") == "system":
             cf_messages.append({
                 "role": "system",
-                "content": m.get("content", "") + "\n\n[CRITICAL: Answer directly and concisely. Do NOT output internal thinking steps.]",
+                "content": (
+                    m.get("content", "")
+                    + "\n\n[CRITICAL: Answer directly in-character as Yukino Yukinoshita. Do NOT output internal thinking steps.]"
+                ),
             })
         else:
             cf_messages.append(m)
@@ -1089,12 +1225,15 @@ async def call_cloudflare_gpt_oss(
     session = get_http_session()
     req_timeout = 40 if is_coding else 22
     tool_schemas = OPENAI_TOOLS_BY_MODE.get(tool_ctx.mode, []) if tool_ctx is not None else []
+    is_voice = ("voice" in (purpose or "").lower())
 
     # Try Cloudflare `/ai/v1/responses` ONLY when not using native OpenAI tool_calls loop
     if not tool_schemas and time.time() >= _CF_RESPONSES_UNSUPPORTED_UNTIL:
         sys_parts = []
         convo_lines = []
-        for m in messages:
+        for m in _adapt_messages_for_oss_fallback(
+            messages, target_model, has_tools=False, is_coding=is_coding, is_voice=is_voice
+        ):
             role = m.get("role", "user")
             txt = (m.get("content") or "").strip()
             if not txt:
@@ -1150,7 +1289,9 @@ async def call_cloudflare_gpt_oss(
             api_log(f"Cloudflare Responses ({purpose}) -> {target_model} note ({type(e).__name__}); trying chat/completions")
 
     chat_url = f"{HTTPS}{cf_host}/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1/chat/completions"
-    work_msgs = [dict(m) for m in messages]
+    work_msgs = _adapt_messages_for_oss_fallback(
+        messages, target_model, has_tools=bool(tool_schemas), is_coding=is_coding, is_voice=is_voice
+    )
     rounds = (max_tool_rounds + 1) if tool_schemas else 1
     tools_enabled = bool(tool_schemas)
 
@@ -1304,8 +1445,13 @@ async def call_groq_chat(
         _GROQ_MODEL_COOLDOWN_UNTIL[groq_model] = now + 3600.0
         return ""
 
+    tool_schemas = OPENAI_TOOLS_BY_MODE.get(tool_ctx.mode, []) if tool_ctx is not None else []
+    is_voice = ("voice" in (purpose or "").lower())
     token_budget = 6000 if is_coding else 4800
-    work_msgs = _compact_messages_for_token_budget(messages, max_est_tokens=token_budget)
+    adapted_msgs = _adapt_messages_for_oss_fallback(
+        messages, groq_model, has_tools=bool(tool_schemas), is_coding=is_coding, is_voice=is_voice
+    )
+    work_msgs = _compact_messages_for_token_budget(adapted_msgs, max_est_tokens=token_budget)
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -1316,7 +1462,6 @@ async def call_groq_chat(
     session = get_http_session()
     req_timeout = 55 if is_coding else 28
 
-    tool_schemas = OPENAI_TOOLS_BY_MODE.get(tool_ctx.mode, []) if tool_ctx is not None else []
     tools_enabled = bool(tool_schemas)
     rounds = (max_tool_rounds + 1) if tools_enabled else 1
 
@@ -1386,9 +1531,11 @@ async def call_groq_chat(
                     continue
                 if resp.status == 429:
                     _GROQ_MODEL_COOLDOWN_UNTIL[groq_model] = time.time() + 60.0
-                elif resp.status in (404, 400):
+                elif resp.status == 404:
                     _GROQ_MODEL_COOLDOWN_UNTIL[groq_model] = time.time() + 3600.0
                     await discover_available_groq_models(force_refresh=True)
+                elif resp.status == 400:
+                    _GROQ_MODEL_COOLDOWN_UNTIL[groq_model] = time.time() + 30.0
                 api_log(f"Groq ({purpose}) -> {groq_model} HTTP {resp.status} ({elapsed:.2f}s): {err_txt[:120]}")
                 return ""
     return ""

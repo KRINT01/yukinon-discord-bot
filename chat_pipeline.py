@@ -236,7 +236,9 @@ async def query_ai_chat(
         or re.search(r"[ぁ-んァ-ヶ一-龯]", prompt)
     )
 
-    active_topic = update_and_get_channel_topic(raw_user_query, channel_id=channel_id)
+    is_button_followup = bool(plan.get("is_button_followup"))
+    isolate_context = bool(plan.get("isolate_context"))
+    active_topic = "" if isolate_context else update_and_get_channel_topic(raw_user_query, channel_id=channel_id)
     live_clock_str = get_current_thai_datetime_str()
 
     # TRUE IMPLICIT PREFIX CACHING (Gemini 3.5 / 4):
@@ -336,10 +338,12 @@ async def query_ai_chat(
         )
     active_tool_ctx = tool_ctx if use_native_tools else None
 
-    # Pre-fetch weather only for pure single-intent weather queries (compound prompts call `get_weather` natively in parallel!)
+    # Pre-fetch weather only for pure single-intent weather queries (never on non-weather buttons or confident non-weather routes!)
     if not is_compound:
         if dec_route == "weather" and dec_conf >= 0.65:
             is_weather_query = allow_agentic_search
+        elif is_button_followup or (dec_route and dec_route != "weather" and dec_conf >= 0.75):
+            is_weather_query = False
         else:
             is_weather_query = allow_agentic_search and detect_weather_intent(raw_user_query, channel_id=channel_id)
     else:
@@ -461,9 +465,6 @@ async def query_ai_chat(
         or (bool(active_topic) and not is_voice_mode)
     )
 
-    is_button_followup = bool(plan.get("is_button_followup"))
-    isolate_context = bool(plan.get("isolate_context"))
-
     flash_thinking_level = (
         "MINIMAL"
         if (
@@ -542,7 +543,9 @@ async def query_ai_chat(
                 if ans:
                     return ans
 
-            ans = await call_gemma_ai_studio_chat(messages, temperature=temperature, max_output_tokens=4096, purpose="Code")
+            ans = await call_gemma_ai_studio_chat(
+                messages, temperature=temperature, max_output_tokens=4096, purpose="Code", tool_ctx=active_tool_ctx
+            )
             if ans:
                 return ans
 
@@ -573,28 +576,63 @@ async def query_ai_chat(
                 return ans
 
         # PATH B: Compound Multi-Intent / Native Function-Calling / Search / Fact-Check / Manga & Social Media
+        # Persona-First Priority: Gemini Flash -> Gemma 4 AI Studio (native systemInstruction + tools)
+        # -> Cloudflare Gemma 4 (when no live tools needed) -> Groq (qwen3.8-27b first) -> gpt-oss-20b last resort!
         if prefer_high_knowledge_llm and not is_coding:
             target_temp = 0.2 if (did_search or is_user_correction or is_compound) else temperature
+            b_purpose = (
+                "CompoundTools"
+                if is_compound
+                else ("VoiceTools" if is_voice_mode else ("MangaSocialChat" if is_japanese_or_social_media else "FactSearchChat"))
+            )
 
-            # Compound multi-intent, Voice tool/factual queries, & Japanese/social-media prioritize Gemini Flash-Lite first!
-            prefer_gemini_first = bool(is_compound or is_japanese_or_social_media or is_voice_mode)
-            if prefer_gemini_first and GEMINI_API_KEY:
+            # 1. Gemini Flash (3-flash-preview first for MangaSocialChat prose; standard Flash-Lite order otherwise)
+            if GEMINI_API_KEY:
                 manga_prose_models = (
                     ["gemini-3-flash-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
                     if (is_japanese_or_social_media and not is_voice_mode and not is_compound)
                     else None
                 )
-                ans = await call_gemini_chat_messages(
+                try:
+                    ans = await call_gemini_chat_messages(
+                        messages,
+                        temperature=target_temp,
+                        purpose=b_purpose,
+                        thinking_level="MINIMAL" if (is_voice_mode and not active_tool_ctx) else flash_thinking_level,
+                        tool_ctx=active_tool_ctx,
+                        preferred_models=manga_prose_models,
+                    )
+                    if ans:
+                        return ans
+                except Exception as e:
+                    print(f"Gemini {b_purpose} fallback warning: {e}")
+
+            # 2. Gemma 4 AI Studio (`gemma-4-31b-it` -> `gemma-4-26b-a4b-it`) with native systemInstruction + tools
+            if GEMINI_API_KEY:
+                ans = await call_gemma_ai_studio_chat(
                     messages,
                     temperature=target_temp,
-                    purpose="CompoundTools" if is_compound else ("VoiceTools" if is_voice_mode else "MangaSocialChat"),
-                    thinking_level="MINIMAL" if (is_voice_mode and not active_tool_ctx) else flash_thinking_level,
+                    max_output_tokens=2048,
+                    purpose=b_purpose,
                     tool_ctx=active_tool_ctx,
-                    preferred_models=manga_prose_models,
+                    prefer_fast_26b=is_voice_mode,
                 )
                 if ans:
                     return ans
 
+            # 3. Cloudflare Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`) before Groq/gpt-oss for strong Thai Yukino persona
+            if not active_tool_ctx:
+                ans = await _call_cf_gemma_hedged_with_groq(
+                    messages,
+                    temperature=target_temp,
+                    max_tokens=2048,
+                    purpose=b_purpose,
+                    hedge_delay_sec=10.0 if is_japanese_or_social_media else 6.5,
+                )
+                if ans:
+                    return ans
+
+            # 4. Groq LPU (`qwen/qwen3.8-27b` prioritized ahead of `openai/gpt-oss-20b`)
             if GROQ_API_KEY:
                 groq_search_candidates = await get_groq_search_and_chat_candidates()
                 for g_mod in groq_search_candidates:
@@ -604,7 +642,7 @@ async def query_ai_chat(
                             g_mod,
                             target_temp,
                             is_coding=False,
-                            purpose="CompoundTools" if is_compound else "FactSearchChat",
+                            purpose=b_purpose,
                             tool_ctx=active_tool_ctx,
                         )
                         if ans:
@@ -612,47 +650,32 @@ async def query_ai_chat(
                     except Exception:
                         continue
 
-            if not prefer_gemini_first and GEMINI_API_KEY:
-                try:
-                    ans = await call_gemini_chat_messages(
-                        messages,
-                        temperature=target_temp,
-                        purpose="FactSearchChat",
-                        thinking_level=flash_thinking_level,
-                        tool_ctx=active_tool_ctx,
-                    )
-                    if ans:
-                        return ans
-                except Exception as e:
-                    print(f"Gemini FactSearchChat fallback warning: {e}")
+            # 5. Cloudflare Gemma 4 final persona fallback (if skipped earlier because tools were enabled)
+            if active_tool_ctx:
+                ans = await call_cloudflare_gemma_chat(
+                    messages,
+                    temperature=target_temp,
+                    max_tokens=2048,
+                    purpose=b_purpose,
+                )
+                if ans:
+                    return ans
 
+            # 6. Cloudflare GPT-OSS-20B (last resort only, with persona lock)
             ans = await call_cloudflare_gpt_oss(
                 messages,
                 cf_model=CF_CHAT_FAST_MODEL,
                 temperature=target_temp,
                 is_coding=False,
-                purpose="FactSearchChat",
+                purpose=b_purpose,
                 tool_ctx=active_tool_ctx,
-            )
-            if ans:
-                return ans
-
-            ans = await call_gemma_ai_studio_chat(messages, temperature=target_temp, max_output_tokens=1800, purpose="FactSearchChat")
-            if ans:
-                return ans
-
-            ans = await _call_cf_gemma_hedged_with_groq(
-                messages,
-                temperature=target_temp,
-                max_tokens=1800,
-                purpose="MangaSocialChat" if is_japanese_or_social_media else "FactSearchChat",
-                hedge_delay_sec=14.0 if is_japanese_or_social_media else 6.5,
             )
             if ans:
                 return ans
 
         # PATH C: Casual Chat, Weather & Voice Chat (Thai-strong Gemma 4 / Gemini Flash-Lite before Groq)
         chat_temp = 0.25 if (did_search or is_user_correction or is_weather_query) else temperature
+        c_purpose = "VoiceChat" if is_voice_mode else "Chat"
 
         if is_voice_mode and GEMINI_API_KEY:
             ans = await call_gemini_chat_messages(
@@ -669,13 +692,20 @@ async def query_ai_chat(
             messages,
             temperature=chat_temp,
             max_tokens=1024,
-            purpose="VoiceChat" if is_voice_mode else "Chat",
+            purpose=c_purpose,
             hedge_delay_sec=6.5,
         )
         if ans:
             return ans
 
-        ans = await call_gemma_ai_studio_chat(messages, temperature=chat_temp, max_output_tokens=1024, purpose="Chat")
+        ans = await call_gemma_ai_studio_chat(
+            messages,
+            temperature=chat_temp,
+            max_output_tokens=1024,
+            purpose=c_purpose,
+            tool_ctx=active_tool_ctx,
+            prefer_fast_26b=is_voice_mode,
+        )
         if ans:
             return ans
 
@@ -683,7 +713,12 @@ async def query_ai_chat(
             for g_mod in await get_groq_search_and_chat_candidates():
                 try:
                     ans = await call_groq_chat(
-                        messages, g_mod, chat_temp, is_coding=False, purpose="ChatFallback", tool_ctx=active_tool_ctx
+                        messages,
+                        g_mod,
+                        chat_temp,
+                        is_coding=False,
+                        purpose="VoiceChatFallback" if is_voice_mode else "ChatFallback",
+                        tool_ctx=active_tool_ctx,
                     )
                     if ans:
                         return ans
@@ -691,7 +726,12 @@ async def query_ai_chat(
                     continue
 
         ans = await call_cloudflare_gpt_oss(
-            messages, cf_model=CF_CHAT_FAST_MODEL, temperature=chat_temp, is_coding=False, purpose="ChatFallback", tool_ctx=active_tool_ctx
+            messages,
+            cf_model=CF_CHAT_FAST_MODEL,
+            temperature=chat_temp,
+            is_coding=False,
+            purpose="VoiceChatFallback" if is_voice_mode else "ChatFallback",
+            tool_ctx=active_tool_ctx,
         )
         if ans:
             return ans

@@ -317,11 +317,29 @@ def build_contextual_search_query(user_text: str, channel_id: int = None) -> str
     return (stripped or subject_prefix or raw)[:140]
 
 
+_WEATHER_CONTEXT_FOR_EN_RAIN_REGEX = re.compile(
+    r"(\b(?:weather|forecast|raining|temperature|humidity|storm|umbrella|today|tonight|tomorrow|outside|will\s+it|going\s+to|heavy|light|chance|check|bangkok|thailand)\b|"
+    r"ฝน|อากาศ|พยากรณ์|พกร่ม|อุณหภูมิ|วันนี้|คืนนี้|พรุ่งนี้|ข้างนอก)",
+    re.IGNORECASE,
+)
+_NON_WEATHER_RAIN_PROPER_NOUN_REGEX = re.compile(
+    r"(?:ศิลปิน|ผู้วาด|ผลงาน|บัญชี|นักวาด|เพลง|คาเฟ่|ร้าน|\b(?:artist|illustrator|pixiv|twitter|fanbox|summer\s+rain|heavy\s+rain|purple\s+rain|november\s+rain)\b|@rain\w*|rain_[a-z0-9]+)",
+    re.IGNORECASE,
+)
+
+
 def detect_weather_intent(text: str, channel_id: int = None) -> bool:
     clean_q = _strip_context_and_system_blocks(text)
     if not clean_q:
         return False
-    if WEATHER_INTENT_PATTERN.search(clean_q):
+    matches = [m.group(0).lower() for m in WEATHER_INTENT_PATTERN.finditer(clean_q)]
+    if matches:
+        # Guard against artist/proper-noun 'Rain' (e.g. Rain @Rain_Lambda, Summer Rain cafe)
+        if all(tok == "rain" for tok in matches):
+            if _NON_WEATHER_RAIN_PROPER_NOUN_REGEX.search(clean_q):
+                return False
+            if not _WEATHER_CONTEXT_FOR_EN_RAIN_REGEX.search(clean_q):
+                return False
         return True
     if channel_id and channel_id in channel_last_weather:
         if time.time() - channel_last_weather[channel_id].get("timestamp", 0) < 1200:
@@ -587,7 +605,8 @@ async def _search_google_ai_studio_grounded_async(query: str) -> list[dict]:
         },
     }
     session = get_http_session()
-    for model_id in ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite"):
+    saw_429_all = True
+    for model_id in ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3-flash-preview"):
         url = clean_url(
             f"{HTTPS}generativelanguage.googleapis.com/v1beta/models/"
             f"{model_id}:generateContent?key={GEMINI_API_KEY}"
@@ -631,11 +650,16 @@ async def _search_google_ai_studio_grounded_async(query: str) -> list[dict]:
                             "skip_scrape": True,
                         }]
                 elif resp.status == 429:
-                    state.gemini_grounding_cooldown_until = time.time() + 1800.0
-                    api_log(f"Search (Gemini Grounding) -> {model_id} HTTP 429 (cooldown 30m)")
-                    return []
+                    api_log(f"Search (Gemini Grounding) -> {model_id} HTTP 429; trying next model")
+                    continue
+                else:
+                    saw_429_all = False
         except Exception as e:
+            saw_429_all = False
             api_log(f"Search (Gemini Grounding) -> {model_id} skipped ({type(e).__name__})")
+    if saw_429_all:
+        state.gemini_grounding_cooldown_until = time.time() + 1800.0
+        api_log("Search (Gemini Grounding) -> all models HTTP 429 (cooldown 30m)")
     return []
 
 
@@ -861,12 +885,12 @@ def _search_ddgs_sync(query: str, region_code: str, timelimit: str | None, max_r
     t0 = time.monotonic()
     hits = []
     try:
-        with DDGS(proxy=DDGS_PROXY, timeout=8) as ddgs:
+        with DDGS(proxy=DDGS_PROXY, timeout=5) as ddgs:
             timelimit_passes = [timelimit, None] if timelimit else [None]
             for tl in timelimit_passes:
                 if hits:
                     break
-                for backend_choice in ("auto", "brave", "bing", "google", "wikipedia", "yahoo"):
+                for backend_choice in ("bing", "brave", "auto", "google", "yahoo"):
                     try:
                         ddg_hits = list(
                             ddgs.text(
@@ -980,7 +1004,7 @@ async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
             pass
     else:
         elapsed_ddgs = time.monotonic() - ddgs_start
-        ddgs_budget = max(0.25, _DDGS_SOFT_WAIT_SEC - elapsed_ddgs) if hits else max(1.0, 8.5 - elapsed_ddgs)
+        ddgs_budget = max(0.25, _DDGS_SOFT_WAIT_SEC - elapsed_ddgs) if hits else max(1.0, 10.5 - elapsed_ddgs)
         done_set, _ = await asyncio.wait({ddgs_task}, timeout=ddgs_budget)
         if ddgs_task in done_set:
             try:
