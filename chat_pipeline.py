@@ -586,10 +586,10 @@ async def query_ai_chat(
                 else ("VoiceTools" if is_voice_mode else ("MangaSocialChat" if is_japanese_or_social_media else "FactSearchChat"))
             )
 
-            # 1. Gemini Flash (3-flash-preview first for MangaSocialChat prose; standard Flash-Lite order otherwise)
+            # 1. Gemini Flash (3.5-flash-lite first for MangaSocialChat prose & Path B)
             if GEMINI_API_KEY:
                 manga_prose_models = (
-                    ["gemini-3-flash-preview", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+                    ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3-flash-preview"]
                     if (is_japanese_or_social_media and not is_voice_mode and not is_compound)
                     else None
                 )

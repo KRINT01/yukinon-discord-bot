@@ -281,6 +281,17 @@ def _adapt_gemini_thinking_config_for_model(payload: dict, model_id: str) -> dic
     return work_payload
 
 
+def _strip_model_thought_blocks(text: str) -> str:
+    """Strips `<think>...</think>`, `<|thought|>...<|/thought|>`, and Gemma 4 `<|channel>thought...<channel|>` reasoning tags."""
+    if not text:
+        return ""
+    out = re.sub(r"<think>[\s\S]*?</think>", "", text)
+    out = re.sub(r"<\|thought\|>[\s\S]*?<\|/thought\|>", "", out)
+    out = re.sub(r"<\|channel>thought[\s\S]*?<channel\|>", "", out)
+    out = re.sub(r"<\|channel>thought\s*", "", out)
+    return out.strip()
+
+
 def _extract_gemini_text_and_calls(data: dict) -> tuple[str, list[tuple[str, dict]], list[dict]]:
     """
     Extracts `(text_output, [(fn_name, fn_args), ...], raw_model_parts)` from a Gemini API response.
@@ -305,9 +316,7 @@ def _extract_gemini_text_and_calls(data: dict) -> tuple[str, list[tuple[str, dic
         elif part.get("text") and not part.get("thought", False):
             text_chunks.append(part["text"])
 
-    out_txt = "".join(text_chunks).strip()
-    out_txt = re.sub(r"<think>[\s\S]*?</think>", "", out_txt).strip()
-    out_txt = re.sub(r"<\|thought\|>[\s\S]*?<\|/thought\|>", "", out_txt).strip()
+    out_txt = _strip_model_thought_blocks("".join(text_chunks))
     return out_txt, fn_calls, raw_parts
 
 
@@ -827,8 +836,8 @@ async def call_gemma_ai_studio_vision(
             "contents": [
                 {
                     "parts": [
-                        {"text": prompt_text},
                         {"inlineData": {"mimeType": mime_type, "data": b64_img}},
+                        {"text": prompt_text},
                     ]
                 }
             ],
@@ -1107,7 +1116,7 @@ async def call_cloudflare_gemma_chat(
                 if choices:
                     msg_obj = choices[0].get("message") or {}
                     content = msg_obj.get("content") or ""
-                    content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+                    content = _strip_model_thought_blocks(content)
                     if content:
                         state.record_provider_call("cloudflare")
                         api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
@@ -1368,8 +1377,19 @@ async def call_cloudflare_gpt_oss(
 
 
 async def call_cloudflare_vision_chat(
-    prompt_text: str, mime_type: str, b64_img: str, max_tokens: int = 2048, purpose: str = "Vision"
+    prompt_text: str,
+    mime_type: str,
+    b64_img: str,
+    max_tokens: int = 2048,
+    purpose: str = "Vision",
+    enable_thinking: bool = False,
 ) -> str:
+    """
+    Cloudflare Workers AI Gemma 4 Vision (`@cf/google/gemma-4-26b-a4b-it`):
+    - Places `image_url` BEFORE `text` per official Gemma 4 multimodal best practices.
+    - Supports optional `enable_thinking=True` (for Google Lens-style visual deduction on
+      fanart/products) with higher token headroom and automatic non-thinking retry if empty.
+    """
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
         return ""
     cf_host = "api." + "cloudflare.com"
@@ -1378,46 +1398,62 @@ async def call_cloudflare_vision_chat(
         "Authorization": f"Bearer {CF_API_TOKEN}",
         "Content-Type": "application/json",
     }
-    payload = {
-        "model": CF_VISION_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": "Respond directly and concisely with the requested output. Do NOT output internal thinking steps.",
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt_text},
-                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
-                ],
-            },
-        ],
-        "temperature": 0.1,
-        "max_tokens": max_tokens,
-        "chat_template_kwargs": {"enable_thinking": False},
-    }
-    t0 = time.monotonic()
-    try:
-        session = get_http_session()
-        async with session.post(
-            cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=18)
-        ) as resp:
-            elapsed = time.monotonic() - t0
-            if resp.status == 200:
-                data = await resp.json()
-                choices = data.get("choices") or []
-                if choices:
-                    msg_obj = choices[0].get("message") or {}
-                    content = msg_obj.get("content") or ""
-                    content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
-                    if content:
-                        state.record_provider_call("cloudflare")
-                        api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
-                        return content
-            api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} HTTP {resp.status} ({elapsed:.2f}s)")
-    except Exception as e:
-        api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} failed ({type(e).__name__})")
+    session = get_http_session()
+    attempts = [True, False] if enable_thinking else [False]
+
+    for think_flag in attempts:
+        sys_msg = (
+            "Analyze all visible visual details carefully before concluding, then output only the clean structured response."
+            if think_flag
+            else "Respond directly and concisely with the requested output. Do NOT output internal thinking steps."
+        )
+        eff_max_tokens = max(max_tokens, 3072) if think_flag else max_tokens
+        req_timeout = 26 if think_flag else 18
+        payload = {
+            "model": CF_VISION_MODEL,
+            "messages": [
+                {"role": "system", "content": sys_msg},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
+                        {"type": "text", "text": prompt_text},
+                    ],
+                },
+            ],
+            "temperature": 0.1,
+            "max_tokens": eff_max_tokens,
+            "chat_template_kwargs": {"enable_thinking": think_flag},
+        }
+        t0 = time.monotonic()
+        try:
+            async with session.post(
+                cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=req_timeout)
+            ) as resp:
+                elapsed = time.monotonic() - t0
+                if resp.status == 200:
+                    data = await resp.json()
+                    choices = data.get("choices") or []
+                    if choices:
+                        msg_obj = choices[0].get("message") or {}
+                        content = _strip_model_thought_blocks(msg_obj.get("content") or "")
+                        if content:
+                            state.record_provider_call("cloudflare")
+                            mode_tag = " [think]" if think_flag else ""
+                            api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL}{mode_tag} 200 OK ({elapsed:.2f}s)")
+                            return content
+                    if think_flag:
+                        api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} [think] empty output; retrying direct")
+                        continue
+                api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} HTTP {resp.status} ({elapsed:.2f}s)")
+                if resp.status == 400 and think_flag:
+                    continue
+                return ""
+        except Exception as e:
+            api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} failed ({type(e).__name__})")
+            if think_flag:
+                continue
+            return ""
     return ""
 
 

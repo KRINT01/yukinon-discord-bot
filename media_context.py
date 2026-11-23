@@ -42,6 +42,7 @@ from search_engine import (
     validate_safe_public_url_async,
 )
 from llm import (
+    get_google_model_cooldown,
     discover_active_groq_vision_models,
     call_gemma_ai_studio_vision,
     call_cloudflare_vision_chat,
@@ -197,6 +198,25 @@ def _is_blind_handle_or_id_query(q: str) -> bool:
     ):
         return True
     return False
+
+
+def _is_google_ai_studio_congested() -> bool:
+    """True when all 3 primary Flash endpoints just entered cooldown (503/Timeout storm)."""
+    now = time.time()
+    return all(
+        now < get_google_model_cooldown(m)
+        for m in ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3-flash-preview")
+    )
+
+
+def _strip_vision_thought_blocks(text: str) -> str:
+    if not text:
+        return ""
+    out = re.sub(r"<think>[\s\S]*?</think>", "", text)
+    out = re.sub(r"<\|thought\|>[\s\S]*?<\|/thought\|>", "", out)
+    out = re.sub(r"<\|channel>thought[\s\S]*?<channel\|>", "", out)
+    out = re.sub(r"<\|channel>thought\s*", "", out)
+    return out.strip()
 
 
 def parse_xlsx_bytes_to_markdown(raw_bytes: bytes, max_chars: int = 25000) -> str:
@@ -1114,8 +1134,8 @@ async def collect_embedded_images_and_metadata(
             if tw_meta:
                 resolved_social_api_post = True
                 metadata_sections.append(f"=== Embedded X (Twitter) Post Metadata & Caption ===\n{tw_meta}")
-                for p_url in tw_photos:
-                    _queue_img(p_url)
+            for p_url in tw_photos:
+                _queue_img(p_url)
             continue
 
         px_m = PIXIV_ILLUST_URL_REGEX.search(url)
@@ -1126,8 +1146,8 @@ async def collect_embedded_images_and_metadata(
             if px_meta:
                 resolved_social_api_post = True
                 metadata_sections.append(f"=== Embedded Pixiv Artwork Metadata & Caption ===\n{px_meta}")
-                for p_url in px_photos:
-                    _queue_img(p_url, referer=f"{HTTPS}www.pixiv.net/artworks/{illust_id}")
+            for p_url in px_photos:
+                _queue_img(p_url, referer=f"{HTTPS}www.pixiv.net/artworks/{illust_id}")
             continue
 
         bsky_m = BSKY_POST_URL_REGEX.search(url)
@@ -1137,8 +1157,8 @@ async def collect_embedded_images_and_metadata(
             if b_meta:
                 resolved_social_api_post = True
                 metadata_sections.append(f"=== Embedded Bluesky Post Metadata & Caption ===\n{b_meta}")
-                for p_url in b_photos:
-                    _queue_img(p_url)
+            for p_url in b_photos:
+                _queue_img(p_url)
             continue
 
         if DIRECT_IMAGE_URL_REGEX.match(url):
@@ -1581,17 +1601,17 @@ def _build_tailored_single_image_ocr_prompt(
             f"{context_header}"
             "Act like Google Lens and identify this real-world object, scale model kit, collectible figure, or product with high precision:\n"
             "1. [Subject / Franchise / Product Identification]:\n"
-            "   - If it is a scale model kit, plastic model, mecha, starship, statue, or anime/game figure: identify the EXACT subject name "
+            " - If it is a scale model kit, plastic model, mecha, starship, statue, or anime/game figure: identify the EXACT subject name "
             "and originating franchise/series/installment (e.g., Space Battleship Yamato from Yamato 2199/2202/3199, Gundam MS designation, character name) "
             "whenever recognizable from unmistakable design cues, plus likely manufacturer (e.g., Bandai Spirits, Tamashii Nations, Good Smile, Kotobukiya).\n"
-            "   - If it is consumer hardware, coffee gear, audio gear, or everyday product: identify the exact Brand, Product Line, and Model Name/Number.\n"
+            " - If it is consumer hardware, coffee gear, audio gear, or everyday product: identify the exact Brand, Product Line, and Model Name/Number.\n"
             "2. [Visual Cues & Possible Product Lines / Scales]:\n"
-            "   - List the concrete distinguishing visual features (colors, hull/armor silhouette, weapons/markings, crest/emblem, display stand, paint/finish, ports).\n"
-            "   - If multiple releases or scales share this design (e.g., 1/1000 plastic model kit vs. Mecha Collection vs. pre-painted Kikan-Taizen / Soul of Chogokin figure), "
+            " - List the concrete distinguishing visual features (colors, hull/armor silhouette, weapons/markings, crest/emblem, display stand, paint/finish, ports).\n"
+            " - If multiple releases or scales share this design (e.g., 1/1000 plastic model kit vs. Mecha Collection vs. pre-painted Kikan-Taizen / Soul of Chogokin figure), "
             "name the top likely candidates AND note clearly if the exact scale or release cannot be confirmed from this angle alone.\n"
             "3. [Verbatim Visible Text]: Transcribe ALL visible text, decals, labels, or model stickers verbatim (if none, write 'None').\n"
             "4. [WEB_VERIFY_QUERY]: On the very last line, ONLY if you identified a concrete subject/product/model name (NEVER a Twitter @handle, account name, URL, or numeric ID!), output:\n"
-            "   `[WEB_VERIFY_QUERY: <exact identified subject/franchise or brand + model name>]`"
+            " `[WEB_VERIFY_QUERY: <exact identified subject/franchise or brand + model name>]`"
         )
 
     # Default / manga_comic / anime_fanart / meme_casual prompt
@@ -1601,20 +1621,71 @@ def _build_tailored_single_image_ocr_prompt(
         "franchise/character identity, visual story, speaker attribution, and source.\n"
         "Provide your output in 3 concise, well-structured sections:\n"
         "1. [Identification & Visual Context]:\n"
-        "   - Identify the Anime/VTuber/Game/Manga Series, Character name(s), or iconic mecha/ship/item whenever recognizable "
+        " - Identify the Anime/VTuber/Game/Manga Series, Character name(s), or iconic mecha/ship/item whenever recognizable "
         "from unmistakable visual features (hair color/style, signature outfit/costume, ornaments, straps, weapons, insignia, halos/no halos) "
         "or the post caption above — EVEN IF the character's face is partially or fully cropped out of frame. "
         "NEVER mix character names from one franchise with a different franchise title, and write 'Unknown / Unconfirmed Series' only if genuinely unrecognizable.\n"
-        "   - For comics/manga: describe what happens visually in each panel in traditional Japanese reading order (Top-to-Bottom, Right-to-Left).\n"
-        "   - For illustrations/fanart: note the camera framing (if the head/face is cropped out of frame, briefly state 'Head/face not in frame' and skip facial expression), "
+        " - For comics/manga: describe what happens visually in each panel in traditional Japanese reading order (Top-to-Bottom, Right-to-Left).\n"
+        " - For illustrations/fanart: note the camera framing (if the head/face is cropped out of frame, briefly state 'Head/face not in frame' and skip facial expression), "
         "and concisely describe the visible pose, outfit, accessories, lighting, props, and mood.\n"
         "2. [Ordered Dialogue & Verbatim OCR Text]:\n"
-        "   - For comics/manga: list the dialogue and key SFX in reading order (Right-to-Left, Top-to-Bottom) tagged with the speaker.\n"
-        "   - Transcribe ALL visible text (Thai, Japanese, English, code, labels) verbatim, paying close attention to Thai tone marks/vowels.\n"
+        " - For comics/manga: list the dialogue and key SFX in reading order (Right-to-Left, Top-to-Bottom) tagged with the speaker.\n"
+        " - Transcribe ALL visible text (Thai, Japanese, English, code, labels) verbatim, paying close attention to Thai tone marks/vowels.\n"
         "3. [WEB_VERIFY_QUERY]: On the very last line, ONLY if the image contains actual spoken dialogue or a clearly identified subject/product name "
         "(NEVER pure comic SFX like タッ/ドシッ, NEVER a raw Twitter @handle, URL, or numeric status ID!), output:\n"
-        "   `[WEB_VERIFY_QUERY: <exact verbatim dialogue quote or identified subject/series name>]`"
+        " `[WEB_VERIFY_QUERY: <exact verbatim dialogue quote or identified subject/series name>]`"
     )
+
+
+def _build_gemma_feature_first_vision_prompt(
+    context_header: str,
+    triage_type: str | None,
+) -> str:
+    """
+    Feature-First Google Lens prompt optimized for Gemma 4 (26B A4B / 31B) fallback vision:
+    Forces the model to inventory concrete visual anchors FIRST (logos, hair/costume design,
+    stripes, lacing, accessories, decals, crop boundaries), deduce exact character/franchise/model
+    identity SECOND from those combined clues, and emit a descriptive `[WEB_VERIFY_QUERY]` so
+    live web verification can confirm the entity just like Google Lens.
+    """
+    if triage_type == "real_world_product":
+        return (
+            f"{context_header}"
+            "Inspect this real-world photo carefully like Google Lens, listing concrete visual evidence BEFORE deducing the product or model.\n"
+            "1. [Concrete Visual Clues & Framing]:\n"
+            " - List ALL unmistakable physical cues: visible brand logos/decals/text, color scheme, hull/armor/body shape, "
+            "weapons/markings/emblems, ports/buttons, stand/base, material finish, and scale cues.\n"
+            "2. [Deduced Subject / Franchise / Product & Likely Scale]:\n"
+            " - Combine the clues in Section 1 to identify the exact Subject + Franchise (for model kits/figures/mecha/starships) "
+            "or exact Brand + Product Line + Model Name (for hardware/coffee/audio gear), plus likely manufacturer and scale/release candidates "
+            "(state clearly if exact scale/release cannot be confirmed from this angle).\n"
+            "3. [Verbatim Visible Text]: Transcribe all visible text, decals, or stickers verbatim (or 'None').\n"
+            "4. [WEB_VERIFY_QUERY]: On the very last line, output a focused search query combining the deduced name OR the top distinctive visual features + visible markings "
+            "(NEVER a raw URL or numeric tweet ID):\n"
+            " `[WEB_VERIFY_QUERY: <deduced brand/franchise/model OR visible text + distinctive object cues>]`"
+        )
+
+    if triage_type == "anime_fanart":
+        return (
+            f"{context_header}"
+            "Inspect this anime/VTuber/game illustration carefully like Google Lens, listing unmistakable visual anchors BEFORE naming the character.\n"
+            "1. [Concrete Visual Clues & Camera Framing]:\n"
+            " - First state camera framing and crop boundaries (if head/face is cropped out of frame, state 'Head/face not in frame' and NEVER invent facial expressions).\n"
+            " - List EVERY distinctive character design cue visible in the pixels: exact hair color/length/tips, jacket/hoodie/top colors and stripes, "
+            "ribbon/sleeve lacing/eyelets, skirt/shorts style, tights/stockings color, thigh garters/harnesses/rings, boots, weapons, insignia, or floating halos (note if NO halo).\n"
+            "2. [Deduced Character / Franchise / Outfit Identification]:\n"
+            " - Synthesize ALL visual clues from Section 1 together with the artist/caption context above to identify the exact Character, Franchise/Agency "
+            "(e.g., Hololive, Blue Archive, Honkai: Star Rail, Genshin Impact, Fate, etc.), and specific costume name EVEN IF the face is cropped out. "
+            "NEVER mix characters across franchises. Write 'Unknown / Unconfirmed Series' only if genuinely unrecognizable.\n"
+            "3. [Verbatim Visible Text]: Transcribe any visible text/signatures/watermarks verbatim (or 'None').\n"
+            "4. [WEB_VERIFY_QUERY]: On the very last line, output a focused search query to verify the character/costume on the web: "
+            "if you deduced a character name, output `<character name> <series> <costume keywords>`; "
+            "if unsure, output `<artist name/handle if in context> <3-4 most distinctive hair/outfit color cues> character` "
+            "(NEVER a bare @handle alone, URL, or numeric tweet ID!):\n"
+            " `[WEB_VERIFY_QUERY: <descriptive character/outfit verification query>]`"
+        )
+
+    return _build_tailored_single_image_ocr_prompt(context_header, triage_type)
 
 
 def _extract_gemini_vision_text_with_diag(data: dict, purpose: str) -> str:
@@ -1627,7 +1698,7 @@ def _extract_gemini_vision_text_with_diag(data: dict, purpose: str) -> str:
     out = "\n".join(
         p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text") and not p.get("thought", False)
     ).strip()
-    out = re.sub(r"<think>[\s\S]*?</think>", "", out).strip()
+    out = _strip_vision_thought_blocks(out)
     if not out:
         fin = cand.get("finishReason") or "NONE"
         blk = ((data.get("promptFeedback") or {}).get("blockReason")) or "NONE"
@@ -1675,8 +1746,8 @@ async def _call_gemini_multi_image_batch(
             max_wall_sec=65.0,
         )
         out_txt = _extract_gemini_vision_text_with_diag(data, purpose) if data else ""
-        if not out_txt:
-            # Retry once on fallback Flash models if primary returned HTTP 200 with empty text (e.g. thought/safety blank)
+        # Only run Empty-200 retry when HTTP 200 actually returned empty text (NOT when all Tier-1 models hit 503/Timeout!)
+        if data is not None and not out_txt:
             retry_payload = {
                 "contents": [{"parts": parts}],
                 "safetySettings": _GEMINI_VISION_SAFETY_SETTINGS,
@@ -1719,10 +1790,12 @@ async def _call_cf_multi_image_batch(
         "Authorization": f"Bearer {CF_API_TOKEN}",
         "Content-Type": "application/json",
     }
-    user_content: list[dict] = [{"type": "text", "text": batch_prompt}]
+    # Official Gemma 4 multimodal best practice: place images BEFORE the main instruction text
+    user_content: list[dict] = []
     for idx, (b64_img, mime_type, fname) in enumerate(encoded_images, 1):
-        user_content.append({"type": "text", "text": f"=== Image {idx}/{len(encoded_images)} (`{fname}`) ==="})
         user_content.append({"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}})
+        user_content.append({"type": "text", "text": f"[Above: Image {idx}/{len(encoded_images)} (`{fname}`)]"})
+    user_content.append({"type": "text", "text": batch_prompt})
 
     cf_payload = {
         "model": CF_VISION_MODEL,
@@ -1748,8 +1821,7 @@ async def _call_cf_multi_image_batch(
                 data = await resp.json()
                 choices = data.get("choices") or []
                 if choices:
-                    content = (choices[0].get("message") or {}).get("content") or ""
-                    content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+                    content = _strip_vision_thought_blocks((choices[0].get("message") or {}).get("content") or "")
                     if content:
                         state.record_provider_call("cloudflare")
                         api_log(f"MultiImageOCR (Tier 2 CF) -> {CF_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
@@ -1829,14 +1901,14 @@ async def extract_multi_images_batch_ocr(
             f"You are analyzing {len(encoded_images)} sequential software/code/terminal/log screenshots.\n"
             + (f"User/Post Context:\n{post_meta_hint[:1000]}\n\n" if post_meta_hint else "")
             + "For each image (Image 1, Image 2, ...), transcribe ALL visible code, SQL queries, error messages, "
-              "stack traces, config values, and terminal outputs verbatim, connecting how the screenshots relate to each other."
+            "stack traces, config values, and terminal outputs verbatim, connecting how the screenshots relate to each other."
         )
     elif triage_type == "document_table":
         batch_prompt = (
             f"You are analyzing {len(encoded_images)} sequential document/table/slide pages.\n"
             + (f"User/Post Context:\n{post_meta_hint[:1000]}\n\n" if post_meta_hint else "")
             + "For each page (Image 1, Image 2, ...), transcribe ALL visible headings, body text, numbers, dates, "
-              "and table rows verbatim in their original language (Thai/English/Japanese)."
+            "and table rows verbatim in their original language (Thai/English/Japanese)."
         )
     elif triage_type == "real_world_product":
         batch_prompt = (
@@ -1844,9 +1916,9 @@ async def extract_multi_images_batch_ocr(
             "scale model kit, collectible figure, or hardware item.\n"
             + (f"User/Post Context:\n{post_meta_hint[:1000]}\n\n" if post_meta_hint else "")
             + "1. [Subject / Franchise / Product Identification]: Identify the exact subject, franchise/series, brand/manufacturer, "
-              "and likely product line(s) or scale(s) across all angles (note clearly if exact scale/release cannot be confirmed).\n"
-              "2. [Angle-by-Angle Details & Visible Text]: Summarize distinguishing visual details, craftsmanship/modifications, "
-              "and any visible text/decals/labels across Images 1..N."
+            "and likely product line(s) or scale(s) across all angles (note clearly if exact scale/release cannot be confirmed).\n"
+            "2. [Angle-by-Angle Details & Visible Text]: Summarize distinguishing visual details, craftsmanship/modifications, "
+            "and any visible text/decals/labels across Images 1..N."
         )
     else:
         batch_prompt = (
@@ -1854,15 +1926,15 @@ async def extract_multi_images_batch_ocr(
             + (f"Post Metadata / Caption Context:\n{post_meta_hint[:1400]}\n\n" if post_meta_hint else "")
             + "Examine ALL pages together in sequence so you maintain strict character & franchise consistency across every page:\n"
             "1. [Series / Franchise & Character Identification — STRICT EVIDENCE RULE]:\n"
-            "   - Verify concrete visual traits (hair/eye color, signature hair accessories/ornaments, outfits, presence or absence of floating halos) "
+            " - Verify concrete visual traits (hair/eye color, signature hair accessories/ornaments, outfits, presence or absence of floating halos) "
             "and cross-check with the post caption/tags before naming ANY franchise or character.\n"
-            "   - NEVER mix characters from one franchise with the title/protagonist of a different franchise! "
+            " - NEVER mix characters from one franchise with the title/protagonist of a different franchise! "
             "(For example: do NOT label a post as 'Blue Archive' or call a male character 'Sensei' unless floating halos above characters' heads "
             "or explicit Blue Archive names are actually visible; if characters are Firefly/Hotaru and Caelus, the franchise is 'Honkai: Star Rail').\n"
-            "   - If the franchise or character names are not 100% certain from the visuals or caption, write 'Unknown / Unconfirmed Series' "
+            " - If the franchise or character names are not 100% certain from the visuals or caption, write 'Unknown / Unconfirmed Series' "
             "and describe the characters strictly by appearance rather than guessing.\n"
             "2. [Page-by-Page Story, Framing & Panel-by-Panel Dialogue/SFX (Right-to-Left, Top-to-Bottom)]:\n"
-            "   - For each page (Page 1, Page 2, ...), summarize only what is literally drawn inside the frame "
+            " - For each page (Page 1, Page 2, ...), summarize only what is literally drawn inside the frame "
             "(note if a face/head is cropped out so off-screen expressions are not invented), "
             "and list all dialogue, thoughts, and key SFX in Japanese reading order tagged with the speaker."
         )
@@ -1873,7 +1945,7 @@ async def extract_multi_images_batch_ocr(
     cf_timeout = min(55, 25 + (3 * len(encoded_images)))
 
     try:
-        if not has_gemini and has_cf:
+        if (not has_gemini or _is_google_ai_studio_congested()) and has_cf:
             return await _call_cf_multi_image_batch(
                 encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=min(3072, out_tokens), triage_header=triage_header
             )
@@ -1941,9 +2013,8 @@ async def _call_gemini_single_image_vision(
     """
     Calls Gemini Flash Vision with `maxOutputTokens=4096` (prevents Gemini 3.5 hidden thinking
     tokens from starving visible output on `HTTP 200 OK`) and `BLOCK_NONE` safety settings.
-    If the primary model still returns HTTP 200 with empty visible text, logs exact diagnostics
-    and immediately retries on fallback Flash models (`gemini-3.1-flash-lite` -> `gemini-3-flash-preview`)
-    BEFORE dropping down to Tier 2/3 Gemma 4.
+    Runs `Empty-200 Retry` ONLY when HTTP 200 genuinely returned empty/safety-blocked text
+    (`data is not None and not out`) — NEVER during a Google AI Studio HTTP 503 / Timeout storm!
     """
     if not GEMINI_API_KEY:
         return ""
@@ -1971,11 +2042,14 @@ async def _call_gemini_single_image_vision(
         max_models=3,
         max_wall_sec=26.0,
     )
-    out = _extract_gemini_vision_text_with_diag(data, purpose) if data else ""
+    if data is None:
+        return ""
+
+    out = _extract_gemini_vision_text_with_diag(data, purpose)
     if out:
         return out
 
-    # Self-healing retry on secondary Flash models if primary returned HTTP 200 with empty/thought-only output
+    # Self-healing retry on secondary Flash models ONLY when HTTP 200 returned empty/thought-only/safety-blank output
     retry_payload = {
         "contents": contents_block,
         "safetySettings": _GEMINI_VISION_SAFETY_SETTINGS,
@@ -2018,15 +2092,14 @@ async def inspect_image_details_deep_async(
         + (f"Post Metadata:\n{post_meta_hint[:600]}\n\n" if post_meta_hint else "")
         + (f"Previous Summary (add NEW grounded observations; also identify the character/series if missed):\n{prev_reply[:900]}\n\n" if prev_reply else "")
         + "Provide your analysis in 3 concise sections:\n"
-        "1. [Character / Series / Costume Identification]: Identify the Anime/VTuber/Game/Manga character, "
-        "series/agency (e.g., Hololive, Blue Archive, Honkai, etc.), and specific outfit/costume whenever recognizable "
-        "from unmistakable visual cues (hair color/tips, jacket/hoodie design, skirt pattern, straps, ornaments, emblems) — "
+        "1. [Framing & Fine Visual Clues]: First explicitly state what is inside the frame AND what is cropped out "
+        "(e.g., if the head/face is NOT visible in the image, state 'Head/face is cropped out of frame — no facial expression visible'). "
+        "Then describe ONLY details literally visible in the pixels: hair color/tips, camera angle/composition, lighting/shadows/highlights, "
+        "color palette, jacket/hoodie/skirt design, fabric folds/textures, outfit accessories/straps/lacing/buckles/eyelets, visible pose/hands, props, and background.\n"
+        "2. [Character / Series / Costume Identification]: Synthesize the exact visual clues above to identify the Anime/VTuber/Game/Manga character, "
+        "series/agency (e.g., Hololive, Blue Archive, Honkai, etc.), and specific outfit/costume whenever recognizable — "
         "EVEN IF the face is cropped out of frame. Write 'Unconfirmed / Original Character' only if genuinely unrecognizable.\n"
-        "2. [Framing & Crop]: Explicitly state what is inside the frame AND what is cropped out "
-        "(e.g., if the head/face is NOT visible in the image, state 'Head/face is cropped out of frame — no facial expression visible').\n"
-        "3. [Fine Visual Details]: Describe ONLY details literally visible in the pixels: "
-        "camera angle/composition, lighting/shadows/highlights, color palette, fabric folds/textures, "
-        "outfit accessories/straps/buckles/eyelets, hair/skin rendering style, visible pose/hands, props, and background elements.\n"
+        "3. [New Observations]: Highlight any subtle craftsmanship or visual details not yet covered in the Previous Summary.\n"
         "Rule: NEVER invent facial expressions, eyes, or body parts that are outside the image crop."
     )
 
@@ -2042,7 +2115,7 @@ async def inspect_image_details_deep_async(
                 continue
         if len(encoded_batch) >= 2:
             out = ""
-            if GEMINI_API_KEY:
+            if GEMINI_API_KEY and not _is_google_ai_studio_congested():
                 out = await _call_gemini_multi_image_batch(
                     encoded_batch, deep_prompt, timeout_sec=24, max_output_tokens=4096
                 )
@@ -2066,13 +2139,18 @@ async def inspect_image_details_deep_async(
         vis_out = await _call_gemini_single_image_vision(
             deep_prompt, mime_type, b64_img, purpose="Deep Image Detail Vision"
         )
-    if not vis_out and GEMINI_API_KEY:
+    if not vis_out and GEMINI_API_KEY and not _is_google_ai_studio_congested():
         vis_out = await call_gemma_ai_studio_vision(
             deep_prompt, mime_type, b64_img, timeout_sec=12, purpose="Deep Image Detail AI Studio"
         )
     if not vis_out:
         vis_out = await call_cloudflare_vision_chat(
-            deep_prompt, mime_type, b64_img, purpose="Deep Image Detail CF"
+            deep_prompt,
+            mime_type,
+            b64_img,
+            max_tokens=3072,
+            purpose="Deep Image Detail CF",
+            enable_thinking=True,
         )
     return (vis_out or "").strip()
 
@@ -2165,6 +2243,8 @@ async def extract_image_via_transient_ocr(
         )
 
     ocr_prompt = _build_tailored_single_image_ocr_prompt(context_header, triage_type or None)
+    gemma_ocr_prompt = _build_gemma_feature_first_vision_prompt(context_header, triage_type or None)
+    use_cf_thinking = triage_type in ("anime_fanart", "real_world_product")
 
     saucenao_task = asyncio.create_task(_search_saucenao_async(raw_bytes, filename)) if do_saucenao else None
     tracemoe_task = asyncio.create_task(_search_tracemoe_async(raw_bytes, mime_type)) if do_tracemoe else None
@@ -2182,16 +2262,25 @@ async def extract_image_via_transient_ocr(
             used_gemini_tier1 = True
 
     # Tier 2: Google AI Studio Gemma 4 Vision (`gemma-4-26b-a4b-it`)
-    if not vision_result and GEMINI_API_KEY:
+    # Skipped immediately if all 3 primary Flash endpoints just hit 503/Timeout so failover to Cloudflare is instant!
+    if not vision_result and GEMINI_API_KEY and not _is_google_ai_studio_congested():
         gemma_ocr = await call_gemma_ai_studio_vision(
-            ocr_prompt, mime_type, b64_img, timeout_sec=12, purpose="Image OCR Tier 2 AI Studio"
+            gemma_ocr_prompt, mime_type, b64_img, timeout_sec=12, purpose="Image OCR Tier 2 AI Studio"
         )
         if gemma_ocr:
             vision_result = gemma_ocr
 
     # Tier 3: Cloudflare Workers AI Vision (`@cf/google/gemma-4-26b-a4b-it`)
+    # Uses Feature-First prompt + image-before-text + thinking mode for fanart/products!
     if not vision_result:
-        cf_ocr = await call_cloudflare_vision_chat(ocr_prompt, mime_type, b64_img, purpose="Image OCR Tier 3 CF")
+        cf_ocr = await call_cloudflare_vision_chat(
+            gemma_ocr_prompt,
+            mime_type,
+            b64_img,
+            max_tokens=3072 if use_cf_thinking else 2048,
+            purpose="Image OCR Tier 3 CF",
+            enable_thinking=use_cf_thinking,
+        )
         if cf_ocr:
             vision_result = cf_ocr
 
@@ -2214,8 +2303,8 @@ async def extract_image_via_transient_ocr(
                         {
                             "role": "user",
                             "content": [
-                                {"type": "text", "text": ocr_prompt},
                                 {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
+                                {"type": "text", "text": gemma_ocr_prompt},
                             ],
                         }
                     ],
@@ -2229,8 +2318,7 @@ async def extract_image_via_transient_ocr(
                     if resp.status == 200:
                         state.active_groq_vision_model = g_mod
                         g_data = await resp.json()
-                        content = g_data["choices"][0]["message"]["content"].strip()
-                        content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+                        content = _strip_vision_thought_blocks(g_data["choices"][0]["message"]["content"] or "")
                         if content:
                             state.record_provider_call("groq")
                             api_log(f"Image OCR (Tier 4 Groq) -> {g_mod} 200 OK ({elapsed:.2f}s)")
@@ -2285,21 +2373,27 @@ async def extract_image_via_transient_ocr(
         clean_vis = re.sub(r"\[WEB_VERIFY_QUERY:\s*[^\]]+?\]", "", vision_result, flags=re.IGNORECASE).strip()
         out_parts.append(f"=== Vision Analysis & OCR ===\n{clean_vis}")
 
-        q_match = re.search(r"\[WEB_VERIFY_QUERY:\s*([^\]]+?)\s*\]", vision_result, re.IGNORECASE)
-        if do_web_verify and q_match:
-            verify_q = q_match.group(1).strip()[:120]
-            if (
-                verify_q
-                and verify_q.lower() not in ("none", "n/a")
-                and not _is_pure_sfx_query(verify_q)
-                and not _is_blind_handle_or_id_query(verify_q)
-            ):
-                try:
-                    web_verify = await run_safe_web_search_async(verify_q, max_results=3)
-                    if web_verify:
-                        out_parts.append(f"=== Web Verification for Image (`{verify_q}`) ===\n{web_verify}")
-                except Exception:
-                    pass
+    # Google Lens Fallback Rescue: when vision fell back off Gemini Tier 1 (e.g. Cloudflare Gemma 4)
+    # on fanart or real-world products, run web verification on the visual/entity query automatically!
+    fallback_web_verify = bool(
+        not used_gemini_tier1
+        and triage_type in ("anime_fanart", "real_world_product")
+    )
+    q_match = re.search(r"\[WEB_VERIFY_QUERY:\s*([^\]]+?)\s*\]", vision_result, re.IGNORECASE)
+    if (do_web_verify or fallback_web_verify) and q_match:
+        verify_q = q_match.group(1).strip()[:120]
+        if (
+            verify_q
+            and verify_q.lower() not in ("none", "n/a")
+            and not _is_pure_sfx_query(verify_q)
+            and not _is_blind_handle_or_id_query(verify_q)
+        ):
+            try:
+                web_verify = await run_safe_web_search_async(verify_q, max_results=3)
+                if web_verify:
+                    out_parts.append(f"=== Web Verification for Image (`{verify_q}`) ===\n{web_verify}")
+            except Exception:
+                pass
 
     return "\n\n".join(out_parts) if out_parts else "[OCR could not extract text from image]"
 
