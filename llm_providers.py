@@ -16,6 +16,7 @@ from config import (
     CF_ACCOUNT_ID,
     CF_API_TOKEN,
     CF_VISION_MODEL,
+    CF_VISION_FALLBACK_MODEL,
     CF_CODE_MODEL,
     CF_CHAT_FAST_MODEL,
     GROQ_API_KEY,
@@ -58,6 +59,8 @@ _GOOGLE_ALL_MODELS_CACHE: list[str] = []
 _GOOGLE_ALL_MODELS_TS: float = 0.0
 
 _CF_GEMMA_COOLDOWN_UNTIL: float = 0.0
+_CF_QWEN_VISION_COOLDOWN_UNTIL: float = 0.0
+_CF_MODEL_COOLDOWN_UNTIL: dict[str, float] = {}
 _CF_RESPONSES_UNSUPPORTED_UNTIL: float = 0.0
 
 
@@ -647,10 +650,21 @@ async def discover_available_groq_models(force_refresh: bool = False) -> list[st
     return _GROQ_AVAILABLE_MODELS_CACHE
 
 
+def _is_reserved_groq_vision_model(model_id: str) -> bool:
+    """Reserves `qwen/qwen3.8-27b` (and `GROQ_VISION_FALLBACK_MODEL`) exclusively for Vision fallback."""
+    low = (model_id or "").strip().lower()
+    if not low:
+        return False
+    if "qwen3.8" in low:
+        return True
+    if GROQ_VISION_FALLBACK_MODEL and low == GROQ_VISION_FALLBACK_MODEL.strip().lower():
+        return True
+    return False
+
+
 async def get_groq_search_and_chat_candidates() -> list[str]:
     live_models = await discover_available_groq_models()
     preferred_order = [
-        "qwen/qwen3.8-27b",
         state.active_groq_search_model,
         GROQ_SEARCH_MODEL,
         "openai/gpt-oss-20b",
@@ -658,13 +672,13 @@ async def get_groq_search_and_chat_candidates() -> list[str]:
     ]
     candidates = []
     for mod in preferred_order:
-        if not mod or mod == GROQ_CODE_MODEL:
+        if not mod or mod == GROQ_CODE_MODEL or _is_reserved_groq_vision_model(mod):
             continue
         if (not live_models or mod in live_models) and mod not in candidates:
             candidates.append(mod)
 
     for mod in live_models:
-        if mod != GROQ_CODE_MODEL and mod not in candidates:
+        if mod != GROQ_CODE_MODEL and not _is_reserved_groq_vision_model(mod) and mod not in candidates:
             candidates.append(mod)
 
     return candidates
@@ -1146,8 +1160,18 @@ async def call_gemini_chat_messages(
 # CLOUDFLARE WORKERS AI (GEMMA 4 + OPENAI GPT-OSS-120B / GPT-OSS-20B) + HEDGING
 # ==============================================================================
 async def call_cloudflare_gemma_chat(
-    messages: list, temperature: float = 0.4, max_tokens: int = 1024, purpose: str = "CFGemmaChat"
+    messages: list,
+    temperature: float = 0.4,
+    max_tokens: int = 1024,
+    purpose: str = "CFGemmaChat",
+    tool_ctx: ToolExecutionContext | None = None,
+    max_tool_rounds: int = 3,
 ) -> str:
+    """
+    Cloudflare Workers AI Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`) with native
+    multi-round parallel function calling (`tools` + `parallel_tool_calls`) and
+    graceful HTTP 400 fallback to plain chat.
+    """
     global _CF_GEMMA_COOLDOWN_UNTIL
     if not CF_ACCOUNT_ID or not CF_API_TOKEN or time.time() < _CF_GEMMA_COOLDOWN_UNTIL:
         return ""
@@ -1158,10 +1182,10 @@ async def call_cloudflare_gemma_chat(
         "Authorization": f"Bearer {CF_API_TOKEN}",
         "Content-Type": "application/json",
     }
-    cf_messages = []
+    work_msgs = []
     for idx, m in enumerate(messages):
         if idx == 0 and m.get("role") == "system":
-            cf_messages.append({
+            work_msgs.append({
                 "role": "system",
                 "content": (
                     m.get("content", "")
@@ -1169,41 +1193,88 @@ async def call_cloudflare_gemma_chat(
                 ),
             })
         else:
-            cf_messages.append(m)
+            work_msgs.append(dict(m))
 
-    payload = {
-        "model": CF_VISION_MODEL,
-        "messages": cf_messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "chat_template_kwargs": {"enable_thinking": False},
-    }
-    t0 = time.monotonic()
-    try:
-        session = get_http_session()
-        async with session.post(
-            cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=36)
-        ) as resp:
-            elapsed = time.monotonic() - t0
-            if resp.status == 200:
-                data = await resp.json()
-                choices = data.get("choices") or []
-                if choices:
+    tool_schemas = _get_tools_for_ctx(tool_ctx, OPENAI_TOOLS_BY_MODE)
+    tools_enabled = bool(tool_schemas)
+    rounds = (max_tool_rounds + 1) if tools_enabled else 1
+    session = get_http_session()
+
+    for r_idx in range(rounds):
+        allow_tools_now = tools_enabled and (r_idx < max_tool_rounds)
+        payload: dict = {
+            "model": CF_VISION_MODEL,
+            "messages": work_msgs,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        if allow_tools_now:
+            payload["tools"] = tool_schemas
+            payload["tool_choice"] = "auto"
+            payload["parallel_tool_calls"] = True
+
+        t0 = time.monotonic()
+        try:
+            async with session.post(
+                cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=36)
+            ) as resp:
+                elapsed = time.monotonic() - t0
+                if resp.status == 200:
+                    data = await resp.json()
+                    choices = data.get("choices") or []
+                    if not choices:
+                        return ""
                     msg_obj = choices[0].get("message") or {}
-                    content = msg_obj.get("content") or ""
-                    content = _strip_model_thought_blocks(content)
+                    tool_calls = msg_obj.get("tool_calls") or []
+                    if tool_calls and allow_tools_now and tool_ctx is not None:
+                        work_msgs.append({
+                            "role": "assistant",
+                            "content": msg_obj.get("content") or "",
+                            "tool_calls": tool_calls,
+                        })
+                        parsed_calls = [
+                            (
+                                (tc.get("function") or {}).get("name", ""),
+                                (tc.get("function") or {}).get("arguments", "{}"),
+                            )
+                            for tc in tool_calls
+                        ]
+                        obs_list = await execute_tool_calls_parallel(parsed_calls, tool_ctx)
+                        _record_tool_observations_on_ctx(tool_ctx, parsed_calls, obs_list)
+                        for tc, obs_text in zip(tool_calls, obs_list):
+                            work_msgs.append({
+                                "role": "tool",
+                                "tool_call_id": tc.get("id") or f"call_{r_idx}",
+                                "name": (tc.get("function") or {}).get("name", ""),
+                                "content": obs_text,
+                            })
+                        continue
+
+                    content = _strip_model_thought_blocks(msg_obj.get("content") or "")
                     if content:
                         state.record_provider_call("cloudflare")
-                        api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} 200 OK ({elapsed:.2f}s)")
+                        api_log(
+                            f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} 200 OK ({elapsed:.2f}s"
+                            + (f", tools={len(tool_ctx.tools_used)}" if (tool_ctx and tool_ctx.tools_used) else "")
+                            + ")"
+                        )
                         return content
-            elif resp.status == 429:
-                _CF_GEMMA_COOLDOWN_UNTIL = time.time() + 300.0
-            api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} HTTP {resp.status} ({elapsed:.2f}s)")
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        _CF_GEMMA_COOLDOWN_UNTIL = time.time() + 120.0
-        api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} failed ({type(e).__name__})")
+                    return ""
+                elif resp.status == 400 and allow_tools_now:
+                    tools_enabled = False
+                    api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} HTTP 400 on tools; retrying plain chat")
+                    continue
+                elif resp.status == 429:
+                    _CF_GEMMA_COOLDOWN_UNTIL = time.time() + 300.0
+                api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} HTTP {resp.status} ({elapsed:.2f}s)")
+                return ""
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _CF_GEMMA_COOLDOWN_UNTIL = time.time() + 120.0
+            api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} failed ({type(e).__name__})")
+            return ""
     return ""
 
 
@@ -1236,10 +1307,22 @@ async def _call_cf_gemma_hedged_with_groq(
     max_tokens: int = 1024,
     purpose: str = "Chat",
     hedge_delay_sec: float = 6.5,
+    tool_ctx: ToolExecutionContext | None = None,
 ) -> str:
     cf_available = bool(CF_ACCOUNT_ID and CF_API_TOKEN and time.time() >= _CF_GEMMA_COOLDOWN_UNTIL)
     if not cf_available:
         return ""
+
+    # When live native tools are enabled on `tool_ctx`, run Cloudflare Gemma 4 directly without
+    # a concurrent Groq race so side-effecting tools (OT, memory, image gen) can never double-fire.
+    if tool_ctx is not None:
+        return await call_cloudflare_gemma_chat(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            purpose=purpose,
+            tool_ctx=tool_ctx,
+        )
 
     cf_task = asyncio.create_task(
         call_cloudflare_gemma_chat(messages, temperature=temperature, max_tokens=max_tokens, purpose=purpose)
@@ -1298,7 +1381,7 @@ async def call_cloudflare_gpt_oss(
     target_model = cf_model or (CF_CODE_MODEL if is_coding else CF_CHAT_FAST_MODEL)
     if not CF_ACCOUNT_ID or not CF_API_TOKEN or not target_model:
         return ""
-    if time.time() < state.cf_gpt_oss_cooldown_until:
+    if time.time() < _CF_MODEL_COOLDOWN_UNTIL.get(target_model, 0.0):
         return ""
 
     cf_host = "api." + "cloudflare.com"
@@ -1311,8 +1394,11 @@ async def call_cloudflare_gpt_oss(
     tool_schemas = _get_tools_for_ctx(tool_ctx, OPENAI_TOOLS_BY_MODE)
     is_voice = ("voice" in (purpose or "").lower())
 
-    # Try Cloudflare `/ai/v1/responses` ONLY when not using native OpenAI tool_calls loop
-    if not tool_schemas and time.time() >= _CF_RESPONSES_UNSUPPORTED_UNTIL:
+    is_gpt_oss_model = "gpt-oss" in target_model.lower()
+    is_glm_model = "glm-" in target_model.lower()
+
+    # Try Cloudflare `/ai/v1/responses` ONLY for `gpt-oss` models when not using native OpenAI tool_calls loop
+    if is_gpt_oss_model and not tool_schemas and time.time() >= _CF_RESPONSES_UNSUPPORTED_UNTIL:
         sys_parts = []
         convo_lines = []
         for m in _adapt_messages_for_oss_fallback(
@@ -1363,7 +1449,7 @@ async def call_cloudflare_gpt_oss(
                         api_log(f"Cloudflare Responses ({purpose}) -> {target_model} 200 OK ({elapsed:.2f}s)")
                         return out_txt
                 elif resp.status == 429:
-                    state.cf_gpt_oss_cooldown_until = time.time() + 180.0
+                    _CF_MODEL_COOLDOWN_UNTIL[target_model] = time.time() + 180.0
                     api_log(f"Cloudflare Responses ({purpose}) -> {target_model} HTTP 429 (cooldown 3m)")
                     return ""
                 elif resp.status in (400, 404):
@@ -1387,9 +1473,12 @@ async def call_cloudflare_gpt_oss(
             "temperature": temperature,
             "max_tokens": 4096 if is_coding else 2048,
         }
+        if is_glm_model and not is_coding:
+            chat_payload["chat_template_kwargs"] = {"enable_thinking": False}
         if allow_tools_now:
             chat_payload["tools"] = tool_schemas
             chat_payload["tool_choice"] = "auto"
+            chat_payload["parallel_tool_calls"] = True
 
         t1 = time.monotonic()
         try:
@@ -1428,8 +1517,7 @@ async def call_cloudflare_gpt_oss(
                             })
                         continue
 
-                    content = msg_obj.get("content") or ""
-                    content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
+                    content = _strip_model_thought_blocks(msg_obj.get("content") or "")
                     if content:
                         state.record_provider_call("cloudflare")
                         api_log(f"Cloudflare Chat ({purpose}) -> {target_model} 200 OK ({elapsed:.2f}s)")
@@ -1440,7 +1528,7 @@ async def call_cloudflare_gpt_oss(
                     api_log(f"Cloudflare Chat ({purpose}) -> {target_model} HTTP 400 on tools; retrying plain chat")
                     continue
                 elif resp.status == 429:
-                    state.cf_gpt_oss_cooldown_until = time.time() + 180.0
+                    _CF_MODEL_COOLDOWN_UNTIL[target_model] = time.time() + 180.0
                     api_log(f"Cloudflare Chat ({purpose}) -> {target_model} HTTP 429 ({elapsed:.2f}s)")
                     return ""
                 else:
@@ -1530,6 +1618,270 @@ async def call_cloudflare_vision_chat(
             if think_flag:
                 continue
             return ""
+    return ""
+
+
+async def call_cloudflare_vision_fallback_qwen(
+    prompt_text: str,
+    mime_type: str,
+    b64_img: str,
+    max_tokens: int = 2048,
+    purpose: str = "VisionCFQwen",
+    timeout_sec: int = 24,
+) -> str:
+    """
+    Emergency Cloudflare Vision Fallback (`@cf/qwen/qwen3.8-27b`) used ONLY after Gemini,
+    Gemma 4 (AI Studio + Cloudflare), and Groq `qwen/qwen3.8-27b` are unavailable.
+    Forces `reasoning_effort="low"` to stay fast and conserve Cloudflare Neurons.
+    """
+    global _CF_QWEN_VISION_COOLDOWN_UNTIL
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN or not CF_VISION_FALLBACK_MODEL:
+        return ""
+    if time.time() < _CF_QWEN_VISION_COOLDOWN_UNTIL:
+        return ""
+
+    cf_host = "api." + "cloudflare.com"
+    cf_chat_url = f"{HTTPS}{cf_host}/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": CF_VISION_FALLBACK_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Respond directly and concisely with the requested analysis. Do NOT output internal thinking steps.",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
+                    {"type": "text", "text": prompt_text},
+                ],
+            },
+        ],
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
+        "reasoning_effort": "low",
+    }
+    t0 = time.monotonic()
+    try:
+        session = get_http_session()
+        async with session.post(
+            cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=timeout_sec)
+        ) as resp:
+            elapsed = time.monotonic() - t0
+            if resp.status == 200:
+                data = await resp.json()
+                choices = data.get("choices") or []
+                if choices:
+                    content = _strip_model_thought_blocks((choices[0].get("message") or {}).get("content") or "")
+                    if content:
+                        state.record_provider_call("cloudflare")
+                        api_log(f"Cloudflare ({purpose}) -> {CF_VISION_FALLBACK_MODEL} 200 OK ({elapsed:.2f}s)")
+                        return content
+            elif resp.status == 429:
+                _CF_QWEN_VISION_COOLDOWN_UNTIL = time.time() + 300.0
+            elif resp.status in (500, 503):
+                _CF_QWEN_VISION_COOLDOWN_UNTIL = time.time() + 120.0
+            api_log(f"Cloudflare ({purpose}) -> {CF_VISION_FALLBACK_MODEL} HTTP {resp.status} ({elapsed:.2f}s)")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        _CF_QWEN_VISION_COOLDOWN_UNTIL = time.time() + 120.0
+        api_log(f"Cloudflare ({purpose}) -> {CF_VISION_FALLBACK_MODEL} failed ({type(e).__name__})")
+    return ""
+
+
+async def call_cloudflare_multi_image_vision_qwen(
+    encoded_images: list[tuple[str, str, str]],
+    batch_prompt: str,
+    timeout_sec: int = 50,
+    max_tokens: int = 3072,
+    purpose: str = "MultiImageCFQwen",
+) -> str:
+    """Multi-image emergency Cloudflare Vision Fallback (`@cf/qwen/qwen3.8-27b`, `reasoning_effort="low"`)."""
+    global _CF_QWEN_VISION_COOLDOWN_UNTIL
+    if not encoded_images or not CF_ACCOUNT_ID or not CF_API_TOKEN or not CF_VISION_FALLBACK_MODEL:
+        return ""
+    if time.time() < _CF_QWEN_VISION_COOLDOWN_UNTIL:
+        return ""
+
+    cf_host = "api." + "cloudflare.com"
+    cf_chat_url = f"{HTTPS}{cf_host}/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    user_content: list[dict] = []
+    for idx, (b64_img, mime_type, fname) in enumerate(encoded_images, 1):
+        user_content.append({"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}})
+        user_content.append({"type": "text", "text": f"[Above: Image {idx}/{len(encoded_images)} (`{fname}`)]"})
+    user_content.append({"type": "text", "text": batch_prompt})
+
+    payload = {
+        "model": CF_VISION_FALLBACK_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Respond directly and concisely with the requested analysis. Do NOT output internal thinking steps.",
+            },
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
+        "reasoning_effort": "low",
+    }
+    t0 = time.monotonic()
+    try:
+        session = get_http_session()
+        async with session.post(
+            cf_chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=timeout_sec)
+        ) as resp:
+            elapsed = time.monotonic() - t0
+            if resp.status == 200:
+                data = await resp.json()
+                choices = data.get("choices") or []
+                if choices:
+                    content = _strip_model_thought_blocks((choices[0].get("message") or {}).get("content") or "")
+                    if content:
+                        state.record_provider_call("cloudflare")
+                        api_log(f"Cloudflare ({purpose}) -> {CF_VISION_FALLBACK_MODEL} 200 OK ({elapsed:.2f}s)")
+                        return content
+            elif resp.status == 429:
+                _CF_QWEN_VISION_COOLDOWN_UNTIL = time.time() + 300.0
+            elif resp.status in (500, 503):
+                _CF_QWEN_VISION_COOLDOWN_UNTIL = time.time() + 120.0
+            api_log(f"Cloudflare ({purpose}) -> {CF_VISION_FALLBACK_MODEL} HTTP {resp.status} ({elapsed:.2f}s)")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        _CF_QWEN_VISION_COOLDOWN_UNTIL = time.time() + 120.0
+        api_log(f"Cloudflare ({purpose}) -> {CF_VISION_FALLBACK_MODEL} failed ({type(e).__name__})")
+    return ""
+
+
+async def call_groq_vision_chat(
+    prompt_text: str,
+    mime_type: str,
+    b64_img: str,
+    max_tokens: int = 3072,
+    timeout_sec: int = 22,
+    purpose: str = "VisionGroq",
+) -> str:
+    """Single-image Groq Vision Fallback reserved exclusively for `qwen/qwen3.8-27b`."""
+    if not GROQ_API_KEY:
+        return ""
+    groq_candidates = await discover_active_groq_vision_models()
+    groq_host = "api." + "groq.com"
+    chat_url = f"{HTTPS}{groq_host}/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    session = get_http_session()
+    for g_mod in groq_candidates:
+        if time.time() < _GROQ_MODEL_COOLDOWN_UNTIL.get(g_mod, 0.0):
+            continue
+        payload = {
+            "model": g_mod,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
+                        {"type": "text", "text": prompt_text},
+                    ],
+                }
+            ],
+            "temperature": 0.0,
+            "max_tokens": max_tokens,
+        }
+        t0 = time.monotonic()
+        try:
+            async with session.post(
+                chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=timeout_sec)
+            ) as resp:
+                elapsed = time.monotonic() - t0
+                if resp.status == 200:
+                    state.active_groq_vision_model = g_mod
+                    g_data = await resp.json()
+                    content = _strip_model_thought_blocks((g_data["choices"][0]["message"].get("content") or ""))
+                    if content:
+                        state.record_provider_call("groq")
+                        api_log(f"Groq ({purpose}) -> {g_mod} 200 OK ({elapsed:.2f}s)")
+                        return content
+                elif resp.status == 429:
+                    _GROQ_MODEL_COOLDOWN_UNTIL[g_mod] = time.time() + 60.0
+                elif resp.status == 404:
+                    _GROQ_MODEL_COOLDOWN_UNTIL[g_mod] = time.time() + 3600.0
+                api_log(f"Groq ({purpose}) -> {g_mod} HTTP {resp.status} ({elapsed:.2f}s)")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            api_log(f"Groq ({purpose}) -> {g_mod} failed ({type(e).__name__})")
+    return ""
+
+
+async def call_groq_multi_image_vision(
+    encoded_images: list[tuple[str, str, str]],
+    batch_prompt: str,
+    max_tokens: int = 3072,
+    timeout_sec: int = 35,
+    purpose: str = "MultiImageGroq",
+) -> str:
+    """Multi-image Groq Vision Fallback reserved exclusively for `qwen/qwen3.8-27b`."""
+    if not encoded_images or not GROQ_API_KEY:
+        return ""
+    groq_candidates = await discover_active_groq_vision_models()
+    groq_host = "api." + "groq.com"
+    chat_url = f"{HTTPS}{groq_host}/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    # Cap multi-image payload to 5 frames on Groq to stay safely within free-tier TPM/request limits
+    batch_slice = encoded_images[:5]
+    user_content: list[dict] = []
+    for idx, (b64_img, mime_type, fname) in enumerate(batch_slice, 1):
+        user_content.append({"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}})
+        user_content.append({"type": "text", "text": f"[Above: Image {idx}/{len(batch_slice)} (`{fname}`)]"})
+    user_content.append({"type": "text", "text": batch_prompt})
+
+    session = get_http_session()
+    for g_mod in groq_candidates:
+        if time.time() < _GROQ_MODEL_COOLDOWN_UNTIL.get(g_mod, 0.0):
+            continue
+        payload = {
+            "model": g_mod,
+            "messages": [{"role": "user", "content": user_content}],
+            "temperature": 0.0,
+            "max_tokens": max_tokens,
+        }
+        t0 = time.monotonic()
+        try:
+            async with session.post(
+                chat_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=timeout_sec)
+            ) as resp:
+                elapsed = time.monotonic() - t0
+                if resp.status == 200:
+                    state.active_groq_vision_model = g_mod
+                    g_data = await resp.json()
+                    content = _strip_model_thought_blocks((g_data["choices"][0]["message"].get("content") or ""))
+                    if content:
+                        state.record_provider_call("groq")
+                        api_log(f"Groq ({purpose}) -> {g_mod} 200 OK ({elapsed:.2f}s)")
+                        return content
+                elif resp.status == 429:
+                    _GROQ_MODEL_COOLDOWN_UNTIL[g_mod] = time.time() + 60.0
+                elif resp.status == 404:
+                    _GROQ_MODEL_COOLDOWN_UNTIL[g_mod] = time.time() + 3600.0
+                api_log(f"Groq ({purpose}) -> {g_mod} HTTP {resp.status} ({elapsed:.2f}s)")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            api_log(f"Groq ({purpose}) -> {g_mod} failed ({type(e).__name__})")
     return ""
 
 

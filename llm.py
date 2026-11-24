@@ -1,13 +1,14 @@
 """
 Backward-compatible LLM facade re-exporting the split multi-cloud modules:
-- `llm_providers.py`       : Google AI Studio (Hydrogen, Flash-Lite, Gemma 4), Groq LPU, Cloudflare Workers AI
-- `decision_orchestrator.py`: 4-Phase `gemini-decision-1` orchestrator, Image/PDF triage, Voice/Scribe, Search Filter, Arbitrator
-- `chat_pipeline.py`       : Unified `query_ai_chat()` pipeline with prefix caching, native tools, and passive memory capture
+- `llm_providers.py`      : Google AI Studio (Hydrogen, Flash-Lite, Gemma 4), Cloudflare Workers AI, Groq LPU
+- `decision_orchestrator.py`: 4-Phase `gemini-decision-1` + `@cf/cloudflare/clef-flash` fallback orchestrator
+- `chat_pipeline.py`      : Unified `query_ai_chat()` pipeline with prefix caching, native tools, and passive memory capture
 """
 
 from llm_providers import (  # noqa: F401
     get_google_model_cooldown,
     set_google_model_cooldown,
+    is_google_ai_studio_congested,
     _fetch_google_ai_studio_model_names,
     discover_available_groq_models,
     get_groq_search_and_chat_candidates,
@@ -24,6 +25,10 @@ from llm_providers import (  # noqa: F401
     _call_cf_gemma_hedged_with_groq,
     call_cloudflare_gpt_oss,
     call_cloudflare_vision_chat,
+    call_cloudflare_vision_fallback_qwen,
+    call_cloudflare_multi_image_vision_qwen,
+    call_groq_vision_chat,
+    call_groq_multi_image_vision,
     call_groq_chat,
 )
 from decision_orchestrator import (  # noqa: F401

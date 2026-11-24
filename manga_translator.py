@@ -31,8 +31,9 @@ from llm import (
     call_gemini_generate_content_self_healing,
     call_gemma_ai_studio_vision,
     call_cloudflare_vision_chat,
+    call_cloudflare_vision_fallback_qwen,
     call_cloudflare_gemma_chat,
-    discover_active_groq_vision_models,
+    call_groq_vision_chat,
     _fetch_google_ai_studio_model_names,
     get_google_model_cooldown,
     set_google_model_cooldown,
@@ -46,7 +47,7 @@ from manga_cv_render import (
     _release_cv_page_masks,
 )
 
-MANGA_TRANSLATOR_VERSION = "v17.1"
+MANGA_TRANSLATOR_VERSION = "v17.2"
 MANGA_CV_VER = getattr(_mcr_mod, "MANGA_CV_RENDER_VERSION", "old")
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
 # Bundle 2 dynamic parallel hedge: faster 15s recovery on typical 2-4p X threads, patient 25s on 5-12p batches
@@ -2041,54 +2042,60 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
     except Exception as e:
         api_log(f"MangaSingle [req={req_id}] Tier 3 Cloudflare Gemma 4 warning: {e}")
 
+    # Tier 4: Groq Qwen 3.8 27B Vision (`qwen/qwen3.8-27b`)
     if GROQ_API_KEY:
-        groq_vision_candidates = await discover_active_groq_vision_models()
-        groq_host = "api." + "groq.com"
-        chat_url = f"{HTTPS}{groq_host}/openai/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        session = get_http_session()
-        for g_model in groq_vision_candidates:
-            try:
-                groq_payload = {
-                    "model": g_model,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": manga_system_instruction},
-                                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
-                            ],
-                        }
-                    ],
-                    "temperature": 0.0,
-                    "max_tokens": 4096,
-                }
-                async with session.post(
-                    chat_url, headers=headers, json=groq_payload, timeout=aiohttp.ClientTimeout(total=25)
-                ) as resp:
-                    if resp.status == 200:
-                        state.active_groq_vision_model = g_model
-                        state.record_provider_call("groq")
-                        g_data = await resp.json()
-                        content = g_data["choices"][0]["message"]["content"].strip()
-                        bubbles, summary = _parse_manga_bubbles_json(content)
-                        if bubbles:
-                            has_anchor = any(
-                                (b.get("bubble_id") is not None)
-                                or (isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4)
-                                for b in bubbles
-                            )
-                            if has_anchor:
-                                api_log(f"MangaSingle [req={req_id}] RESPONSE -> Tier 4 Groq ({g_model}) OK ({len(bubbles)} bubbles)")
-                                return bubbles, summary, cv_bubbles
-                            if not fallback_bubbles_no_boxes:
-                                fallback_bubbles_no_boxes = bubbles
-                                fallback_summary = summary
-            except Exception as e:
-                api_log(f"MangaSingle [req={req_id}] Tier 4 Groq ({g_model}) warning: {e}")
+        try:
+            gq_content = await call_groq_vision_chat(
+                manga_system_instruction,
+                mime_type,
+                b64_img,
+                max_tokens=4096,
+                timeout_sec=25,
+                purpose=f"MangaSingle[{req_id}]",
+            )
+            if gq_content:
+                bubbles, summary = _parse_manga_bubbles_json(gq_content)
+                if bubbles:
+                    has_anchor = any(
+                        (b.get("bubble_id") is not None)
+                        or (isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4)
+                        for b in bubbles
+                    )
+                    if has_anchor:
+                        api_log(f"MangaSingle [req={req_id}] RESPONSE -> Tier 4 Groq Qwen OK ({len(bubbles)} bubbles)")
+                        return bubbles, summary, cv_bubbles
+                    if not fallback_bubbles_no_boxes:
+                        fallback_bubbles_no_boxes = bubbles
+                        fallback_summary = summary
+        except Exception as e:
+            api_log(f"MangaSingle [req={req_id}] Tier 4 Groq Qwen warning: {e}")
+
+    # Tier 5: Cloudflare Qwen 3.8 27B Vision (`@cf/qwen/qwen3.8-27b`, `reasoning_effort="low"`)
+    try:
+        cfq_content = await call_cloudflare_vision_fallback_qwen(
+            manga_system_instruction,
+            mime_type,
+            b64_img,
+            max_tokens=4096,
+            purpose=f"MangaSingleCFQwen[{req_id}]",
+            timeout_sec=30,
+        )
+        if cfq_content:
+            bubbles, summary = _parse_manga_bubbles_json(cfq_content)
+            if bubbles:
+                has_anchor = any(
+                    (b.get("bubble_id") is not None)
+                    or (isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4)
+                    for b in bubbles
+                )
+                if has_anchor:
+                    api_log(f"MangaSingle [req={req_id}] RESPONSE -> Tier 5 Cloudflare Qwen OK ({len(bubbles)} bubbles)")
+                    return bubbles, summary, cv_bubbles
+                if not fallback_bubbles_no_boxes:
+                    fallback_bubbles_no_boxes = bubbles
+                    fallback_summary = summary
+    except Exception as e:
+        api_log(f"MangaSingle [req={req_id}] Tier 5 Cloudflare Qwen warning: {e}")
 
     if fallback_bubbles_no_boxes:
         return fallback_bubbles_no_boxes, fallback_summary, cv_bubbles

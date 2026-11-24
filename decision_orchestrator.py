@@ -8,6 +8,9 @@ from config import (
     HTTPS,
     GEMINI_API_KEY,
     GEMINI_DECISION_MODEL,
+    CF_ACCOUNT_ID,
+    CF_API_TOKEN,
+    CF_DECISION_MODEL,
     PURE_DATETIME_PATTERN,
     channel_memory,
     channel_active_topic,
@@ -206,29 +209,99 @@ def _build_recent_channel_history_preview(channel_id: int | None, max_chars: int
     return "\n".join(lines)[:max_chars]
 
 
-async def call_gemini_decision_orchestrator(
-    shared_input: str | list[dict],
-    questions: dict,
-    timeout_sec: float = 4.0,
-    purpose: str = "Orchestrator",
-) -> dict:
-    if not GEMINI_API_KEY or not GEMINI_DECISION_MODEL:
-        return {}
-    if time.time() < state.gemini_decision_cooldown_until:
-        return {}
+def _can_use_cf_decision_fallback() -> bool:
+    return bool(
+        CF_ACCOUNT_ID
+        and CF_API_TOKEN
+        and CF_DECISION_MODEL
+        and time.time() >= getattr(state, "cf_decision_cooldown_until", 0.0)
+    )
 
-    url = clean_url(f"{HTTPS}generativelanguage.googleapis.com/v1beta/decisions")
-    headers = {
-        "x-goog-api-key": GEMINI_API_KEY,
-        "Content-Type": "application/json",
-    }
-    formatted_input = shared_input[:16000] if isinstance(shared_input, str) else shared_input
-    payload = {
-        "model": GEMINI_DECISION_MODEL,
-        "input": formatted_input,
+
+def _has_any_decision_backend(allow_cf: bool = True) -> bool:
+    gemini_ready = bool(
+        GEMINI_API_KEY
+        and GEMINI_DECISION_MODEL
+        and time.time() >= state.gemini_decision_cooldown_until
+    )
+    if gemini_ready:
+        return True
+    return bool(allow_cf and _can_use_cf_decision_fallback())
+
+
+def _build_cf_clef_payload(shared_input: str | list[dict], questions: dict) -> dict | None:
+    """
+    Translates Decision-1 `(shared_input, questions)` into Cloudflare Workers AI Clef-Flash
+    (`@cf/cloudflare/clef-flash`) REST payload:
+    - Text-only `str` -> `{"model": "clef-flash", "state": ..., "questions": ...}`
+    - Multimodal `list[dict]` -> joins text blocks into `state` and converts image blocks
+      into Data URLs in `images` (max 4 PNG/JPEG/WebP).
+    - Returns `None` if a PDF `document` block is present (Clef-flash does not accept PDFs).
+    """
+    model_selector = (CF_DECISION_MODEL or "@cf/cloudflare/clef-flash").rsplit("/", 1)[-1].strip()
+    if model_selector not in ("clef", "clef-flash", "clef-omni"):
+        model_selector = "clef-flash"
+
+    if isinstance(shared_input, str):
+        state_text = shared_input[:14000]
+        images_arr: list[str] = []
+    elif isinstance(shared_input, list):
+        text_parts: list[str] = []
+        images_arr = []
+        for blk in shared_input:
+            if not isinstance(blk, dict):
+                continue
+            b_type = str(blk.get("type") or "").lower()
+            if b_type == "document":
+                return None
+            if b_type == "text" and blk.get("text"):
+                text_parts.append(str(blk["text"]))
+            elif b_type == "image" and blk.get("data") and len(images_arr) < 4:
+                mime = str(blk.get("mime_type") or "image/jpeg").strip().lower()
+                if mime not in ("image/jpeg", "image/png", "image/webp"):
+                    mime = "image/jpeg"
+                b64_val = str(blk["data"]).strip()
+                if b64_val.startswith("data:image/"):
+                    images_arr.append(b64_val)
+                else:
+                    images_arr.append(f"data:{mime};base64,{b64_val}")
+        state_text = "\n".join(text_parts).strip()[:14000] or "Evaluate the supplied image(s)."
+    else:
+        return None
+
+    payload: dict = {
+        "model": model_selector,
+        "state": state_text,
         "questions": questions,
     }
+    if images_arr:
+        payload["images"] = images_arr
+    return payload
 
+
+async def _call_cloudflare_clef_decision_fallback(
+    shared_input: str | list[dict],
+    questions: dict,
+    timeout_sec: float = 4.5,
+    purpose: str = "Orchestrator",
+) -> dict:
+    """
+    Automatic Cloudflare Workers AI `@cf/cloudflare/clef-flash` fallback for `gemini-decision-1`:
+    Same typed `noul`/`choice`/`score` API + up to 4 images, zero output token billing ($0.038/1M input).
+    """
+    if not _can_use_cf_decision_fallback():
+        return {}
+
+    payload = _build_cf_clef_payload(shared_input, questions)
+    if payload is None:
+        return {}
+
+    cf_host = "api." + "cloudflare.com"
+    url = clean_url(f"{HTTPS}{cf_host}/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_DECISION_MODEL}")
+    headers = {
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
     t0 = time.monotonic()
     try:
         session = get_http_session()
@@ -237,32 +310,98 @@ async def call_gemini_decision_orchestrator(
         ) as resp:
             elapsed = time.monotonic() - t0
             if resp.status == 200:
-                data = await resp.json()
-                answers = data.get("answers") or {}
+                data = await resp.json(content_type=None)
+                res_obj = data.get("result") if isinstance(data, dict) and isinstance(data.get("result"), dict) else data
+                answers = (res_obj.get("answers") or {}) if isinstance(res_obj, dict) else {}
                 if isinstance(answers, dict) and answers:
+                    state.record_provider_call("cloudflare")
                     state.record_decision_stat(elapsed, ok=True)
-                    api_log(f"Decision API ({purpose}) -> {GEMINI_DECISION_MODEL} 200 OK ({elapsed:.2f}s)")
+                    api_log(f"Decision API ({purpose}) -> {CF_DECISION_MODEL} 200 OK ({elapsed:.2f}s)")
                     return answers
             elif resp.status == 429:
                 state.record_decision_stat(elapsed, ok=False)
-                state.gemini_decision_cooldown_until = time.time() + 60.0
-                api_log(f"Decision API ({purpose}) -> HTTP 429 (cooldown 60s)")
-            elif resp.status == 400:
-                state.record_decision_stat(elapsed, ok=False)
-                err_txt = await resp.text()
-                # Do NOT put Decision API on a 3m cooldown if a single message triggered safety filters
-                if "safety" not in err_txt.lower():
-                    state.gemini_decision_cooldown_until = time.time() + 30.0
-                api_log(f"Decision API ({purpose}) -> HTTP 400 ({elapsed:.2f}s): {err_txt[:120]}")
+                state.cf_decision_cooldown_until = time.time() + 180.0
+                api_log(f"Decision API ({purpose}) -> {CF_DECISION_MODEL} HTTP 429 (cooldown 180s)")
             else:
                 state.record_decision_stat(elapsed, ok=False)
                 err_txt = await resp.text()
-                state.gemini_decision_cooldown_until = time.time() + 180.0
-                api_log(f"Decision API ({purpose}) -> HTTP {resp.status} ({elapsed:.2f}s): {err_txt[:100]}")
+                state.cf_decision_cooldown_until = time.time() + (30.0 if resp.status == 400 else 120.0)
+                api_log(f"Decision API ({purpose}) -> {CF_DECISION_MODEL} HTTP {resp.status} ({elapsed:.2f}s): {err_txt[:110]}")
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         state.record_decision_stat(time.monotonic() - t0, ok=False)
-        state.gemini_decision_cooldown_until = time.time() + 120.0
-        api_log(f"Decision API ({purpose}) -> skipped ({type(e).__name__})")
+        state.cf_decision_cooldown_until = time.time() + 120.0
+        api_log(f"Decision API ({purpose}) -> {CF_DECISION_MODEL} skipped ({type(e).__name__})")
+    return {}
+
+
+async def call_gemini_decision_orchestrator(
+    shared_input: str | list[dict],
+    questions: dict,
+    timeout_sec: float = 4.0,
+    purpose: str = "Orchestrator",
+    allow_cf_fallback: bool = True,
+) -> dict:
+    """
+    Runs Phase 1-4 semantic orchestration on Google AI Studio `gemini-decision-1` first,
+    automatically falling back to Cloudflare Workers AI `@cf/cloudflare/clef-flash` if
+    Gemini Decision-1 is unconfigured, on cooldown, or returns an error/timeout.
+    """
+    if GEMINI_API_KEY and GEMINI_DECISION_MODEL and time.time() >= state.gemini_decision_cooldown_until:
+        url = clean_url(f"{HTTPS}generativelanguage.googleapis.com/v1beta/decisions")
+        headers = {
+            "x-goog-api-key": GEMINI_API_KEY,
+            "Content-Type": "application/json",
+        }
+        formatted_input = shared_input[:16000] if isinstance(shared_input, str) else shared_input
+        payload = {
+            "model": GEMINI_DECISION_MODEL,
+            "input": formatted_input,
+            "questions": questions,
+        }
+
+        t0 = time.monotonic()
+        try:
+            session = get_http_session()
+            async with session.post(
+                url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=timeout_sec)
+            ) as resp:
+                elapsed = time.monotonic() - t0
+                if resp.status == 200:
+                    data = await resp.json()
+                    answers = data.get("answers") or {}
+                    if isinstance(answers, dict) and answers:
+                        state.record_decision_stat(elapsed, ok=True)
+                        api_log(f"Decision API ({purpose}) -> {GEMINI_DECISION_MODEL} 200 OK ({elapsed:.2f}s)")
+                        return answers
+                elif resp.status == 429:
+                    state.record_decision_stat(elapsed, ok=False)
+                    state.gemini_decision_cooldown_until = time.time() + 60.0
+                    api_log(f"Decision API ({purpose}) -> HTTP 429 (cooldown 60s)")
+                elif resp.status == 400:
+                    state.record_decision_stat(elapsed, ok=False)
+                    err_txt = await resp.text()
+                    # Do NOT put Decision API on a 3m cooldown if a single message triggered safety filters
+                    if "safety" not in err_txt.lower():
+                        state.gemini_decision_cooldown_until = time.time() + 30.0
+                    api_log(f"Decision API ({purpose}) -> HTTP 400 ({elapsed:.2f}s): {err_txt[:120]}")
+                else:
+                    state.record_decision_stat(elapsed, ok=False)
+                    err_txt = await resp.text()
+                    state.gemini_decision_cooldown_until = time.time() + 180.0
+                    api_log(f"Decision API ({purpose}) -> HTTP {resp.status} ({elapsed:.2f}s): {err_txt[:100]}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            state.record_decision_stat(time.monotonic() - t0, ok=False)
+            state.gemini_decision_cooldown_until = time.time() + 120.0
+            api_log(f"Decision API ({purpose}) -> skipped ({type(e).__name__})")
+
+    if allow_cf_fallback and _can_use_cf_decision_fallback():
+        return await _call_cloudflare_clef_decision_fallback(
+            shared_input, questions, timeout_sec=max(4.5, timeout_sec), purpose=purpose
+        )
     return {}
 
 
@@ -847,9 +986,7 @@ async def filter_search_snippets_with_decision_1(
     """
     if not items or len(items) < 2:
         return list(items[:max_keep])
-    if not GEMINI_API_KEY or not GEMINI_DECISION_MODEL:
-        return list(items[:max_keep])
-    if time.time() < state.gemini_decision_cooldown_until:
+    if not _has_any_decision_backend(allow_cf=True):
         return list(items[:max_keep])
 
     candidates = list(items[:8])
@@ -955,9 +1092,7 @@ async def arbitrate_fact_check_with_decision_1(
     """
     if not previous_claim or not user_challenge or not search_evidence:
         return None
-    if not GEMINI_API_KEY or not GEMINI_DECISION_MODEL:
-        return None
-    if time.time() < state.gemini_decision_cooldown_until:
+    if not _has_any_decision_backend(allow_cf=True):
         return None
 
     shared_input = (
@@ -1023,11 +1158,10 @@ async def triage_image_with_decision_1(
     Phase 2 Multimodal Pre-OCR Triage (~250-350ms, ~260 tokens at low resolution):
     Classifies an image BEFORE launching OCR / SauceNAO / IQDB / trace.moe so code
     screenshots, documents, and real-world product photos skip anime reverse-search
-    completely and receive tailored OCR prompts.
+    completely and receive tailored OCR prompts. Automatically falls back to
+    Cloudflare `@cf/cloudflare/clef-flash` during Google AI Studio outages.
     """
-    if not b64_img or not GEMINI_API_KEY or not GEMINI_DECISION_MODEL:
-        return None
-    if time.time() < state.gemini_decision_cooldown_until:
+    if not b64_img or not _has_any_decision_backend(allow_cf=True):
         return None
 
     safe_mime = (mime_type or "image/jpeg").strip().lower()
@@ -1071,12 +1205,11 @@ async def triage_pdf_with_decision_1(
     Phase 2 Multimodal PDF Triage using Decision-1's native `document` block (`application/pdf`):
     Inspects scanned/image-only PDFs directly without rendering pages locally on 0.1 vCPU,
     determining readability, category, and whether `gemini-4-hydrogen` is needed.
+    (Gemini-only since Cloudflare Clef-flash does not accept PDF `document` inputs.)
     """
-    if not pdf_bytes or not GEMINI_API_KEY or not GEMINI_DECISION_MODEL:
+    if not pdf_bytes or not _has_any_decision_backend(allow_cf=False):
         return None
     if len(pdf_bytes) > MAX_NATIVE_INLINE_PDF_BYTES:
-        return None
-    if time.time() < state.gemini_decision_cooldown_until:
         return None
 
     b64_pdf = ""
@@ -1125,7 +1258,7 @@ async def triage_pdf_with_decision_1(
             },
         }
         answers = await call_gemini_decision_orchestrator(
-            shared_input, questions, timeout_sec=8.0, purpose="PDFTriage"
+            shared_input, questions, timeout_sec=8.0, purpose="PDFTriage", allow_cf_fallback=False
         )
         if not answers:
             return None

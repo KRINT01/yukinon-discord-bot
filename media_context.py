@@ -43,9 +43,12 @@ from search_engine import (
 )
 from llm import (
     get_google_model_cooldown,
-    discover_active_groq_vision_models,
     call_gemma_ai_studio_vision,
     call_cloudflare_vision_chat,
+    call_cloudflare_vision_fallback_qwen,
+    call_cloudflare_multi_image_vision_qwen,
+    call_groq_vision_chat,
+    call_groq_multi_image_vision,
     call_gemini_generate_content_self_healing,
     triage_image_with_decision_1,
     triage_pdf_with_decision_1,
@@ -1944,17 +1947,43 @@ async def extract_multi_images_batch_ocr(
     gemini_timeout = min(38, 18 + (2 * len(encoded_images)))
     cf_timeout = min(55, 25 + (3 * len(encoded_images)))
 
+    async def _run_multi_qwen_vision_fallbacks() -> str:
+        prefix = f"{triage_header}\n" if triage_header else ""
+        # Tier 3: Groq Qwen 3.8 27B Vision (reserved exclusively for Vision)
+        gq_out = await call_groq_multi_image_vision(
+            encoded_images,
+            batch_prompt,
+            max_tokens=min(3072, out_tokens),
+            timeout_sec=38,
+            purpose=f"MultiImageOCR({len(encoded_images)}p)",
+        )
+        if gq_out:
+            return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{prefix}{gq_out}"
+        # Tier 4: Cloudflare Qwen 3.8 27B Vision Fallback (`@cf/qwen/qwen3.8-27b`, `reasoning_effort="low"`)
+        cfq_out = await call_cloudflare_multi_image_vision_qwen(
+            encoded_images,
+            batch_prompt,
+            timeout_sec=cf_timeout,
+            max_tokens=min(3072, out_tokens),
+            purpose=f"MultiImageOCR-Qwen({len(encoded_images)}p)",
+        )
+        if cfq_out:
+            return f"=== Unified Multi-Image Visual & OCR Analysis ({len(encoded_images)} Images) ===\n{prefix}{cfq_out}"
+        return ""
+
     try:
         if (not has_gemini or _is_google_ai_studio_congested()) and has_cf:
-            return await _call_cf_multi_image_batch(
+            res = await _call_cf_multi_image_batch(
                 encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=min(3072, out_tokens), triage_header=triage_header
             )
+            return res or await _run_multi_qwen_vision_fallbacks()
         if has_gemini and not has_cf:
-            return await _call_gemini_multi_image_batch(
+            res = await _call_gemini_multi_image_batch(
                 encoded_images, batch_prompt, timeout_sec=gemini_timeout, max_output_tokens=out_tokens, triage_header=triage_header
             )
+            return res or await _run_multi_qwen_vision_fallbacks()
         if not has_gemini and not has_cf:
-            return ""
+            return await _run_multi_qwen_vision_fallbacks()
 
         gemini_task = asyncio.create_task(
             _call_gemini_multi_image_batch(
@@ -1969,9 +1998,10 @@ async def extract_multi_images_batch_ocr(
                     return res
             except Exception:
                 pass
-            return await _call_cf_multi_image_batch(
+            res_cf = await _call_cf_multi_image_batch(
                 encoded_images, batch_prompt, timeout_sec=cf_timeout, max_tokens=min(3072, out_tokens), triage_header=triage_header
             )
+            return res_cf or await _run_multi_qwen_vision_fallbacks()
 
         api_log(f"Hedge (MultiImageOCR {len(encoded_images)}p) -> Gemini >16s; racing Cloudflare batch in parallel")
         cf_task = asyncio.create_task(
@@ -2002,7 +2032,7 @@ async def extract_multi_images_batch_ocr(
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
-        return ""
+        return await _run_multi_qwen_vision_fallbacks()
     finally:
         encoded_images.clear()
 
@@ -2123,6 +2153,14 @@ async def inspect_image_details_deep_async(
                 out = await _call_cf_multi_image_batch(
                     encoded_batch, deep_prompt, timeout_sec=30, max_tokens=2048
                 )
+            if not out:
+                out = await call_groq_multi_image_vision(
+                    encoded_batch, deep_prompt, max_tokens=2048, timeout_sec=28, purpose="Deep Image Detail Groq"
+                )
+            if not out:
+                out = await call_cloudflare_multi_image_vision_qwen(
+                    encoded_batch, deep_prompt, timeout_sec=32, max_tokens=2048, purpose="Deep Image Detail CF Qwen"
+                )
             encoded_batch.clear()
             release_unused_memory()
             return out.strip()
@@ -2152,6 +2190,24 @@ async def inspect_image_details_deep_async(
             max_tokens=3072,
             purpose="Deep Image Detail CF",
             enable_thinking=True,
+        )
+    if not vis_out:
+        vis_out = await call_groq_vision_chat(
+            deep_prompt,
+            mime_type,
+            b64_img,
+            max_tokens=3072,
+            timeout_sec=22,
+            purpose="Deep Image Detail Groq",
+        )
+    if not vis_out:
+        vis_out = await call_cloudflare_vision_fallback_qwen(
+            deep_prompt,
+            mime_type,
+            b64_img,
+            max_tokens=3072,
+            purpose="Deep Image Detail CF Qwen",
+            timeout_sec=24,
         )
     b64_img = ""
     release_unused_memory()
@@ -2287,49 +2343,31 @@ async def extract_image_via_transient_ocr(
         if cf_ocr:
             vision_result = cf_ocr
 
-    # Tier 4: Groq LPU Vision (`qwen/qwen3.8-27b`)
+    # Tier 4: Groq LPU Vision (`qwen/qwen3.8-27b` — reserved strictly for Vision fallback)
     if not vision_result and GROQ_API_KEY:
-        groq_candidates = await discover_active_groq_vision_models()
-        groq_host = "api." + "groq.com"
-        chat_url = f"{HTTPS}{groq_host}/openai/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        session = get_http_session()
-        for g_mod in groq_candidates:
-            t0 = time.monotonic()
-            try:
-                groq_vision_payload = {
-                    "model": g_mod,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}},
-                                {"type": "text", "text": gemma_ocr_prompt},
-                            ],
-                        }
-                    ],
-                    "temperature": 0.0,
-                    "max_tokens": 3072,
-                }
-                async with session.post(
-                    chat_url, headers=headers, json=groq_vision_payload, timeout=aiohttp.ClientTimeout(total=20)
-                ) as resp:
-                    elapsed = time.monotonic() - t0
-                    if resp.status == 200:
-                        state.active_groq_vision_model = g_mod
-                        g_data = await resp.json()
-                        content = _strip_vision_thought_blocks(g_data["choices"][0]["message"]["content"] or "")
-                        if content:
-                            state.record_provider_call("groq")
-                            api_log(f"Image OCR (Tier 4 Groq) -> {g_mod} 200 OK ({elapsed:.2f}s)")
-                            vision_result = content
-                            break
-                    api_log(f"Image OCR (Tier 4 Groq) -> {g_mod} HTTP {resp.status}; trying next candidate")
-            except Exception as e:
-                api_log(f"Image OCR (Tier 4 Groq) -> {g_mod} failed ({type(e).__name__}); trying next candidate")
+        gq_ocr = await call_groq_vision_chat(
+            gemma_ocr_prompt,
+            mime_type,
+            b64_img,
+            max_tokens=3072,
+            timeout_sec=20,
+            purpose="Image OCR Tier 4 Groq",
+        )
+        if gq_ocr:
+            vision_result = gq_ocr
+
+    # Tier 5: Cloudflare Workers AI Qwen 3.8 27B Vision (`@cf/qwen/qwen3.8-27b`, `reasoning_effort="low"`)
+    if not vision_result:
+        cfq_ocr = await call_cloudflare_vision_fallback_qwen(
+            gemma_ocr_prompt,
+            mime_type,
+            b64_img,
+            max_tokens=3072,
+            purpose="Image OCR Tier 5 CF Qwen",
+            timeout_sec=24,
+        )
+        if cfq_ocr:
+            vision_result = cfq_ocr
 
     out_parts = []
     if triage_type:

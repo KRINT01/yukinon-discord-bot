@@ -548,6 +548,13 @@ async def query_ai_chat(
             if ans:
                 return ans
 
+            if CF_CHAT_FAST_MODEL and CF_CHAT_FAST_MODEL != CF_CODE_MODEL:
+                ans = await call_cloudflare_gpt_oss(
+                    messages, cf_model=CF_CHAT_FAST_MODEL, temperature=temperature, is_coding=True, purpose="CodeGLM", tool_ctx=active_tool_ctx
+                )
+                if ans:
+                    return ans
+
             if GEMINI_API_KEY:
                 ans = await call_gemini_chat_messages(
                     messages, temperature=temperature, purpose="CodeGemini", thinking_level="LOW", tool_ctx=active_tool_ctx
@@ -561,7 +568,9 @@ async def query_ai_chat(
             if ans:
                 return ans
 
-            ans = await call_cloudflare_gemma_chat(messages, temperature=temperature, max_tokens=4096, purpose="Code")
+            ans = await call_cloudflare_gemma_chat(
+                messages, temperature=temperature, max_tokens=4096, purpose="Code", tool_ctx=active_tool_ctx
+            )
             if ans:
                 return ans
 
@@ -589,7 +598,7 @@ async def query_ai_chat(
 
         # PATH B: Compound Multi-Intent / Native Function-Calling / Search / Fact-Check / Manga & Social Media
         # Persona-First Priority: Gemini Flash -> Gemma 4 AI Studio (native systemInstruction + tools)
-        # -> Cloudflare Gemma 4 (when no live tools needed) -> Groq (qwen3.8-27b first) -> gpt-oss-20b last resort!
+        # -> Cloudflare Gemma 4 (native tools) -> Cloudflare GLM-4.7-Flash -> Groq (gpt-oss-20b; qwen3.8 reserved for Vision)
         if prefer_high_knowledge_llm and not is_coding:
             target_temp = 0.2 if (did_search or is_user_correction or is_compound) else temperature
             b_purpose = (
@@ -652,20 +661,36 @@ async def query_ai_chat(
                 fb_messages, has_collected_obs = _build_fallback_msgs_with_obs()
                 fb_tool_ctx = None if (has_collected_obs and active_tool_ctx and active_tool_ctx.did_search) else active_tool_ctx
 
-            # 3. Cloudflare Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`) when no live tools remain needed
-            #    (including right after Gemini fetched search hits before failing on Round 2!)
-            if not fb_tool_ctx:
-                ans = await _call_cf_gemma_hedged_with_groq(
-                    fb_messages,
-                    temperature=target_temp,
-                    max_tokens=2048,
-                    purpose=b_purpose,
-                    hedge_delay_sec=10.0 if is_japanese_or_social_media else 6.5,
-                )
-                if ans:
-                    return ans
+            # 3. Cloudflare Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`) with native parallel tool calling!
+            #    Runs directly with tools when `fb_tool_ctx` is active, or hedged with Groq when synthesis-only.
+            ans = await _call_cf_gemma_hedged_with_groq(
+                fb_messages,
+                temperature=target_temp,
+                max_tokens=2048,
+                purpose=b_purpose,
+                hedge_delay_sec=10.0 if is_japanese_or_social_media else 6.5,
+                tool_ctx=fb_tool_ctx,
+            )
+            if ans:
+                return ans
+            fb_messages, has_collected_obs = _build_fallback_msgs_with_obs()
+            fb_tool_ctx = None if (has_collected_obs and active_tool_ctx and active_tool_ctx.did_search) else active_tool_ctx
 
-            # 4. Groq LPU (`qwen/qwen3.8-27b` prioritized ahead of `openai/gpt-oss-20b`)
+            # 4. Cloudflare Fast Multilingual Fallback (`@cf/zai-org/glm-4.7-flash`, 131K ctx, native tools)
+            ans = await call_cloudflare_gpt_oss(
+                fb_messages,
+                cf_model=CF_CHAT_FAST_MODEL,
+                temperature=target_temp,
+                is_coding=False,
+                purpose=b_purpose,
+                tool_ctx=fb_tool_ctx,
+            )
+            if ans:
+                return ans
+            fb_messages, has_collected_obs = _build_fallback_msgs_with_obs()
+            fb_tool_ctx = None if (has_collected_obs and active_tool_ctx and active_tool_ctx.did_search) else active_tool_ctx
+
+            # 5. Groq LPU Chat Fallback (`openai/gpt-oss-20b`; `qwen/qwen3.8-27b` is reserved strictly for Vision)
             if GROQ_API_KEY:
                 groq_search_candidates = await get_groq_search_and_chat_candidates()
                 for g_mod in groq_search_candidates:
@@ -684,30 +709,6 @@ async def query_ai_chat(
                             return ans
                     except Exception:
                         continue
-
-            # 5. Cloudflare Gemma 4 final persona fallback (with any tool results gathered so far)
-            fb_messages, _ = _build_fallback_msgs_with_obs()
-            if fb_tool_ctx is not None:
-                ans = await call_cloudflare_gemma_chat(
-                    fb_messages,
-                    temperature=target_temp,
-                    max_tokens=2048,
-                    purpose=b_purpose,
-                )
-                if ans:
-                    return ans
-
-            # 6. Cloudflare GPT-OSS-20B (last resort only, with persona lock & carried tool results)
-            ans = await call_cloudflare_gpt_oss(
-                fb_messages,
-                cf_model=CF_CHAT_FAST_MODEL,
-                temperature=target_temp,
-                is_coding=False,
-                purpose=b_purpose,
-                tool_ctx=fb_tool_ctx,
-            )
-            if ans:
-                return ans
 
         # PATH C: Casual Chat, Weather & Voice Chat (Thai-strong Gemma 4 / Gemini Flash-Lite before Groq)
         chat_temp = 0.25 if (did_search or is_user_correction or is_weather_query) else temperature
@@ -730,17 +731,30 @@ async def query_ai_chat(
             max_tokens=1024,
             purpose=c_purpose,
             hedge_delay_sec=6.5,
+            tool_ctx=active_tool_ctx,
         )
         if ans:
             return ans
 
-        ans = await call_gemma_ai_studio_chat(
+        if GEMINI_API_KEY and not is_google_ai_studio_congested():
+            ans = await call_gemma_ai_studio_chat(
+                messages,
+                temperature=chat_temp,
+                max_output_tokens=1024,
+                purpose=c_purpose,
+                tool_ctx=active_tool_ctx,
+                prefer_fast_26b=is_voice_mode,
+            )
+            if ans:
+                return ans
+
+        ans = await call_cloudflare_gpt_oss(
             messages,
+            cf_model=CF_CHAT_FAST_MODEL,
             temperature=chat_temp,
-            max_output_tokens=1024,
-            purpose=c_purpose,
+            is_coding=False,
+            purpose="VoiceChatFallback" if is_voice_mode else "ChatFallback",
             tool_ctx=active_tool_ctx,
-            prefer_fast_26b=is_voice_mode,
         )
         if ans:
             return ans
@@ -760,17 +774,6 @@ async def query_ai_chat(
                         return ans
                 except Exception:
                     continue
-
-        ans = await call_cloudflare_gpt_oss(
-            messages,
-            cf_model=CF_CHAT_FAST_MODEL,
-            temperature=chat_temp,
-            is_coding=False,
-            purpose="VoiceChatFallback" if is_voice_mode else "ChatFallback",
-            tool_ctx=active_tool_ctx,
-        )
-        if ans:
-            return ans
 
         if GEMINI_API_KEY and not is_voice_mode:
             ans = await call_gemini_chat_messages(

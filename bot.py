@@ -35,6 +35,8 @@ from config import (
     CF_ACCOUNT_ID,
     CF_IMAGE_MODEL,
     CF_VISION_MODEL,
+    CF_VISION_FALLBACK_MODEL,
+    CF_DECISION_MODEL,
     CF_CODE_MODEL,
     CF_CHAT_FAST_MODEL,
     GEMINI_API_KEY,
@@ -223,6 +225,7 @@ async def _preload_image_attachments_and_thumb(
     Preloads up to 4 image attachments and decodes the first image ONCE via
     `encode_ocr_and_decision_thumb_sync` to produce BOTH the 512px PreRoute thumbnail
     and the OCR-ready JPEG reused directly by `extract_all_context` (zero duplicate decode).
+    Supports both `gemini-decision-1` AND Cloudflare `@cf/cloudflare/clef-flash` fallback.
     """
     preloaded: dict[int, bytes] = {}
     all_valid_imgs = [
@@ -239,7 +242,17 @@ async def _preload_image_attachments_and_thumb(
 
     low_res_imgs: list[tuple[str, str]] = []
     preencoded_ocr: dict[int, tuple[str, str, bool, int, int]] = {}
-    if preloaded and GEMINI_API_KEY and time.time() >= state.gemini_decision_cooldown_until:
+    now = time.time()
+    has_decision_backend = bool(
+        (GEMINI_API_KEY and GEMINI_DECISION_MODEL and now >= state.gemini_decision_cooldown_until)
+        or (
+            CF_ACCOUNT_ID
+            and CF_API_TOKEN
+            and CF_DECISION_MODEL
+            and now >= getattr(state, "cf_decision_cooldown_until", 0.0)
+        )
+    )
+    if preloaded and has_decision_backend:
         try:
             first_att_id = next(iter(preloaded))
             first_bytes = preloaded[first_att_id]
@@ -276,6 +289,7 @@ def _collect_health_metrics() -> dict:
     )
     gemini_cd = max(0, int(state.gemini_grounding_cooldown_until - now))
     decision_cd = max(0, int(state.gemini_decision_cooldown_until - now))
+    cf_decision_cd = max(0, int(getattr(state, "cf_decision_cooldown_until", 0.0) - now))
     hydrogen_cd = max(0, int(state.gemini_hydrogen_cooldown_until - now))
     live_stt_cd = max(0, int(state.gemini_transcribe_live_cooldown_until - now))
     edge_cd = max(0, int(state.edge_tts_cooldown_until - now))
@@ -323,8 +337,11 @@ def _collect_health_metrics() -> dict:
             "groq_search_model": state.active_groq_search_model if GROQ_API_KEY else None,
             "groq_vision_model": state.active_groq_vision_model if GROQ_API_KEY else None,
             "cloudflare_enabled": bool(CF_API_TOKEN and CF_ACCOUNT_ID),
+            "cloudflare_decision_model": CF_DECISION_MODEL if CF_API_TOKEN else None,
+            "cloudflare_decision_cooldown_sec": cf_decision_cd,
             "cloudflare_image_model": CF_IMAGE_MODEL if CF_API_TOKEN else None,
             "cloudflare_gemma_model": CF_VISION_MODEL if CF_API_TOKEN else None,
+            "cloudflare_vision_fallback_model": CF_VISION_FALLBACK_MODEL if CF_API_TOKEN else None,
             "cloudflare_gpt_oss_models": [CF_CODE_MODEL, CF_CHAT_FAST_MODEL] if CF_API_TOKEN else [],
             "gemini_enabled": bool(GEMINI_API_KEY),
             "gemini_decision_orchestrator": GEMINI_DECISION_MODEL if GEMINI_API_KEY else None,
@@ -382,7 +399,7 @@ async def handle_root(request: web.Request) -> web.Response:
         <p><b>Provider Calls:</b> Flash <code>{pc.get('gemini_flash', 0)}</code> | Hydrogen <code>{pc.get('gemini_hydrogen', 0)}</code> | Gemma <code>{pc.get('gemma_ai_studio', 0)}</code> | Groq <code>{pc.get('groq', 0)}</code> | CF <code>{pc.get('cloudflare', 0)}</code></p>
         <hr style="border: 0; border-top: 1px solid #e5e7eb; margin: 16px 0;">
         <p><b>Google AI Studio:</b> {"Enabled (Orchestrator: <code>" + str(ai['gemini_decision_orchestrator']) + "</code> | Heavy Specialist: <code>" + str(ai['gemini_heavy_specialist']) + "</code> | Live STT: <code>" + str(ai['gemini_transcribe_live_model']) + "</code> | Gemma 4: <code>" + str(ai['gemma_active_model']) + "</code> | Flash-Lite: <code>" + str(ai['gemini_active_model']) + "</code>)" + gemini_cd_note if ai['gemini_enabled'] else "Disabled"}</p>
-        <p><b>Cloudflare Workers AI:</b> {"Enabled (Code: <code>" + CF_CODE_MODEL + "</code> | Fast: <code>" + CF_CHAT_FAST_MODEL + "</code> | Vision/Gemma: <code>" + str(ai['cloudflare_gemma_model']) + "</code> | Image: <code>" + str(ai['cloudflare_image_model']) + "</code>)" if ai['cloudflare_enabled'] else "Disabled"}</p>
+        <p><b>Cloudflare Workers AI:</b> {"Enabled (Decision Fallback: <code>" + str(ai['cloudflare_decision_model']) + "</code> | Code: <code>" + CF_CODE_MODEL + "</code> | Fast: <code>" + CF_CHAT_FAST_MODEL + "</code> | Vision/Gemma: <code>" + str(ai['cloudflare_gemma_model']) + "</code> | Vision Fallback: <code>" + str(ai['cloudflare_vision_fallback_model']) + "</code> | Image: <code>" + str(ai['cloudflare_image_model']) + "</code>)" if ai['cloudflare_enabled'] else "Disabled"}</p>
         <p><b>Groq LPU Acceleration:</b> {"Enabled (Code: <code>" + GROQ_CODE_MODEL + "</code> | Search: <code>" + str(ai['groq_search_model']) + "</code> | Vision: <code>" + str(ai['groq_vision_model']) + "</code>)" if ai['groq_enabled'] else "Disabled"}</p>
         <p><b>Uptime:</b> {m['uptime_human']} ({m['uptime_sec']}s)</p>
     </body>

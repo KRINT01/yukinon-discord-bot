@@ -94,8 +94,10 @@ CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "").strip()
 CF_API_TOKEN = os.getenv("CF_API_TOKEN", "").strip()
 CF_IMAGE_MODEL = os.getenv("CF_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell").strip()
 CF_VISION_MODEL = os.getenv("CF_VISION_MODEL", "@cf/google/gemma-4-26b-a4b-it").strip()
+CF_VISION_FALLBACK_MODEL = os.getenv("CF_VISION_FALLBACK_MODEL", "@cf/qwen/qwen3.8-27b").strip()
+CF_DECISION_MODEL = os.getenv("CF_DECISION_MODEL", "@cf/cloudflare/clef-flash").strip()
 CF_CODE_MODEL = os.getenv("CF_CODE_MODEL", "@cf/openai/gpt-oss-120b").strip()
-CF_CHAT_FAST_MODEL = os.getenv("CF_CHAT_FAST_MODEL", "@cf/openai/gpt-oss-20b").strip()
+CF_CHAT_FAST_MODEL = os.getenv("CF_CHAT_FAST_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
 
 # Google AI Studio Free Tier (Decisions API + Gemini 3.5 Flash-Lite -> 3.1 Flash-Lite -> 3 Flash Preview + Hydrogen + Gemma 4 + Live STT)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -228,6 +230,7 @@ class RuntimeState:
         self.active_groq_vision_model: str = GROQ_VISION_FALLBACK_MODEL
         self.gemini_grounding_cooldown_until: float = 0.0
         self.gemini_decision_cooldown_until: float = 0.0
+        self.cf_decision_cooldown_until: float = 0.0
         self.gemini_hydrogen_cooldown_until: float = 0.0
         self.gemini_transcribe_live_cooldown_until: float = 0.0
         self.gemini_hydrogen_call_timestamps: deque = deque(maxlen=5)
