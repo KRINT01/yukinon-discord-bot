@@ -22,16 +22,24 @@ except ImportError:
     davey = None
 
 
+_GLIBC_LIBC = None
+
+
 def _configure_glibc_low_ram_allocator():
     """
-    Locks Linux glibc `M_TRIM_THRESHOLD` (-1) and `M_MMAP_THRESHOLD` (-3) to 128 KB so
-    multi-megabyte Pillow RGB image buffers use `mmap()` instead of permanently expanding
-    the `brk` heap on 512 MB Render containers.
+    Locks Linux glibc `M_TRIM_THRESHOLD` (-1) and `M_MMAP_THRESHOLD` (-3) to 128 KB and caps
+    `M_ARENA_MAX` (-8) (default 2, override via `MALLOC_ARENA_MAX`) so multi-megabyte Pillow/OpenCV
+    buffers allocated inside `asyncio.to_thread()` workers use `mmap()` and return cleanly to the OS
+    instead of fragmenting per-thread `brk` arenas on 512 MB Render containers.
     """
+    global _GLIBC_LIBC
     try:
         libc = ctypes.CDLL("libc.so.6")
-        libc.mallopt(-1, 131072)  # M_TRIM_THRESHOLD = 128 KB
-        libc.mallopt(-3, 131072)  # M_MMAP_THRESHOLD = 128 KB
+        _GLIBC_LIBC = libc
+        arena_max = max(1, int(os.getenv("MALLOC_ARENA_MAX", "2") or "2"))
+        libc.mallopt(-1, 131072)     # M_TRIM_THRESHOLD = 128 KB
+        libc.mallopt(-3, 131072)     # M_MMAP_THRESHOLD = 128 KB
+        libc.mallopt(-8, arena_max)  # M_ARENA_MAX = 2 (caps worker-thread arenas)
         libc.malloc_trim(0)
     except Exception:
         pass
@@ -512,7 +520,7 @@ def release_unused_memory() -> tuple[float, float]:
     gc.collect(2)
 
     try:
-        libc = ctypes.CDLL("libc.so.6")
+        libc = _GLIBC_LIBC or ctypes.CDLL("libc.so.6")
         libc.mallopt(-1, 131072)
         libc.mallopt(-3, 131072)
         libc.malloc_trim(0)

@@ -46,7 +46,7 @@ from manga_cv_render import (
     _release_cv_page_masks,
 )
 
-MANGA_TRANSLATOR_VERSION = "v17"
+MANGA_TRANSLATOR_VERSION = "v17.1"
 MANGA_CV_VER = getattr(_mcr_mod, "MANGA_CV_RENDER_VERSION", "old")
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
 # Bundle 2 dynamic parallel hedge: faster 15s recovery on typical 2-4p X threads, patient 25s on 5-12p batches
@@ -2118,6 +2118,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
     ref_msg = await resolve_referenced_message(msg) if getattr(msg, "reference", None) else None
 
     job_dir = ""
+    req_id = ""
     disk_pages: list[tuple[str, str]] = []
     embed_meta_sections: list[str] = []
     cv_bubbles_per_page: list[list[dict]] = []
@@ -2402,3 +2403,10 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
         disk_pages.clear()
         if job_dir:
             await asyncio.to_thread(_cleanup_manga_job_dir_sync, job_dir)
+        if req_id or job_dir:
+            before_mb, after_mb = release_unused_memory()
+            freed_mb = round(max(0.0, before_mb - after_mb), 1)
+            api_log(
+                f"MangaCleanup [req={req_id or 'pre'}] -> RAM {before_mb} MB -> {after_mb} MB"
+                + (f" (freed {freed_mb} MB)" if freed_mb > 0 else "")
+            )

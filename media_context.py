@@ -2124,6 +2124,7 @@ async def inspect_image_details_deep_async(
                     encoded_batch, deep_prompt, timeout_sec=30, max_tokens=2048
                 )
             encoded_batch.clear()
+            release_unused_memory()
             return out.strip()
 
     raw_b, fname = images_list[0]
@@ -2152,6 +2153,8 @@ async def inspect_image_details_deep_async(
             purpose="Deep Image Detail CF",
             enable_thinking=True,
         )
+    b64_img = ""
+    release_unused_memory()
     return (vis_out or "").strip()
 
 
@@ -2595,7 +2598,7 @@ async def extract_all_context(
                     has_code_file = True
                 blocks.append(res_block)
 
-    if parsed_heavy_doc or embed_images:
+    if parsed_heavy_doc or embed_images or processed_image_count > 0:
         embed_images.clear()
         release_unused_memory()
 
