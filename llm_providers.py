@@ -1270,6 +1270,7 @@ async def call_cloudflare_gemma_chat(
                 api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} HTTP {resp.status} ({elapsed:.2f}s)")
                 return ""
         except asyncio.CancelledError:
+            api_log(f"Cloudflare ({purpose}) -> {CF_VISION_MODEL} cancelled by hedge ({time.monotonic() - t0:.2f}s)")
             raise
         except Exception as e:
             _CF_GEMMA_COOLDOWN_UNTIL = time.time() + 120.0
@@ -1308,13 +1309,14 @@ async def _call_cf_gemma_hedged_with_groq(
     purpose: str = "Chat",
     hedge_delay_sec: float = 6.5,
     tool_ctx: ToolExecutionContext | None = None,
+    hedge_with_cf_fast: bool = False,
 ) -> str:
     cf_available = bool(CF_ACCOUNT_ID and CF_API_TOKEN and time.time() >= _CF_GEMMA_COOLDOWN_UNTIL)
     if not cf_available:
         return ""
 
     # When live native tools are enabled on `tool_ctx`, run Cloudflare Gemma 4 directly without
-    # a concurrent Groq race so side-effecting tools (OT, memory, image gen) can never double-fire.
+    # a concurrent hedge race so side-effecting tools (OT, memory, image gen) can never double-fire.
     if tool_ctx is not None:
         return await call_cloudflare_gemma_chat(
             messages,
@@ -1328,7 +1330,15 @@ async def _call_cf_gemma_hedged_with_groq(
         call_cloudflare_gemma_chat(messages, temperature=temperature, max_tokens=max_tokens, purpose=purpose)
     )
 
-    if not GROQ_API_KEY:
+    can_cf_fast_hedge = bool(
+        hedge_with_cf_fast
+        and CF_CHAT_FAST_MODEL
+        and CF_CHAT_FAST_MODEL != CF_VISION_MODEL
+        and time.time() >= _CF_MODEL_COOLDOWN_UNTIL.get(CF_CHAT_FAST_MODEL, 0.0)
+    )
+    if hedge_with_cf_fast and not can_cf_fast_hedge:
+        return await cf_task
+    if (not hedge_with_cf_fast) and (not GROQ_API_KEY):
         return await cf_task
 
     done, _ = await asyncio.wait({cf_task}, timeout=hedge_delay_sec)
@@ -1338,11 +1348,23 @@ async def _call_cf_gemma_hedged_with_groq(
         except Exception:
             return ""
 
-    api_log(f"Hedge ({purpose}) -> CF >{hedge_delay_sec:.1f}s; racing Groq backup in parallel")
-    groq_task = asyncio.create_task(
-        _run_fast_groq_hedge(messages, temperature=temperature, purpose=f"{purpose}-Hedge")
-    )
-    tasks = {cf_task, groq_task}
+    if hedge_with_cf_fast:
+        api_log(f"Hedge ({purpose}) -> CF >{hedge_delay_sec:.1f}s; racing {CF_CHAT_FAST_MODEL} in parallel")
+        backup_task = asyncio.create_task(
+            call_cloudflare_gpt_oss(
+                messages,
+                cf_model=CF_CHAT_FAST_MODEL,
+                temperature=temperature,
+                is_coding=False,
+                purpose=f"{purpose}-Hedge",
+            )
+        )
+    else:
+        api_log(f"Hedge ({purpose}) -> CF >{hedge_delay_sec:.1f}s; racing Groq backup in parallel")
+        backup_task = asyncio.create_task(
+            _run_fast_groq_hedge(messages, temperature=temperature, purpose=f"{purpose}-Hedge")
+        )
+    tasks = {cf_task, backup_task}
     try:
         while tasks:
             done_set, pending_set = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -1532,9 +1554,15 @@ async def call_cloudflare_gpt_oss(
                     api_log(f"Cloudflare Chat ({purpose}) -> {target_model} HTTP 429 ({elapsed:.2f}s)")
                     return ""
                 else:
+                    if resp.status >= 500:
+                        _CF_MODEL_COOLDOWN_UNTIL[target_model] = time.time() + 60.0
                     api_log(f"Cloudflare Chat ({purpose}) -> {target_model} HTTP {resp.status} ({elapsed:.2f}s)")
                     return ""
+        except asyncio.CancelledError:
+            api_log(f"Cloudflare Chat ({purpose}) -> {target_model} cancelled by hedge ({time.monotonic() - t1:.2f}s)")
+            raise
         except Exception as e:
+            _CF_MODEL_COOLDOWN_UNTIL[target_model] = time.time() + 60.0
             api_log(f"Cloudflare Chat ({purpose}) -> {target_model} failed ({type(e).__name__})")
             return ""
     return ""

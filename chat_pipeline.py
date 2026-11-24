@@ -662,14 +662,16 @@ async def query_ai_chat(
                 fb_tool_ctx = None if (has_collected_obs and active_tool_ctx and active_tool_ctx.did_search) else active_tool_ctx
 
             # 3. Cloudflare Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`) with native parallel tool calling!
-            #    Runs directly with tools when `fb_tool_ctx` is active, or hedged with Groq when synthesis-only.
+            #    Runs directly with tools when `fb_tool_ctx` is active; for MangaSocialChat hedges at 16s
+            #    with `@cf/zai-org/glm-4.7-flash` (never letting Groq `gpt-oss-20b` preempt Thai prose).
             ans = await _call_cf_gemma_hedged_with_groq(
                 fb_messages,
                 temperature=target_temp,
                 max_tokens=2048,
                 purpose=b_purpose,
-                hedge_delay_sec=10.0 if is_japanese_or_social_media else 6.5,
+                hedge_delay_sec=16.0 if is_japanese_or_social_media else 6.5,
                 tool_ctx=fb_tool_ctx,
+                hedge_with_cf_fast=is_japanese_or_social_media,
             )
             if ans:
                 return ans
