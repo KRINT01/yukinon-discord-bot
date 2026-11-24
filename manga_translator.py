@@ -46,7 +46,7 @@ from manga_cv_render import (
     _release_cv_page_masks,
 )
 
-MANGA_TRANSLATOR_VERSION = "v16"
+MANGA_TRANSLATOR_VERSION = "v17"
 MANGA_CV_VER = getattr(_mcr_mod, "MANGA_CV_RENDER_VERSION", "old")
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
 # Bundle 2 dynamic parallel hedge: faster 15s recovery on typical 2-4p X threads, patient 25s on 5-12p batches
@@ -65,6 +65,10 @@ _ASCII_LATIN_WORD_REGEX = re.compile(r"[A-Za-z]{2,}")
 _COMMON_SAFE_THAI_LOAN_ABBREVS = frozenset({
     "ok", "dm", "hp", "mp", "xp", "tv", "pc", "ai", "sns", "id", "ng", "vr", "gps", "rpg", "npc", "bgm", "op", "ed",
 })
+_LEAKED_CONTAINER_ARTIFACT_REGEX = re.compile(
+    r"^(?:\{\s*['\"][^'\"]+['\"]\s*:.*\}|\[\s*['\"\{].*\])$",
+    re.DOTALL,
+)
 
 # Set-of-Mark (SoM) JSON responseSchema with explicit `propertyOrdering`:
 # - Every numbered CV bubble `[k]` maps 1-to-1 via `"bubble_id": k` (zero coordinate drift!).
@@ -377,11 +381,14 @@ def _extract_norm_box_2d(raw_box) -> list[float] | None:
 def _is_valid_target_script(tr_text: str, src_text: str, target_lang_name: str) -> bool:
     """
     Universal script sanity check (zero ad-hoc typo regexes):
-    Rejects empty outputs, leaked Korean Hangul, or translations missing any target-language
-    script character when `source_text` contained Japanese/East Asian text.
+    Rejects empty outputs, leaked Python/JSON dict/list artifacts (e.g. `{'1': '...'}`),
+    leaked Korean Hangul, or translations missing any target-language script character
+    when `source_text` contained Japanese/East Asian text.
     """
     raw_tr = str(tr_text or "").strip()
     if not raw_tr or _HANGUL_REGEX.search(raw_tr):
+        return False
+    if _LEAKED_CONTAINER_ARTIFACT_REGEX.match(raw_tr):
         return False
     cleaned = _sanitize_text_for_manga_font(raw_tr)
     if not cleaned:
@@ -592,14 +599,48 @@ async def _recover_omitted_pages_async(
     return batch_results, cv_bubbles_per_page
 
 
+def _unwrap_polish_text_value(val, depth: int = 0) -> str:
+    """
+    Safely extracts a plain string from a Stage 2 polish JSON value without ever
+    stringifying a nested Python `dict`/`list` into `"{'1': '...'}"`:
+    - Plain `str` -> returned immediately (zero impact on standard flat responses).
+    - Nested `dict` with known text keys (`tr`, `translated_text`, `text`, ...) -> unwraps that key.
+    - Single-entry nested `dict` (e.g. `{"1": "อ๊ะ..."}`) or 1-element `list` -> unwraps recursively.
+    - Ambiguous multi-key dicts/lists -> returns `""` so Stage 1's clean draft is preserved.
+    """
+    if depth > 3 or val is None:
+        return ""
+    if isinstance(val, str):
+        return val.strip()
+    if isinstance(val, dict):
+        for key in ("tr", "translated_text", "translation", "text", "polished", "draft", "sum", "summary"):
+            if key in val:
+                unwrapped = _unwrap_polish_text_value(val[key], depth + 1)
+                if unwrapped:
+                    return unwrapped
+        if len(val) == 1:
+            only_val = next(iter(val.values()))
+            return _unwrap_polish_text_value(only_val, depth + 1)
+        return ""
+    if isinstance(val, list):
+        if len(val) == 1:
+            return _unwrap_polish_text_value(val[0], depth + 1)
+        return ""
+    return ""
+
+
 def _parse_polish_json_response(raw_out: str) -> tuple[dict[int, str], dict[int, str]]:
     """
     Parses Stage 2 Gemma 4 polish JSON (`{"s": {"1": "..."}, "b": {"0": "...", ...}}` or
-    flat `{"0": "..."}` fallback). Returns `(summary_map, bubble_map)`.
+    flat `{"0": "..."}` fallback). Safely unwraps nested single-entry or page-grouped dicts
+    (e.g. `{"0": {"1": "อ๊ะ..."}}` or `{"1": {"0": "...", "1": "..."}}`) without ever leaking
+    `str(dict)` artifacts. Returns `(summary_map, bubble_map)`.
     """
     if not raw_out:
         return {}, {}
-    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", raw_out).strip()
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", raw_out)
+    cleaned = re.sub(r"<\|channel>thought[\s\S]*?<channel\|>", "", cleaned)
+    cleaned = re.sub(r"<\|channel>thought\s*", "", cleaned).strip()
     cleaned = re.sub(r"^```(?:json)?|```$", "", cleaned).strip()
     m_obj = re.search(r"\{[\s\S]*\}", cleaned)
     if not m_obj:
@@ -625,7 +666,9 @@ def _parse_polish_json_response(raw_out: str) -> tuple[dict[int, str], dict[int,
     if isinstance(raw_s, dict):
         for k_str, val in raw_s.items():
             try:
-                summary_map[int(k_str)] = str(val or "").strip()
+                unwrapped_s = _unwrap_polish_text_value(val)
+                if unwrapped_s:
+                    summary_map[int(k_str)] = unwrapped_s
             except Exception:
                 continue
 
@@ -633,7 +676,29 @@ def _parse_polish_json_response(raw_out: str) -> tuple[dict[int, str], dict[int,
     if isinstance(raw_b, dict):
         for k_str, val in raw_b.items():
             try:
-                bubble_map[int(k_str)] = str(val or "").strip()
+                if isinstance(val, str):
+                    txt = val.strip()
+                    if txt:
+                        bubble_map[int(k_str)] = txt
+                elif isinstance(val, dict):
+                    # Handle page-grouped nested maps like `"1": {"0": "...", "1": "..."}`
+                    if (
+                        len(val) >= 2
+                        and all(str(ik).strip().isdigit() for ik in val.keys())
+                        and all(isinstance(iv, str) for iv in val.values())
+                    ):
+                        for ik, iv in val.items():
+                            txt = iv.strip()
+                            if txt:
+                                bubble_map[int(ik)] = txt
+                    else:
+                        unwrapped_b = _unwrap_polish_text_value(val)
+                        if unwrapped_b:
+                            bubble_map[int(k_str)] = unwrapped_b
+                else:
+                    unwrapped_b = _unwrap_polish_text_value(val)
+                    if unwrapped_b:
+                        bubble_map[int(k_str)] = unwrapped_b
             except Exception:
                 continue
     elif isinstance(raw_b, list):
@@ -641,18 +706,24 @@ def _parse_polish_json_response(raw_out: str) -> tuple[dict[int, str], dict[int,
             if isinstance(val, dict):
                 try:
                     ki = int(val.get("i", val.get("idx", idx_i)))
-                    bubble_map[ki] = str(val.get("tr") or val.get("translated_text") or "").strip()
+                    txt = _unwrap_polish_text_value(val)
+                    if txt:
+                        bubble_map[ki] = txt
                 except Exception:
                     continue
             elif isinstance(val, str):
-                bubble_map[idx_i] = val.strip()
+                txt = val.strip()
+                if txt:
+                    bubble_map[idx_i] = txt
     else:
         # Flat `{"0": "...", "1": "..."}` format
         for k_str, val in parsed.items():
             if k_str in ("s", "summaries", "b", "bubbles"):
                 continue
             try:
-                bubble_map[int(k_str)] = str(val or "").strip()
+                unwrapped_b = _unwrap_polish_text_value(val)
+                if unwrapped_b:
+                    bubble_map[int(k_str)] = unwrapped_b
             except Exception:
                 continue
 
@@ -847,7 +918,7 @@ async def _polish_single_chunk_gemma_async(
         f"and return polished, natural, typo-free {target_lang_name}.\n"
         f"RULES:\n{lang_guidance}\n"
         "- Keep lines concise enough to fit cleanly inside manga speech bubbles.\n"
-        "- Return ONLY valid JSON with this exact compact schema (include EVERY bubble index `i` and page number `p` present in INPUT):\n"
+        "- Return ONLY valid JSON with this exact compact flat-string schema (include EVERY bubble index `i` and page number `p` present in INPUT; values MUST be plain strings, NEVER nested objects):\n"
         '{"s": {"1": "polished summary"}, "b": {"0": "polished bubble 0"}}'
     )
     compact_json_input = json.dumps({"pages": chunk_pages}, ensure_ascii=False, separators=(",", ":"))
@@ -1214,7 +1285,7 @@ def _repair_truncated_manga_batch_json(raw_target: str) -> dict | None:
     last_close_brace = raw_target.rfind("}")
     while last_close_brace > 20:
         candidate = raw_target[: last_close_brace + 1]
-        for suffix in ("]}", "]}]}", "]}"):
+        for suffix in ("]}", "]}\n]}", "]}"):
             try:
                 obj = json.loads(candidate + suffix)
                 if isinstance(obj, dict) and isinstance(obj.get("pages"), list) and obj["pages"]:
@@ -1644,41 +1715,41 @@ and translate EVERY SINGLE speech bubble and narration/caption box on EVERY page
 
 CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
 1. MANDATORY 1-TO-1 NUMBERED BADGE CHECKLIST (`bubble_id`):
-   - Each page header lists the exact numbered badge IDs present on that page (`[1, 2, ..., K]`).
-   - You MUST inspect and output an entry for EVERY SINGLE badge ID `1..K` on that page — NEVER skip a badge ID, NEVER merge two separate badges into one entry, and NEVER put text from a DIFFERENT bubble into another bubble's badge ID!
-   - Double-check which exact RED/WHITE NUMBERED badge touches the bubble or narration box whose Japanese text you are reading before assigning `"bubble_id"`.
-   - MANDATORY: Translate BOTH spoken speech bubbles AND EVERY rectangular white/colored narration/caption box (คำบรรยาย)! If badge `k` contains ANY Japanese sentence, dialogue, monologue, or narration caption: set `"bubble_id": k`, `"should_translate": true`, `"box_2d": null`, transcribe ONLY the exact `"source_text"` visually INSIDE badge `k`, and write its natural {target_lang_name} `"translated_text"`.
-   - CRITICAL ANTI-DUPLICATE RULE: If badge `k` outlines a character face, body, clothing, hand, background art, or pure SFX with NO dialogue text visually inside badge `k`, you MUST set `"should_translate": false`, `"source_text": ""`, `"translated_text": ""` — NEVER copy or duplicate dialogue from a neighboring bubble onto an empty face/body badge! (Conversely, NEVER set `"should_translate": false` on a real narration/caption box.)
+ - Each page header lists the exact numbered badge IDs present on that page (`[1, 2, ..., K]`).
+ - You MUST inspect and output an entry for EVERY SINGLE badge ID `1..K` on that page — NEVER skip a badge ID, NEVER merge two separate badges into one entry, and NEVER put text from a DIFFERENT bubble into another bubble's badge ID!
+ - Double-check which exact RED/WHITE NUMBERED badge touches the bubble or narration box whose Japanese text you are reading before assigning `"bubble_id"`.
+ - MANDATORY: Translate BOTH spoken speech bubbles AND EVERY rectangular white/colored narration/caption box (คำบรรยาย)! If badge `k` contains ANY Japanese sentence, dialogue, monologue, or narration caption: set `"bubble_id": k`, `"should_translate": true`, `"box_2d": null`, transcribe ONLY the exact `"source_text"` visually INSIDE badge `k`, and write its natural {target_lang_name} `"translated_text"`.
+ - CRITICAL ANTI-DUPLICATE RULE: If badge `k` outlines a character face, body, clothing, hand, background art, or pure SFX with NO dialogue text visually inside badge `k`, you MUST set `"should_translate": false`, `"source_text": ""`, `"translated_text": ""` — NEVER copy or duplicate dialogue from a neighboring bubble onto an empty face/body badge! (Conversely, NEVER set `"should_translate": false` on a real narration/caption box.)
 2. UNMARKED / BORDERLESS DIALOGUE (`bubble_id: null`):
-   - ALSO scan every panel for real spoken dialogue or monologue written WITHOUT a numbered badge around it.
-   - For each unmarked dialogue or narration box, add a SEPARATE entry with `"bubble_id": null`, `"should_translate": true`, transcribe `"source_text"`, and provide `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY that Japanese text in its OWN panel — NEVER over faces, hands, or artwork!).
-   - NEVER merge unbadged dialogue from another panel into an earlier panel's badge!
-   - NEVER output floating handwritten SFX (e.g. ドーン, トスッ, ポスン, ムチッ, ぐっ, カチャッ, ガチャ, ぎゅっ, にま, べた, もじっ) as `box_2d`.
+ - ALSO scan every panel for real spoken dialogue or monologue written WITHOUT a numbered badge around it.
+ - For each unmarked dialogue or narration box, add a SEPARATE entry with `"bubble_id": null`, `"should_translate": true`, transcribe `"source_text"`, and provide `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY that Japanese text in its OWN panel — NEVER over faces, hands, or artwork!).
+ - NEVER merge unbadged dialogue from another panel into an earlier panel's badge!
+ - NEVER output floating handwritten SFX (e.g. ドーン, トスッ, ポスン, ムチッ, ぐっ, カチャッ, ガチャ, ぎゅっ, にま, べた, もじっ) as `box_2d`.
 3. Accurate Speaker Attribution, Names & Visual Gender:
-   - Identify the actual character speaking each bubble visually (follow the tail; never copy one character's name onto every bubble).
-   - Keep character names, titles/ranks, and faction names consistent across all pages using accurate Japanese phonetics.
-   - Match pronouns and politeness particles strictly to each speaker's visual gender and setting: in Thai, visually female characters (including female subordinates, guards, and attendants) must use female/neutral endings (`ค่ะ`, `คะ`, `นะคะ`, `นะ`, `ล่ะ`, `สิ`) — NEVER use male `ครับ`/`ผม` unless the speaker is clearly drawn as male!
-   - PURE TARGET LANGUAGE & FONT-SAFE OUTPUT: Write EVERY `translated_text` and `summary` purely in natural, correctly spelled {target_lang_name} using ONLY standard {target_lang_name} script and ASCII punctuation (`...`, `~`, `-`, `'`, `!`, `?`) — no emojis, no heart/music symbols, and no mixed English/romanized syllables inside Thai (e.g. render `えへへ` as `เอะเฮะ`, `…っ!!` as `...อ๊ะ!!`, `コイツ` as `ไอ้หมอนี่`).
-   - When translating to English, preserve Japanese honorifics attached directly with a hyphen and NO space (`-san`, `-kun`, `-chan`, `-sama`, `-sensei`, `-senpai`).
+ - Identify the actual character speaking each bubble visually (follow the tail; never copy one character's name onto every bubble).
+ - Keep character names, titles/ranks, and faction names consistent across all pages using accurate Japanese phonetics.
+ - Match pronouns and politeness particles strictly to each speaker's visual gender and setting: in Thai, visually female characters (including female subordinates, guards, and attendants) must use female/neutral endings (`ค่ะ`, `คะ`, `นะคะ`, `นะ`, `ล่ะ`, `สิ`) — NEVER use male `ครับ`/`ผม` unless the speaker is clearly drawn as male!
+ - PURE TARGET LANGUAGE & FONT-SAFE OUTPUT: Write EVERY `translated_text` and `summary` purely in natural, correctly spelled {target_lang_name} using ONLY standard {target_lang_name} script and ASCII punctuation (`...`, `~`, `-`, `'`, `!`, `?`) — no emojis, no heart/music symbols, and no mixed English/romanized syllables inside Thai (e.g. render `えへへ` as `เอะเฮะ`, `…っ!!` as `...อ๊ะ!!`, `コイツ` as `ไอ้หมอนี่`).
+ - When translating to English, preserve Japanese honorifics attached directly with a hyphen and NO space (`-san`, `-kun`, `-chan`, `-sama`, `-sensei`, `-senpai`).
 4. Return ONLY valid JSON matching this exact structure for all {num_pages} page(s) (write `summary` in {target_lang_name}):
 {{
-  "pages": [
-    {{
-      "page_index": 1,
-      "summary": "Brief 1-sentence scene context for Page 1 in {target_lang_name}",
-      "bubbles": [
-        {{
-          "id": 1,
-          "bubble_id": 1,
-          "should_translate": true,
-          "speaker_or_note": "Actual speaker name / Narration",
-          "source_text": "Original Japanese text inside badge 1",
-          "box_2d": null,
-          "translated_text": "Natural {target_lang_name} translation"
-        }}
-      ]
-    }}
-  ]
+ "pages": [
+ {{
+ "page_index": 1,
+ "summary": "Brief 1-sentence scene context for Page 1 in {target_lang_name}",
+ "bubbles": [
+ {{
+ "id": 1,
+ "bubble_id": 1,
+ "should_translate": true,
+ "speaker_or_note": "Actual speaker name / Narration",
+ "source_text": "Original Japanese text inside badge 1",
+ "box_2d": null,
+ "translated_text": "Natural {target_lang_name} translation"
+ }}
+ ]
+ }}
+ ]
 }}
 """.strip()
 
@@ -1846,28 +1917,28 @@ Translate EVERY SINGLE speech bubble and narration/caption box on this page into
 
 CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
 1. MANDATORY 1-TO-1 NUMBERED BADGE CHECKLIST (`bubble_id`):
-   - Output an entry for EVERY SINGLE badge ID listed above — NEVER skip a badge ID, NEVER merge two separate badges, and NEVER put text from a different bubble into another bubble's badge ID!
-   - MANDATORY: Translate BOTH spoken speech bubbles AND EVERY rectangular narration/caption box (คำบรรยาย)! If badge `k` contains ANY Japanese dialogue, monologue, or narration caption: set `"bubble_id": k`, `"should_translate": true`, `"box_2d": null`, exact `"source_text"` inside ONLY badge `k`, and its natural {target_lang_name} `"translated_text"`.
-   - CRITICAL ANTI-DUPLICATE RULE: If badge `k` outlines a character face, body, clothing, hand, background art, or pure SFX with NO dialogue text inside it, set `"should_translate": false`, `"source_text": ""`, `"translated_text": ""` — NEVER copy dialogue from a nearby bubble onto an empty face/body badge! (Never skip a real narration/caption box.)
+ - Output an entry for EVERY SINGLE badge ID listed above — NEVER skip a badge ID, NEVER merge two separate badges, and NEVER put text from a different bubble into another bubble's badge ID!
+ - MANDATORY: Translate BOTH spoken speech bubbles AND EVERY rectangular narration/caption box (คำบรรยาย)! If badge `k` contains ANY Japanese dialogue, monologue, or narration caption: set `"bubble_id": k`, `"should_translate": true`, `"box_2d": null`, exact `"source_text"` inside ONLY badge `k`, and its natural {target_lang_name} `"translated_text"`.
+ - CRITICAL ANTI-DUPLICATE RULE: If badge `k` outlines a character face, body, clothing, hand, background art, or pure SFX with NO dialogue text inside it, set `"should_translate": false`, `"source_text": ""`, `"translated_text": ""` — NEVER copy dialogue from a nearby bubble onto an empty face/body badge! (Never skip a real narration/caption box.)
 2. UNMARKED / BORDERLESS DIALOGUE (`bubble_id: null`):
-   - For real spoken dialogue/narration WITHOUT a numbered badge (e.g. vertical text on open white panels), output a SEPARATE entry with `"bubble_id": null`, `"should_translate": true`, `"source_text"`, and `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY the Japanese text in its own panel).
+ - For real spoken dialogue/narration WITHOUT a numbered badge (e.g. vertical text on open white panels), output a SEPARATE entry with `"bubble_id": null`, `"should_translate": true`, `"source_text"`, and `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY the Japanese text in its own panel).
 3. Accurate Speaker Attribution, Names & Visual Gender:
-   - Identify the actual speaker visually; match Thai/English tone to visual gender (never use male Thai `ครับ`/`ผม` for female characters/guards).
-   - PURE TARGET LANGUAGE & FONT-SAFE OUTPUT: Write EVERY `translated_text` and `summary` purely in natural, correctly spelled {target_lang_name} using ONLY standard {target_lang_name} script and ASCII punctuation (`...`, `~`, `-`, `'`, `!`, `?`) — no emojis, no heart/music symbols, and no mixed English/romanized syllables inside Thai (e.g. render `えへへ` as `เอะเฮะ`, `…っ!!` as `...อ๊ะ!!`, `コイツ` as `ไอ้หมอนี่`).
+ - Identify the actual speaker visually; match Thai/English tone to visual gender (never use male Thai `ครับ`/`ผม` for female characters/guards).
+ - PURE TARGET LANGUAGE & FONT-SAFE OUTPUT: Write EVERY `translated_text` and `summary` purely in natural, correctly spelled {target_lang_name} using ONLY standard {target_lang_name} script and ASCII punctuation (`...`, `~`, `-`, `'`, `!`, `?`) — no emojis, no heart/music symbols, and no mixed English/romanized syllables inside Thai (e.g. render `えへへ` as `เอะเฮะ`, `…っ!!` as `...อ๊ะ!!`, `コイツ` as `ไอ้หมอนี่`).
 4. Return ONLY valid JSON matching this exact structure (write `summary` in {target_lang_name}):
 {{
-  "summary": "Brief 1-sentence scene context in {target_lang_name}",
-  "bubbles": [
-    {{
-      "id": 1,
-      "bubble_id": 1,
-      "should_translate": true,
-      "speaker_or_note": "Actual speaker name / Narration",
-      "source_text": "Original Japanese text inside badge 1",
-      "box_2d": null,
-      "translated_text": "Natural {target_lang_name} translation"
-    }}
-  ]
+ "summary": "Brief 1-sentence scene context in {target_lang_name}",
+ "bubbles": [
+ {{
+ "id": 1,
+ "bubble_id": 1,
+ "should_translate": true,
+ "speaker_or_note": "Actual speaker name / Narration",
+ "source_text": "Original Japanese text inside badge 1",
+ "box_2d": null,
+ "translated_text": "Natural {target_lang_name} translation"
+ }}
+ ]
 }}
 """.strip()
 
@@ -2263,7 +2334,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
                             src_txt = re.sub(r"\s+", " ", (b.get("source_text") or "")).strip()
                             tr_txt = re.sub(r"\s+", " ", (b.get("translated_text") or "")).strip()
                             if tr_txt:
-                                transcript_lines.append(f"**[#{idx} | {speaker}]** `{src_txt}`\n  ↳ **{tr_txt}**")
+                                transcript_lines.append(f"**[#{idx} | {speaker}]** `{src_txt}`\n ↳ **{tr_txt}**")
 
                         try:
                             out_jpg_path = os.path.join(job_dir, f"out_p{page_idx:02d}.jpg")
@@ -2331,4 +2402,3 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
         disk_pages.clear()
         if job_dir:
             await asyncio.to_thread(_cleanup_manga_job_dir_sync, job_dir)
-        release_unused_memory()

@@ -509,9 +509,13 @@ async def execute_tool_call(
 
         if t_name == "add_reaction":
             emoji = str(args.get("emoji") or "").strip().split()[0] if args.get("emoji") else ""
+            if ctx.message is None:
+                api_log(f"ToolExec -> add_reaction('{emoji}') skipped (no target message)")
+                return "[Reaction skipped: no direct user message target in this interaction. Reply directly now.]"
             if emoji and len(emoji) <= 8 and emoji not in ctx.reactions and len(ctx.reactions) < 2:
                 ctx.reactions.append(emoji)
-            ctx.tools_used.append(t_name)
+                ctx.tools_used.append(t_name)
+                api_log(f"ToolExec -> add_reaction('{emoji}')")
             return f"[Reaction '{emoji}' queued for the user's message.]"
 
         return f"[Tool Error: Unhandled tool '{t_name}'.]"

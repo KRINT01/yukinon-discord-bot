@@ -78,6 +78,23 @@ def is_google_ai_studio_congested() -> bool:
     )
 
 
+def _get_tools_for_ctx(tool_ctx: ToolExecutionContext | None, schema_map: dict) -> list:
+    """
+    Returns mode-scoped tool declarations for `tool_ctx`, omitting `add_reaction`
+    when `tool_ctx.message` is None (interactive button follow-ups / slash commands)
+    so models never waste an extra [r2] round-trip calling a no-op reaction tool.
+    """
+    if tool_ctx is None:
+        return []
+    tools_list = schema_map.get(tool_ctx.mode, [])
+    if getattr(tool_ctx, "message", None) is None and tools_list:
+        return [
+            t for t in tools_list
+            if (t.get("name") or (t.get("function") or {}).get("name")) != "add_reaction"
+        ]
+    return tools_list
+
+
 def _record_tool_observations_on_ctx(
     tool_ctx: ToolExecutionContext | None,
     fn_calls: list[tuple[str, object]],
@@ -501,7 +518,7 @@ async def call_gemini_hydrogen_chat(
         return ""
 
     safe_level = thinking_level.upper() if thinking_level.upper() in ("LOW", "MEDIUM", "HIGH", "XHIGH") else "LOW"
-    tool_decls = GEMINI_TOOLS_BY_MODE.get(tool_ctx.mode, []) if tool_ctx is not None else []
+    tool_decls = _get_tools_for_ctx(tool_ctx, GEMINI_TOOLS_BY_MODE)
     rounds = (max_tool_rounds + 1) if tool_decls else 1
 
     for r_idx in range(rounds):
@@ -751,7 +768,7 @@ async def call_gemma_ai_studio_chat(
     else:
         candidates = sorted(discovered, key=lambda x: (0 if "31b" in x else (1 if "26b" in x else 2)))
 
-    tool_decls = GEMINI_TOOLS_BY_MODE.get(tool_ctx.mode, []) if tool_ctx is not None else []
+    tool_decls = _get_tools_for_ctx(tool_ctx, GEMINI_TOOLS_BY_MODE)
     session = get_http_session()
 
     for model_id in candidates:
@@ -1071,7 +1088,7 @@ async def call_gemini_chat_messages(
     if not contents:
         return ""
 
-    tool_decls = GEMINI_TOOLS_BY_MODE.get(tool_ctx.mode, []) if tool_ctx is not None else []
+    tool_decls = _get_tools_for_ctx(tool_ctx, GEMINI_TOOLS_BY_MODE)
     rounds = (max_tool_rounds + 1) if tool_decls else 1
 
     for r_idx in range(rounds):
@@ -1291,7 +1308,7 @@ async def call_cloudflare_gpt_oss(
     }
     session = get_http_session()
     req_timeout = 40 if is_coding else 22
-    tool_schemas = OPENAI_TOOLS_BY_MODE.get(tool_ctx.mode, []) if tool_ctx is not None else []
+    tool_schemas = _get_tools_for_ctx(tool_ctx, OPENAI_TOOLS_BY_MODE)
     is_voice = ("voice" in (purpose or "").lower())
 
     # Try Cloudflare `/ai/v1/responses` ONLY when not using native OpenAI tool_calls loop
@@ -1540,7 +1557,7 @@ async def call_groq_chat(
         _GROQ_MODEL_COOLDOWN_UNTIL[groq_model] = now + 3600.0
         return ""
 
-    tool_schemas = OPENAI_TOOLS_BY_MODE.get(tool_ctx.mode, []) if tool_ctx is not None else []
+    tool_schemas = _get_tools_for_ctx(tool_ctx, OPENAI_TOOLS_BY_MODE)
     is_voice = ("voice" in (purpose or "").lower())
     token_budget = 6000 if is_coding else 4800
     adapted_msgs = _adapt_messages_for_oss_fallback(
