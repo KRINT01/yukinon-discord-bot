@@ -139,6 +139,7 @@ from ui_interactions import (
     is_failure_or_refusal_reply,
 )
 from tools import ToolExecutionContext, TOOL_SPECS
+from discord_tables import format_markdown_tables_for_discord
 
 OT_REPORT_CHANNEL_ID = int(os.getenv("OT_REPORT_CHANNEL_ID", "0") or "0")
 
@@ -471,10 +472,10 @@ async def monthly_ot_auto_report_task():
             if not target_channel:
                 continue
             summary_md = build_monthly_ot_summary_markdown(ot_logs, prev_year, prev_month)
-            await send_chunked_response(
-                target_channel,
-                f"📅 **[สรุปยอด OT ประจำเดือน{prev_month_label} — รายงานอัตโนมัติวันที่ 1 ของเดือนใหม่]**\n{summary_md}",
-            )
+            report_text = f"📅 **[สรุปยอด OT ประจำเดือน{prev_month_label} — รายงานอัตโนมัติวันที่ 1 ของเดือนใหม่]**\n{summary_md}"
+            if len(report_text) <= 7500:
+                report_text = format_markdown_tables_for_discord(report_text)
+            await send_chunked_response(target_channel, report_text)
 
 
 class YukinonBot(commands.Bot):
@@ -674,21 +675,24 @@ async def _send_response_with_interactive_view(
 ):
     if not answer or not answer.strip():
         return
-    if len(answer) <= 1900:
+    display_answer = format_markdown_tables_for_discord(answer) if len(answer) <= 7500 else answer
+    if len(display_answer) <= 1900:
         sent_msg = None
         if reply_to is not None:
             try:
-                sent_msg = await reply_to.reply(answer, view=view, mention_author=False)
+                sent_msg = await reply_to.reply(display_answer, view=view, mention_author=False)
             except Exception:
                 sent_msg = None
         if sent_msg is None:
-            sent_msg = await channel.send(answer, view=view)
+            sent_msg = await channel.send(display_answer, view=view)
         if view is not None and hasattr(view, "message"):
             view.message = sent_msg
             view.delete_message_on_timeout = False
         return
 
-    await send_chunked_response(channel, answer, reply_to=reply_to)
+    # If formatting expanded an inline message past 7500, let send_chunked_response attach raw Markdown (.md)
+    chunk_payload = display_answer if len(display_answer) <= 7500 else answer
+    await send_chunked_response(channel, chunk_payload, reply_to=reply_to)
     if view is not None:
         footer_msg = await channel.send("-# ตัวเลือกเพิ่มเติม:", view=view)
         if hasattr(view, "message"):

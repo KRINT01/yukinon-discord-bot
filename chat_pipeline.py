@@ -40,6 +40,7 @@ from search_engine import (
     run_safe_web_search_async,
 )
 from tools import ToolExecutionContext
+from discord_tables import format_markdown_tables_for_discord
 from llm_providers import (
     _can_use_gemini_hydrogen,
     is_google_ai_studio_congested,
@@ -260,7 +261,20 @@ async def query_ai_chat(
     speaker_static_block = get_speaker_identity_context(
         speaker_user, fallback_name=speaker_name, include_volatile_memory=False
     )
-    static_system_prompt = f"{system_prompt}\n\n{speaker_static_block}".strip()
+    is_voice_sys = (norm_mode == "voice") or ("ห้องเสียง" in system_prompt) or (
+        tool_ctx is not None and tool_ctx.mode == "voice"
+    )
+    table_policy_block = (
+        ""
+        if is_voice_sys
+        else (
+            "\n\n[Discord Table Auto-Formatter Rule — Overrides Blanket Table Ban]: "
+            "สำหรับแชททั่วไป การเล่าเรื่อง หรือรีวิวภาพ/มังงะ/โพสต์โซเชียล ให้ตอบเป็นย่อหน้าสนทนาตามปกติโดยไม่สร้างตาราง "
+            "แต่เมื่อผู้ใช้ขอเปรียบเทียบสินค้า/สเปค/ราคา/ตัวเลือก หรือขอให้สรุปเป็นตาราง ให้สร้างตาราง Markdown มาตรฐาน (`| หัวข้อ | ... |` ไม่เกิน 4-5 คอลัมน์กระชับ) "
+            "ได้ทันที ระบบจะจัดแนวให้แสดงผลเป็นตารางที่สวยงามบน Discord อัตโนมัติ (ห้ามจัดเว้นวรรค ASCII เองในบล็อกโค้ด)"
+        )
+    )
+    static_system_prompt = f"{system_prompt}{table_policy_block}\n\n{speaker_static_block}".strip()
 
     volatile_ctx_lines = [f"- เวลาปัจจุบันของระบบ (Real-Time System Clock): **{live_clock_str}**"]
     speaker_volatile_mem = get_speaker_volatile_context(speaker_user)
@@ -279,6 +293,27 @@ async def query_ai_chat(
             "และจุดสังเกตสำคัญจาก Vision Analysis ให้ชัดเจน (หากยังไม่ยืนยันสเกล/รุ่นย่อยจากมุมเดียวได้ ให้บอกตรงๆ ว่ายังระบุสเกลแน่ชัดไม่ได้) "
             "และห้ามใส่คำว่า 'คุณ' นำหน้าชื่อเจ้าของโพสต์หรือผู้สร้างผลงานเด็ดขาด"
         )
+
+    is_coding_prelim = (norm_mode == "code") or (dec_route == "code" and dec_conf >= 0.70)
+    if is_coding_prelim and not is_button_followup:
+        is_complex_coding_case = bool(
+            has_fresh_attachment
+            or len(raw_user_query) >= 1200
+            or (complexity_score is not None and complexity_score >= 2.0)
+        )
+        if is_complex_coding_case:
+            volatile_ctx_lines.append(
+                "- ระดับความละเอียดโหมดโค้ด (Complex/Detailed): วิเคราะห์ด้วยเหตุผลและตรรกะอย่างละเอียดครบถ้วน "
+                "ไล่บริบทข้ามไฟล์/เลเยอร์ ชี้ Edge Cases และให้โค้ดแก้ไขที่สมบูรณ์พร้อมเหตุผล "
+                "(ขึ้นบรรทัดใหม่ก่อนเปิด ```lang และก่อนปิด ``` เสมอ)"
+            )
+        else:
+            volatile_ctx_lines.append(
+                "- ระดับความละเอียดโหมดโค้ด (Focused/Concise): ใช้ตรรกะและบริบทจริงวิเคราะห์ให้แม่นยำแล้วตอบสั้น กระชับ ตรงประเด็นที่สุด — "
+                "ระบุ Root Cause ชัดๆ + วิธีแก้ที่ดีที่สุดเพียง 1 แนวทาง ห้ามใส่ตัวอย่างโค้ดซ้ำซ้อนหลายแบบ "
+                "ห้ามเขียน Unit Test/ErrorBoundary ที่ไม่ได้ขอ และห้ามสรุปขั้นตอนซ้ำท้ายข้อความ "
+                "(ขึ้นบรรทัดใหม่ก่อนเปิด ```lang และก่อนปิด ``` เสมอ)"
+            )
 
     working_prompt = (
         f"{working_prompt}\n\n"
@@ -840,6 +875,9 @@ async def query_ai_chat(
             speaker_name,
             allow_cjk_override=is_japanese_or_social_media,
         )
+
+    if not is_voice_mode and answer:
+        answer = format_markdown_tables_for_discord(answer)
 
     if speaker_user is not None:
         record_user_interaction(

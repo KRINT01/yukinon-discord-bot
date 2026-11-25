@@ -21,6 +21,7 @@ from config import (
     api_log,
     get_http_session,
 )
+from persona import normalize_markdown_code_fences
 from llm import (
     call_gemma_ai_studio_chat,
     call_cloudflare_gemma_chat,
@@ -107,6 +108,7 @@ def _find_safe_thai_split_index(line: str, max_len: int) -> int:
 # DISCORD SMART CHUNKING & NAMED SOURCE-FILE DELIVERY
 # ==============================================================================
 def extract_named_code_files(text: str) -> tuple[str, list[discord.File]]:
+    text = normalize_markdown_code_fences(text)
     files: list[discord.File] = []
     used_names: set[str] = set()
 
@@ -140,27 +142,65 @@ def extract_named_code_files(text: str) -> tuple[str, list[discord.File]]:
     return summary_text, files[:10]
 
 
+def _is_empty_code_chunk(chunk_lines: list[str]) -> bool:
+    """True when a chunk consists solely of an empty ```lang ... ``` wrapper with zero code lines."""
+    non_empty = [ln.strip() for ln in chunk_lines if ln.strip()]
+    if not non_empty:
+        return True
+    if len(non_empty) == 2 and non_empty[0].startswith("```") and non_empty[1] == "```":
+        return True
+    return False
+
+
 def split_discord_message_smart(text: str, max_len: int = 1900) -> list[str]:
+    """
+    Splits long Discord messages cleanly at <= `max_len` chars:
+    - Normalizes malformed/inline code fences first so fence parity can NEVER invert across chunks.
+    - Never leaves an orphaned opening fence (` ```lang\\n``` `) at the tail of a chunk.
+    - Preserves language headers when splitting multi-line code blocks across messages.
+    """
+    text = normalize_markdown_code_fences(text)
     if len(text) <= 1990:
         return [text]
 
     lines = text.split("\n")
-    chunks = []
-    current_lines = []
+    chunks: list[str] = []
+    current_lines: list[str] = []
     current_len = 0
     in_code_block = False
     code_fence_header = "```"
 
+    def _flush_current(reopen_if_in_code: bool = True):
+        nonlocal current_lines, current_len
+        if not current_lines:
+            return
+        if in_code_block:
+            # Avoid emitting a trailing empty ```lang\n``` block
+            if len(current_lines) == 1 and current_lines[0].strip().startswith("```"):
+                current_lines = [code_fence_header] if reopen_if_in_code else []
+                current_len = (len(code_fence_header) + 1) if reopen_if_in_code else 0
+                return
+            current_lines.append("```")
+        if not _is_empty_code_chunk(current_lines):
+            chunks.append("\n".join(current_lines))
+        if in_code_block and reopen_if_in_code:
+            current_lines = [code_fence_header]
+            current_len = len(code_fence_header) + 1
+        else:
+            current_lines = []
+            current_len = 0
+
     for line in lines:
         stripped = line.strip()
-        if len(line) > max_len:
-            if current_lines:
-                if in_code_block:
-                    current_lines.append("```")
-                chunks.append("\n".join(current_lines))
-                current_lines = [code_fence_header] if in_code_block else []
-                current_len = len(code_fence_header) + 1 if in_code_block else 0
+        is_fence_line = stripped.startswith("```")
 
+        # If an opening code fence lands near the end of a chunk (< 120 chars left),
+        # flush BEFORE opening it so the code block begins cleanly in the next message!
+        if is_fence_line and not in_code_block and current_lines and (current_len + len(stripped) + 120 > max_len):
+            _flush_current(reopen_if_in_code=False)
+
+        if len(line) > max_len:
+            _flush_current(reopen_if_in_code=True)
             while len(line) > max_len:
                 split_at = _find_safe_thai_split_index(line, max_len)
                 part = line[:split_at]
@@ -171,17 +211,17 @@ def split_discord_message_smart(text: str, max_len: int = 1900) -> list[str]:
                 line = line[split_at:].lstrip()
 
         add_len = len(line) + 1
-        if current_len + add_len > max_len and current_lines:
-            if in_code_block:
-                current_lines.append("```")
-            chunks.append("\n".join(current_lines))
-            current_lines = [code_fence_header] if in_code_block else []
-            current_len = (len(code_fence_header) + 1) if in_code_block else 0
+        # Reserve 5 chars for closing "\n```" if currently inside a code block
+        effective_limit = (max_len - 5) if in_code_block else max_len
+        if current_len + add_len > effective_limit and current_lines:
+            # Don't split right before a closing ``` if it can fit within Discord's 1990 ceiling
+            if not (is_fence_line and in_code_block and current_len + add_len <= 1980):
+                _flush_current(reopen_if_in_code=True)
 
         current_lines.append(line)
         current_len += add_len
 
-        if stripped.startswith("```"):
+        if is_fence_line:
             if not in_code_block:
                 in_code_block = True
                 code_fence_header = stripped
@@ -189,11 +229,7 @@ def split_discord_message_smart(text: str, max_len: int = 1900) -> list[str]:
                 in_code_block = False
                 code_fence_header = "```"
 
-    if current_lines:
-        if in_code_block:
-            current_lines.append("```")
-        chunks.append("\n".join(current_lines))
-
+    _flush_current(reopen_if_in_code=False)
     return [c for c in chunks if c.strip()]
 
 

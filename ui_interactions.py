@@ -55,6 +55,7 @@ from user_memory import (
     backup_user_profiles_to_discord,
 )
 from tools import ToolExecutionContext
+from discord_tables import format_markdown_tables_for_discord
 
 _CONTEXT_ERROR_NOTICE_REGEX = re.compile(
     r"\[(?:Web extraction error|Error reading|Attachment Size Notice|PDF Notice|OCR could not extract|Error inspecting embedded image)[^\]]*\]",
@@ -378,19 +379,20 @@ async def _send_interaction_with_auto_view(
     if not answer or not answer.strip():
         return
     effective_view = view if (allow_view_on_error or not is_failure_or_refusal_reply(answer)) else None
+    display_answer = format_markdown_tables_for_discord(answer) if len(answer) <= 7500 else answer
 
-    if len(answer) <= 1900:
+    if len(display_answer) <= 1900:
         try:
             if effective_view is not None:
-                sent_msg = await interaction.followup.send(answer, view=effective_view, wait=True)
+                sent_msg = await interaction.followup.send(display_answer, view=effective_view, wait=True)
                 effective_view.message = sent_msg
                 effective_view.delete_message_on_timeout = False
             else:
-                await interaction.followup.send(answer)
+                await interaction.followup.send(display_answer)
             return
         except discord.NotFound:
             if interaction.channel is not None:
-                sent_msg = await interaction.channel.send(answer, view=effective_view)
+                sent_msg = await interaction.channel.send(display_answer, view=effective_view)
                 if effective_view is not None:
                     effective_view.message = sent_msg
                     effective_view.delete_message_on_timeout = False
@@ -402,7 +404,8 @@ async def _send_interaction_with_auto_view(
             await interaction.followup.send(chunked_header)
         except discord.NotFound:
             pass
-        await send_chunked_response(interaction.channel, answer)
+        chunk_payload = display_answer if len(display_answer) <= 7500 else answer
+        await send_chunked_response(interaction.channel, chunk_payload)
         if effective_view is not None:
             footer_msg = await interaction.channel.send("-# ตัวเลือกเพิ่มเติม:", view=effective_view)
             effective_view.message = footer_msg
@@ -840,7 +843,7 @@ class GeneralAssistantActionView(AutoDisappearingView):
         )
         composed = (
             f"{instruction}{search_hint_tag}\n\n"
-            f"[กฎสำคัญ]: ห้ามคัดลอกหรือเขียนคำตอบเดิมซ้ำ ห้ามสร้างตาราง และห้ามเขียนหัวข้อเมตาของตัวละครเด็ดขาด"
+            f"[กฎสำคัญ]: ห้ามคัดลอกหรือเขียนคำตอบเดิมซ้ำ และห้ามเขียนหัวข้อเมตาของตัวละครเด็ดขาด (สร้างตาราง Markdown ได้เฉพาะเมื่อเปรียบเทียบข้อมูล)"
             f"{extra_grounding_rule}\n\n"
             f"[บริบทหัวข้อก่อนหน้า]: {self.user_query}\n"
             f"[สรุปคำตอบก่อนหน้า (ห้ามเขียนซ้ำ)]: {self.bot_reply[:1500]}"
@@ -1410,8 +1413,9 @@ class OTActionView(AutoDisappearingView):
             if pk:
                 target_y, target_m = pk[0], pk[1]
         summary_md = build_monthly_ot_summary_markdown(ot_logs, target_y, target_m)
-        if len(summary_md) <= 1950:
-            await interaction.response.send_message(summary_md, ephemeral=True)
+        display_summary = format_markdown_tables_for_discord(summary_md)
+        if len(display_summary) <= 1950:
+            await interaction.response.send_message(display_summary, ephemeral=True)
         else:
             await interaction.response.send_message(
                 content=f"📊 ตาราง OT เดือน `{target_m:02d}/{target_y + 543}` ยาวเกิน 2,000 ตัวอักษร ฉันแนบเป็นไฟล์ไว้ให้นะคะ:",
