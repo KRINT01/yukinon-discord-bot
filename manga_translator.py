@@ -16,6 +16,8 @@ from config import (
     HTTPS,
     GEMINI_API_KEY,
     GROQ_API_KEY,
+    OPENROUTER_API_KEY,
+    OPENROUTER_MANGA_MODEL,
     THAI_CHAR_REGEX,
     IMAGE_EXTENSIONS,
     manga_semaphore,
@@ -34,6 +36,7 @@ from llm import (
     call_cloudflare_vision_fallback_qwen,
     call_cloudflare_gemma_chat,
     call_groq_vision_chat,
+    call_openrouter_multi_image_manga_batch,
     _fetch_google_ai_studio_model_names,
     get_google_model_cooldown,
     set_google_model_cooldown,
@@ -47,7 +50,7 @@ from manga_cv_render import (
     _release_cv_page_masks,
 )
 
-MANGA_TRANSLATOR_VERSION = "v17.2"
+MANGA_TRANSLATOR_VERSION = "v17.3"
 MANGA_CV_VER = getattr(_mcr_mod, "MANGA_CV_RENDER_VERSION", "old")
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
 # Bundle 2 dynamic parallel hedge: faster 15s recovery on typical 2-4p X threads, patient 25s on 5-12p batches
@@ -1668,7 +1671,7 @@ async def extract_and_translate_manga_pages_batch(
         )
         return [(b, s)], [cv_list], False
 
-    if not GEMINI_API_KEY:
+    if not GEMINI_API_KEY and not OPENROUTER_API_KEY:
         return [([], "") for _ in range(num_pages)], [[] for _ in range(num_pages)], True
 
     if num_pages >= 9:
@@ -1767,9 +1770,9 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
             parts.append({"text": f"=== PAGE {idx} ({fname} | {badge_note}) ==="})
             parts.append({"inlineData": {"mimeType": mime_type, "data": b64_img}})
 
-        full_chain = await _discover_manga_batch_models()
+        full_chain = (await _discover_manga_batch_models()) if GEMINI_API_KEY else []
         active_chain = [m for m in full_chain if not _is_gemini_model_on_cooldown(m[0])]
-        if not active_chain:
+        if not active_chain and full_chain:
             active_chain = full_chain
 
         per_call_timeout = min(85.0, 40.0 + (4.5 * num_pages))
@@ -1864,6 +1867,66 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
                 return res_m, cv_bubbles_per_page, False
             if fb_m is not None and fallback_text_only_results is None:
                 fallback_text_only_results = fb_m
+
+        # Emergency Multi-Page Fallback via OpenRouter (`nvidia/nemotron-3.5-super-vl:free`, 1M ctx)
+        # Fires ONLY when all Google AI Studio batch models fail/timeout (single multi-page batch, no per-page split!)
+        if (
+            OPENROUTER_API_KEY
+            and OPENROUTER_MANGA_MODEL
+            and time.time() >= getattr(state, "openrouter_manga_cooldown_until", 0.0)
+        ):
+            await _notify("🌐 **2/3** ฝั่ง Google ขัดข้องชั่วคราว กำลังสลับไปแปลผ่าน OpenRouter ให้แทนนะคะ...")
+            or_timeout = min(85.0, max(45.0, per_call_timeout))
+            or_max_tokens = min(16384, max(4096, 1600 * num_pages))
+            api_log(
+                f"{label_prefix} [req={req_id}] REQUEST -> OpenRouter model={OPENROUTER_MANGA_MODEL} "
+                f"(timeout={int(or_timeout)}s, dim={batch_dim}px)"
+            )
+            or_t0 = time.monotonic()
+            hb_or = asyncio.create_task(
+                _waiting_heartbeat_logger(
+                    label_prefix, req_id, OPENROUTER_MANGA_MODEL, or_t0, notify_fn=_notify
+                )
+            )
+            try:
+                raw_or_json = await call_openrouter_multi_image_manga_batch(
+                    b64_pages,
+                    manga_batch_instruction,
+                    mime_type=mime_type,
+                    timeout_sec=or_timeout,
+                    max_tokens=or_max_tokens,
+                    purpose=f"{label_prefix} [req={req_id}]",
+                )
+            finally:
+                hb_or.cancel()
+                try:
+                    await hb_or
+                except Exception:
+                    pass
+
+            if raw_or_json:
+                or_elapsed = time.monotonic() - or_t0
+                or_results = _parse_manga_pages_batch_json(raw_or_json, num_pages)
+                total_b = sum(len(b) for b, _ in or_results)
+                total_anchored = sum(
+                    1 for b_list, _ in or_results for b in b_list
+                    if (b.get("bubble_id") is not None)
+                    or (isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4)
+                )
+                if total_b > 0 and total_anchored > 0:
+                    matched_som = sum(
+                        1 for b_list, _ in or_results for b in b_list
+                        if b.get("bubble_id") is not None
+                    )
+                    per_page_llm = [len(b_list) for b_list, _ in or_results]
+                    api_log(
+                        f"{label_prefix}/{MANGA_TRANSLATOR_VERSION} [req={req_id}] RESPONSE -> "
+                        f"model={OPENROUTER_MANGA_MODEL} HTTP 200 OK ({or_elapsed:.2f}s, "
+                        f"{total_b} bubbles: {matched_som} SoM-anchored, {total_anchored - matched_som} box_2d, per_page={per_page_llm})"
+                    )
+                    return or_results, cv_bubbles_per_page, False
+                if total_b > 0 and fallback_text_only_results is None:
+                    fallback_text_only_results = or_results
     finally:
         b64_pages.clear()
 

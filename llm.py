@@ -30,6 +30,7 @@ from llm_providers import (  # noqa: F401
     call_groq_vision_chat,
     call_groq_multi_image_vision,
     call_groq_chat,
+    call_openrouter_multi_image_manga_batch,
 )
 from decision_orchestrator import (  # noqa: F401
     MAX_NATIVE_INLINE_PDF_BYTES,

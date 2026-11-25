@@ -43,6 +43,8 @@ from config import (
     GEMINI_DECISION_MODEL,
     GEMINI_HEAVY_MODEL,
     GEMINI_TRANSCRIBE_LIVE_MODEL,
+    OPENROUTER_API_KEY,
+    OPENROUTER_MANGA_MODEL,
     TTS_GOOGLE_PITCH,
     TTS_GOOGLE_SPEED,
     AUDIO_EXTENSIONS,
@@ -290,6 +292,7 @@ def _collect_health_metrics() -> dict:
     gemini_cd = max(0, int(state.gemini_grounding_cooldown_until - now))
     decision_cd = max(0, int(state.gemini_decision_cooldown_until - now))
     cf_decision_cd = max(0, int(getattr(state, "cf_decision_cooldown_until", 0.0) - now))
+    openrouter_cd = max(0, int(getattr(state, "openrouter_manga_cooldown_until", 0.0) - now))
     hydrogen_cd = max(0, int(state.gemini_hydrogen_cooldown_until - now))
     live_stt_cd = max(0, int(state.gemini_transcribe_live_cooldown_until - now))
     edge_cd = max(0, int(state.edge_tts_cooldown_until - now))
@@ -336,6 +339,9 @@ def _collect_health_metrics() -> dict:
             "groq_enabled": bool(GROQ_API_KEY),
             "groq_search_model": state.active_groq_search_model if GROQ_API_KEY else None,
             "groq_vision_model": state.active_groq_vision_model if GROQ_API_KEY else None,
+            "openrouter_enabled": bool(OPENROUTER_API_KEY),
+            "openrouter_manga_model": OPENROUTER_MANGA_MODEL if OPENROUTER_API_KEY else None,
+            "openrouter_manga_cooldown_sec": openrouter_cd,
             "cloudflare_enabled": bool(CF_API_TOKEN and CF_ACCOUNT_ID),
             "cloudflare_decision_model": CF_DECISION_MODEL if CF_API_TOKEN else None,
             "cloudflare_decision_cooldown_sec": cf_decision_cd,
@@ -396,11 +402,12 @@ async def handle_root(request: web.Request) -> web.Response:
         <p><b>Runtime Telemetry:</b> Decision-1 <code>{tel['decision_calls']}</code> calls (avg <code>{tel['decision_avg_ms']}ms</code>, errs <code>{tel['decision_errors']}</code>) |
            SearchFilter dropped <code>{tel['search_filter_dropped']}</code> (<code>{tel['search_filter_drop_pct']}%</code>) |
            Gemini Implicit Cache: <code>{tel['gemini_cache_hits']}</code> hit(s), <code>{tel['gemini_cached_tokens_total']:,}</code> tokens</p>
-        <p><b>Provider Calls:</b> Flash <code>{pc.get('gemini_flash', 0)}</code> | Hydrogen <code>{pc.get('gemini_hydrogen', 0)}</code> | Gemma <code>{pc.get('gemma_ai_studio', 0)}</code> | Groq <code>{pc.get('groq', 0)}</code> | CF <code>{pc.get('cloudflare', 0)}</code></p>
+        <p><b>Provider Calls:</b> Flash <code>{pc.get('gemini_flash', 0)}</code> | Hydrogen <code>{pc.get('gemini_hydrogen', 0)}</code> | Gemma <code>{pc.get('gemma_ai_studio', 0)}</code> | Groq <code>{pc.get('groq', 0)}</code> | CF <code>{pc.get('cloudflare', 0)}</code> | OR <code>{pc.get('openrouter', 0)}</code></p>
         <hr style="border: 0; border-top: 1px solid #e5e7eb; margin: 16px 0;">
         <p><b>Google AI Studio:</b> {"Enabled (Orchestrator: <code>" + str(ai['gemini_decision_orchestrator']) + "</code> | Heavy Specialist: <code>" + str(ai['gemini_heavy_specialist']) + "</code> | Live STT: <code>" + str(ai['gemini_transcribe_live_model']) + "</code> | Gemma 4: <code>" + str(ai['gemma_active_model']) + "</code> | Flash-Lite: <code>" + str(ai['gemini_active_model']) + "</code>)" + gemini_cd_note if ai['gemini_enabled'] else "Disabled"}</p>
         <p><b>Cloudflare Workers AI:</b> {"Enabled (Decision Fallback: <code>" + str(ai['cloudflare_decision_model']) + "</code> | Code: <code>" + CF_CODE_MODEL + "</code> | Fast: <code>" + CF_CHAT_FAST_MODEL + "</code> | Vision/Gemma: <code>" + str(ai['cloudflare_gemma_model']) + "</code> | Vision Fallback: <code>" + str(ai['cloudflare_vision_fallback_model']) + "</code> | Image: <code>" + str(ai['cloudflare_image_model']) + "</code>)" if ai['cloudflare_enabled'] else "Disabled"}</p>
         <p><b>Groq LPU Acceleration:</b> {"Enabled (Code: <code>" + GROQ_CODE_MODEL + "</code> | Search: <code>" + str(ai['groq_search_model']) + "</code> | Vision: <code>" + str(ai['groq_vision_model']) + "</code>)" if ai['groq_enabled'] else "Disabled"}</p>
+        <p><b>OpenRouter Fallback:</b> {"Enabled (MangaBatch: <code>" + str(ai['openrouter_manga_model']) + "</code>)" if ai['openrouter_enabled'] else "Disabled"}</p>
         <p><b>Uptime:</b> {m['uptime_human']} ({m['uptime_sec']}s)</p>
     </body>
     </html>
@@ -1612,7 +1619,7 @@ async def status_command(ctx):
         f"SearchFilter drop `{tel['search_filter_dropped']}` (`{tel['search_filter_drop_pct']}%`) | "
         f"Cache `{tel['gemini_cache_hits']}` hits (`{tel['gemini_cached_tokens_total']:,}` tok)\n"
         f"- **Provider Calls:** Flash `{pc.get('gemini_flash', 0)}` | H2 `{pc.get('gemini_hydrogen', 0)}` | "
-        f"Gemma `{pc.get('gemma_ai_studio', 0)}` | Groq `{pc.get('groq', 0)}` | CF `{pc.get('cloudflare', 0)}`"
+        f"Gemma `{pc.get('gemma_ai_studio', 0)}` | Groq `{pc.get('groq', 0)}` | CF `{pc.get('cloudflare', 0)}` | OR `{pc.get('openrouter', 0)}`"
     )
 
 

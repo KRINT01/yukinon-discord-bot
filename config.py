@@ -110,6 +110,10 @@ GEMINI_TRANSCRIBE_LIVE_MODEL = os.getenv("GEMINI_TRANSCRIBE_LIVE_MODEL", "gemini
 GEMMA_CHAT_MODEL = os.getenv("GEMMA_CHAT_MODEL", "gemma-4-31b-it").strip()
 GEMMA_VISION_MODEL = os.getenv("GEMMA_VISION_MODEL", "gemma-4-26b-a4b-it").strip()
 
+# OpenRouter Free Tier (Emergency Multi-Page MangaBatch Vision Fallback when Google AI Studio is down)
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_MANGA_MODEL = os.getenv("OPENROUTER_MANGA_MODEL", "nvidia/nemotron-3.5-super-vl:free").strip()
+
 # Search & Weather Defaults (Defaulting to Thung Song Hong, Lak Si: 13.862694, 100.555222)
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 DEFAULT_WEATHER_CITY = os.getenv("DEFAULT_WEATHER_CITY", "ทุ่งสองห้อง, เขตหลักสี่, กรุงเทพฯ").strip()
@@ -235,6 +239,7 @@ class RuntimeState:
         self.gemini_transcribe_live_cooldown_until: float = 0.0
         self.gemini_hydrogen_call_timestamps: deque = deque(maxlen=5)
         self.cf_gpt_oss_cooldown_until: float = 0.0
+        self.openrouter_manga_cooldown_until: float = 0.0
         self.edge_tts_cooldown_until: float = 0.0
         self.last_ot_auto_report_ym: str = ""
 
@@ -252,6 +257,7 @@ class RuntimeState:
             "gemma_ai_studio": 0,
             "groq": 0,
             "cloudflare": 0,
+            "openrouter": 0,
         }
 
     def record_decision_stat(self, elapsed_sec: float, ok: bool = True) -> None:

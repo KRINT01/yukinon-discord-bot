@@ -24,6 +24,8 @@ from config import (
     GROQ_SEARCH_MODEL,
     GROQ_CHAT_FALLBACK_MODEL,
     GROQ_VISION_FALLBACK_MODEL,
+    OPENROUTER_API_KEY,
+    OPENROUTER_MANGA_MODEL,
     state,
     clean_url,
     api_log,
@@ -1309,8 +1311,17 @@ async def _call_cf_gemma_hedged_with_groq(
     purpose: str = "Chat",
     hedge_delay_sec: float = 6.5,
     tool_ctx: ToolExecutionContext | None = None,
-    hedge_with_cf_fast: bool = False,
+    hedge_with_cf_fast: bool = True,
+    allow_groq_hedge_fallback: bool = True,
 ) -> str:
+    """
+    Runs Cloudflare Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`) with a parallel backup hedge if it
+    exceeds `hedge_delay_sec`:
+    - Prioritizes `CF_CHAT_FAST_MODEL` (`@cf/zai-org/glm-4.7-flash`) ahead of Groq `openai/gpt-oss-20b`
+      across ALL Path B (manga + non-manga) and Path C turns.
+    - Falls back to hedging with Groq only if `CF_CHAT_FAST_MODEL` is cooled down / unavailable
+      AND `allow_groq_hedge_fallback=True`.
+    """
     cf_available = bool(CF_ACCOUNT_ID and CF_API_TOKEN and time.time() >= _CF_GEMMA_COOLDOWN_UNTIL)
     if not cf_available:
         return ""
@@ -1336,9 +1347,9 @@ async def _call_cf_gemma_hedged_with_groq(
         and CF_CHAT_FAST_MODEL != CF_VISION_MODEL
         and time.time() >= _CF_MODEL_COOLDOWN_UNTIL.get(CF_CHAT_FAST_MODEL, 0.0)
     )
-    if hedge_with_cf_fast and not can_cf_fast_hedge:
-        return await cf_task
-    if (not hedge_with_cf_fast) and (not GROQ_API_KEY):
+    can_groq_hedge = bool(allow_groq_hedge_fallback and GROQ_API_KEY)
+
+    if not can_cf_fast_hedge and not can_groq_hedge:
         return await cf_task
 
     done, _ = await asyncio.wait({cf_task}, timeout=hedge_delay_sec)
@@ -1348,7 +1359,7 @@ async def _call_cf_gemma_hedged_with_groq(
         except Exception:
             return ""
 
-    if hedge_with_cf_fast:
+    if can_cf_fast_hedge:
         api_log(f"Hedge ({purpose}) -> CF >{hedge_delay_sec:.1f}s; racing {CF_CHAT_FAST_MODEL} in parallel")
         backup_task = asyncio.create_task(
             call_cloudflare_gpt_oss(
@@ -2031,4 +2042,137 @@ async def call_groq_chat(
                     _GROQ_MODEL_COOLDOWN_UNTIL[groq_model] = time.time() + 30.0
                 api_log(f"Groq ({purpose}) -> {groq_model} HTTP {resp.status} ({elapsed:.2f}s): {err_txt[:120]}")
                 return ""
+    return ""
+
+# ==============================================================================
+# OPENROUTER MULTI-PAGE MANGA BATCH FALLBACK (`nvidia/nemotron-3.5-super-vl:free`)
+# ==============================================================================
+async def call_openrouter_multi_image_manga_batch(
+    b64_pages: list[tuple[str, str, int]],
+    batch_instruction: str,
+    mime_type: str = "image/jpeg",
+    timeout_sec: float = 75.0,
+    max_tokens: int = 8192,
+    purpose: str = "MangaBatchOpenRouter",
+) -> str:
+    """
+    Emergency multi-page MangaBatch Vision fallback via OpenRouter (`nvidia/nemotron-3.5-super-vl:free`,
+    1M context, 120B/12B MoE). Sends ALL pages in a single Set-of-Mark batch request (no per-page split)
+    with `reasoning: {"effort": "low", "exclude": True}` and `response_format: {"type": "json_object"}`
+    for fast, clean JSON output during Google AI Studio outages.
+    """
+    if not b64_pages or not OPENROUTER_API_KEY or not OPENROUTER_MANGA_MODEL:
+        return ""
+    if time.time() < getattr(state, "openrouter_manga_cooldown_until", 0.0):
+        return ""
+
+    or_host = "openrouter." + "ai"
+    or_url = f"{HTTPS}{or_host}/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://yukinon-bot.local",
+        "X-Title": "Yukinon Discord Bot",
+    }
+
+    user_content: list[dict] = [{"type": "text", "text": batch_instruction}]
+    for idx, (b64_img, fname, cv_cnt) in enumerate(b64_pages, 1):
+        if cv_cnt > 0:
+            badge_ids_str = ", ".join(str(i) for i in range(1, cv_cnt + 1))
+            badge_note = (
+                f"NUMBERED BADGES ON THIS PAGE: [{badge_ids_str}] "
+                "(account for EVERY badge ID strictly inside its own red outline; "
+                "add bubble_id=null for any unbadged dialogue in other panels)"
+            )
+        else:
+            badge_note = "no numbered badges (use bubble_id=null + box_2d for any dialogue)"
+        user_content.append({"type": "text", "text": f"=== PAGE {idx} ({fname} | {badge_note}) ==="})
+        user_content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime_type};base64,{b64_img}"},
+        })
+
+    payload: dict = {
+        "model": OPENROUTER_MANGA_MODEL,
+        "messages": [{"role": "user", "content": user_content}],
+        "temperature": 0.1,
+        "max_tokens": int(max_tokens),
+        "response_format": {"type": "json_object"},
+        "reasoning": {"effort": "low", "exclude": True},
+    }
+
+    session = get_http_session()
+    for attempt in range(2):
+        t0 = time.monotonic()
+        try:
+            async with session.post(
+                or_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=timeout_sec)
+            ) as resp:
+                status = resp.status
+                body_text = await resp.text()
+                elapsed = time.monotonic() - t0
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            state.openrouter_manga_cooldown_until = time.time() + 60.0
+            api_log(
+                f"OpenRouter ({purpose}) -> {OPENROUTER_MANGA_MODEL} failed "
+                f"({type(e).__name__}, {time.monotonic() - t0:.2f}s)"
+            )
+            return ""
+
+        if status == 200:
+            try:
+                data = json.loads(body_text)
+                choices = data.get("choices") or []
+                msg_obj = (choices[0].get("message") or {}) if choices else {}
+                raw_content = msg_obj.get("content") or ""
+                if isinstance(raw_content, list):
+                    raw_content = "".join(
+                        str(p.get("text") or "") for p in raw_content if isinstance(p, dict)
+                    )
+                content = _strip_model_thought_blocks(str(raw_content))
+            except Exception as e:
+                api_log(f"OpenRouter ({purpose}) -> {OPENROUTER_MANGA_MODEL} JSON parse error ({type(e).__name__})")
+                return ""
+            if content:
+                state.record_provider_call("openrouter")
+                api_log(f"OpenRouter ({purpose}) -> {OPENROUTER_MANGA_MODEL} 200 OK ({elapsed:.2f}s)")
+                return content
+            api_log(f"OpenRouter ({purpose}) -> {OPENROUTER_MANGA_MODEL} HTTP 200 empty output ({elapsed:.2f}s)")
+            return ""
+
+        if status == 400 and attempt == 0:
+            changed = False
+            low_err = body_text.lower()
+            if "response_format" in payload and ("response_format" in low_err or "json" in low_err or "schema" in low_err):
+                payload.pop("response_format", None)
+                changed = True
+            if "reasoning" in payload and ("reasoning" in low_err or "effort" in low_err or "exclude" in low_err):
+                payload.pop("reasoning", None)
+                changed = True
+            if not changed and ("response_format" in payload or "reasoning" in payload):
+                payload.pop("response_format", None)
+                payload.pop("reasoning", None)
+                changed = True
+            if changed:
+                api_log(
+                    f"OpenRouter ({purpose}) -> {OPENROUTER_MANGA_MODEL} HTTP 400 ({elapsed:.2f}s); "
+                    "retrying without response_format/reasoning"
+                )
+                continue
+
+        if status == 429:
+            state.openrouter_manga_cooldown_until = time.time() + 120.0
+        elif status in (401, 402, 403):
+            state.openrouter_manga_cooldown_until = time.time() + 1800.0
+        elif status >= 500:
+            state.openrouter_manga_cooldown_until = time.time() + 60.0
+
+        api_log(
+            f"OpenRouter ({purpose}) -> {OPENROUTER_MANGA_MODEL} HTTP {status} "
+            f"({elapsed:.2f}s): {body_text[:140]}"
+        )
+        return ""
+
     return ""
