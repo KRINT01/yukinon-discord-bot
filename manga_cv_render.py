@@ -26,7 +26,7 @@ except ImportError:
 
 from config import THAI_CHAR_REGEX
 
-MANGA_CV_RENDER_VERSION = "v19"
+MANGA_CV_RENDER_VERSION = "v20"
 SOM_CV_MAX_DIM = 360  # Fast 360px grid derived from single 1024px resize (~1-2.5s for 10 pages with OpenCV+NumPy!)
 # Bundle 2 RAM & Discord upload optimization: quality=90 with standard 4:2:0 subsampling (~50% smaller than 94/4:4:4)
 MANGA_RENDER_JPEG_QUALITY = 90
@@ -873,7 +873,8 @@ def _extract_and_filter_white_components_cv2(
         if not np.any(inner_core):
             inner_core = cv2.erode(filled_crop, _CV2_K3, iterations=1)
         inner_area = max(1, int(np.count_nonzero(inner_core)))
-        black_ink_px = int(np.count_nonzero((inner_core > 0) & (g_sub < 135) & (c_sub < 32)))
+        ink_chroma_max = 42 if is_pastel_pass else 32
+        black_ink_px = int(np.count_nonzero((inner_core > 0) & (g_sub < 145 if is_pastel_pass else g_sub < 135) & (c_sub < ink_chroma_max)))
         ink_density = black_ink_px / float(inner_area)
         is_small_clean_oval = (filled_area < 550 and solidity >= 0.92 and rect_fill >= 0.72)
         min_blk_px = 6 if is_small_clean_oval else 12
@@ -887,7 +888,7 @@ def _extract_and_filter_white_components_cv2(
         if (not is_pastel_pass) and filled_area > int(sw * sh * 0.035) and (rect_fill < 0.70 or solidity < 0.88) and ink_density < 0.045:
             continue
 
-        ink_bin = np.where((inner_core > 0) & (g_sub < 145) & (c_sub < 35), np.uint8(255), np.uint8(0))
+        ink_bin = np.where((inner_core > 0) & (g_sub < 145) & (c_sub < (45 if is_pastel_pass else 35)), np.uint8(255), np.uint8(0))
         num_ink_cc, _ = cv2.connectedComponents(ink_bin, connectivity=8)
         if (num_ink_cc - 1) < 3:
             continue
@@ -909,7 +910,7 @@ def _extract_and_filter_white_components_cv2(
                     v_in = cv2.erode(vm_full, _CV2_K5, iterations=1)
                 vg_sub = vis_gray[vy1_v:vy2_v, vx1_v:vx2_v]
                 vc_sub = vis_chroma[vy1_v:vy2_v, vx1_v:vx2_v]
-                v_ink = np.where((v_in > 0) & (vg_sub < 145) & (vc_sub < 38), np.uint8(255), np.uint8(0))
+                v_ink = np.where((v_in > 0) & (vg_sub < 145) & (vc_sub < (46 if is_pastel_pass else 38)), np.uint8(255), np.uint8(0))
                 vn_cc, _, vcc_st, _ = cv2.connectedComponentsWithStats(v_ink, connectivity=8)
                 reg_glyphs = 0
                 dot_glyphs = 0
@@ -1267,12 +1268,17 @@ def _detect_white_outlined_text_clusters_cv2(
     vis_gray: "np.ndarray",
     vis_chroma: "np.ndarray",
     is_color: bool = True,
+    covered_vis_mask: "np.ndarray | None" = None,
 ) -> list[dict]:
     """
-    Pass C fallback (runs ONLY when Passes A1/A2/A3/B find 0 classic enclosed bubbles):
-    Detects white-halo-outlined Japanese dialogue clusters on BOTH full-color CG/VN pages
-    (`is_color=True`) AND pure B&W borderless narration pages (`is_color=False`, e.g. white-outlined
-    vertical narration columns over black panels/speedlines), filtering out hair/eye/chest FPs!
+    Pass C fallback (runs when Passes A1/A2/A4/B find 0 classic white/dark enclosed bubbles,
+    including character-sheet / CG pages where Pass A3 found only pastel pills/banners):
+    - Detects dark-on-white or white-halo-outlined Japanese text clusters while skipping any
+      pixels already covered by Pass A3 pastel bubbles (`covered_vis_mask`).
+    - Tighter vertical grouping (`kh = max(11, int(vh * 0.015)) | 1`) keeps furigana cleanly
+      separated from display kanji underneath (e.g. `なつき` above `那月`).
+    - Anti-artwork glyph density guard (`gly_fill >= 0.040`) eliminates sparse wrist-cuff/skin/hair
+      line-art clusters (`gly_fill ~ 0.015`) while preserving all real text blocks (`0.15-0.25`)!
     """
     vh, vw = vis_gray.shape[:2]
     white_px = (vis_gray >= (225 if is_color else 218)) & (vis_chroma <= 30)
@@ -1284,6 +1290,8 @@ def _detect_white_outlined_text_clusters_cv2(
     w_thresh = 0.42 if is_color else 0.46
     white_near = cv2.dilate(white_px.astype(np.uint8), ring_k, iterations=1) > 0
     dark_core_cand = np.where(dark_any & white_near, np.uint8(255), np.uint8(0))
+    if covered_vis_mask is not None:
+        dark_core_cand[covered_vis_mask > 0] = 0
 
     n_cc, lbls, st, _ = cv2.connectedComponentsWithStats(dark_core_cand, connectivity=8)
     if n_cc <= 1:
@@ -1310,8 +1318,8 @@ def _detect_white_outlined_text_clusters_cv2(
         return []
 
     outlined_glyphs = cv2.dilate(glyph_mask, _CV2_K3, iterations=1)
-    kw = max(15, int(vw * 0.032)) | 1
-    kh = max(15, int(vh * 0.023)) | 1
+    kw = max(15, int(vw * 0.030)) | 1
+    kh = max(11, int(vh * 0.015)) | 1
     kern_grp = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kw, kh))
     grouped = cv2.dilate(outlined_glyphs, kern_grp, iterations=1)
 
@@ -1332,7 +1340,7 @@ def _detect_white_outlined_text_clusters_cv2(
         ys, xs = np.nonzero(sub_g)
         if ys.size == 0:
             continue
-        pad = 12
+        pad = 10
         tx1 = max(0, gx1 + int(xs.min()) - pad)
         ty1 = max(0, gy1 + int(ys.min()) - pad)
         tx2 = min(vw, gx1 + int(xs.max()) + pad + 1)
@@ -1340,6 +1348,15 @@ def _detect_white_outlined_text_clusters_cv2(
         tw, th = tx2 - tx1, ty2 - ty1
         if tw < 24 or th < 24 or (tw * th) > int(vw * vh * 0.35):
             continue
+        # Anti-Artwork Density Guard: kills sparse cuff/hair/eye line-art clusters (`gly_fill ~ 0.015`)
+        # while keeping real printed/outlined text blocks (`gly_fill ~ 0.08-0.25`)!
+        gly_fill = float(np.count_nonzero(sub_g)) / float(max(1, tw * th))
+        if gly_fill < 0.040:
+            continue
+        if covered_vis_mask is not None:
+            cov_ov = float(np.count_nonzero(covered_vis_mask[ty1:ty2, tx1:tx2])) / float(max(1, tw * th))
+            if cov_ov >= 0.25:
+                continue
         # On pure B&W pages, reject compact square artwork/hair/face clusters; keep real vertical text columns
         if (not is_color) and (th / float(max(1, tw))) < 1.90:
             continue
@@ -1374,15 +1391,15 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
     vision_quality: int = 84,
 ) -> tuple[str, list[dict]]:
     """
-    Fully vectorized OpenCV + NumPy Stage 1 detector & Set-of-Mark JPEG builder:
-    - Pass A1 (`gray >= 232`): clean base white bubble pass (now corner-bubble safe!).
+    Fully vectorized OpenCV + NumPy Stage 1 detector & Set-of-Mark JPEG builder (v20):
+    - Pass A1 (`gray >= 232`): clean base white bubble pass (corner-bubble safe!).
     - Pass A2 (`INTER_AREA` dark-outline preservation): thin-bordered ovals on white panels.
-    - Pass A3 (`gray >= 178 & sat < 95 & dark_box < 24`): enclosed pastel/colored light speech
-      bubbles (pale blue, pink, lavender, green, cream, yellow) with 2px border trim + nested
-      white-halo deduplication.
+    - Pass A3 (`gray >= 175 & (sat >= 16 | chroma >= 14) & sat < 95 & dark_box < 24`): enclosed
+      OR borderless pastel/colored light speech bubbles & character-sheet pills (pale blue, pink,
+      lavender, green, cream, yellow) without ever merging into pure white page backgrounds!
     - Pass B (`gray <= 95`): enclosed dark speech bubbles with strict anti-dark-panel guards.
-    - Draws crisp RED bubble contours + high-contrast RED/WHITE/BLACK numbered badges so
-      badges stand out clearly even next to red SFX (`ガチャ`, `ぎゅっ`) or top edges!
+    - Pass C: White-paper / white-halo text clusters when 0 classic white/dark bubbles exist
+      (also runs alongside pastel-only detections while skipping already-covered regions).
     """
     arr = np.frombuffer(raw_bytes, dtype=np.uint8)
     img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -1476,11 +1493,15 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
         )
     )
 
-    # Pass A3: Enclosed pastel / colored light speech bubbles — ONLY on actual color pages!
-    # (Prevents pure B&W screentone panels/faces from being misclassified as pastel bubbles!)
+    # Pass A3: Pastel / colored light speech bubbles & borderless pastel pills — ONLY on actual color pages!
+    # Requiring `(small_sat >= 16) | (small_chroma >= 14)` prevents borderless pastel pills on white
+    # character sheets from merging into the pure-white page background!
     if page_is_color:
         pastel_bin = np.where(
-            (small_gray >= 178) & (small_sat < 95) & (small_dark_box < 24),
+            (small_gray >= 175)
+            & ((small_sat >= 16) | (small_chroma >= 14))
+            & (small_sat < 95)
+            & (small_dark_box < 24),
             np.uint8(255),
             np.uint8(0),
         )
@@ -1756,10 +1777,25 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
                             if sub_ok is not None:
                                 detected.append(sub_ok)
 
-    # Pass C: White-halo-outlined text clusters (runs ONLY when Passes A1-B found 0 enclosed bubbles;
-    # supports both color CG/VN pages and pure B&W borderless white-halo narration columns!)
-    if not detected:
-        detected.extend(_detect_white_outlined_text_clusters_cv2(vis_gray, vis_chroma, is_color=page_is_color))
+    # Pass C: White-paper / white-halo text clusters.
+    # Runs when 0 classic white/dark enclosed bubbles were found (including character-sheet / CG pages
+    # where Pass A3 found only pastel pills/banners!), while masking out already-covered regions!
+    has_classic_bubble = any((not d.get("is_pastel")) for d in detected)
+    if (not detected) or (page_is_color and not has_classic_bubble):
+        cov_vis = (
+            cv2.dilate(
+                cv2.resize(already_covered, (vw, vh), interpolation=cv2.INTER_NEAREST),
+                _CV2_K7,
+                iterations=1,
+            )
+            if np.any(already_covered)
+            else None
+        )
+        detected.extend(
+            _detect_white_outlined_text_clusters_cv2(
+                vis_gray, vis_chroma, is_color=page_is_color, covered_vis_mask=cov_vis
+            )
+        )
     del vis_gray, vis_chroma
 
     # On dense B&W pages, cap to top 24 highest-solidity/largest candidates
@@ -1793,7 +1829,10 @@ def _detect_page_bubbles_and_build_som_b64_cv2_sync(
         m_w = max(2, vx2 - vx1)
         m_h = max(2, vy2 - vy1)
         m_up = cv2.resize(b_obj["mask_np"], (m_w, m_h), interpolation=cv2.INTER_NEAREST)
-        contour = cv2.subtract(m_up, cv2.erode(m_up, _CV2_K3, iterations=1))
+        contour = cv2.subtract(
+            m_up,
+            cv2.erode(m_up, _CV2_K3, iterations=1, borderType=cv2.BORDER_CONSTANT, borderValue=0),
+        )
         vis_bgr[vy1 : vy1 + m_h, vx1 : vx1 + m_w][contour > 0] = (20, 20, 235)
 
         label = str(bid)
@@ -2352,55 +2391,82 @@ def _clean_exact_cv_bubble_and_build_render_slots_cv2(
     is_dark = bool(cv_obj.get("is_dark"))
     is_pastel = bool(cv_obj.get("is_pastel"))
 
-    # Pass C White-Halo Outlined Text Bubble (CG / translucent dark-oval / visual-novel dialogue)
+    # Pass C White-Paper / White-Halo Outlined Text Cluster
     if bool(cv_obj.get("is_outlined_text")):
-        pad_e = 8
-        ex1, ey1 = max(0, x1 - pad_e), max(0, y1 - pad_e)
-        ex2, ey2 = min(width, x2 + pad_e), min(height, y2 + pad_e)
-        ebw, ebh = ex2 - ex1, ey2 - ey1
-        sub_bgr = img_bgr[ey1:ey2, ex1:ex2]
-        sub_g = base_gray[ey1:ey2, ex1:ex2]
-        sub_ch = sub_bgr.max(axis=2) - sub_bgr.min(axis=2)
-
-        is_very_dark_bg = float(np.percentile(sub_g, 25)) < 55.0
-        w_thr_e = 165 if is_very_dark_bg else 218
-        wp = (sub_g >= w_thr_e) & (sub_ch <= 36)
-        da = (sub_g <= 158)
-        w_near_d = wp & (cv2.dilate(da.astype(np.uint8), _CV2_K7, iterations=1) > 0)
-        d_near_w = da & (cv2.dilate(wp.astype(np.uint8), _CV2_K7, iterations=1) > 0)
-        erase_u8 = cv2.dilate(np.where(w_near_d | d_near_w, np.uint8(255), np.uint8(0)), _CV2_K5, iterations=1)
-        erase_u8 = cv2.morphologyEx(erase_u8, cv2.MORPH_CLOSE, _CV2_K5)
-        erase_bool = erase_u8 > 0
-
-        if np.any(erase_bool):
-            inp_scale = min(0.5, 220.0 / float(max(ebw, ebh)))
-            if ebw >= 40 and ebh >= 40 and inp_scale < 1.0:
-                iw, ih = max(16, int(round(ebw * inp_scale))), max(16, int(round(ebh * inp_scale)))
-                sm_bgr = cv2.resize(sub_bgr, (iw, ih), interpolation=cv2.INTER_AREA)
-                sm_m = np.where(cv2.resize(erase_u8, (iw, ih), interpolation=cv2.INTER_LINEAR) >= 32, np.uint8(255), np.uint8(0))
-                sm_inp = cv2.inpaint(sm_bgr, sm_m, 4, cv2.INPAINT_TELEA)
-                full_inp = cv2.resize(sm_inp, (ebw, ebh), interpolation=cv2.INTER_LINEAR)
-                sub_bgr[erase_bool] = full_inp[erase_bool]
-            else:
-                full_inp = cv2.inpaint(sub_bgr, erase_u8, 4, cv2.INPAINT_TELEA)
-                sub_bgr[erase_bool] = full_inp[erase_bool]
-
-        bg_after = img_bgr[y1:y2, x1:x2]
-        bg_lum_after = float(np.median(cv2.cvtColor(bg_after, cv2.COLOR_BGR2GRAY)))
-        if bg_lum_after < 155.0:
-            fg_rgb = (252, 252, 252)
-            stroke_rgb = (16, 16, 16)
-        else:
-            fg_rgb = (15, 15, 15)
-            stroke_rgb = (250, 250, 250)
-
-        # Slightly widen vertical JP text bbox horizontally so horizontal Thai fits comfortably in the oval
         bw_c = x2 - x1
-        extra_x = min(28, max(16, int(bw_c * 0.28)))
-        tx1 = max(4, x1 - extra_x)
-        tx2 = min(width - 4, x2 + extra_x)
+        bh_c = y2 - y1
+        sub_bgr_raw = img_bgr[y1:y2, x1:x2]
+        sub_g_raw = base_gray[y1:y2, x1:x2]
+        sub_ch_raw = sub_bgr_raw.max(axis=2) - sub_bgr_raw.min(axis=2)
+        p75_g = float(np.percentile(sub_g_raw, 75))
+        white_bg_ratio = float(np.count_nonzero((sub_g_raw >= 235) & (sub_ch_raw <= 18))) / float(max(1, sub_g_raw.size))
+
+        # Clean white paper (character sheets / open white panels): erase dark ink directly to pure white
+        # (ZERO grey TELEA smudges!) while protecting adjacent colored artwork with the chroma shield.
+        if p75_g >= 245.0 and white_bg_ratio >= 0.52:
+            pad_w = 4
+            ex1, ey1 = max(0, x1 - pad_w), max(0, y1 - pad_w)
+            ex2, ey2 = min(width, x2 + pad_w), min(height, y2 + pad_w)
+            sub_bgr = img_bgr[ey1:ey2, ex1:ex2]
+            sub_g = base_gray[ey1:ey2, ex1:ex2]
+            sub_ch = sub_bgr.max(axis=2) - sub_bgr.min(axis=2)
+            non_chroma = _build_true_chroma_art_shield_cv2(sub_bgr, chroma_thresh=30, is_dark=False)
+            dark_ink = np.where((sub_g < 240) & (sub_ch < 35), np.uint8(255), np.uint8(0))
+            erase_u8 = cv2.dilate(dark_ink, _CV2_K5, iterations=1)
+            sub_bgr[(erase_u8 > 0) & (non_chroma > 0)] = (255, 255, 255)
+            fg_rgb = (15, 15, 15)
+            stroke_rgb = (255, 255, 255)
+        else:
+            pad_e = 8
+            ex1, ey1 = max(0, x1 - pad_e), max(0, y1 - pad_e)
+            ex2, ey2 = min(width, x2 + pad_e), min(height, y2 + pad_e)
+            ebw, ebh = ex2 - ex1, ey2 - ey1
+            sub_bgr = img_bgr[ey1:ey2, ex1:ex2]
+            sub_g = base_gray[ey1:ey2, ex1:ex2]
+            sub_ch = sub_bgr.max(axis=2) - sub_bgr.min(axis=2)
+
+            is_very_dark_bg = float(np.percentile(sub_g, 25)) < 55.0
+            w_thr_e = 165 if is_very_dark_bg else 218
+            wp = (sub_g >= w_thr_e) & (sub_ch <= 36)
+            da = (sub_g <= 158)
+            w_near_d = wp & (cv2.dilate(da.astype(np.uint8), _CV2_K7, iterations=1) > 0)
+            d_near_w = da & (cv2.dilate(wp.astype(np.uint8), _CV2_K7, iterations=1) > 0)
+            erase_u8 = cv2.dilate(np.where(w_near_d | d_near_w, np.uint8(255), np.uint8(0)), _CV2_K5, iterations=1)
+            erase_u8 = cv2.morphologyEx(erase_u8, cv2.MORPH_CLOSE, _CV2_K5)
+            erase_bool = erase_u8 > 0
+
+            if np.any(erase_bool):
+                inp_scale = min(0.5, 220.0 / float(max(ebw, ebh)))
+                if ebw >= 40 and ebh >= 40 and inp_scale < 1.0:
+                    iw, ih = max(16, int(round(ebw * inp_scale))), max(16, int(round(ebh * inp_scale)))
+                    sm_bgr = cv2.resize(sub_bgr, (iw, ih), interpolation=cv2.INTER_AREA)
+                    sm_m = np.where(cv2.resize(erase_u8, (iw, ih), interpolation=cv2.INTER_LINEAR) >= 32, np.uint8(255), np.uint8(0))
+                    sm_inp = cv2.inpaint(sm_bgr, sm_m, 4, cv2.INPAINT_TELEA)
+                    full_inp = cv2.resize(sm_inp, (ebw, ebh), interpolation=cv2.INTER_LINEAR)
+                    sub_bgr[erase_bool] = full_inp[erase_bool]
+                else:
+                    full_inp = cv2.inpaint(sub_bgr, erase_u8, 4, cv2.INPAINT_TELEA)
+                    sub_bgr[erase_bool] = full_inp[erase_bool]
+
+            bg_after = img_bgr[y1:y2, x1:x2]
+            bg_lum_after = float(np.median(cv2.cvtColor(bg_after, cv2.COLOR_BGR2GRAY)))
+            if bg_lum_after < 155.0:
+                fg_rgb = (252, 252, 252)
+                stroke_rgb = (16, 16, 16)
+            else:
+                fg_rgb = (15, 15, 15)
+                stroke_rgb = (250, 250, 250)
+
+        # Only widen horizontally when the source cluster is a vertical JP column (`bh > bw * 1.15`)
+        if bh_c > int(bw_c * 1.15):
+            extra_x = min(28, max(16, int(bw_c * 0.28)))
+            tx1 = max(4, x1 - extra_x)
+            tx2 = min(width - 4, x2 + extra_x)
+        else:
+            tx1, tx2 = x1, x2
         hb = (tx1, y1, tx2, y2)
         return [[hb[0], hb[1], hb[2], hb[3], fg_rgb, stroke_rgb, trans_text, hb]]
+
     rx1, ry1, rx2, ry2, mask_full, rect_fill = _refine_cv_bubble_mask_locally_cv2(
         img_bgr, cv_obj, x1, y1, x2, y2, other_cv_boxes=other_cv_boxes
     )
@@ -2823,6 +2889,7 @@ def _render_translated_manga_image_cv2_sync(
     raw_bytes: bytes,
     bubbles: list[dict],
     cv_bubbles: list[dict] | None = None,
+    render_stats: dict | None = None,
 ) -> bytes | None:
     arr = np.frombuffer(raw_bytes, dtype=np.uint8)
     img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -2875,6 +2942,7 @@ def _render_translated_manga_image_cv2_sync(
     prepared_renders: list[list] = []
     used_cv_ids: set[int] = set()
     rendered_rects: list[tuple[int, int, int, int]] = []
+    rendered_bubble_count = 0
 
     # Pass 1: Render all CV-anchored Set-of-Mark bubbles
     for b in bubbles:
@@ -2895,6 +2963,7 @@ def _render_translated_manga_image_cv2_sync(
         if not slots:
             continue
         used_cv_ids.add(bid)
+        rendered_bubble_count += 1
         for slot in slots:
             prepared_renders.append(slot)
             rendered_rects.append(slot[7])
@@ -2947,6 +3016,7 @@ def _render_translated_manga_image_cv2_sync(
             )
             if slots:
                 used_cv_ids.add(snapped_cv_id)
+                rendered_bubble_count += 1
                 for slot in slots:
                     prepared_renders.append(slot)
                     rendered_rects.append(slot[7])
@@ -2966,8 +3036,14 @@ def _render_translated_manga_image_cv2_sync(
         if cleaned_open is None:
             continue
         lx1, ly1, lx2, ly2, fg_text, stroke_col, hard_bounds = cleaned_open
+        rendered_bubble_count += 1
         prepared_renders.append([lx1, ly1, lx2, ly2, fg_text, stroke_col, tr_txt, hard_bounds])
         rendered_rects.append(hard_bounds)
+
+    if isinstance(render_stats, dict):
+        render_stats["rendered_bubbles"] = rendered_bubble_count
+        render_stats["rendered_slots"] = len(prepared_renders)
+        render_stats["total_bubbles"] = len(bubbles)
 
     white_exclusion_mask = None
     if not prepared_renders:
@@ -3028,6 +3104,7 @@ def render_translated_manga_image_sync(
     raw_bytes_or_path: bytes | str | os.PathLike,
     bubbles: list[dict],
     cv_bubbles: list[dict] | None = None,
+    render_stats: dict | None = None,
 ) -> bytes | None:
     """
     Renders translated dialogue at FULL ORIGINAL RESOLUTION using vectorized OpenCV + NumPy
@@ -3038,6 +3115,11 @@ def render_translated_manga_image_sync(
     if not raw_bytes or not bubbles:
         return None
     if HAS_CV2:
-        return _render_translated_manga_image_cv2_sync(raw_bytes, bubbles, cv_bubbles)
+        return _render_translated_manga_image_cv2_sync(raw_bytes, bubbles, cv_bubbles, render_stats=render_stats)
     from manga_pil_fallback import _render_translated_manga_image_pil_sync
-    return _render_translated_manga_image_pil_sync(raw_bytes, bubbles, cv_bubbles)
+    res = _render_translated_manga_image_pil_sync(raw_bytes, bubbles, cv_bubbles)
+    if isinstance(render_stats, dict) and res is not None:
+        render_stats["rendered_bubbles"] = len(bubbles)
+        render_stats["rendered_slots"] = len(bubbles)
+        render_stats["total_bubbles"] = len(bubbles)
+    return res

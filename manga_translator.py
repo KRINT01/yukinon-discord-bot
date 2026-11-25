@@ -50,7 +50,7 @@ from manga_cv_render import (
     _release_cv_page_masks,
 )
 
-MANGA_TRANSLATOR_VERSION = "v17.3"
+MANGA_TRANSLATOR_VERSION = "v17.4"
 MANGA_CV_VER = getattr(_mcr_mod, "MANGA_CV_RENDER_VERSION", "old")
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
 # Bundle 2 dynamic parallel hedge: faster 15s recovery on typical 2-4p X threads, patient 25s on 5-12p batches
@@ -246,6 +246,7 @@ def _render_manga_page_to_disk_sync(
     bubbles: list[dict],
     page_cv: list[dict],
     out_jpg_path: str,
+    render_stats: dict | None = None,
 ) -> bool:
     """
     Streams one manga page from `/tmp` (or raw bytes), renders translated bubbles,
@@ -255,7 +256,9 @@ def _render_manga_page_to_disk_sync(
     raw_b = _read_page_bytes_sync(page_source)
     if not raw_b:
         return False
-    rendered_jpg = render_translated_manga_image_sync(raw_b, bubbles, page_cv)
+    rendered_jpg = render_translated_manga_image_sync(
+        raw_b, bubbles, page_cv, render_stats=render_stats
+    )
     if not rendered_jpg:
         return False
     with open(out_jpg_path, "wb") as f:
@@ -1986,6 +1989,7 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
  - CRITICAL ANTI-DUPLICATE RULE: If badge `k` outlines a character face, body, clothing, hand, background art, or pure SFX with NO dialogue text inside it, set `"should_translate": false`, `"source_text": ""`, `"translated_text": ""` — NEVER copy dialogue from a nearby bubble onto an empty face/body badge! (Never skip a real narration/caption box.)
 2. UNMARKED / BORDERLESS DIALOGUE (`bubble_id: null`):
  - For real spoken dialogue/narration WITHOUT a numbered badge (e.g. vertical text on open white panels), output a SEPARATE entry with `"bubble_id": null`, `"should_translate": true`, `"source_text"`, and `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY the Japanese text in its own panel).
+ - NEVER concatenate or repeat text that already belongs to numbered badges into an extra `bubble_id: null` summary entry, and NEVER shift a banner/title onto an adjacent paragraph's badge ID.
 3. Accurate Speaker Attribution, Names & Visual Gender:
  - Identify the actual speaker visually; match Thai/English tone to visual gender (never use male Thai `ครับ`/`ผม` for female characters/guards).
  - PURE TARGET LANGUAGE & FONT-SAFE OUTPUT: Write EVERY `translated_text` and `summary` purely in natural, correctly spelled {target_lang_name} using ONLY standard {target_lang_name} script and ASCII punctuation (`...`, `~`, `-`, `'`, `!`, `?`) — no emojis, no heart/music symbols, and no mixed English/romanized syllables inside Thai (e.g. render `えへへ` as `เอะเฮะ`, `…っ!!` as `...อ๊ะ!!`, `コイツ` as `ไอ้หมอนี่`).
@@ -2006,8 +2010,61 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
 }}
 """.strip()
 
-    fallback_bubbles_no_boxes = []
-    fallback_summary = ""
+    valid_cv_ids = {int(c["bubble_id"]) for c in cv_bubbles if c.get("bubble_id") is not None}
+
+    def _evaluate_grounding_quality(cand_bubbles: list[dict]) -> tuple[int, float, float]:
+        """
+        Scores how well `cand_bubbles` can actually be rendered onto the image:
+        Returns `(anchored_count, anchored_char_ratio, composite_score)`.
+        Prevents accepting a fallback output where a long bio paragraph was dumped into an
+        unanchored `bubble_id: null` + `box_2d: null` entry (which prints in chat but drops from image!).
+        """
+        if not cand_bubbles:
+            return 0, 0.0, 0.0
+        total_chars = 0
+        anchored_chars = 0
+        anchored_cnt = 0
+        used_bids: set[int] = set()
+        for b in cand_bubbles:
+            tr = (b.get("translated_text") or "").strip()
+            ch_len = max(1, len(tr))
+            total_chars += ch_len
+            bid = b.get("bubble_id")
+            box = b.get("box_2d")
+            has_valid_bid = (bid is not None) and (int(bid) in valid_cv_ids) and (int(bid) not in used_bids)
+            has_valid_box = isinstance(box, list) and len(box) == 4
+            if has_valid_bid:
+                used_bids.add(int(bid))
+                anchored_cnt += 1
+                anchored_chars += ch_len
+            elif has_valid_box:
+                anchored_cnt += 1
+                anchored_chars += ch_len
+        char_ratio = anchored_chars / float(max(1, total_chars))
+        count_ratio = anchored_cnt / float(max(1, len(cand_bubbles)))
+        score = (char_ratio * 0.70) + (count_ratio * 0.30)
+        return anchored_cnt, char_ratio, score
+
+    best_candidate: tuple[float, list[dict], str, str] | None = None
+
+    def _consider_candidate(tier_label: str, cand_bubbles: list[dict], cand_summary: str) -> bool:
+        nonlocal best_candidate
+        anc_cnt, char_ratio, score = _evaluate_grounding_quality(cand_bubbles)
+        if best_candidate is None or score > best_candidate[0]:
+            best_candidate = (score, cand_bubbles, cand_summary, tier_label)
+        # Accept immediately when anchored text covers >= 70% of all translated characters
+        if anc_cnt > 0 and char_ratio >= 0.70:
+            api_log(
+                f"MangaSingle [req={req_id}] RESPONSE -> {tier_label} OK "
+                f"({anc_cnt}/{len(cand_bubbles)} anchored, {int(round(char_ratio * 100))}% text grounded)"
+            )
+            return True
+        if cand_bubbles:
+            api_log(
+                f"MangaSingle [req={req_id}] {tier_label} partial grounding "
+                f"({anc_cnt}/{len(cand_bubbles)} anchored, {int(round(char_ratio * 100))}% text); trying next tier"
+            )
+        return False
 
     if GEMINI_API_KEY:
         api_log(
@@ -2046,17 +2103,8 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
                     p.get("text", "") for p in parts if p.get("text") and not p.get("thought", False)
                 ).strip()
                 bubbles, summary = _parse_manga_bubbles_json(raw_json_str)
-                if bubbles:
-                    anchored = sum(
-                        1 for b in bubbles
-                        if (b.get("bubble_id") is not None)
-                        or (isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4)
-                    )
-                    if anchored > 0:
-                        api_log(f"MangaSingle [req={req_id}] RESPONSE -> Tier 1 Gemini OK ({anchored}/{len(bubbles)} anchored)")
-                        return bubbles, summary, cv_bubbles
-                    fallback_bubbles_no_boxes = bubbles
-                    fallback_summary = summary
+                if bubbles and _consider_candidate("Tier 1 Gemini", bubbles, summary):
+                    return bubbles, summary, cv_bubbles
         except Exception as e:
             api_log(f"MangaSingle [req={req_id}] Tier 1 Gemini warning ({type(e).__name__}): {e}")
 
@@ -2071,37 +2119,45 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
         )
         if gemma_content:
             bubbles, summary = _parse_manga_bubbles_json(gemma_content)
-            if bubbles:
-                has_anchor = any(
-                    (b.get("bubble_id") is not None)
-                    or (isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4)
-                    for b in bubbles
-                )
-                if has_anchor:
-                    api_log(f"MangaSingle [req={req_id}] RESPONSE -> Tier 2 AI Studio Gemma 4 OK ({len(bubbles)} bubbles)")
-                    return bubbles, summary, cv_bubbles
-                if not fallback_bubbles_no_boxes:
-                    fallback_bubbles_no_boxes = bubbles
-                    fallback_summary = summary
+            if bubbles and _consider_candidate("Tier 2 AI Studio Gemma 4", bubbles, summary):
+                return bubbles, summary, cv_bubbles
     except Exception as e:
         api_log(f"MangaSingle [req={req_id}] Tier 2 AI Studio Gemma 4 warning: {e}")
 
+    # Tier 2.5: OpenRouter Vision Fallback (`nvidia/nemotron-3.5-super-vl:free`) when Google AI Studio is down
+    if (
+        OPENROUTER_API_KEY
+        and OPENROUTER_MANGA_MODEL
+        and time.time() >= getattr(state, "openrouter_manga_cooldown_until", 0.0)
+    ):
+        try:
+            or_content = await call_openrouter_multi_image_manga_batch(
+                [(b64_img, filename, len(cv_bubbles))],
+                manga_system_instruction,
+                mime_type=mime_type,
+                timeout_sec=45.0,
+                max_tokens=4096,
+                purpose=f"MangaSingleOpenRouter[{req_id}]",
+            )
+            if or_content:
+                bubbles, summary = _parse_manga_bubbles_json(or_content)
+                if bubbles and _consider_candidate("Tier 2.5 OpenRouter Nemotron", bubbles, summary):
+                    return bubbles, summary, cv_bubbles
+        except Exception as e:
+            api_log(f"MangaSingle [req={req_id}] Tier 2.5 OpenRouter warning: {e}")
+
     try:
-        cf_content = await call_cloudflare_vision_chat(manga_system_instruction, mime_type, b64_img)
+        cf_content = await call_cloudflare_vision_chat(
+            manga_system_instruction,
+            mime_type,
+            b64_img,
+            max_tokens=4096,
+            purpose=f"MangaSingleCF[{req_id}]",
+        )
         if cf_content:
             bubbles, summary = _parse_manga_bubbles_json(cf_content)
-            if bubbles:
-                has_anchor = any(
-                    (b.get("bubble_id") is not None)
-                    or (isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4)
-                    for b in bubbles
-                )
-                if has_anchor:
-                    api_log(f"MangaSingle [req={req_id}] RESPONSE -> Tier 3 Cloudflare Gemma 4 OK ({len(bubbles)} bubbles)")
-                    return bubbles, summary, cv_bubbles
-                if not fallback_bubbles_no_boxes:
-                    fallback_bubbles_no_boxes = bubbles
-                    fallback_summary = summary
+            if bubbles and _consider_candidate("Tier 3 Cloudflare Gemma 4", bubbles, summary):
+                return bubbles, summary, cv_bubbles
     except Exception as e:
         api_log(f"MangaSingle [req={req_id}] Tier 3 Cloudflare Gemma 4 warning: {e}")
 
@@ -2118,18 +2174,8 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
             )
             if gq_content:
                 bubbles, summary = _parse_manga_bubbles_json(gq_content)
-                if bubbles:
-                    has_anchor = any(
-                        (b.get("bubble_id") is not None)
-                        or (isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4)
-                        for b in bubbles
-                    )
-                    if has_anchor:
-                        api_log(f"MangaSingle [req={req_id}] RESPONSE -> Tier 4 Groq Qwen OK ({len(bubbles)} bubbles)")
-                        return bubbles, summary, cv_bubbles
-                    if not fallback_bubbles_no_boxes:
-                        fallback_bubbles_no_boxes = bubbles
-                        fallback_summary = summary
+                if bubbles and _consider_candidate("Tier 4 Groq Qwen", bubbles, summary):
+                    return bubbles, summary, cv_bubbles
         except Exception as e:
             api_log(f"MangaSingle [req={req_id}] Tier 4 Groq Qwen warning: {e}")
 
@@ -2145,23 +2191,18 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
         )
         if cfq_content:
             bubbles, summary = _parse_manga_bubbles_json(cfq_content)
-            if bubbles:
-                has_anchor = any(
-                    (b.get("bubble_id") is not None)
-                    or (isinstance(b.get("box_2d"), list) and len(b["box_2d"]) == 4)
-                    for b in bubbles
-                )
-                if has_anchor:
-                    api_log(f"MangaSingle [req={req_id}] RESPONSE -> Tier 5 Cloudflare Qwen OK ({len(bubbles)} bubbles)")
-                    return bubbles, summary, cv_bubbles
-                if not fallback_bubbles_no_boxes:
-                    fallback_bubbles_no_boxes = bubbles
-                    fallback_summary = summary
+            if bubbles and _consider_candidate("Tier 5 Cloudflare Qwen", bubbles, summary):
+                return bubbles, summary, cv_bubbles
     except Exception as e:
         api_log(f"MangaSingle [req={req_id}] Tier 5 Cloudflare Qwen warning: {e}")
 
-    if fallback_bubbles_no_boxes:
-        return fallback_bubbles_no_boxes, fallback_summary, cv_bubbles
+    if best_candidate is not None:
+        b_score, b_bubs, b_sum, b_tier = best_candidate
+        api_log(
+            f"MangaSingle [req={req_id}] RESPONSE -> Best available fallback ({b_tier}, "
+            f"{len(b_bubs)} bubbles, grounding={b_score:.2f})"
+        )
+        return b_bubs, b_sum, cv_bubbles
 
     return [], "", cv_bubbles
 
@@ -2409,8 +2450,14 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
 
                         try:
                             out_jpg_path = os.path.join(job_dir, f"out_p{page_idx:02d}.jpg")
+                            page_rstats: dict = {}
                             rendered_ok = await asyncio.to_thread(
-                                _render_manga_page_to_disk_sync, page_path, bubbles, page_cv, out_jpg_path
+                                _render_manga_page_to_disk_sync,
+                                page_path,
+                                bubbles,
+                                page_cv,
+                                out_jpg_path,
+                                page_rstats,
                             )
                             if rendered_ok:
                                 base_name = os.path.splitext(fname)[0]
@@ -2420,6 +2467,13 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
                                         filename=f"translated_p{page_idx}_{base_name}.jpg",
                                     )
                                 )
+                                r_cnt = page_rstats.get("rendered_bubbles")
+                                t_cnt = page_rstats.get("total_bubbles")
+                                if r_cnt is not None and t_cnt is not None and r_cnt < t_cnt:
+                                    api_log(
+                                        f"MangaRender [req={req_id}] page {page_idx}/{num_pages} ({fname}) "
+                                        f"rendered {r_cnt}/{t_cnt} bubble(s) (cv={len(page_cv)})"
+                                    )
                             else:
                                 api_log(
                                     f"MangaRender [req={req_id}] page {page_idx}/{num_pages} ({fname}) returned None "
