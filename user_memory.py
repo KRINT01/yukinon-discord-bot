@@ -16,9 +16,11 @@ from config import (
     GAME_QUERY_REGEX,
     ANIME_MANGA_QUERY_REGEX,
     CODE_INTENT_PATTERN,
+    STACK_TRACE_SIGNATURE_REGEX,
     CAT_TOPIC_REGEX,
     WEATHER_INTENT_PATTERN,
     OWNER_NAME_STRIP_REGEX,
+    URL_REGEX,
     channel_active_topic,
     state,
     api_log,
@@ -36,6 +38,8 @@ _CLOUD_BACKUP_LOCK: asyncio.Lock | None = None
 _LOCAL_SAVE_THREAD_LOCK = threading.Lock()
 _CONSOLIDATION_COOLDOWN: dict[str, float] = {}
 _CONSOLIDATION_IN_PROGRESS: set[str] = set()
+_TOPIC_SUMMARIZE_COOLDOWN: dict[str, float] = {}
+_TOPIC_SUMMARIZE_IN_PROGRESS: set[str] = set()
 
 USER_MENTION_REGEX = re.compile(r"<@!?(\d+)>")
 AGENTIC_MEMO_TAG_REGEX = re.compile(r"\[MEMO:\s*([^\]]+?)\s*\]", re.IGNORECASE)
@@ -53,20 +57,128 @@ _USER_TAG_REGEX = re.compile(r"^user_\d+$", re.IGNORECASE)
 _FAV_TOPIC_NOISE_TOKENS = frozenset({
     "partner", "owner", "partner (owner)", "member", "yukino", "yukinon", "yuki",
     "bot", "discord", "ot", "unknown", "user",
+    "row", "col", "column", "header", "cell", "table", "error", "undefined", "null", "test",
 })
+
+# ==============================================================================
+# MEMORY HYGIENE FILTERS (BLOCKS CODE/LOGS/TABLES/INTERNAL PROMPTS FROM POLLUTING MEMORY)
+# ==============================================================================
+_TABLE_OR_BOX_ART_REGEX = re.compile(
+    r"(?:\+[-=]{3,}\+|\|\s*[-:]{2,}\s*\||[┏━┿┃│]{3,}|"
+    r"\|\s*Header\s*\d|\bRow\s*\d+\s*Col\s*\d+|\bHeader\s*1\b.*\bHeader\s*2\b)",
+    re.IGNORECASE,
+)
+_CODE_SYNTAX_OR_ERROR_REGEX = re.compile(
+    r"(?:```|\b(?:TypeError|ReferenceError|SyntaxError|RangeError|NullPointerException|"
+    r"IllegalArgumentException|IndexError|KeyError|ValueError|AttributeError|ImportError|"
+    r"ORA-\d{4,5}|TNS-\d{4,5}|Traceback\s*\(most recent|CrashLoopBackOff|OOMKilled)\b|"
+    r"can't\s+access\s+property|cannot\s+read\s+propert|\bis\s+undefined\b|\bis\s+not\s+a\s+function\b|"
+    r"\.(?:tsx?|jsx?|py|java|sql|log|json|ya?ml|xml|css|html|sh|ps1|min\.js):\d+|"
+    r"\b(?:const|let|var|function|return|import|export|async|await|interface|class)\s+[A-Za-z_$]|"
+    r"=>|===|!==|\bscheduler\.production\.min\.js\b|\bwebpack\s+\d+\b)",
+    re.IGNORECASE,
+)
+_DOTTED_CODE_IDENT_REGEX = re.compile(r"\b[a-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\b")
+_FILE_EXT_OR_LINE_REF_REGEX = re.compile(
+    r"(?:\.(?:tsx?|jsx?|py|java|class|kt|go|rs|cpp|cs|php|rb|sql|pls|pkb|pks|log|json|ya?ml|xml|css|scss|html|sh|ps1|bat)\b|:\d+\b)",
+    re.IGNORECASE,
+)
+_PLACEHOLDER_TABLE_TOKEN_REGEX = re.compile(
+    r"^(?:(?:row|col|column|header|cell|field|item|test|sample|example)\s*\d+(?:\s+(?:row|col|column|header|cell|field|item)\s*\d+)*)$",
+    re.IGNORECASE,
+)
+_INTERNAL_BOT_OR_BUTTON_PROMPT_REGEX = re.compile(
+    r"(?:\(ผู้ใช้ส่งลิงก์นี้มาให้|ช่วยเจาะลึกองค์ประกอบภาพ|ช่วยค้นหาข้อมูลเพิ่มเติมเกี่ยวกับศิลปิน|"
+    r"ช่วยอธิบายเจาะลึกเฉพาะความสัมพันธ์ของตัวละคร|ช่วยสร้าง\s*\*\*Code\s+Map|"
+    r"ช่วย\s*\*\*อธิบายการทำงานและสาเหตุ|ช่วย\s*\*\*ปรับปรุงประสิทธิภาพและโครงสร้าง|"
+    r"ช่วยวิเคราะห์ข้อดี\s+ข้อเสีย\s+ความคุ้มค่า|ช่วยสรุปใจความสำคัญและข้อสรุปหลัก|"
+    r"ช่วยสรุปขั้นตอนที่ต้องทำ|จากสินค้า\s+โมเดล\s+หรือฟิกเกอร์ที่ระบุไว้|"
+    r"ช่วยเล่าเหตุการณ์และบทสนทนาที่เห็นในภาพ|ช่วยตรวจสอบ\s+วิเคราะห์จุดบกพร่องหรือหา\s+Root\s+Cause|"
+    r"ช่วยระบุที่มาของภาพและลิงก์นี้อย่างละเอียด|\[กฎสำคัญ\]|\[บริบทหัวข้อก่อนหน้า\]|\[SEARCH_HINT:|\[สรุปคำตอบก่อนหน้า)",
+    re.IGNORECASE,
+)
+_BARE_X_URL_EXTRACT_REGEX = re.compile(
+    r"https?://(?:www\.|mobile\.)?(?:x\.com|twitter\.com|fixupx\.com|fxtwitter\.com|vxtwitter\.com)/([A-Za-z0-9_]{2,30})/status/\d+",
+    re.IGNORECASE,
+)
+_BARE_PIXIV_URL_EXTRACT_REGEX = re.compile(
+    r"https?://(?:www\.)?(?:pixiv\.net|phixiv\.net|ppxiv\.net)/(?:[a-z]{2}/)?(?:artworks/|i/)(\d+)",
+    re.IGNORECASE,
+)
+_BARE_BSKY_URL_EXTRACT_REGEX = re.compile(
+    r"https?://(?:www\.)?(?:bsky\.app|fxbsky\.app)/profile/([^/\s]+)/post/[a-zA-Z0-9]+",
+    re.IGNORECASE,
+)
+_BARE_YT_URL_EXTRACT_REGEX = re.compile(
+    r"https?://(?:www\.|m\.)?(?:youtube\.com|youtu\.be)/\S+",
+    re.IGNORECASE,
+)
+_ERROR_TYPE_EXTRACT_REGEX = re.compile(
+    r"\b(TypeError|ReferenceError|SyntaxError|RangeError|NullPointerException|"
+    r"IllegalArgumentException|KeyError|ValueError|AttributeError|ImportError|IndexError|"
+    r"ORA-\d{4,5}|TNS-\d{4,5}|HTTP\s*[45]\d{2}|CrashLoopBackOff|OOMKilled)\b",
+    re.IGNORECASE,
+)
+_FILENAME_EXTRACT_REGEX = re.compile(
+    r"\b([A-Za-z0-9_.-]+\.(?:tsx?|jsx?|py|java|sql|ya?ml|xml|json|log|sh|ps1|css|html))\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_code_or_error_or_table(text: str) -> bool:
+    """True when text contains raw stack traces, error logs, code syntax, or ASCII/Markdown tables."""
+    if not text:
+        return False
+    s = str(text)
+    if _TABLE_OR_BOX_ART_REGEX.search(s):
+        return True
+    if _CODE_SYNTAX_OR_ERROR_REGEX.search(s):
+        return True
+    if STACK_TRACE_SIGNATURE_REGEX.search(s):
+        return True
+    if s.count("|") >= 3 and (re.search(r"\|\s*[-:]{2,}\s*\|", s) or s.count("\n") >= 1 or "+---" in s):
+        return True
+    # High programming punctuation density (`{ } ; ( )` combined with `=` or `.`)
+    if len(s) >= 20 and sum(s.count(ch) for ch in ("{", "}", ";")) >= 2:
+        return True
+    return False
+
+
+def _looks_like_internal_bot_or_button_prompt(text: str) -> bool:
+    """True when text is an internal bot wrapper prompt or UI follow-up button instruction."""
+    if not text:
+        return False
+    return bool(_INTERNAL_BOT_OR_BUTTON_PROMPT_REGEX.search(str(text)))
 
 
 def _is_blocked_favorite_topic(topic: str, user=None, profile: dict | None = None) -> bool:
-    """Blocks Discord usernames, display names, owner names, @handles, and bot/system noise from favorite_topics."""
-    t = re.sub(r"\s+", " ", str(topic or "")).strip()
-    if len(t) < 2:
+    """
+    Blocks Discord usernames, display names, owner names, @handles, URLs,
+    code/stack-trace snippets, filenames/line refs, table placeholders (`Row 1 Col 1`),
+    and internal bot prompts from polluting `favorite_topics`.
+    """
+    raw = str(topic or "")
+    if "\n" in raw or "\r" in raw:
+        return True
+    t = re.sub(r"\s+", " ", raw).strip()
+    if len(t) < 2 or len(t) > 50:
         return True
     tl = t.lower()
-    if tl in _FAV_TOPIC_NOISE_TOKENS or tl.startswith(("@", "http://", "https://", "<@")):
+    if tl in _FAV_TOPIC_NOISE_TOKENS or tl.startswith(("@", "http://", "https://", "<@", "```", "|", "+-")):
         return True
     if _USER_TAG_REGEX.match(tl):
         return True
     if OWNER_NAME_STRIP_REGEX.search(t):
+        return True
+    if _PLACEHOLDER_TABLE_TOKEN_REGEX.match(t):
+        return True
+    if _FILE_EXT_OR_LINE_REF_REGEX.search(t):
+        return True
+    if _DOTTED_CODE_IDENT_REGEX.search(t):
+        return True
+    if _looks_like_code_or_error_or_table(t) or _looks_like_internal_bot_or_button_prompt(t):
+        return True
+    if any(ch in t for ch in ("`", "|", "{", "}", "[", "]", ";", "=")):
         return True
 
     identity_names: set[str] = set()
@@ -87,14 +199,194 @@ def _is_blocked_favorite_topic(topic: str, user=None, profile: dict | None = Non
     return False
 
 
+def _is_valid_custom_note(note: str) -> bool:
+    """
+    Validates rolling `custom_notes` and auto-saved facts:
+    Blocks raw code/stack traces/tables, URLs, internal bot/button prompts, and empty/trivial noise.
+    """
+    s = re.sub(r"\s+", " ", str(note or "")).strip()
+    if len(s) < 5 or len(s) > 150:
+        return False
+    if _looks_like_code_or_error_or_table(s) or _looks_like_internal_bot_or_button_prompt(s):
+        return False
+    if _PLACEHOLDER_TABLE_TOKEN_REGEX.match(s):
+        return False
+    # Reject bare URLs or strings that are mostly a link
+    if URL_REGEX.search(s) and len(URL_REGEX.sub("", s).strip()) < 10:
+        return False
+    return True
+
+
+def _is_valid_recent_topic(topic: str) -> bool:
+    """
+    Validates entries in `recent_topics` (both newly recorded and during startup scrubbing):
+    Rejects raw code blocks, ASCII/Markdown tables, raw error traces, raw social URLs,
+    internal `(ผู้ใช้ส่งลิงก์นี้มาให้...)` wrappers, and internal UI button instructions.
+    """
+    s = re.sub(r"\s+", " ", str(topic or "")).strip()
+    if len(s) < 4 or len(s) > 120:
+        return False
+    if _looks_like_internal_bot_or_button_prompt(s):
+        return False
+    if _TABLE_OR_BOX_ART_REGEX.search(s) or "```" in s:
+        return False
+    if _PLACEHOLDER_TABLE_TOKEN_REGEX.match(s):
+        return False
+    # Reject raw un-summarized URLs (e.g. `https://x.com/hibikamin/status/...`)
+    if re.search(r"https?://\S+", s):
+        return False
+    # Reject raw un-summarized stack traces / property access errors
+    if re.search(
+        r"(?:can't\s+access\s+property|cannot\s+read\s+propert|Error\s+fetc?hing|Traceback\s*\(|"
+        r"scheduler\.production\.min\.js|webpack\s+\d+|:\d+:\d+|e\.[a-zA-Z_]+\s+is\s+undefined)",
+        s,
+        re.IGNORECASE,
+    ):
+        return False
+    # Reject raw code lines with braces/semicolons/arrows
+    if sum(s.count(ch) for ch in ("{", "}", ";")) >= 2 or "=>" in s:
+        return False
+    return True
+
+
+def _condense_recent_topic_sync(
+    user_prompt: str,
+    is_coding: bool = False,
+    is_button_followup: bool = False,
+) -> tuple[str, bool]:
+    """
+    Deterministically cleans and summarizes a user turn into a crisp `recent_topics` label
+    (zero API latency). Returns `(condensed_topic, wants_bg_llm_summary)`.
+    - Returns `("", False)` to skip noise (UI button clicks, pure test tables, empty/tiny text).
+    - Summarizes raw stack traces/code dumps into crisp labels like `"ดีบัก TypeError (FormSearch.tsx)"`.
+    - Summarizes bare X/Pixiv/Bluesky/YouTube links into clean labels like `"ดูโพสต์ X ของ @hibikamin"`.
+    """
+    if is_button_followup or not user_prompt:
+        return "", False
+
+    raw = str(user_prompt).strip()
+    if not raw:
+        return "", False
+
+    # Strip internal bot prompt wrapper `(ผู้ใช้ส่งลิงก์นี้มาให้...)` BEFORE checking button prompts
+    had_bare_link_wrapper = bool(re.search(r"\(ผู้ใช้ส่งลิงก์นี้มาให้[\s\S]*$", raw))
+    stripped_wrapper = re.sub(r"\n*\(ผู้ใช้ส่งลิงก์นี้มาให้[\s\S]*$", "", raw).strip()
+    stripped_wrapper = re.sub(r"^\[ผู้พูด:[^\]]+\]\s*", "", stripped_wrapper).strip()
+    stripped_wrapper = re.sub(r"<@!?\d+>", "", stripped_wrapper).strip()
+
+    if _looks_like_internal_bot_or_button_prompt(stripped_wrapper):
+        return "", False
+
+    # 1. Pure ASCII/Markdown test table -> skip completely (unrelated noise!)
+    if _TABLE_OR_BOX_ART_REGEX.search(stripped_wrapper):
+        no_table_text = re.sub(r"```[\s\S]*?```", " ", stripped_wrapper)
+        no_table_text = "\n".join(
+            ln for ln in no_table_text.splitlines()
+            if not re.match(r"^\s*(?:[+|┃┏┗┠]|[|\s:-]{4,}|Row\s*\d+|Header\s*\d+)", ln, re.IGNORECASE)
+        )
+        no_table_text = re.sub(r"\s+", " ", no_table_text).strip()
+        if len(no_table_text) < 12 or _PLACEHOLDER_TABLE_TOKEN_REGEX.match(no_table_text):
+            return "", False
+        stripped_wrapper = no_table_text
+
+    # 2. Bare social/media link (X, Pixiv, Bluesky, YouTube) -> clean readable label + optional BG refine
+    text_no_urls = URL_REGEX.sub(" ", stripped_wrapper).strip()
+    if URL_REGEX.search(stripped_wrapper) and (had_bare_link_wrapper or len(text_no_urls) < 8):
+        m_x = _BARE_X_URL_EXTRACT_REGEX.search(stripped_wrapper)
+        if m_x:
+            return f"ดูโพสต์ X ของ @{m_x.group(1)}", True
+        m_px = _BARE_PIXIV_URL_EXTRACT_REGEX.search(stripped_wrapper)
+        if m_px:
+            return f"ดูภาพ Pixiv #{m_px.group(1)}", True
+        m_bsky = _BARE_BSKY_URL_EXTRACT_REGEX.search(stripped_wrapper)
+        if m_bsky:
+            return f"ดูโพสต์ Bluesky ของ @{m_bsky.group(1)}", True
+        if _BARE_YT_URL_EXTRACT_REGEX.search(stripped_wrapper):
+            return "ดูวิดีโอ YouTube", True
+        return "", False
+
+    # 3. Raw stack trace / error log / code dump -> clean concise debug label (never raw trace!)
+    if _looks_like_code_or_error_or_table(stripped_wrapper):
+        err_m = _ERROR_TYPE_EXTRACT_REGEX.search(stripped_wrapper)
+        fn_m = _FILENAME_EXTRACT_REGEX.search(stripped_wrapper)
+        err_tok = err_m.group(1) if err_m else ""
+        fn_tok = fn_m.group(1) if fn_m else ""
+        # Check if there is also a short natural Thai/English question line outside code fences
+        prose_only = re.sub(r"```[\s\S]*?```", " ", stripped_wrapper)
+        prose_lines = [
+            ln.strip() for ln in prose_only.splitlines()
+            if ln.strip() and not _looks_like_code_or_error_or_table(ln) and not _FILE_EXT_OR_LINE_REF_REGEX.search(ln)
+        ]
+        prose_q = re.sub(r"\s+", " ", " ".join(prose_lines)).strip()
+        if err_tok and fn_tok:
+            return f"ดีบัก {err_tok} ({fn_tok})", True
+        if err_tok:
+            return f"ดีบัก {err_tok}", True
+        if fn_tok:
+            return f"ตรวจโค้ด ({fn_tok})", True
+        if len(prose_q) >= 10:
+            clean_p = prose_q[:72].rsplit(" ", 1)[0] if len(prose_q) > 72 and " " in prose_q[:72] else prose_q[:72]
+            return clean_p.strip(), len(prose_q) > 65
+        return "สอบถาม/ดีบักโค้ด", True
+
+    # 4. Normal conversational query -> strip URLs, collapse whitespace, cut cleanly without chopping words
+    clean_q = re.sub(r"\s+", " ", text_no_urls).strip()
+    if len(clean_q) <= 6 or _PLACEHOLDER_TABLE_TOKEN_REGEX.match(clean_q):
+        return "", False
+
+    if len(clean_q) <= 75:
+        return clean_q, (is_coding and len(clean_q) > 55)
+
+    # Trim at a clean whitespace boundary if available
+    cut = clean_q[:75]
+    if " " in cut[35:]:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.strip(" ,.-:"), True
+
+
 def _scrub_profile_favorite_topics(profile: dict, user=None) -> bool:
-    """Removes polluted Discord names/noise from a profile's favorite_topics in-place. Returns True if modified."""
+    """Removes polluted Discord names, code/error traces, and table noise from favorite_topics in-place."""
     raw_favs = list(profile.get("favorite_topics") or [])
     cleaned = [t for t in raw_favs if not _is_blocked_favorite_topic(t, user=user, profile=profile)]
     if cleaned != raw_favs:
         profile["favorite_topics"] = cleaned
         return True
     return False
+
+
+def _scrub_profile_memory(profile: dict, user=None) -> bool:
+    """
+    Scrubs polluted entries across `favorite_topics`, `recent_topics`, AND `custom_notes`
+    in-place so legacy or accidental code/error/table/button-prompt noise is automatically removed.
+    Returns True if any field was modified.
+    """
+    changed = _scrub_profile_favorite_topics(profile, user=user)
+
+    raw_recents = list(profile.get("recent_topics") or [])
+    clean_recents: list[str] = []
+    seen_r: set[str] = set()
+    for r in raw_recents:
+        rs = re.sub(r"\s+", " ", str(r or "")).strip()
+        if rs and _is_valid_recent_topic(rs) and rs.lower() not in seen_r:
+            seen_r.add(rs.lower())
+            clean_recents.append(rs)
+    if clean_recents != raw_recents:
+        profile["recent_topics"] = clean_recents[-6:]
+        changed = True
+
+    raw_notes = list(profile.get("custom_notes") or [])
+    clean_notes: list[str] = []
+    seen_n: set[str] = set()
+    for n in raw_notes:
+        ns = re.sub(r"\s+", " ", str(n or "")).strip()
+        if ns and _is_valid_custom_note(ns) and ns.lower() not in seen_n:
+            seen_n.add(ns.lower())
+            clean_notes.append(ns)
+    if clean_notes != raw_notes:
+        profile["custom_notes"] = clean_notes[-14:]
+        changed = True
+
+    return changed
 
 
 def has_dirty_user_profiles() -> bool:
@@ -179,8 +471,8 @@ def _find_backup_channel(bot: discord.Client):
 async def restore_user_profiles_from_discord(bot: discord.Client):
     """
     Restores user_profiles.json from a private Discord channel (#yukinon-memory or MEMORY_BACKUP_CHANNEL_ID)
-    on startup, auto-scrubs polluted Discord names from favorite_topics, and scans #work channels
-    to recover any OT logs so records survive Render redeploys.
+    on startup, auto-scrubs polluted entries from favorite_topics, recent_topics, and custom_notes,
+    and scans #work channels to recover any OT logs so records survive Render redeploys.
     """
     global user_profiles, _DIRTY_SINCE_LAST_BACKUP
     await asyncio.to_thread(load_user_profiles_local)
@@ -213,12 +505,12 @@ async def restore_user_profiles_from_discord(bot: discord.Client):
 
     scrubbed_any = False
     for prof in user_profiles.values():
-        if isinstance(prof, dict) and _scrub_profile_favorite_topics(prof):
+        if isinstance(prof, dict) and _scrub_profile_memory(prof):
             scrubbed_any = True
     if scrubbed_any:
         _DIRTY_SINCE_LAST_BACKUP = True
         await save_user_profiles_local_async()
-        print("[User Memory] Auto-scrubbed polluted Discord names/noise from favorite_topics.", flush=True)
+        print("[User Memory] Auto-scrubbed polluted code/error/table/prompt noise from user profiles.", flush=True)
         await backup_user_profiles_to_discord(force=True)
 
 
@@ -331,11 +623,109 @@ def _dedupe_clean_list(items: list[str], max_items: int = 12, max_item_len: int 
     return out
 
 
+async def _summarize_recent_topic_bg(
+    uid_str: str,
+    placeholder_topic: str,
+    user_prompt: str,
+    assistant_reply: str = "",
+):
+    """
+    Non-blocking background topic summarizer (0ms user reply latency):
+    Replaces a condensed `recent_topics` placeholder in-place with a crisp 1-phrase
+    topic summary (<= 65 chars, no raw URLs, stack traces, or code syntax).
+    """
+    global _DIRTY_SINCE_LAST_BACKUP
+    if not uid_str or not placeholder_topic or uid_str in _TOPIC_SUMMARIZE_IN_PROGRESS:
+        return
+    now = time.time()
+    if now < _TOPIC_SUMMARIZE_COOLDOWN.get(uid_str, 0.0):
+        return
+
+    _TOPIC_SUMMARIZE_IN_PROGRESS.add(uid_str)
+    _TOPIC_SUMMARIZE_COOLDOWN[uid_str] = now + 20.0
+    try:
+        from config import GROQ_API_KEY
+        from llm import (
+            call_groq_chat,
+            get_groq_search_and_chat_candidates,
+            call_gemma_ai_studio_chat,
+            call_cloudflare_gemma_chat,
+        )
+
+        clean_u = re.sub(r"\(ผู้ใช้ส่งลิงก์นี้มาให้[\s\S]*$", "", str(user_prompt or "")).strip()[:350]
+        clean_a = re.sub(r"\s+", " ", str(assistant_reply or "")).strip()[:350]
+        sum_prompt = (
+            "Summarize this chat exchange into ONE ultra-concise topic phrase (<= 55 characters, "
+            "natural Thai or English matching the conversation) suitable for a `recent_topics` list.\n"
+            "STRICT RULES:\n"
+            "- NEVER include raw URLs, stack traces, raw code syntax, table borders, or internal prompt text.\n"
+            "- If the message is just a test table, formatting test, or trivial filler, return {\"topic\": \"\"}.\n"
+            "- Examples: \"ดีบัก TypeError ใน FormSearch.tsx\", \"ดูงานวาด อาโออิ เซนะ ของ @hibikamin\", "
+            "\"ปรับสูตรชงเอสเปรสโซ่คั่วกลาง\", \"ถามเรื่องสเปคโมเดล Yamato 1/350\".\n"
+            'Return ONLY valid JSON: {"topic": "..."}\n\n'
+            f"User input: {clean_u}\n"
+            + (f"Bot reply snippet: {clean_a}" if clean_a else "")
+        )
+        msgs = [{"role": "user", "content": sum_prompt}]
+        raw_out = ""
+        if GROQ_API_KEY:
+            for g_mod in await get_groq_search_and_chat_candidates():
+                try:
+                    raw_out = await call_groq_chat(
+                        msgs, g_mod, temperature=0.0, is_coding=False, purpose="TopicSummarize"
+                    )
+                    if raw_out:
+                        break
+                except Exception:
+                    continue
+        if not raw_out:
+            raw_out = await call_gemma_ai_studio_chat(
+                msgs, temperature=0.0, max_output_tokens=120, purpose="TopicSummarize"
+            )
+        if not raw_out:
+            raw_out = await call_cloudflare_gemma_chat(
+                msgs, temperature=0.0, max_tokens=120, purpose="TopicSummarize"
+            )
+        if not raw_out:
+            return
+
+        m_json = re.search(r"\{[\s\S]*\}", raw_out)
+        if not m_json:
+            return
+        parsed = json.loads(m_json.group(0))
+        summary = re.sub(r"\s+", " ", str(parsed.get("topic") or "")).strip()[:70]
+
+        prof = user_profiles.get(uid_str)
+        if not isinstance(prof, dict):
+            return
+        recents = list(prof.get("recent_topics") or [])
+        if placeholder_topic not in recents:
+            return
+        idx = len(recents) - 1 - recents[::-1].index(placeholder_topic)
+        if not summary:
+            # Summarizer determined it was trivial/test noise -> remove placeholder cleanly
+            recents.pop(idx)
+        elif _is_valid_recent_topic(summary):
+            recents[idx] = summary
+            # Deduplicate consecutive/duplicate entries
+            recents = _dedupe_clean_list(recents, max_items=6, max_item_len=80)
+        else:
+            return
+
+        prof["recent_topics"] = recents[-6:]
+        _DIRTY_SINCE_LAST_BACKUP = True
+        await save_user_profiles_local_async()
+    except Exception as e:
+        api_log(f"TopicSummarize -> skipped ({type(e).__name__})")
+    finally:
+        _TOPIC_SUMMARIZE_IN_PROGRESS.discard(uid_str)
+
+
 async def consolidate_user_memory_async(uid_str: str):
     """
     Background LLM memory consolidator: triggered automatically when rolling `custom_notes`
     exceeds 10 entries. Merges duplicates, promotes durable personal facts to `pinned_facts`,
-    and prunes outdated ephemeral notes without blocking the user's reply.
+    drops transient code/error/table/URL noise, and prunes outdated ephemeral notes without blocking replies.
     """
     global _DIRTY_SINCE_LAST_BACKUP
     now = time.time()
@@ -364,14 +754,16 @@ async def consolidate_user_memory_async(uid_str: str):
         )
 
         consolidation_prompt = (
-            "You are a memory consolidation module. Deduplicate and organize the user's memory entries.\n"
+            "You are a memory consolidation module. Deduplicate, clean, and organize the user's memory entries.\n"
             "Rules:\n"
-            "1. Keep ALL existing `pinned_facts` unless an exact duplicate or directly contradicted by a newer entry.\n"
+            "1. Keep ALL valid existing `pinned_facts` unless an exact duplicate or directly contradicted by a newer entry.\n"
             "2. Promote durable long-term facts (preferences, hardware, profession, pets, hobbies, recurring goals) "
             "from `custom_notes` into `pinned_facts` (max 15 items total).\n"
-            "3. Keep only distinct, recent short-term context in `custom_notes` (max 8 items total), merging duplicates.\n"
-            "4. Preserve original language (Thai/English) concisely.\n"
-            '5. Return ONLY valid JSON: {"pinned_facts": [...], "custom_notes": [...]}\n\n'
+            "3. Keep only distinct, recent, meaningful short-term context in `custom_notes` (max 8 items total), merging duplicates.\n"
+            "4. DISCARD any temporary error logs, stack traces, raw code snippets, Markdown/ASCII tables, raw URLs, "
+            "one-off debugging errors, or internal bot prompts.\n"
+            "5. Preserve original language (Thai/English) concisely.\n"
+            '6. Return ONLY valid JSON: {"pinned_facts": [...], "custom_notes": [...]}\n\n'
             f"Current pinned_facts: {json.dumps(pinned, ensure_ascii=False)}\n"
             f"Current custom_notes: {json.dumps(notes, ensure_ascii=False)}"
         )
@@ -402,8 +794,10 @@ async def consolidate_user_memory_async(uid_str: str):
         new_pinned = parsed.get("pinned_facts")
         new_notes = parsed.get("custom_notes")
         if isinstance(new_pinned, list) and isinstance(new_notes, list):
-            prof["pinned_facts"] = _dedupe_clean_list(new_pinned, max_items=15, max_item_len=150)
-            prof["custom_notes"] = _dedupe_clean_list(new_notes, max_items=8, max_item_len=150)
+            clean_pinned = [x for x in new_pinned if _is_valid_custom_note(x)]
+            clean_notes = [x for x in new_notes if _is_valid_custom_note(x)]
+            prof["pinned_facts"] = _dedupe_clean_list(clean_pinned, max_items=15, max_item_len=150)
+            prof["custom_notes"] = _dedupe_clean_list(clean_notes, max_items=8, max_item_len=150)
             _DIRTY_SINCE_LAST_BACKUP = True
             await save_user_profiles_local_async()
             api_log(
@@ -425,8 +819,8 @@ def _schedule_bg_task(coro) -> bool:
         if state.bot and getattr(state.bot, "loop", None) and state.bot.loop.is_running():
             state.bot.loop.create_task(coro)
             return True
-    coro.close()
-    return False
+        coro.close()
+        return False
 
 
 def record_user_interaction(
@@ -434,8 +828,14 @@ def record_user_interaction(
     user_prompt: str,
     channel_id: int = None,
     learned_memo: str = "",
+    is_button_followup: bool = False,
+    is_coding: bool = False,
+    assistant_reply: str = "",
 ):
-    """Updates the persistent profile of the speaker with their topics, interaction count, and optional LLM memo."""
+    """
+    Updates the persistent profile of the speaker with hygiene-filtered topics, interaction count,
+    clean condensed/summarized recent topics, and validated LLM memos.
+    """
     global _DIRTY_SINCE_LAST_BACKUP
     if user is None or getattr(user, "bot", False):
         return
@@ -460,33 +860,42 @@ def record_user_interaction(
     profile["interaction_count"] = 1 if is_new else (int(profile.get("interaction_count", 0)) + 1)
     profile["last_seen"] = now_str
 
-    _scrub_profile_favorite_topics(profile, user=user)
+    _scrub_profile_memory(profile, user=user)
     favs = list(profile.get("favorite_topics") or [])
-    if channel_id and channel_id in channel_active_topic:
+    if not is_button_followup and channel_id and channel_id in channel_active_topic:
         act_t = channel_active_topic[channel_id].get("topic", "").strip()
         if act_t and act_t not in favs and not _is_blocked_favorite_topic(act_t, user=user, profile=profile):
             favs.append(act_t)
 
-    for label, pattern in TOPIC_KEYWORDS_MAP.items():
-        if pattern.search(user_prompt) and label not in favs:
-            favs.append(label)
+    if not is_button_followup and not _looks_like_internal_bot_or_button_prompt(user_prompt):
+        for label, pattern in TOPIC_KEYWORDS_MAP.items():
+            if pattern.search(user_prompt) and label not in favs:
+                favs.append(label)
 
     profile["favorite_topics"] = favs[-12:]
 
-    clean_q = re.sub(r"\s+", " ", user_prompt).strip()
-    if len(clean_q) > 6:
+    condensed_recent, wants_bg_summary = _condense_recent_topic_sync(
+        user_prompt,
+        is_coding=is_coding,
+        is_button_followup=is_button_followup,
+    )
+    if condensed_recent and _is_valid_recent_topic(condensed_recent):
         recents = list(profile.get("recent_topics") or [])
-        snippet = clean_q[:90]
-        if not recents or recents[-1] != snippet:
-            recents.append(snippet)
-        profile["recent_topics"] = recents[-6:]
+        if not recents or recents[-1].lower() != condensed_recent.lower():
+            recents.append(condensed_recent)
+        profile["recent_topics"] = _dedupe_clean_list(recents, max_items=6, max_item_len=80)
+        if wants_bg_summary:
+            _schedule_bg_task(
+                _summarize_recent_topic_bg(uid_str, condensed_recent, user_prompt, assistant_reply)
+            )
 
     if learned_memo:
-        notes = list(profile.get("custom_notes") or [])
-        clean_memo = learned_memo.strip()[:150]
-        if clean_memo and clean_memo not in notes:
-            notes.append(clean_memo)
-        profile["custom_notes"] = notes[-14:]
+        clean_memo = re.sub(r"\s+", " ", learned_memo).strip()[:150]
+        if _is_valid_custom_note(clean_memo):
+            notes = list(profile.get("custom_notes") or [])
+            if clean_memo.lower() not in {n.lower() for n in notes}:
+                notes.append(clean_memo)
+                profile["custom_notes"] = notes[-14:]
 
     user_profiles[uid_str] = profile
     _DIRTY_SINCE_LAST_BACKUP = True
@@ -742,7 +1151,7 @@ def format_user_memory_card(target_uid: str, header_title: str = "ข้อม�
 
 
 async def apply_tool_memory_action(speaker_user, action: str, value: str = "") -> tuple[str, str]:
-    """Native function-calling handler for `manage_user_memory`."""
+    """Native function-calling handler for `manage_user_memory` with strict noise hygiene."""
     uid_str = str(getattr(speaker_user, "id", ""))
     if not uid_str:
         return "[Memory Error: Missing user ID]", ""
@@ -756,18 +1165,22 @@ async def apply_tool_memory_action(speaker_user, action: str, value: str = "") -
         is_owner=owner_flag,
     )
     act = (action or "view").strip().lower()
-    val = (value or "").strip()
+    val = re.sub(r"\s+", " ", (value or "")).strip()
 
     if act == "view":
         return format_user_memory_card(uid_str), uid_str
 
     if act == "pin_fact" and val:
+        if not _is_valid_custom_note(val):
+            return "[Memory Notice: Skipped saving non-personal code/log/table/URL noise into pinned_facts.]", ""
         pinned = list(prof.get("pinned_facts") or [])
         pinned.append(val)
         await update_user_memory_fields(uid_str, pinned_facts=pinned)
         return f"Pinned permanent fact to user memory: '{val}'.\n" + format_user_memory_card(uid_str), uid_str
 
     if act == "add_note" and val:
+        if not _is_valid_custom_note(val):
+            return "[Memory Notice: Skipped saving non-personal code/log/table/URL noise into custom_notes.]", ""
         notes = list(prof.get("custom_notes") or [])
         notes.append(val)
         await update_user_memory_fields(uid_str, custom_notes=notes)
@@ -776,7 +1189,13 @@ async def apply_tool_memory_action(speaker_user, action: str, value: str = "") -
         return f"Saved rolling note to user memory: '{val}'.", uid_str
 
     if act == "add_topic" and val:
-        new_items = [x.strip() for x in re.split(r"[,;،]+", val) if x.strip()]
+        raw_items = [x.strip() for x in re.split(r"[,;،]+", val) if x.strip()]
+        new_items = [
+            x for x in raw_items
+            if not _is_blocked_favorite_topic(x, user=speaker_user, profile=prof)
+        ]
+        if not new_items:
+            return "[Memory Notice: Skipped adding blocked/code/table noise into favorite_topics.]", ""
         favs = list(prof.get("favorite_topics") or []) + new_items
         await update_user_memory_fields(uid_str, favorite_topics=favs)
         return f"Added favorite topic(s): {', '.join(new_items)}.", uid_str

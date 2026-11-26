@@ -47,7 +47,8 @@ from config import (
     channel_has_recent_code_attachment,
 )
 
-ENGLISH_ENTITY_REGEX = re.compile(r"\b[A-Za-z][A-Za-z0-9_.:-]{1,25}(?:\s+[A-Za-z0-9_.:-]{1,25}){0,4}\b")
+# Restrict horizontal whitespace `[ \t]+` so entity spans NEVER bridge across newlines (prevents stack-trace line merges!)
+ENGLISH_ENTITY_REGEX = re.compile(r"\b[A-Za-z][A-Za-z0-9_.-]{1,25}(?:[ \t]+[A-Za-z0-9_.-]{1,25}){0,4}\b")
 
 STOPWORD_ENTITIES = {
     "search", "google", "wikipedia", "wiki", "what", "when", "where", "which", "who", "how",
@@ -60,10 +61,41 @@ STOPWORD_ENTITIES = {
     "ot", "ping", "ram", "status", "memory", "profile", "scribe", "voice",
     "hi", "hello", "hey", "thanks", "thank", "please", "sorry", "test", "check",
     "fix", "code", "bug", "log", "run", "try", "lol", "gg",
+    "row", "col", "column", "header", "cell", "value", "item", "foo", "bar", "baz",
+    "undefined", "null", "nan", "true", "false", "const", "let", "var", "return", "async", "await",
 }
-_MARKUP_NOISE_WORDS = {"markdown", "json", "html", "in-bubble", "ocr", "sfx", "error", "extraction", "readable"}
+_MARKUP_NOISE_WORDS = {
+    "markdown", "json", "html", "in-bubble", "ocr", "sfx", "error", "extraction", "readable",
+    "typeerror", "referenceerror", "syntaxerror", "rangeerror", "exception", "traceback",
+    "undefined", "nullpointerexception", "webpack", "scheduler", "localecompare", "settimeout",
+}
 _USER_TAG_REGEX = re.compile(r"^user_\d+$", re.IGNORECASE)
 _ARTIST_SOCIAL_SKIP_WIKI_REGEX = re.compile(r"\b(?:pixiv|fanbox|skeb|booth|fantia|twitter|artist|illustrator)\b", re.IGNORECASE)
+
+# Reject code/log/table/placeholder artifacts from entering `channel_active_topic` (and downstream `favorite_topics`)
+_ENTITY_CODE_FILE_EXT_REGEX = re.compile(
+    r"\.(?:tsx?|jsx?|py|java|class|kt|go|rs|cpp|cc|c|h|cs|php|rb|sql|pls|pkb|pks|log|json|ya?ml|xml|toml|ini|conf|env|css|scss|html|sh|ps1|bat|min\.js)\b",
+    re.IGNORECASE,
+)
+_ENTITY_DOTTED_PROP_REGEX = re.compile(r"\b[a-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\b")
+_ENTITY_PLACEHOLDER_TABLE_REGEX = re.compile(
+    r"^(?:(?:row|col|column|header|cell|field|item|test|sample|example)\s*\d+(?:\s+(?:row|col|column|header|cell|field|item)\s*\d+)*)$",
+    re.IGNORECASE,
+)
+_TOPIC_SKIP_TABLE_OR_CODE_REGEX = re.compile(
+    r"(?:```|\+[-=]{3,}\+|\|\s*[-:]{3,}\s*\||[┏━┿┃│]{3,}|\b(?:Header\s*1|Row\s*1\s*Col\s*1)\b|"
+    r"\b(?:TypeError|ReferenceError|SyntaxError|RangeError|NullPointerException|IllegalArgumentException|ORA-\d{4,5}|Traceback\s*\(most recent)\b|"
+    r"can't\s+access\s+property|cannot\s+read\s+propert|\bis\s+undefined\b|\bis\s+not\s+a\s+function\b|"
+    r"\.(?:tsx?|jsx?|py|java|sql|log):\d+)",
+    re.IGNORECASE,
+)
+_TOPIC_SKIP_INTERNAL_BUTTON_REGEX = re.compile(
+    r"(?:ช่วยเจาะลึกองค์ประกอบภาพ|ช่วยค้นหาข้อมูลเพิ่มเติมเกี่ยวกับศิลปิน|ช่วยอธิบายเจาะลึกเฉพาะความสัมพันธ์ของตัวละคร|"
+    r"ช่วยสร้าง\s*\*\*Code\s+Map|ช่วย\s*\*\*อธิบายการทำงานและสาเหตุ|ช่วย\s*\*\*ปรับปรุงประสิทธิภาพและโครงสร้าง|"
+    r"ช่วยวิเคราะห์ข้อดี\s+ข้อเสีย\s+ความคุ้มค่า|ช่วยสรุปใจความสำคัญและข้อสรุปหลัก|ช่วยสรุปขั้นตอนที่ต้องทำ|"
+    r"จากสินค้า\s+โมเดล\s+หรือฟิกเกอร์ที่ระบุไว้)",
+    re.IGNORECASE,
+)
 
 # Bounded 5-minute in-memory TTL cache for search results (eliminates redundant lookups on follow-up buttons)
 _SEARCH_CACHE: dict[str, tuple[float, str]] = {}
@@ -169,11 +201,22 @@ def detect_web_search_intent(text: str, channel_id: int = None) -> bool:
 
 def _is_valid_entity_phrase(phrase: str) -> bool:
     p = phrase.strip()
-    if not p or len(p) < 3 or p.lower() in STOPWORD_ENTITIES:
+    if not p or len(p) < 3 or len(p) > 48:
+        return False
+    if "\n" in p or "\r" in p or any(ch in p for ch in ("`", "|", "{", "}", "[", "]", ";", "=", "/", "\\", ":")):
+        return False
+    pl = p.lower()
+    if pl in STOPWORD_ENTITIES:
         return False
     if p.startswith("@") or _USER_TAG_REGEX.match(p):
         return False
     if OWNER_NAME_STRIP_REGEX.search(p):
+        return False
+    if _ENTITY_CODE_FILE_EXT_REGEX.search(p):
+        return False
+    if _ENTITY_DOTTED_PROP_REGEX.search(p):
+        return False
+    if _ENTITY_PLACEHOLDER_TABLE_REGEX.match(p):
         return False
     words = [w.lower() for w in p.split()]
     if any(w in _MARKUP_NOISE_WORDS for w in words):
@@ -195,6 +238,9 @@ def update_and_get_channel_topic(user_text: str, channel_id: int = None) -> str:
     if existing and (now - existing.get("timestamp", 0) > 1800):
         channel_active_topic.pop(channel_id, None)
         existing = None
+    if existing and not _is_valid_entity_phrase(existing.get("topic", "")):
+        channel_active_topic.pop(channel_id, None)
+        existing = None
 
     yt_title_m = re.search(r"Video Title:\s*(.+)", user_text)
     if yt_title_m:
@@ -209,6 +255,15 @@ def update_and_get_channel_topic(user_text: str, channel_id: int = None) -> str:
             return yt_title
 
     question_only = _strip_context_and_system_blocks(user_text)
+
+    # Never extract a conversational topic from raw code blocks, stack traces, tables, or internal UI button instructions!
+    if (
+        _TOPIC_SKIP_TABLE_OR_CODE_REGEX.search(question_only)
+        or STACK_TRACE_SIGNATURE_REGEX.search(question_only)
+        or _TOPIC_SKIP_INTERNAL_BUTTON_REGEX.search(question_only)
+    ):
+        return existing.get("topic", "") if existing else ""
+
     text_without_urls = re.sub(r"https?://\S+", " ", question_only)
 
     is_corr = bool(USER_CORRECTION_PATTERN.search(text_without_urls))
@@ -243,6 +298,12 @@ def update_and_get_channel_topic(user_text: str, channel_id: int = None) -> str:
             if msg.get("role") != "user":
                 continue
             hist_clean = re.sub(r"https?://\S+", " ", _strip_context_and_system_blocks(msg.get("content", "")))
+            if (
+                _TOPIC_SKIP_TABLE_OR_CODE_REGEX.search(hist_clean)
+                or STACK_TRACE_SIGNATURE_REGEX.search(hist_clean)
+                or _TOPIC_SKIP_INTERNAL_BUTTON_REGEX.search(hist_clean)
+            ):
+                continue
             first_ents = [
                 m.strip() for m in ENGLISH_ENTITY_REGEX.findall(hist_clean)
                 if _is_valid_entity_phrase(m)
@@ -672,18 +733,18 @@ async def _search_google_news_rss_async(query: str, is_thai: bool, max_results: 
             if resp.status != 200:
                 return []
             xml_bytes = await resp.read()
-        root = ET.fromstring(xml_bytes)
-        for item in root.findall("./channel/item")[:max_results]:
-            title = (item.findtext("title") or "").strip()
-            link = (item.findtext("link") or "").strip()
-            pub_date = (item.findtext("pubDate") or "").strip()
-            source = (item.findtext("source") or "").strip()
-            results.append({
-                "title": f"[{source}] {title}" if source else title,
-                "href": link,
-                "body": f"สำนักข่าว (Source): {source or 'Unknown'} | วันที่เผยแพร่: {pub_date} | พาดหัวข่าว: {title}",
-                "skip_scrape": True,
-            })
+            root = ET.fromstring(xml_bytes)
+            for item in root.findall("./channel/item")[:max_results]:
+                title = (item.findtext("title") or "").strip()
+                link = (item.findtext("link") or "").strip()
+                pub_date = (item.findtext("pubDate") or "").strip()
+                source = (item.findtext("source") or "").strip()
+                results.append({
+                    "title": f"[{source}] {title}" if source else title,
+                    "href": link,
+                    "body": f"สำนักข่าว (Source): {source or 'Unknown'} | วันที่เผยแพร่: {pub_date} | พาดหัวข่าว: {title}",
+                    "skip_scrape": True,
+                })
         if results:
             api_log(f"Search (Google News RSS) -> {len(results)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception as e:
@@ -722,10 +783,10 @@ async def _search_wikipedia_full_extract_async(query: str, is_thai: bool, max_re
                 if resp.status != 200:
                     continue
                 data = await resp.json()
-            search_items = ((data.get("query") or {}).get("search")) or []
-            titles = [item.get("title", "") for item in search_items[:max_results] if item.get("title")]
-            if not titles:
-                continue
+                search_items = ((data.get("query") or {}).get("search")) or []
+                titles = [item.get("title", "") for item in search_items[:max_results] if item.get("title")]
+                if not titles:
+                    continue
 
             # Batch-fetch all matched Wikipedia page extracts in ONE HTTP request (instead of N serial requests!)
             titles_param = "|".join(titles)
@@ -740,18 +801,18 @@ async def _search_wikipedia_full_extract_async(query: str, is_thai: bool, max_re
                 if e_resp.status != 200:
                     continue
                 e_data = await e_resp.json()
-            pages = ((e_data.get("query") or {}).get("pages")) or {}
-            for _, p_obj in pages.items():
-                title = p_obj.get("title") or ""
-                extract = (p_obj.get("extract") or "").strip()
-                if title and extract:
-                    page_url = f"{HTTPS}{lang_host}.wikipedia.org/wiki/{quote_plus(title.replace(' ', '_'))}"
-                    hits.append({
-                        "title": f"[Wikipedia {lang_host.upper()}] {title}",
-                        "href": page_url,
-                        "body": extract[:3800],
-                        "skip_scrape": True,
-                    })
+                pages = ((e_data.get("query") or {}).get("pages")) or {}
+                for _, p_obj in pages.items():
+                    title = p_obj.get("title") or ""
+                    extract = (p_obj.get("extract") or "").strip()
+                    if title and extract:
+                        page_url = f"{HTTPS}{lang_host}.wikipedia.org/wiki/{quote_plus(title.replace(' ', '_'))}"
+                        hits.append({
+                            "title": f"[Wikipedia {lang_host.upper()}] {title}",
+                            "href": page_url,
+                            "body": extract[:3800],
+                            "skip_scrape": True,
+                        })
             if hits:
                 api_log(f"Search (Wikipedia:{lang_host} q='{q_for_wiki[:35]}') -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
         except Exception:
@@ -781,23 +842,23 @@ async def _search_jikan_anime_manga_async(query: str, max_results: int = 2) -> l
             if resp.status != 200:
                 return []
             data = await resp.json()
-        for item in (data.get("data") or [])[:max_results]:
-            title = item.get("title") or "Unknown"
-            title_jp = item.get("title_japanese") or ""
-            score = item.get("score") or "N/A"
-            status = item.get("status") or "Unknown"
-            episodes_or_ch = item.get("episodes") or item.get("chapters") or "?"
-            synopsis = (item.get("synopsis") or "").strip()[:1200]
-            mal_url = item.get("url") or ""
-            hits.append({
-                "title": f"[MyAnimeList {media_type.upper()}] {title} ({title_jp})",
-                "href": mal_url,
-                "body": (
-                    f"Type: {item.get('type')} | Score: {score}/10 | Status: {status} | "
-                    f"Episodes/Chapters: {episodes_or_ch}\nSynopsis: {synopsis}"
-                ),
-                "skip_scrape": True,
-            })
+            for item in (data.get("data") or [])[:max_results]:
+                title = item.get("title") or "Unknown"
+                title_jp = item.get("title_japanese") or ""
+                score = item.get("score") or "N/A"
+                status = item.get("status") or "Unknown"
+                episodes_or_ch = item.get("episodes") or item.get("chapters") or "?"
+                synopsis = (item.get("synopsis") or "").strip()[:1200]
+                mal_url = item.get("url") or ""
+                hits.append({
+                    "title": f"[MyAnimeList {media_type.upper()}] {title} ({title_jp})",
+                    "href": mal_url,
+                    "body": (
+                        f"Type: {item.get('type')} | Score: {score}/10 | Status: {status} | "
+                        f"Episodes/Chapters: {episodes_or_ch}\nSynopsis: {synopsis}"
+                    ),
+                    "skip_scrape": True,
+                })
         if hits:
             api_log(f"Search (Jikan MAL:{media_type}) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception:
@@ -827,19 +888,19 @@ async def _search_steam_games_async(query: str, max_results: int = 2) -> list[di
             if resp.status != 200:
                 return []
             data = await resp.json()
-        for item in (data.get("items") or [])[:max_results]:
-            gid = item.get("id")
-            name = item.get("name") or "Unknown Game"
-            price_info = item.get("price") or {}
-            final_thb = (price_info.get("final", 0) / 100.0) if price_info else 0
-            price_str = f"{final_thb:,.2f} THB" if final_thb > 0 else "Free-to-Play / TBA"
-            store_url = f"{HTTPS}store.steampowered.com/app/{gid}" if gid else ""
-            hits.append({
-                "title": f"[Steam Store TH] {name}",
-                "href": store_url,
-                "body": f"Game: {name} | Steam Thailand Price: {price_str} | AppID: {gid}",
-                "skip_scrape": True,
-            })
+            for item in (data.get("items") or [])[:max_results]:
+                gid = item.get("id")
+                name = item.get("name") or "Unknown Game"
+                price_info = item.get("price") or {}
+                final_thb = (price_info.get("final", 0) / 100.0) if price_info else 0
+                price_str = f"{final_thb:,.2f} THB" if final_thb > 0 else "Free-to-Play / TBA"
+                store_url = f"{HTTPS}store.steampowered.com/app/{gid}" if gid else ""
+                hits.append({
+                    "title": f"[Steam Store TH] {name}",
+                    "href": store_url,
+                    "body": f"Game: {name} | Steam Thailand Price: {price_str} | AppID: {gid}",
+                    "skip_scrape": True,
+                })
         if hits:
             api_log(f"Search (Steam Store) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception:
@@ -862,12 +923,12 @@ async def _search_tavily_async(query: str, max_results: int = 5) -> list[dict]:
             if resp.status != 200:
                 return []
             t_data = await resp.json()
-        for r in t_data.get("results", []):
-            hits.append({
-                "title": r.get("title", ""),
-                "href": r.get("url", ""),
-                "body": r.get("content", ""),
-            })
+            for r in t_data.get("results", []):
+                hits.append({
+                    "title": r.get("title", ""),
+                    "href": r.get("url", ""),
+                    "body": r.get("content", ""),
+                })
         if hits:
             api_log(f"Search (Tavily) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
     except Exception as e:

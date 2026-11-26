@@ -93,6 +93,14 @@ async def _extract_and_save_durable_fact_bg(speaker_user, raw_user_query: str):
     if len(clean_q) < 10:
         return
 
+    from user_memory import (
+        _looks_like_code_or_error_or_table,
+        _looks_like_internal_bot_or_button_prompt,
+        _is_valid_custom_note,
+    )
+    if _looks_like_code_or_error_or_table(clean_q) or _looks_like_internal_bot_or_button_prompt(clean_q):
+        return
+
     _PASSIVE_FACT_IN_PROGRESS.add(uid_str)
     _PASSIVE_FACT_COOLDOWN_UNTIL[uid_str] = now + 60.0
     try:
@@ -100,6 +108,8 @@ async def _extract_and_save_durable_fact_bg(speaker_user, raw_user_query: str):
             "Extract at most ONE concise, durable long-term personal fact about the speaker "
             "(hardware/setup, profession, tech stack, preferences, pets, hobbies, or recurring goals) "
             "from the user message below. Preserve Thai/English naturally in <= 100 chars.\n"
+            'STRICT EXCLUSIONS: Return {"fact": ""} for temporary debugging errors, stack traces, '
+            "code snippets, Markdown/ASCII tables, one-off social media links, or transient chat questions.\n"
             'If there is NO clear durable personal fact, return {"fact": ""}.\n'
             'Return ONLY valid JSON: {"fact": "..."}\n\n'
             f"User message: {clean_q}"
@@ -132,7 +142,7 @@ async def _extract_and_save_durable_fact_bg(speaker_user, raw_user_query: str):
             return
         parsed = json.loads(m_json.group(0))
         fact = re.sub(r"\s+", " ", str(parsed.get("fact") or "")).strip()[:120]
-        if len(fact) >= 6:
+        if len(fact) >= 6 and _is_valid_custom_note(fact):
             from user_memory import apply_tool_memory_action
             await apply_tool_memory_action(speaker_user, "add_note", fact)
             api_log(f"PassiveMemory -> saved note for uid={uid_str[-4:]}: '{fact[:55]}'")
@@ -897,10 +907,14 @@ async def query_ai_chat(
             raw_user_query[:300],
             channel_id=channel_id,
             learned_memo=learned_memo,
+            is_button_followup=is_button_followup,
+            is_coding=is_coding,
+            assistant_reply=(answer or "")[:450],
         )
         # Passive Long-Term Memory Gate: non-blocking extraction when user shares a durable personal fact
         if (
             plan.get("has_durable_user_fact")
+            and not is_button_followup
             and not learned_memo
             and not (tool_ctx and tool_ctx.memory_updated_uid)
         ):
