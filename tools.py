@@ -466,6 +466,12 @@ async def execute_tool_call(
                 )
             ctx.tools_used.append(t_name)
             api_log(f"ToolExec -> manage_overtime('{cmd[:40]}') ({time.monotonic() - t0:.2f}s)")
+            if ctx.mode == "voice":
+                return (
+                    "Overtime action completed. Confirm briefly in 1 short spoken sentence "
+                    "(recorded date, time slot, and total hours only — under 35 words for TTS):\n"
+                    + ot_reply
+                )[:MAX_TOOL_OUTPUT_CHARS]
             return (
                 "Overtime action completed. Include the exact recorded date, time slot, hours, and summary below in your response:\n"
                 + ot_reply
@@ -504,7 +510,7 @@ async def execute_tool_call(
             return (
                 f"[Image generation queued for prompt: '{full_p}'. "
                 "The rendered image will be automatically attached right after your text reply — "
-                "tell the user briefly in Yukino's voice that you drew it for them.]"
+                "let the user know briefly and naturally that you drew it for them.]"
             )
 
         if t_name == "add_reaction":

@@ -41,7 +41,6 @@ from search_engine import (
     run_safe_web_search_async,
 )
 from tools import ToolExecutionContext
-from discord_tables import format_markdown_tables_for_discord
 from llm_providers import (
     _can_use_gemini_hydrogen,
     is_google_ai_studio_congested,
@@ -65,15 +64,15 @@ _PASSIVE_FACT_IN_PROGRESS: set[str] = set()
 
 _TONE_CUE_INSTRUCTIONS = {
     "sharp_tease": (
-        "น้ำเสียงที่เหมาะสมในรอบนี้: ใช้ไหวพริบและความจิกกัดเบาๆ สไตล์ยูกิโนะอย่างเป็นธรรมชาติ "
+        "น้ำเสียงที่เหมาะสมในรอบนี้: ใช้ไหวพริบและความจิกกัดเบาๆ อย่างเป็นธรรมชาติ "
         "(ไม่หยาบคายและไม่เทศนา) ก่อนมอบคำตอบที่ถูกต้องให้"
     ),
     "focused_support": (
         "น้ำเสียงที่เหมาะสมในรอบนี้: คู่สนทนากำลังแก้ปัญหาจริงจัง ให้ตอบด้วยน้ำเสียงสุขุม ชัดเจน "
-        "ตรงประเด็น และพึ่งพาได้แบบประธานชมรมบริการ"
+        "ตรงประเด็น และพึ่งพาได้"
     ),
     "gap_moe_soft": (
-        "น้ำเสียงที่เหมาะสมในรอบนี้: หัวข้อเกี่ยวกับแมวหรือแพนซัง ให้แอบเสียอาการหรือแสดงความเอ็นดูเล็กน้อยแบบเก็บทรงไว้ตัวสไตล์ยูกิโนะ"
+        "น้ำเสียงที่เหมาะสมในรอบนี้: หัวข้อเกี่ยวกับแมวหรือแพนซัง ให้หลุดความเอ็นดูหรือแก้เก้อเบาๆ แบบเก็บอาการไว้ตัว"
     ),
 }
 
@@ -269,8 +268,16 @@ async def query_ai_chat(
     # `systemInstruction` contains ONLY static persona + static speaker role + permanent `pinned_facts`.
     # All per-turn / auto-updating fields (clock, interaction_count, last_seen, favorite_topics,
     # rolling notes, recent topics, active topic, tone) go into trailing `[ข้อมูลบริบทระบบปัจจุบัน]`!
-    speaker_static_block = get_speaker_identity_context(
-        speaker_user, fallback_name=speaker_name, include_volatile_memory=False
+    is_group_transcript = bool(
+        plan.get("preserve_owner_name")
+        or (speaker_user is None and not speaker_name and "=== บันทึกบทสนทนา (Voice Transcript) ===" in prompt)
+    )
+    speaker_static_block = (
+        ""
+        if is_group_transcript
+        else get_speaker_identity_context(
+            speaker_user, fallback_name=speaker_name, include_volatile_memory=False
+        )
     )
     is_voice_sys = (norm_mode == "voice") or ("ห้องเสียง" in system_prompt) or (
         tool_ctx is not None and tool_ctx.mode == "voice"
@@ -310,10 +317,11 @@ async def query_ai_chat(
             "และจุดสังเกตสำคัญจาก Vision Analysis ให้ชัดเจน (หากยังไม่ยืนยันสเกล/รุ่นย่อยจากมุมเดียวได้ ให้บอกตรงๆ ว่ายังระบุสเกลแน่ชัดไม่ได้)"
         )
     elif is_japanese_or_social_media and not is_voice_sys:
+        jp_table_suffix = " และห้ามสร้างตารางในคำตอบนี้" if (no_tables_flag or is_fresh_social_embed) else ""
         volatile_ctx_lines.append(
             "- ความสม่ำเสมอของชื่อและศัพท์ญี่ปุ่น: ใช้ชื่อตัวละคร ชื่อศิลปิน และศัพท์เฉพาะตาม Canonical Names ในข้อมูล OCR/บริบท "
             "โดยทับศัพท์ตามเสียงคานะญี่ปุ่นให้แม่นยำ (เช่น `あおい` = `อาโออิ`, `せな` = `เซนะ`) หรือใช้ Romaji "
-            "ห้ามแปลชื่อตัวละครหรือศัพท์เฉพาะแบบตรงตัวแข็งทื่อ และห้ามสร้างตารางในคำตอบนี้"
+            f"ห้ามแปลชื่อตัวละครหรือศัพท์เฉพาะแบบตรงตัวแข็งทื่อ{jp_table_suffix}"
         )
 
     is_coding_prelim = (norm_mode == "code") or (dec_route == "code" and dec_conf >= 0.70)
@@ -478,7 +486,7 @@ async def query_ai_chat(
                     elif v_code == "user_was_right":
                         arbitrator_verdict_note = (
                             f"\n- **[คำตัดสินจากหลักฐาน (confidence={v_conf:.2f}) -> คำตอบเดิมของคุณผิดจริงและผู้ใช้พูดถูก]**: "
-                            "จงยอมรับผิดอย่างตรงไปตรงมาสั้นๆ ในสไตล์ยูกิโนะ (ไม่ยืดเยื้อ) และแก้ไขข้อมูลให้ถูกต้องตามหลักฐานทันที"
+                            "จงยอมรับผิดอย่างตรงไปตรงมาสั้นๆ (ไม่ยืดเยื้อ) และแก้ไขข้อมูลให้ถูกต้องตามหลักฐานทันที"
                         )
                     elif v_code == "partial_truth":
                         arbitrator_verdict_note = (
@@ -921,10 +929,10 @@ async def query_ai_chat(
             if len(detect_mixed_script_corruption(repaired_out, raw_user_query)) < len(corrupted_tokens):
                 raw_answer = repaired_out
 
-    suppress_social_embeds_flag = bool(
-        plan.get("suppress_social_embeds")
-        or (is_fresh_social_embed and not is_button_followup)
-    )
+    if "suppress_social_embeds" in plan:
+        suppress_social_embeds_flag = bool(plan["suppress_social_embeds"])
+    else:
+        suppress_social_embeds_flag = bool(is_fresh_social_embed and not is_button_followup)
 
     answer = sanitize_yukino_output(
         raw_answer,
@@ -933,6 +941,7 @@ async def query_ai_chat(
         speaker_name,
         allow_cjk_override=is_japanese_or_social_media,
         suppress_social_embeds=suppress_social_embeds_flag,
+        preserve_owner_name=is_group_transcript,
     )
 
     if not answer.strip():
@@ -946,10 +955,8 @@ async def query_ai_chat(
             speaker_name,
             allow_cjk_override=is_japanese_or_social_media,
             suppress_social_embeds=suppress_social_embeds_flag,
+            preserve_owner_name=is_group_transcript,
         )
-
-    if not is_voice_mode and answer:
-        answer = format_markdown_tables_for_discord(answer)
 
     if speaker_user is not None:
         record_user_interaction(

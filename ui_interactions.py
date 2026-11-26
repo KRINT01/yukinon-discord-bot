@@ -421,9 +421,10 @@ async def _deliver_button_followup_cleanly(interaction: discord.Interaction, ans
             pass
         return
 
-    if len(answer) <= 1900:
+    display_answer = format_markdown_tables_for_discord(answer) if len(answer) <= 7500 else answer
+    if len(display_answer) <= 1900:
         try:
-            await interaction.followup.send(answer)
+            await interaction.followup.send(display_answer)
             return
         except Exception:
             pass
@@ -433,7 +434,8 @@ async def _deliver_button_followup_cleanly(interaction: discord.Interaction, ans
             await interaction.delete_original_response()
         except Exception:
             pass
-        await send_chunked_response(interaction.channel, answer)
+        chunk_payload = display_answer if len(display_answer) <= 7500 else answer
+        await send_chunked_response(interaction.channel, chunk_payload)
         return
 
     try:
@@ -620,7 +622,7 @@ FOLLOWUP_ACTION_REGISTRY: dict[str, tuple[str, str, str, bool]] = {
     "pros_cons": (
         "เทียบข้อดี-ข้อเสีย",
         "⚖️",
-        "ช่วยวิเคราะห์ข้อดี ข้อเสีย ความคุ้มค่า และข้อควรระวังของเรื่องนี้ในมุมมองที่ตรงไปตรงมาสไตล์ยูกิโนะให้หน่อยค่ะ",
+        "ช่วยวิเคราะห์ข้อดี ข้อเสีย ความคุ้มค่า และข้อควรระวังของเรื่องนี้แบบตรงไปตรงมา ไม่อ้อมค้อมให้หน่อยค่ะ",
         True,
     ),
     "summary_3": (
@@ -652,7 +654,7 @@ FOLLOWUP_ACTION_REGISTRY: dict[str, tuple[str, str, str, bool]] = {
         "เทียบสเกล / ตัวเลือกอื่น",
         "💡",
         "ช่วยเปรียบเทียบความแตกต่างระหว่างสเกล รุ่นย่อย หรือตัวเลือกอื่นที่ใกล้เคียงกัน "
-        "(เช่น รายละเอียด สเปค ความคุ้มค่า และข้อควรระวัง) แบบตรงไปตรงมาสไตล์ยูกิโนะค่ะ",
+        "(เช่น รายละเอียด สเปค ความคุ้มค่า และข้อควรระวัง) แบบตรงไปตรงมา ไม่อ้อมค้อมค่ะ",
         True,
     ),
     "game_build_tips": (
@@ -1118,7 +1120,7 @@ def build_contextual_suggestion_view(
                 "⚖️",
                 discord.ButtonStyle.secondary,
                 "ช่วยเปรียบเทียบความแตกต่างระหว่างสเกล รุ่นย่อย หรือไลน์สินค้าที่ใกล้เคียงกันของสิ่งนี้ "
-                "(เช่น รายละเอียดงาน ข้อต่อ ขนาด และความคุ้มค่า) แบบตรงไปตรงมาสไตล์ยูกิโนะค่ะ",
+                "(เช่น รายละเอียดงาน ข้อต่อ ขนาด และความคุ้มค่า) แบบตรงไปตรงมา ไม่อ้อมค้อมค่ะ",
                 True,
             ),
             (
@@ -1223,7 +1225,7 @@ def build_contextual_suggestion_view(
                 "เทียบข้อดี-ข้อเสีย",
                 "⚖️",
                 discord.ButtonStyle.secondary,
-                "ช่วยวิเคราะห์จุดเด่น ข้อด้อย และความคุ้มค่าของเกม/สายการเล่นนี้ในมุมมองที่ตรงไปตรงมาสไตล์ยูกิโนะให้หน่อยค่ะ",
+                "ช่วยวิเคราะห์จุดเด่น ข้อด้อย และความคุ้มค่าของเกม/สายการเล่นนี้แบบตรงไปตรงมา ไม่อ้อมค้อมให้หน่อยค่ะ",
                 True,
             ),
             (
@@ -1271,7 +1273,7 @@ def build_contextual_suggestion_view(
             "เทียบข้อดี-ข้อเสีย",
             "⚖️",
             discord.ButtonStyle.primary,
-            "ช่วยวิเคราะห์ข้อดี ข้อเสีย ความคุ้มค่า และข้อควรระวังของเรื่องนี้ในมุมมองที่ตรงไปตรงมาสไตล์ยูกิโนะให้หน่อยค่ะ",
+            "ช่วยวิเคราะห์ข้อดี ข้อเสีย ความคุ้มค่า และข้อควรระวังของเรื่องนี้แบบตรงไปตรงมา ไม่อ้อมค้อมให้หน่อยค่ะ",
             True,
         ),
         (
@@ -1880,7 +1882,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
     ):
         if not link.strip() and attachment is None:
             await interaction.response.send_message(
-                "แนบรูปหรือวางลิงก์ (X/Twitter, Pixiv/phixiv หรือลิงก์รูปภาพ) มาด้วยสิคะ",
+                "แนบรูปหรือวางลิงก์ (X/Twitter, Pixiv/phixiv หรือลิงก์รูปภาพ) มาด้วยนะคะ ไม่อย่างนั้นฉันเช็คที่มาให้ไม่ได้ค่ะ",
                 ephemeral=True,
             )
             return
@@ -1909,7 +1911,9 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             extracted_ctx=extracted_ctx,
             purpose="SlashSource",
             channel_id=interaction.channel_id,
-        )
+        ) or {}
+        dec_plan = dict(dec_plan)
+        dec_plan["suppress_social_embeds"] = False
         user_q = question.strip() or (
             "ช่วยระบุที่มาของภาพและลิงก์นี้อย่างละเอียด: "
             "หากเป็นภาพวาด/อนิเมะ/มังงะ ให้บอกชื่อเรื่อง ชื่อตัวละคร ตอนที่/Chapter ชื่อผู้วาด และแนบลิงก์ที่มา (เช่น Pixiv/X/MyAnimeList) ถ้ามี "
@@ -1972,7 +1976,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
     ):
         if not link.strip() and attachment is None:
             await interaction.response.send_message(
-                "แนบรูปมังงะหรือวางลิงก์ X (Twitter) / Pixiv / phixiv มาด้วยสิคะ",
+                "แนบรูปมังงะหรือวางลิงก์ X (Twitter) / Pixiv / phixiv มาด้วยนะคะ ไม่อย่างนั้นฉันแปลให้ไม่ได้ค่ะ",
                 ephemeral=True,
             )
             return
@@ -2112,7 +2116,9 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             extracted_ctx=extracted_ctx,
             purpose="CtxFindSource",
             channel_id=interaction.channel_id,
-        )
+        ) or {}
+        dec_plan = dict(dec_plan)
+        dec_plan["suppress_social_embeds"] = False
         user_q = (
             "ช่วยระบุที่มาของภาพและลิงก์นี้อย่างละเอียด: "
             "หากเป็นภาพวาด/อนิเมะ/มังงะ ให้บอกชื่อเรื่อง ชื่อตัวละคร ตอนที่/Chapter ชื่อผู้วาด และแนบลิงก์ที่มา (เช่น Pixiv/X/MyAnimeList) ถ้ามี "

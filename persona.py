@@ -44,6 +44,12 @@ _LINE_GLITCH_BULLET_REGEX = re.compile(r"(?<=\n)[ \t]*[°º◦·▪▫‣⁃]+[ 
 # Private Use Area / Unicode Replacement tofu glyphs copied from fancy X display names (e.g. ▢MALINO▢)
 _TOFU_PUA_REGEX = re.compile(r"[\uE000-\uF8FF\uFFFD]")
 
+# Isolated Simplified-Chinese / Chinese-only function-word leak stripper (safe on Japanese Kanji!)
+_CHINESE_ONLY_LEAK_REGEX = re.compile(
+    r"(?:才行|的话|其实|但是|因为|所以|应该|觉得|而且|怎么|什么|没有|这里|那里|已经|可以|需要|虽然|不过|还有|就是|还是|这个|那个|非常|这样|那样|"
+    r"(?<=[\u0E00-\u0E7F\s])[呢吗吧哦啊啦嘛呀哇哪啥咱您们这那为从对给把被让](?=[\u0E00-\u0E7F\s.,!?\"')\]]|$))"
+)
+
 # Mixed-script corruption detection (Korean Hangul leaks & Thai+lowercase-Latin mid-word hybrids like 'โฮชิมachi', 'ส이เซ이')
 _HANGUL_CHAR_REGEX = re.compile(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF]")
 _KOREAN_TOPIC_HINT_REGEX = re.compile(r"(เกาหลี|\bkorean\b|\bhangul\b|한국)", re.IGNORECASE)
@@ -470,7 +476,7 @@ def get_speaker_identity_context(
         return (
             "### [กฎการเรียกคู่สนทนาปัจจุบัน (Current Speaker Rules — SERVER MEMBER)]:\n"
             f"- ผู้ที่กำลังคุยกับคุณคือสมาชิกในเซิร์ฟเวอร์ชื่อ: **{clean_name}** (ไม่ใช่คู่หูเจ้าของบอท แต่เป็นสมาชิกที่มาใช้บริการชมรม)\n"
-            f'- การเรียกชื่อ: ให้เรียกชื่อเขาตรงๆ ว่า **"{clean_name}"** (หรือใช้สรรพนาม "นาย" / "เธอ") โดย **ห้ามใส่คำว่า "คุณ" นำหน้าชื่อเด็ดขาด** (เช่น ห้ามพูดว่า "คุณ {clean_name}")\n'
+            f'- การเรียกชื่อ: ให้เรียกชื่อเขาตรงๆ ว่า **"{clean_name}"** (หรือใช้สรรพนาม "นาย" / "เธอ") โดย **ห้ามใส่คำว่า "คุณ" นำหน้าชื่อสมาชิกใน Discord** (เช่น ห้ามพูดว่า "คุณ {clean_name}" ส่วนศิลปินหรือบุคคลภายนอกบนโซเชียลใช้ได้ตามปกติ)\n'
             '- **ข้อยกเว้นเชิงวาทศิลป์**: หากต้องการประชดประชันหรือเหน็บแนมด้วยน้ำเสียงห่างเหิน สามารถใช้คำสรรพนาม **"คุณ"** เดี่ยวๆ (โดยไม่มีชื่อตามหลัง) ได้'
             f"{mem_section}{memo_instruction}"
         ).strip()
@@ -518,6 +524,9 @@ def _sanitize_prose_segment(
     # 2. Strip stray Chinese CJK leaks (preserving Japanese Kanji in Kana) and stray Hangul leaks on non-Korean turns
     if not allow_cjk:
         s = _strip_stray_cjk_preserving_japanese(s)
+    elif not CJK_LEAK_REGEX.search(user_prompt or ""):
+        # Even on Japanese/social turns (where Kanji titles are preserved), strip obvious Chinese-only function-word leaks
+        s = _CHINESE_ONLY_LEAK_REGEX.sub("", s)
     if not allow_hangul:
         s = _HANGUL_CHAR_REGEX.sub("", s)
 
@@ -591,8 +600,9 @@ def _sanitize_prose_segment(
     s = re.sub(r"เร็ว\s*ๆ\s*ก่อนสินะ", "ดูนะคะ", s)
     s = re.sub(r"\n*แล้วนายจะเลือกอะไรดีล่ะคะ\??\s*[😊🙂✨]*\s*$", "", s)
     s = re.sub(r"[😊😄😁🥰🙈🙉🙊😢😭😔😞✅❌👉🔍]+", "", s)
-    s = re.sub(r"ของคุณเอง", "ของนายเอง", s)
-    s = re.sub(r"ถ้าคุณ(?:ชอบ|ต้องการ|สนใจ|อยาก)", "ถ้านายชอบ", s)
+    if is_owner_context:
+        s = re.sub(r"ของคุณเอง", "ของนายเอง", s)
+        s = re.sub(r"ถ้าคุณ(ชอบ|ต้องการ|สนใจ|อยาก)", r"ถ้านาย\1", s)
     s = re.sub(r"(?:^|\n)\s*\*\*\s*สรุป\s*:\*\*\s*", "\n\n", s)
     # Collapse consecutive spaces inside prose lines without touching indentation or newlines
     s = re.sub(r"(?<=[^\n ]) {2,}", " ", s)
@@ -606,6 +616,7 @@ def sanitize_yukino_output(
     speaker_name: str = "",
     allow_cjk_override: bool = False,
     suppress_social_embeds: bool = False,
+    preserve_owner_name: bool = False,
 ) -> str:
     """
     Normalizes Discord Markdown code fences first (fixing inline/inverted/unclosed fences),
@@ -624,7 +635,7 @@ def sanitize_yukino_output(
         _HANGUL_CHAR_REGEX.search(user_prompt or "")
         or _KOREAN_TOPIC_HINT_REGEX.search(user_prompt or "")
     )
-    is_owner_ctx = bool(
+    is_owner_ctx = False if preserve_owner_name else bool(
         is_owner_user(speaker_user)
         or "krint" in (speaker_name or "").lower()
         or speaker_user is None
@@ -848,7 +859,7 @@ YUKIPEDIA_SYSTEM_PROMPT = """
 VOICE_SYSTEM_PROMPT = """
 คุณคือ "ยูกิโนะชิตะ ยูกิโนะ" (ยูกิน่อน) ประธานชมรมบริการจากเรื่อง OreGairu กำลังพูดโต้ตอบผ่านห้องเสียง Discord ด้วยน้ำเสียงสุขุม เรียบง่าย และเป็นธรรมชาติเหมือนเด็กสาว ม.ปลาย ที่คุยกับคนคุ้นเคย
 กฎการพูด:
-1. แทนตัวเองว่า "ฉัน" และเรียกคู่สนทนาว่า "นาย" (หรือละสรรพนามได้ตามธรรมชาติ) ลงท้ายประโยคด้วย "ค่ะ" หรือ "นะคะ" เท่านั้น (ห้ามเติมคำว่า ", นายค่ะ?" หรือเรียกชื่อผู้ใช้ต่อท้ายประโยค ห้ามใช้คำแข็งทื่ออย่าง "รับทราบ"/"ดำเนินการ" และห้ามใช้ "นี่เอง สินะ", "นะคะ สินะ", "จ้า", "จ๊ะ" เด็ดขาด)
+1. แทนตัวเองว่า "ฉัน" และเรียกคู่สนทนาตามกฎผู้พูดปัจจุบัน (ใช้ "นาย" กับคู่หูเจ้าของบอท หรือเรียกชื่อสมาชิกในห้องเสียงตรงๆ โดยไม่ใส่ "คุณ" นำหน้า หรือละสรรพนามตามธรรมชาติ) ลงท้ายประโยคด้วย "ค่ะ" หรือ "นะคะ" เท่านั้น (ห้ามเติมคำว่า ", นายค่ะ?" ห้ามใช้คำแข็งทื่ออย่าง "รับทราบ"/"ดำเนินการ" และห้ามใช้ "นี่เอง สินะ", "นะคะ สินะ", "จ้า", "จ๊ะ" เด็ดขาด)
 2. หากถูกขอให้แนะนำตัว ให้แนะนำตัวสั้นๆ อย่างสง่างามตามจริง เช่น "ฉัน ยูกิโนะชิตะ ยูกิโนะ ประธานชมรมบริการค่ะ มีธุระอะไรให้ช่วยก็พูดมาได้เลยนะคะ"
 3. ตอบตรงคำถามของผู้ใช้เสมอ สามารถเรียกใช้เครื่องมือ `web_search`, `get_weather`, `calculate`, `manage_overtime`, `manage_user_memory` ได้เมื่อจำเป็น ห้ามพูดชื่อฟังก์ชันและห้ามหลุดภาษาจีนเด็ดขาด
 4. กฎสำหรับเสียงพูด (TTS): ตอบสั้นกระชับที่สุดเพียง 1 ถึง 2 ประโยค (ไม่เกิน 35 คำ) ใช้ภาษาพูดที่ไหลลื่น ห้ามใส่วงเล็บ ห้ามใช้สัญลักษณ์พิเศษ (*, #, `) และห้ามใส่บล็อกโค้ด

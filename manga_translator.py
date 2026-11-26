@@ -50,7 +50,7 @@ from manga_cv_render import (
     _release_cv_page_masks,
 )
 
-MANGA_TRANSLATOR_VERSION = "v17.5"
+MANGA_TRANSLATOR_VERSION = "v17.6"
 MANGA_CV_VER = getattr(_mcr_mod, "MANGA_CV_RENDER_VERSION", "old")
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
 # Bundle 2 dynamic parallel hedge: faster 15s recovery on typical 2-4p X threads, patient 25s on 5-12p batches
@@ -1887,9 +1887,18 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
                 f"(timeout={int(or_timeout)}s, dim={batch_dim}px)"
             )
             or_t0 = time.monotonic()
+            async def _on_or_hb_tick(m_id: str, el: float):
+                await _notify(
+                    f"🌐 **2/3** กำลังแปลผ่าน OpenRouter (`{el:.0f}s`)..."
+                )
+
             hb_or = asyncio.create_task(
                 _waiting_heartbeat_logger(
-                    label_prefix, req_id, OPENROUTER_MANGA_MODEL, or_t0, notify_fn=_notify
+                    req_id,
+                    label_prefix,
+                    OPENROUTER_MANGA_MODEL,
+                    interval_sec=15.0,
+                    on_tick=_on_or_hb_tick,
                 )
             )
             try:
@@ -2285,7 +2294,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
 
         if not disk_pages:
             await channel.send(
-                "แนบรูปหน้ามังงะหรือวางลิงก์ (X/Twitter, Pixiv/phixiv หรือลิงก์รูปภาพ) มาด้วยสิคะ "
+                "ถ้าไม่แนบรูปหน้ามังงะหรือวางลิงก์ (X/Twitter, Pixiv/phixiv หรือลิงก์รูปภาพ) มาด้วย ฉันก็ช่วยแปลให้ไม่ได้นะคะ "
                 "แนบหลายหน้าพร้อมกันได้เลย เช่น พิมพ์ `!manga en` หรือ `!manga th` ค่ะ"
             )
             return

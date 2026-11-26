@@ -104,6 +104,10 @@ from llm import (
 )
 from media_context import (
     MAX_BATCH_IMAGES,
+    TWITTER_STATUS_URL_REGEX,
+    PIXIV_ILLUST_URL_REGEX,
+    BSKY_POST_URL_REGEX,
+    DIRECT_IMAGE_URL_REGEX,
     extract_all_context,
     resolve_referenced_message,
     get_batch_ocr_encode_params,
@@ -935,9 +939,34 @@ async def on_message(message: discord.Message):
             await process_yukipedia_request(message, clean_prompt)
             return
 
-        if MANGA_TRANSLATE_INTENT_PATTERN.search(clean_prompt) or (
-            (has_image_att or has_embedded_media_or_link)
-            and re.search(r"(แปล|\btranslate\b|\btl\b)", clean_prompt, re.IGNORECASE)
+        combined_link_text = f"{clean_prompt} {getattr(ref_msg, 'content', '') or ''}"
+        has_visual_social_or_img_url = bool(
+            TWITTER_STATUS_URL_REGEX.search(combined_link_text)
+            or PIXIV_ILLUST_URL_REGEX.search(combined_link_text)
+            or BSKY_POST_URL_REGEX.search(combined_link_text)
+            or DIRECT_IMAGE_URL_REGEX.search(combined_link_text)
+        )
+        has_visual_media_for_manga = bool(
+            has_image_att
+            or has_visual_social_or_img_url
+            or any(
+                getattr(e, "image", None) and getattr(e.image, "url", None)
+                for e in (list(message.embeds) + (list(ref_msg.embeds) if ref_msg else []))
+            )
+        )
+        has_explicit_manga_phrase = bool(
+            re.search(
+                r"(แปลมังงะ|แปลรูป|แปลภาพ|แปลการ์ตูน|แปลหน้า|\btranslate\b.*?\b(?:manga|manhwa|comic|panel|panels|bubble|bubbles)\b)",
+                clean_prompt,
+                re.IGNORECASE,
+            )
+        )
+        if has_explicit_manga_phrase or (
+            has_visual_media_for_manga
+            and (
+                MANGA_TRANSLATE_INTENT_PATTERN.search(clean_prompt)
+                or re.search(r"(แปล|\btranslate\b|\btl\b)", clean_prompt, re.IGNORECASE)
+            )
         ):
             await process_manga_translation_request(message, clean_prompt)
             return
@@ -1072,28 +1101,25 @@ async def on_message(message: discord.Message):
                 decision_plan = {"no_tables": True, "suppress_social_embeds": True}
             user_request = (
                 f"{clean_prompt}\n"
-                "(ผู้ใช้ส่งลิงก์นี้มาให้ ช่วยเล่าเหตุการณ์และบริบทของโพสต์นี้โดยเชื่อมโยงแคปชัน ชื่อผู้วาด และบทสนทนาในภาพตามลำดับช่องอ่าน "
-                "แปลบทพูดสำคัญเป็นภาษาไทยอย่างเป็นธรรมชาติ คงชื่อตัวละคร ชื่อศิลปิน และศัพท์เฉพาะญี่ปุ่นตามเสียงคานะที่ถูกต้องหรือ Romaji "
-                "(ห้ามแปลชื่อตัวละครหรือศัพท์เฉพาะแบบตรงตัวแข็งทื่อ และห้ามผสมอักษรไทย-อังกฤษ-เกาหลีกลางคำ) "
-                "เอ่ยถึงผู้วาดด้วยชื่อหรือ @handle แบบข้อความธรรมดาเท่านั้น ห้ามวางลิงก์โพสต์ซ้ำหรือทำไฮเปอร์ลิงก์กลับไปยังโพสต์ที่ผู้ใช้เพิ่งส่งมา "
-                "และแสดงความรู้สึกส่วนตัวของเธอต่อฉากนี้โดยตรงเป็นย่อหน้าสนทนาต่อเนื่อง "
-                "ห้ามตั้งหัวข้อเมตาเช่น 'เนื้อหาทางภาพ', 'เหตุการณ์และบริบทของเรื่องราว', 'ความรู้สึกของฉัน' หรือ 'ความคิดเห็นในสไตล์ยูกิโนะ' และห้ามสร้างตาราง Markdown เด็ดขาด)"
+                "(ผู้ใช้ส่งลิงก์นี้มาให้ เล่าเหตุการณ์และบริบทของโพสต์โดยเชื่อมโยงแคปชัน ชื่อผู้วาด และบทสนทนาในภาพเป็นย่อหน้าสนทนาต่อเนื่อง "
+                "แปลบทพูดสำคัญให้เป็นธรรมชาติ ใช้ชื่อตัวละคร/ศิลปินตาม Canonical Names โดยเอ่ยชื่อผู้วาดหรือ @handle แบบข้อความธรรมดาไม่ต้องวางลิงก์โพสต์ซ้ำ "
+                "แล้วแทรกความรู้สึกส่วนตัวต่อฉากนี้ลงไปตรงๆ โดยไม่ตั้งหัวข้อ)"
             )
         elif clean_prompt or spoken_clip_text:
             user_request = clean_prompt or spoken_clip_text
         elif message.stickers:
             stk_names = ", ".join(s.name for s in message.stickers)
-            user_request = f"(ผู้ใช้ส่งสติกเกอร์ `{stk_names}` มาให้ ช่วยตอบโต้หรือแสดงความเห็นต่อสติกเกอร์นี้ในสไตล์ยูกิโนะ)"
+            user_request = f"(ผู้ใช้ส่งสติกเกอร์ `{stk_names}` มาให้ ช่วยตอบโต้หรือแสดงความเห็นสั้นๆ อย่างเป็นธรรมชาติ)"
         elif extracted_ctx:
             if use_coder:
                 user_request = "ช่วยตรวจสอบ วิเคราะห์จุดบกพร่องหรือหา Root Cause และสรุปแนวทางแก้ไขสำหรับสิ่งที่แนบมาให้หน่อย"
             else:
                 user_request = (
-                    "ช่วยเล่าเหตุการณ์และบทสนทนาที่เห็นในภาพที่แนบมาตามลำดับช่องอ่าน แปลบทพูดสำคัญเป็นภาษาไทยอย่างเป็นธรรมชาติ "
-                    "และบอกความรู้สึกส่วนตัวของเธอต่อฉากนี้โดยตรงเป็นย่อหน้าสนทนาต่อเนื่อง (ห้ามตั้งหัวข้อเมตาเช่น 'เนื้อหาทางภาพ' หรือ 'ความรู้สึกของฉัน' เด็ดขาด)"
+                    "เล่าเหตุการณ์และบทสนทนาที่เห็นในภาพที่แนบมาเป็นย่อหน้าสนทนาต่อเนื่อง แปลบทพูดสำคัญให้เป็นธรรมชาติ "
+                    "และแทรกความรู้สึกส่วนตัวต่อฉากนี้ลงไปตรงๆ โดยไม่ตั้งหัวข้อ"
                 )
         else:
-            user_request = "สวัสดี (ทักทายกลับตามธรรมชาติในสไตล์ยูกิโนะ)"
+            user_request = "สวัสดี (ทักทายกลับสั้นๆ อย่างเป็นธรรมชาติ)"
 
         extra_blocks = "\n\n".join(b for b in (mentioned_dossier, extracted_ctx) if b)
         full_prompt = f"{user_request}\n\n{extra_blocks}" if extra_blocks else user_request
@@ -1249,7 +1275,7 @@ async def _connect_bot_to_voice_channel(ctx, target_channel, greet: bool = True)
     if greet:
         await ctx.send(f"เข้ามาในห้องเสียง `{target_channel.name}` แล้วค่ะ 🎙️")
         await speak_in_voice_channel(
-            ctx.guild, "เข้ามาในห้องเสียงแล้วค่ะ มีเรื่องอะไรให้ช่วยก็พูดมาได้เลยนะคะ"
+            ctx.guild, "เข้ามาในห้องเสียงแล้วค่ะ ถ้ามีธุระอะไรก็พูดมาได้เลยนะคะ"
         )
     return vc
 
@@ -1419,7 +1445,7 @@ async def voice_status_command(ctx):
 @bot.command(name="imagine", aliases=["img", "draw"])
 async def imagine_command(ctx, *, prompt: str = ""):
     if not prompt.strip():
-        await ctx.send("บอกด้วยสิคะว่าจะให้วาดอะไร เช่น `!imagine แมวส้มนั่งใช้คอมพิวเตอร์ในห้อง` ค่ะ")
+        await ctx.send("ระบุมาด้วยนะคะว่าจะให้วาดอะไร เช่น `!imagine แมวส้มนั่งใช้คอมพิวเตอร์ในห้อง` ค่ะ")
         return
     async with ctx.typing():
         await send_generated_image_to_channel(ctx.channel, prompt, reply_to=ctx.message)
@@ -1544,8 +1570,8 @@ async def source_command(ctx, *, question: str = ""):
         ctx_text, _ = await extract_all_context(ctx.message)
         if not ctx_text:
             await ctx.send(
-                "แนบรูป วางลิงก์ (X/Twitter, Pixiv/phixiv หรือลิงก์รูปภาพ) "
-                "หรือกด Reply ข้อความที่มีรูปมาด้วยสิคะ เดี๋ยวฉันเช็คที่มาให้ค่ะ"
+                "ถ้าไม่แนบรูป วางลิงก์ (X/Twitter, Pixiv/phixiv หรือลิงก์รูปภาพ) "
+                "หรือกด Reply ข้อความที่มีรูปมาด้วย ฉันก็ช่วยเช็คที่มาให้ไม่ได้นะคะ"
             )
             return
         dec_plan = await orchestrate_message_with_decision_1(
@@ -1553,7 +1579,9 @@ async def source_command(ctx, *, question: str = ""):
             extracted_ctx=ctx_text,
             purpose="SourceCmd",
             channel_id=ctx.channel.id,
-        )
+        ) or {}
+        dec_plan = dict(dec_plan)
+        dec_plan["suppress_social_embeds"] = False
         user_q = question.strip() or (
             "ช่วยระบุที่มาของภาพและลิงก์นี้อย่างละเอียด: "
             "หากเป็นภาพวาด/อนิเมะ/มังงะ ให้บอกชื่อเรื่อง ชื่อตัวละคร ตอนที่/Chapter ชื่อผู้วาด และแนบลิงก์ที่มา (เช่น Pixiv/X/MyAnimeList) ถ้ามี "
@@ -1667,7 +1695,7 @@ async def clear_memory(ctx, scope: str = ""):
 async def calc_exp(ctx, *, expr: str = ""):
     clean_expr = (expr or "").strip()
     if not clean_expr:
-        await ctx.send("พิมพ์โจทย์ที่จะให้คิดมาด้วยสิคะ เช่น `!calc (1250 * 1.07) / 3` ค่ะ")
+        await ctx.send("ใส่โจทย์ที่จะให้คำนวณมาด้วยนะคะ เช่น `!calc (1250 * 1.07) / 3` ค่ะ")
         return
     if len(clean_expr) > 200:
         await ctx.send("โจทย์ยาวเกินไปค่ะ (ไม่เกิน 200 ตัวอักษรนะคะ)")

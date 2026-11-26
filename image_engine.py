@@ -462,18 +462,36 @@ async def generate_image_cloudflare_flux(user_prompt: str) -> tuple[bytes, str, 
         return base64.b64decode(b64_img), f"[{mode_tag}] {english_prompt}", cleaned_subject
 
 
-def build_yukino_image_caption(subject_text: str, formatted_en_prompt: str) -> str:
+def build_yukino_image_caption(
+    subject_text: str, formatted_en_prompt: str, speaker_user=None
+) -> str:
+    from persona import is_owner_user
+
     combined = f"{subject_text} {formatted_en_prompt}"
+    is_owner_ctx = (speaker_user is None) or is_owner_user(speaker_user)
+    req_phrase = "ตามที่นายขอ" if is_owner_ctx else "ตามที่ขอ"
+    variant = sum(ord(ch) for ch in (subject_text or "")) % 3
+
     if CAT_TOPIC_REGEX.search(combined):
         is_panda = bool(re.search(r"(แพนซัง|แพนด้า|pan-san|pansan|panda)", combined, re.IGNORECASE))
         fav_item = "แพนซัง" if is_panda else "แมว"
+        cat_lines = (
+            f"ไม่ได้ตั้งใจใส่รายละเอียดมากเป็นพิเศษเพราะเป็น{fav_item}หรอกนะคะ... แค่วาดให้เรียบร้อย{req_phrase}เท่านั้นเองค่ะ (`{subject_text}`)",
+            f"ม-ไม่ใช่ว่าฉันชอบ{fav_item}อะไรขนาดนั้นหรอกนะคะ แค่ทำตามหน้าที่ของชมรมบริการเฉยๆ ค่ะ (`{subject_text}`)",
+            f"เสร็จแล้วค่ะ... เรื่อง{fav_item}น่ะ ฉันแค่วาดให้สมส่วนตามหลักความสมดุลของภาพเท่านั้นนะคะ (`{subject_text}`)",
+        )
         return (
-            f"ฉ-ฉันไม่ได้ตั้งใจวาดเพราะชอบ{fav_item}เป็นพิเศษหรอกนะคะ! "
-            f"ก-ก็แค่นายยืนกรานขอร้องมา ฉันเลยยอมทำให้ตามหน้าที่ของชมรมบริการเท่านั้นแหละค่ะ (`{subject_text}`)\n"
+            f"{cat_lines[variant]}\n"
             f"-# Prompt: *{formatted_en_prompt[:500]}*"
         )
+
+    normal_lines = (
+        f"วาด `{subject_text}` ให้{req_phrase}แล้วค่ะ ลองดูนะคะ",
+        f"จัดการวาด `{subject_text}` ให้เรียบร้อยแล้วค่ะ เช็คดูว่าตรงกับที่ต้องการไหมนะคะ",
+        f"ได้ภาพ `{subject_text}` ตามที่ระบุแล้วค่ะ",
+    )
     return (
-        f"ฉันวาด `{subject_text}` ให้ตามที่นายขอแล้วค่ะ ลองดูสิคะ\n"
+        f"{normal_lines[variant]}\n"
         f"-# Prompt: *{formatted_en_prompt[:500]}*"
     )
 
@@ -481,7 +499,11 @@ def build_yukino_image_caption(subject_text: str, formatted_en_prompt: str) -> s
 async def send_generated_image_to_channel(channel, prompt_text: str, reply_to: discord.Message = None):
     try:
         img_bytes, en_prompt_tag, clean_subj = await generate_image_cloudflare_flux(prompt_text)
-        caption = build_yukino_image_caption(clean_subj, en_prompt_tag)
+        caption = build_yukino_image_caption(
+            clean_subj,
+            en_prompt_tag,
+            speaker_user=getattr(reply_to, "author", None),
+        )
         await _send_or_reply(
             channel,
             reply_to,

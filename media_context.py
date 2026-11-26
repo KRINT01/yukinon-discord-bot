@@ -2537,10 +2537,9 @@ async def extract_all_context(
         except Exception as e:
             blocks.append(f"[Error reading `{att.filename}`: {e}]")
 
+    saved_att_cache_snapshot: list[tuple[bytes, str, str]] = []
     if image_att_batch:
-        # Spill raw attachment bytes to /tmp (zero RAM cost) for instant In-Bubble & Deep Visual follow-ups
-        if getattr(message, "id", 0):
-            await asyncio.to_thread(save_temp_image_cache, message.id, image_att_batch, [])
+        saved_att_cache_snapshot = list(image_att_batch)
         first_preencoded = (
             preencoded_ocr.get(image_att_ids[0])
             if (preencoded_ocr and image_att_ids)
@@ -2596,10 +2595,13 @@ async def extract_all_context(
     embed_filenames = [f[1] for f in embed_images]
     has_embed_imgs = bool(embed_images)
 
+    # Single combined /tmp image cache spill per message.id (prevents embed images overwriting attached images!)
+    if getattr(message, "id", 0) and (saved_att_cache_snapshot or embed_images):
+        combined_cache_imgs = (saved_att_cache_snapshot + list(embed_images))[:MAX_BATCH_IMAGES]
+        await asyncio.to_thread(save_temp_image_cache, message.id, combined_cache_imgs, embed_meta_sections)
+    saved_att_cache_snapshot.clear()
+
     if embed_images and processed_image_count < MAX_BATCH_IMAGES:
-        # Spill downloaded X/Pixiv/Bluesky images to /tmp so 'แปลลงภาพ (In-Bubble)' & 'ดูรายละเอียดภาพเพิ่ม' skip re-downloading!
-        if getattr(message, "id", 0):
-            await asyncio.to_thread(save_temp_image_cache, message.id, embed_images, embed_meta_sections)
         remaining_slots = MAX_BATCH_IMAGES - processed_image_count
         target_embed_imgs = embed_images[:remaining_slots]
         meta_hint = "\n".join(embed_meta_sections)
