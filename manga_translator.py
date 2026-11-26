@@ -50,7 +50,7 @@ from manga_cv_render import (
     _release_cv_page_masks,
 )
 
-MANGA_TRANSLATOR_VERSION = "v17.4"
+MANGA_TRANSLATOR_VERSION = "v17.5"
 MANGA_CV_VER = getattr(_mcr_mod, "MANGA_CV_RENDER_VERSION", "old")
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
 # Bundle 2 dynamic parallel hedge: faster 15s recovery on typical 2-4p X threads, patient 25s on 5-12p batches
@@ -907,6 +907,7 @@ async def _polish_single_chunk_gemma_async(
             "- แปลและเกลาทุกช่องให้เป็นภาษาไทยธรรมชาติ ลื่นไหล สะกดถูกต้อง 100% (ไม่มีคำสะกดผิด ไม่มีสระ/วรรณยุกต์สลับตำแหน่ง)\n"
             "- ใช้เฉพาะอักษรไทยและเครื่องหมาย ASCII มาตรฐาน (`...`, `~`, `-`, `!`, `?`, `'`) ห้ามมีอีโมจิ สัญลักษณ์หัวใจ/โน้ตเพลง ภาษาเกาหลี/จีน/อาหรับ หรือทับศัพท์อังกฤษปนกลางประโยคไทย (เช่น แปล `えへへ` เป็น `เอะเฮะ`, `…っ!!` เป็น `...อ๊ะ!!`, `コイツ` เป็น `ไอ้หมอนี่` ยกเว้นคำย่อสากลที่มีในต้นฉบับจริงเช่น OK/DM/HP)\n"
             "- ใช้คำลงท้ายให้ตรงเพศและบุคลิกของตัวละคร (ตัวละครหญิง/แต่งหญิงใช้ `ค่ะ`/`คะ`/`นะคะ`/`นะ` ตัวเอกชายพูดกับเพื่อนสนิทใช้ภาษาเป็นกันเอง)\n"
+            "- คงชื่อตัวละคร ชื่อศิลปิน และศัพท์เฉพาะญี่ปุ่นตาม Series context / เสียงคานะญี่ปุ่นที่ถูกต้อง (เช่น `あおい` = `อาโออิ`, `せな` = `เซนะ`, `なつき` = `นัตสึกิ`) หรือ Romaji ให้สม่ำเสมอ ห้ามแปลชื่อเฉพาะตรงตัว\n"
             "- หากต้นฉบับ `src` มีอักษรญี่ปุ่น OCR เพี้ยนเล็กน้อย หรือ `draft` ขาดหายกลางประโยค ให้ดูบริบทช่องก่อนหน้าแล้วแปลให้ครบสมบูรณ์\n"
             "- เกลา `sum` (บริบทของฉาก) ของแต่ละหน้าในชุดนี้ให้สั้น กระชับ เป็นภาษาไทยสะอาดตาด้วย"
         )
@@ -1991,7 +1992,7 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
  - For real spoken dialogue/narration WITHOUT a numbered badge (e.g. vertical text on open white panels), output a SEPARATE entry with `"bubble_id": null`, `"should_translate": true`, `"source_text"`, and `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY the Japanese text in its own panel).
  - NEVER concatenate or repeat text that already belongs to numbered badges into an extra `bubble_id: null` summary entry, and NEVER shift a banner/title onto an adjacent paragraph's badge ID.
 3. Accurate Speaker Attribution, Names & Visual Gender:
- - Identify the actual speaker visually; match Thai/English tone to visual gender (never use male Thai `ครับ`/`ผม` for female characters/guards).
+ - Identify the actual speaker visually; keep character names and franchise-specific terms consistent with the Series / Post Context using accurate Japanese phonetics (e.g. `あおい` -> `อาโออิ`, `せな` -> `เซนะ`) or Romaji — NEVER translate Japanese proper names literally; match Thai/English tone to visual gender (never use male Thai `ครับ`/`ผม` for female characters/guards).
  - PURE TARGET LANGUAGE & FONT-SAFE OUTPUT: Write EVERY `translated_text` and `summary` purely in natural, correctly spelled {target_lang_name} using ONLY standard {target_lang_name} script and ASCII punctuation (`...`, `~`, `-`, `'`, `!`, `?`) — no emojis, no heart/music symbols, and no mixed English/romanized syllables inside Thai (e.g. render `えへへ` as `เอะเฮะ`, `…っ!!` as `...อ๊ะ!!`, `コイツ` as `ไอ้หมอนี่`).
 4. Return ONLY valid JSON matching this exact structure (write `summary` in {target_lang_name}):
 {{
@@ -2296,13 +2297,15 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
         if embed_meta_sections:
             context_hints.append("\n".join(embed_meta_sections)[:800])
         if channel and getattr(channel, "id", None):
-            cached_ocr = get_cached_channel_attachments(channel.id, ttl_sec=1800, max_total_chars=4000)
+            cached_ocr = get_cached_channel_attachments(channel.id, ttl_sec=1800, max_total_chars=5000)
             if cached_ocr:
-                id_match = re.search(
-                    r"(1\.\s*\[Series\s*/\s*Franchise[\s\S]{0,700})", cached_ocr
+                # Match the LATEST identification block from single-image Gemini, single-image Gemma, OR multi-image OCR
+                id_matches = re.findall(
+                    r"((?:1\.\s*\[(?:Series\s*/\s*Franchise|Identification\s*&\s*Visual\s*Context)|2\.\s*\[Deduced\s*Character\s*/\s*Franchise)[\s\S]{0,800}?(?=\n(?:2\.\s*\[Ordered|3\.\s*\[Verbatim|2\.\s*\[Page-by-Page|===)|\Z))",
+                    cached_ocr,
                 )
-                if id_match:
-                    context_hints.append(id_match.group(1).strip())
+                if id_matches:
+                    context_hints.append(id_matches[-1].strip()[:800])
         series_context_hint = "\n\n".join(context_hints)[:1400]
 
         _, target_lang_name = _detect_target_translation_lang(user_prompt)

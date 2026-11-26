@@ -208,6 +208,87 @@ def _extract_clean_artist_or_topic_hint(
     return ""
 
 
+_MD_LINK_OR_URL_SPLIT_REGEX = re.compile(r"(\[[^\]]*\]\([^)]+\)|https?://\S+)")
+_UI_CODE_FENCE_SPLIT_REGEX = re.compile(r"(```[\s\S]*?```)")
+_X_LINE_CUE_REGEX = re.compile(r"(?:\bX\b|twitter|x\.com|บัญชี|แอค|ทวิตเตอร์)", re.IGNORECASE)
+_DISALLOWED_X_HANDLES = frozenset({"everyone", "here", "channel", "username", "handle", "twitter", "x"})
+
+
+def _extract_verified_x_handles(*texts: str) -> list[str]:
+    """Extracts verified X (Twitter) screen names from bound source context, URLs, and author headers."""
+    found: list[str] = []
+    seen_low: set[str] = set()
+
+    def _add(h: str):
+        clean_h = (h or "").strip().lstrip("@")
+        low = clean_h.lower()
+        if not (2 <= len(clean_h) <= 30) or low in _DISALLOWED_X_HANDLES or low in seen_low:
+            return
+        if low in ("i", "web", "home", "search", "explore", "intent"):
+            return
+        seen_low.add(low)
+        found.append(clean_h)
+
+    for txt in texts:
+        if not txt:
+            continue
+        for m in _X_HANDLE_URL_REGEX.finditer(txt):
+            _add(m.group(1))
+        for m in re.finditer(
+            r"https?://(?:www\.|mobile\.)?(?:x\.com|twitter\.com)/([A-Za-z0-9_]{2,30})(?=[/?#\s)\]}>]|$)",
+            txt,
+            re.IGNORECASE,
+        ):
+            _add(m.group(1))
+        for raw_auth in _AUTHOR_LINE_REGEX.findall(txt):
+            m_at = re.search(r"\(@([A-Za-z0-9_]{2,30})\)", raw_auth)
+            if m_at:
+                _add(m_at.group(1))
+    return found
+
+
+def _linkify_x_handles_for_discord(text: str, known_handles: list[str] | None = None) -> str:
+    """
+    Turns unlinked X (Twitter) handles (plain `@hibikamin` or backticked `` `@hibikamin` ``)
+    into clickable Discord Markdown links `[@hibikamin](https://x.com/hibikamin)` outside
+    fenced code blocks, existing Markdown links, and bare URLs.
+    """
+    if not text or "@" not in text:
+        return text
+
+    known_low = {h.strip().lstrip("@").lower() for h in (known_handles or []) if h and h.strip()}
+
+    def _linkify_line(line: str) -> str:
+        is_x_context_line = bool(_X_LINE_CUE_REGEX.search(line))
+        segments = _MD_LINK_OR_URL_SPLIT_REGEX.split(line)
+        for idx in range(0, len(segments), 2):
+            seg = segments[idx]
+            if "@" not in seg:
+                continue
+
+            def _repl(m: re.Match) -> str:
+                handle = m.group(1)
+                low = handle.lower()
+                if low in _DISALLOWED_X_HANDLES:
+                    return m.group(0)
+                if low in known_low or is_x_context_line:
+                    return f"[@{handle}](https://x.com/{handle})"
+                return m.group(0)
+
+            seg = re.sub(
+                r"(?<![A-Za-z0-9_/.])`?@([A-Za-z0-9_]{2,30})`?(?![A-Za-z0-9_])",
+                _repl,
+                seg,
+            )
+            segments[idx] = seg
+        return "".join(segments)
+
+    parts = _UI_CODE_FENCE_SPLIT_REGEX.split(text)
+    for p_idx in range(0, len(parts), 2):
+        parts[p_idx] = "\n".join(_linkify_line(ln) for ln in parts[p_idx].split("\n"))
+    return "".join(parts)
+
+
 def has_valid_extracted_context(extracted_ctx: str) -> bool:
     if not extracted_ctx or not extracted_ctx.strip():
         return False
@@ -590,13 +671,16 @@ FOLLOWUP_ACTION_REGISTRY: dict[str, tuple[str, str, str, bool]] = {
         "เจาะลึกตัวละคร & มุก",
         "📖",
         "ช่วยอธิบายเจาะลึกเฉพาะความสัมพันธ์ของตัวละครในเรื่อง (Canon lore/นิสัยตัวละคร) และเกร็ดคำศัพท์หรือมุกภาษาญี่ปุ่นในฉากนี้เพิ่มเติม "
-        "โดยไม่ต้องแปลบทสนทนาซ้ำทั้งหมดค่ะ",
+        "โดยไม่ต้องแปลบทสนทนาซ้ำทั้งหมด คงการสะกดชื่อตัวละครและศัพท์เฉพาะให้สอดคล้องกับบริบทก่อนหน้า (ห้ามแปลชื่อเฉพาะตรงตัว และห้ามสร้างตาราง) ค่ะ",
         False,
     ),
     "find_artist_works": (
         "หาผลงานอื่นของศิลปิน",
         "🔎",
-        "ช่วยค้นหาข้อมูลเพิ่มเติมเกี่ยวกับศิลปิน ผู้วาด (บัญชี X / Pixiv) หรือผลงาน/ซีรีส์ที่เกี่ยวข้องกับโพสต์นี้ให้หน่อยค่ะ",
+        "ช่วยค้นหาข้อมูลเพิ่มเติมเกี่ยวกับศิลปิน ผู้วาด (บัญชี X / Pixiv) แนวผลงาน และซีรีส์ที่เกี่ยวข้องกับโพสต์นี้ให้หน่อยค่ะ "
+        "นำเสนอเป็นย่อหน้าสั้นๆ หรือหัวข้อย่อย (`-`) เท่านั้น ห้ามสร้างตารางเด็ดขาด "
+        "หากมีบัญชี X (Twitter) ให้ใส่เป็นลิงก์คลิกได้ในรูปแบบ `[@username](https://x.com/username)` (เช่น `[@hibikamin](https://x.com/hibikamin)`) "
+        "และคงชื่อตัวละคร/ชื่อศิลปินให้สอดคล้องกับบริบทก่อนหน้าค่ะ",
         True,
     ),
 }
@@ -760,6 +844,7 @@ class GeneralAssistantActionView(AutoDisappearingView):
 
         is_deep_img = (instruction == "__DEEP_IMAGE_INSPECT__")
         is_artist_btn = ("ศิลปิน" in btn_label) or ("ผลงาน" in btn_label)
+        is_lore_btn = ("ตัวละคร" in btn_label) or ("มุก" in btn_label)
         deep_visual_block = ""
         if is_deep_img:
             instruction = (
@@ -808,6 +893,14 @@ class GeneralAssistantActionView(AutoDisappearingView):
                         break
 
         search_hint_tag = ""
+        verified_x_handles: list[str] = []
+        if is_artist_btn:
+            verified_x_handles = _extract_verified_x_handles(
+                self.source_ctx,
+                self.user_query,
+                self.bot_reply,
+                fallback_cached_ctx,
+            )
         if use_search and is_artist_btn:
             artist_hint = _extract_clean_artist_or_topic_hint(
                 self.source_ctx,
@@ -818,10 +911,13 @@ class GeneralAssistantActionView(AutoDisappearingView):
             if artist_hint:
                 search_hint_tag = f"\n[SEARCH_HINT: {artist_hint}]"
 
+        forbid_tables_here = bool(is_artist_btn or is_lore_btn or is_deep_img)
+
         # Deterministic button plan:
         # - `complexity_score=1.6` keeps Gemini thinking at `LOW` (prevents Thai prose glitches at MINIMAL)
         # - `is_button_followup=True` prevents slow 32s `HeavyDoc` Hydrogen escalation on 8p manga follow-ups
         # - `isolate_context=True` prevents earlier posts/artists in `channel_memory` from polluting THIS button's post
+        # - `no_tables=True` blocks pipe tables on artist profiles, character lore, and deep image inspections
         dec_plan = {
             "route": "web_search" if use_search else "chat",
             "route_confidence": 0.95,
@@ -833,6 +929,7 @@ class GeneralAssistantActionView(AutoDisappearingView):
             "complexity_confidence": 0.90,
             "is_button_followup": True,
             "isolate_context": bool(self.source_ctx or is_artist_btn or is_deep_img),
+            "no_tables": forbid_tables_here,
         }
 
         extra_grounding_rule = (
@@ -841,10 +938,26 @@ class GeneralAssistantActionView(AutoDisappearingView):
             if is_deep_img
             else ""
         )
+        artist_format_rule = ""
+        if is_artist_btn:
+            handle_hint = (
+                f" (บัญชี X ที่ยืนยันแล้วของโพสต์นี้คือ [@{verified_x_handles[0]}](https://x.com/{verified_x_handles[0]}))"
+                if verified_x_handles
+                else ""
+            )
+            artist_format_rule = (
+                " ห้ามสร้างตารางเด็ดขาด ให้ใช้ย่อหน้าสั้นๆ หรือหัวข้อย่อย (`-`) เท่านั้น "
+                f"และทำชื่อบัญชี X (Twitter) เป็นลิงก์คลิกได้ในรูปแบบ `[@username](https://x.com/username)` เสมอ{handle_hint}"
+            )
+        table_rule_clause = (
+            " ห้ามสร้างตาราง Markdown เด็ดขาด"
+            if forbid_tables_here
+            else " (สร้างตาราง Markdown ได้เฉพาะเมื่อเปรียบเทียบข้อมูล)"
+        )
         composed = (
             f"{instruction}{search_hint_tag}\n\n"
-            f"[กฎสำคัญ]: ห้ามคัดลอกหรือเขียนคำตอบเดิมซ้ำ และห้ามเขียนหัวข้อเมตาของตัวละครเด็ดขาด (สร้างตาราง Markdown ได้เฉพาะเมื่อเปรียบเทียบข้อมูล)"
-            f"{extra_grounding_rule}\n\n"
+            f"[กฎสำคัญ]: ห้ามคัดลอกหรือเขียนคำตอบเดิมซ้ำ ห้ามเขียนหัวข้อเมตาของตัวละคร คงชื่อตัวละคร/ชื่อศิลปินให้สอดคล้องกับบริบทก่อนหน้า{table_rule_clause}"
+            f"{artist_format_rule}{extra_grounding_rule}\n\n"
             f"[บริบทหัวข้อก่อนหน้า]: {self.user_query}\n"
             f"[สรุปคำตอบก่อนหน้า (ห้ามเขียนซ้ำ)]: {self.bot_reply[:1500]}"
         )
@@ -895,6 +1008,8 @@ class GeneralAssistantActionView(AutoDisappearingView):
             decision_plan=dec_plan,
             tool_ctx=tool_ctx,
         )
+        if answer and is_artist_btn:
+            answer = _linkify_x_handles_for_discord(answer, verified_x_handles)
         if answer and not is_failure_or_refusal_reply(answer):
             compact_note = re.sub(r"\s+", " ", answer).strip()[:750]
             self.followup_findings.append(f"- [{btn_label}]: {compact_note}")
@@ -1063,7 +1178,7 @@ def build_contextual_suggestion_view(
                     "📖",
                     discord.ButtonStyle.secondary,
                     "ช่วยอธิบายเจาะลึกเฉพาะความสัมพันธ์ของตัวละครในเรื่อง (Canon lore/นิสัยตัวละคร) และเกร็ดคำศัพท์หรือมุกภาษาญี่ปุ่นในฉากนี้เพิ่มเติม "
-                    "โดยไม่ต้องแปลบทสนทนาซ้ำทั้งหมดค่ะ",
+                    "โดยไม่ต้องแปลบทสนทนาซ้ำทั้งหมด คงการสะกดชื่อตัวละครและศัพท์เฉพาะให้สอดคล้องกับบริบทก่อนหน้า (ห้ามแปลชื่อเฉพาะตรงตัว และห้ามสร้างตาราง) ค่ะ",
                     False,
                 )
             )
@@ -1083,7 +1198,10 @@ def build_contextual_suggestion_view(
                 "หาผลงานอื่นของศิลปิน",
                 "🔍",
                 discord.ButtonStyle.secondary,
-                "ช่วยค้นหาข้อมูลเพิ่มเติมเกี่ยวกับศิลปิน ผู้วาด (บัญชี X / Pixiv) หรือผลงาน/ซีรีส์ที่เกี่ยวข้องกับโพสต์นี้ให้หน่อยค่ะ",
+                "ช่วยค้นหาข้อมูลเพิ่มเติมเกี่ยวกับศิลปิน ผู้วาด (บัญชี X / Pixiv) แนวผลงาน และซีรีส์ที่เกี่ยวข้องกับโพสต์นี้ให้หน่อยค่ะ "
+                "นำเสนอเป็นย่อหน้าสั้นๆ หรือหัวข้อย่อย (`-`) เท่านั้น ห้ามสร้างตารางเด็ดขาด "
+                "หากมีบัญชี X (Twitter) ให้ใส่เป็นลิงก์คลิกได้ในรูปแบบ `[@username](https://x.com/username)` "
+                "และคงชื่อตัวละคร/ชื่อศิลปินให้สอดคล้องกับบริบทก่อนหน้าค่ะ",
                 True,
             )
         )
