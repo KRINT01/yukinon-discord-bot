@@ -319,9 +319,9 @@ async def query_ai_chat(
     elif is_japanese_or_social_media and not is_voice_sys:
         jp_table_suffix = " และห้ามสร้างตารางในคำตอบนี้" if (no_tables_flag or is_fresh_social_embed) else ""
         volatile_ctx_lines.append(
-            "- ความสม่ำเสมอของชื่อและศัพท์ญี่ปุ่น: ใช้ชื่อตัวละคร ชื่อศิลปิน และศัพท์เฉพาะตาม Canonical Names ในข้อมูล OCR/บริบท "
-            "โดยทับศัพท์ตามเสียงคานะญี่ปุ่นให้แม่นยำ (เช่น `あおい` = `อาโออิ`, `せな` = `เซนะ`) หรือใช้ Romaji "
-            f"ห้ามแปลชื่อตัวละครหรือศัพท์เฉพาะแบบตรงตัวแข็งทื่อ{jp_table_suffix}"
+            "- กฎชื่อศิลปินและชื่อตัวละคร: **คงชื่อศิลปิน/ผู้วาดตามต้นฉบับทุกตัวอักษร (ห้ามแปลและห้ามทับศัพท์เป็นไทย เช่น `ヤッペン (@yatt83)`)** "
+            "ส่วนชื่อตัวละครและศัพท์เฉพาะญี่ปุ่นให้ใช้ตาม Canonical Names ด้วยเสียงอ่านทางการ/คานะที่ถูกต้องหรือ Romaji "
+            f"ห้ามแปลชื่อตัวละครตรงตัว{jp_table_suffix}"
         )
 
     is_coding_prelim = (norm_mode == "code") or (dec_route == "code" and dec_conf >= 0.70)
