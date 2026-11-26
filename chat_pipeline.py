@@ -28,6 +28,7 @@ from persona import (
     get_speaker_identity_context,
     get_speaker_volatile_context,
     sanitize_yukino_output,
+    detect_mixed_script_corruption,
     get_current_thai_datetime_str,
     try_instant_datetime_reply,
 )
@@ -306,8 +307,7 @@ async def query_ai_chat(
     if "[ImageTriage: type=real_world_product" in prompt:
         volatile_ctx_lines.append(
             "- ภาพนี้เป็นภาพถ่ายวัตถุ/โมเดล/ฟิกเกอร์/สินค้าจริง: ให้ระบุชื่อเรื่อง ชื่อรุ่น ไลน์สินค้า/สเกลที่เป็นไปได้ "
-            "และจุดสังเกตสำคัญจาก Vision Analysis ให้ชัดเจน (หากยังไม่ยืนยันสเกล/รุ่นย่อยจากมุมเดียวได้ ให้บอกตรงๆ ว่ายังระบุสเกลแน่ชัดไม่ได้) "
-            "และห้ามใส่คำว่า 'คุณ' นำหน้าชื่อเจ้าของโพสต์หรือผู้สร้างผลงานเด็ดขาด"
+            "และจุดสังเกตสำคัญจาก Vision Analysis ให้ชัดเจน (หากยังไม่ยืนยันสเกล/รุ่นย่อยจากมุมเดียวได้ ให้บอกตรงๆ ว่ายังระบุสเกลแน่ชัดไม่ได้)"
         )
     elif is_japanese_or_social_media and not is_voice_sys:
         volatile_ctx_lines.append(
@@ -657,7 +657,11 @@ async def query_ai_chat(
         # Persona-First Priority: Gemini Flash -> Gemma 4 AI Studio (native systemInstruction + tools)
         # -> Cloudflare Gemma 4 (native tools) -> Cloudflare GLM-4.7-Flash -> Groq (gpt-oss-20b; qwen3.8 reserved for Vision)
         if prefer_high_knowledge_llm and not is_coding:
-            target_temp = 0.2 if (did_search or is_user_correction or is_compound) else temperature
+            target_temp = (
+                0.2
+                if (did_search or is_user_correction or is_compound)
+                else (0.30 if is_japanese_or_social_media else temperature)
+            )
             b_purpose = (
                 "CompoundTools"
                 if is_compound
@@ -878,12 +882,57 @@ async def query_ai_chat(
     memo_match = AGENTIC_MEMO_TAG_REGEX.search(raw_answer or "")
     learned_memo = memo_match.group(1).strip() if memo_match else ""
 
+    # Universal single-shot self-repair if BPE sampling produced mixed-script gibberish (e.g. 'โฮชิมachi ส이เซ이')
+    corrupted_tokens = detect_mixed_script_corruption(raw_answer, raw_user_query) if raw_answer else []
+    if corrupted_tokens and not is_voice_mode:
+        api_log(f"ScriptRepair -> detected mixed-script token(s) {corrupted_tokens}; running 1-shot cleanup")
+        repair_msgs = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a precision Thai/English proofreader. Fix ONLY corrupted mixed-script words "
+                    "(such as Thai fused with Romaji fragments or Korean Hangul) into natural Thai transliteration "
+                    "or clean Romaji, and remove any stray leading symbols like '°- '. "
+                    "Preserve the exact meaning, Yukino tone, paragraph breaks, and valid links verbatim. "
+                    "Return ONLY the corrected text with zero explanations."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Corrupted token(s) to fix: {', '.join(corrupted_tokens)}\n\nText:\n{raw_answer}",
+            },
+        ]
+        repaired_out = ""
+        try:
+            if GEMINI_API_KEY:
+                repaired_out = await call_gemini_chat_messages(
+                    repair_msgs,
+                    temperature=0.1,
+                    purpose="ScriptRepair",
+                    thinking_level="MINIMAL",
+                )
+            if not repaired_out:
+                repaired_out = await call_cloudflare_gemma_chat(
+                    repair_msgs, temperature=0.1, max_tokens=2048, purpose="ScriptRepair"
+                )
+        except Exception as e:
+            api_log(f"ScriptRepair -> skipped ({type(e).__name__})")
+        if repaired_out and len(repaired_out.strip()) >= max(30, int(len(raw_answer) * 0.55)):
+            if len(detect_mixed_script_corruption(repaired_out, raw_user_query)) < len(corrupted_tokens):
+                raw_answer = repaired_out
+
+    suppress_social_embeds_flag = bool(
+        plan.get("suppress_social_embeds")
+        or (is_fresh_social_embed and not is_button_followup)
+    )
+
     answer = sanitize_yukino_output(
         raw_answer,
         raw_user_query,
         speaker_user,
         speaker_name,
         allow_cjk_override=is_japanese_or_social_media,
+        suppress_social_embeds=suppress_social_embeds_flag,
     )
 
     if not answer.strip():
@@ -896,6 +945,7 @@ async def query_ai_chat(
             speaker_user,
             speaker_name,
             allow_cjk_override=is_japanese_or_social_media,
+            suppress_social_embeds=suppress_social_embeds_flag,
         )
 
     if not is_voice_mode and answer:

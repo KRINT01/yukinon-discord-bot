@@ -946,8 +946,9 @@ class GeneralAssistantActionView(AutoDisappearingView):
                 else ""
             )
             artist_format_rule = (
-                " ห้ามสร้างตารางเด็ดขาด ให้ใช้ย่อหน้าสั้นๆ หรือหัวข้อย่อย (`-`) เท่านั้น "
-                f"และทำชื่อบัญชี X (Twitter) เป็นลิงก์คลิกได้ในรูปแบบ `[@username](https://x.com/username)` เสมอ{handle_hint}"
+                " ห้ามสร้างตารางเด็ดขาด ให้ใช้ย่อหน้าสั้นๆ หรือหัวข้อย่อย (`-`) เท่านั้น ห้ามขึ้นต้นบรรทัดด้วย `°- ` "
+                "และทำชื่อบัญชี X (Twitter) เป็นลิงก์คลิกได้โดยใส่เฉพาะ `@username` ในวงเล็บเหลี่ยมรูปแบบ `[@username](https://x.com/username)` เสมอ "
+                f"(ห้ามใส่ชื่อแสดงผลหรือลิงก์ `/status/...` ในลิงก์){handle_hint}"
             )
         table_rule_clause = (
             " ห้ามสร้างตาราง Markdown เด็ดขาด"

@@ -37,12 +37,217 @@ _CODE_FENCE_SPLIT_REGEX = re.compile(r"(```[\s\S]*?```)")
 _ONLY_FENCE_LINE_REGEX = re.compile(r"^[ \t]*(`{3,})[ \t]*([A-Za-z0-9_+#.-]*)[ \t]*(.*)$")
 _TRAILING_CLOSE_FENCE_REGEX = re.compile(r"^(.+?)[ \t]*(`{3,})[ \t]*(.*)$")
 
-# Strip honorific 'คุณ' before third-party Latin names OR lowercase/uppercase @handles
-# (e.g. 'ผลงานจากคุณ Rain' -> 'ผลงานจาก Rain', 'คุณ @akina_murasame' -> '@akina_murasame')
-# while keeping standalone sarcastic 'คุณ' and Thai compound words ('คุณภาพ', 'คุณค่า') intact.
-_KHUN_BEFORE_LATIN_NAME_REGEX = re.compile(
-    r"คุณ[ \t]*(?=@[A-Za-z0-9_.-]{2,30}\b|[A-Z][A-Za-z0-9_.-]{1,30}\b)"
+# Stray leading bullet/degree-sign glitches (e.g. '°- สำหรับศิลปิน...' -> 'สำหรับศิลปิน...')
+_LEADING_GLITCH_INTRO_REGEX = re.compile(r"^[ \t]*[°º◦·▪▫‣⁃]+[ \t]*[-–—]?[ \t]+")
+_LINE_GLITCH_BULLET_REGEX = re.compile(r"(?<=\n)[ \t]*[°º◦·▪▫‣⁃]+[ \t]*[-–—]?[ \t]+")
+
+# Private Use Area / Unicode Replacement tofu glyphs copied from fancy X display names (e.g. ▢MALINO▢)
+_TOFU_PUA_REGEX = re.compile(r"[\uE000-\uF8FF\uFFFD]")
+
+# Mixed-script corruption detection (Korean Hangul leaks & Thai+lowercase-Latin mid-word hybrids like 'โฮชิมachi', 'ส이เซ이')
+_HANGUL_CHAR_REGEX = re.compile(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF]")
+_KOREAN_TOPIC_HINT_REGEX = re.compile(r"(เกาหลี|\bkorean\b|\bhangul\b|한국)", re.IGNORECASE)
+_INLINE_CODE_OR_LINK_MASK_REGEX = re.compile(
+    r"```[\s\S]*?```|`[^`\n]+`|\[[^\]]*\]\([^)]+\)|https?://\S+|@[A-Za-z0-9_.-]+"
 )
+_THAI_LATIN_HYBRID_REGEX = re.compile(
+    r"(?:[\u0E01-\u0E4E]+[a-z]{2,12}(?![A-Za-z0-9_./:-])|[a-z]{2,12}[\u0E01-\u0E4E]+)"
+)
+_SAFE_THAI_GLUED_LATIN_WORDS = frozenset({
+    "hololive", "pixiv", "twitter", "discord", "youtube", "steam", "github", "docker", "react", "next",
+    "java", "node", "python", "spring", "oracle", "linux", "windows", "wifi", "vpn", "pdf", "jpg", "jpeg",
+    "png", "webp", "gif", "mp4", "mp3", "wav", "json", "yaml", "yml", "xml", "tsx", "jsx", "css", "html",
+    "sql", "api", "url", "app", "bot", "id", "ok", "px", "mb", "gb", "tb", "ms", "fps", "hz", "khz",
+    "mm", "cm", "km", "kg", "ml", "cc", "vtuber", "fanbox", "skeb", "booth", "fantia", "anime", "manga",
+    "game", "code", "link", "post", "fanart", "art", "pro", "max", "mini", "plus", "lite", "studio",
+    "cloud", "server", "client", "error", "log", "bug", "fix", "file", "image", "video", "audio", "voice",
+    "chat", "text", "table", "mode", "web", "ai", "ui", "ux", "ot", "dm", "hp", "mp", "xp", "tv", "pc",
+    "vr", "rpg", "npc", "bgm", "op", "ed", "cg", "pv", "mv", "ova", "cosplay", "gacha", "meta", "build",
+    "class", "skill", "buff", "nerf", "patch", "update", "event", "stream", "live", "clip", "meme",
+    "ship", "canon", "lore", "spoiler", "trigger", "prompt", "token", "model", "cache", "ram", "cpu",
+    "gpu", "ssd", "usb", "lan", "dns", "ssl", "tls", "http", "https", "com", "org", "net", "io", "dev",
+    "co", "th", "jp", "en", "us", "render", "groq", "gemini", "gemma", "cloudflare", "unifi", "meraki",
+    "micomet", "suisei", "miko",
+})
+
+# Duplicate social/post URL & broken masked-link cleanup
+_MD_LINK_REGEX = re.compile(r"\[([^\]\n]{1,180})\]\((<?https?://[^)\s>]+>?)\)")
+_X_STATUS_ID_REGEX = re.compile(
+    r"https?://(?:www\.|mobile\.)?(?:x\.com|twitter\.com|fixupx\.com|fxtwitter\.com|vxtwitter\.com|fixvx\.com)/[^/\s]+/status/(\d+)",
+    re.IGNORECASE,
+)
+_PIXIV_ID_REGEX = re.compile(
+    r"https?://(?:www\.)?(?:pixiv\.net|phixiv\.net|ppxiv\.net)/(?:[a-z]{2}/)?(?:artworks/|i/)(\d+)",
+    re.IGNORECASE,
+)
+_X_PROFILE_URL_REGEX = re.compile(
+    r"^https?://(?:www\.|mobile\.)?(?:x\.com|twitter\.com)/([A-Za-z0-9_]{2,30})/?$",
+    re.IGNORECASE,
+)
+_SOCIAL_DOMAIN_URL_REGEX = re.compile(
+    r"^https?://(?:www\.|mobile\.)?(?:x\.com|twitter\.com|fixupx\.com|fxtwitter\.com|vxtwitter\.com|pixiv\.net|phixiv\.net|bsky\.app|fxbsky\.app)/",
+    re.IGNORECASE,
+)
+
+
+def _extract_posted_url_fingerprints(user_prompt: str) -> tuple[set[str], set[str], set[str]]:
+    """Extracts exact normalized URLs, X status IDs, and Pixiv artwork IDs from the user's message."""
+    if not user_prompt:
+        return set(), set(), set()
+    exact_urls: set[str] = set()
+    x_status_ids: set[str] = set()
+    pixiv_ids: set[str] = set()
+    for u in URL_REGEX.findall(user_prompt):
+        norm_u = u.strip().rstrip(".,;!?)]>").lower()
+        if norm_u:
+            exact_urls.add(norm_u)
+        mx = _X_STATUS_ID_REGEX.search(u)
+        if mx:
+            x_status_ids.add(mx.group(1))
+        mp = _PIXIV_ID_REGEX.search(u)
+        if mp:
+            pixiv_ids.add(mp.group(1))
+    return exact_urls, x_status_ids, pixiv_ids
+
+
+def _is_duplicate_of_posted_url(
+    url_str: str, exact_urls: set[str], x_status_ids: set[str], pixiv_ids: set[str]
+) -> bool:
+    clean_u = (url_str or "").strip().strip("<>").rstrip(".,;!?)]>").lower()
+    if not clean_u:
+        return False
+    if clean_u in exact_urls:
+        return True
+    mx = _X_STATUS_ID_REGEX.search(clean_u)
+    if mx and mx.group(1) in x_status_ids:
+        return True
+    mp = _PIXIV_ID_REGEX.search(clean_u)
+    if mp and mp.group(1) in pixiv_ids:
+        return True
+    return False
+
+
+def _clean_links_and_suppress_duplicate_previews(
+    prose: str,
+    user_prompt: str = "",
+    suppress_social_embeds: bool = False,
+) -> str:
+    """
+    Prevents duplicate Discord link previews & broken masked Markdown links in prose:
+    1) If a Markdown link `[label](url)` points to the EXACT post/status URL the user just shared,
+       unwrap it to clean plain text (`label`) so Discord never renders a duplicate embed preview!
+    2) If a bare URL duplicates the user's just-posted URL/status ID, strip it cleanly.
+    3) If a Markdown link points to an X profile (`https://x.com/handle`) with a noisy display-name
+       label (`[Fancy Name (@handle)](https://x.com/handle)`), normalize it to `Fancy Name ([@handle](...))`
+       so special Unicode brackets/emojis in X display names never break Discord's link parser.
+    4) When `suppress_social_embeds=True` (normal post summaries), wrap any remaining social URLs
+       inside `[label](<url>)` or `<url>` so Discord stays preview-free.
+    """
+    if not prose or ("http://" not in prose and "https://" not in prose):
+        return prose
+
+    exact_urls, x_status_ids, pixiv_ids = _extract_posted_url_fingerprints(user_prompt)
+
+    def _clean_md_link(m: re.Match) -> str:
+        raw_label = _TOFU_PUA_REGEX.sub("", m.group(1)).strip()
+        raw_url = m.group(2).strip()
+        is_angle_wrapped = raw_url.startswith("<") and raw_url.endswith(">")
+        bare_url = raw_url[1:-1] if is_angle_wrapped else raw_url
+
+        # 1. Duplicate of the exact post URL the user just shared -> unwrap to clean text (ZERO duplicate preview!)
+        if _is_duplicate_of_posted_url(bare_url, exact_urls, x_status_ids, pixiv_ids):
+            if raw_label and not raw_label.lower().startswith(("http://", "https://")):
+                return raw_label
+            mx_h = re.search(
+                r"https?://(?:www\.|mobile\.)?(?:x\.com|twitter\.com)/([A-Za-z0-9_]{2,30})/status/",
+                bare_url,
+                re.IGNORECASE,
+            )
+            return f"@{mx_h.group(1)}" if mx_h else ""
+
+        # 2. Clean up messy X profile links where display name + (@handle) were stuffed inside `[...]`
+        m_prof = _X_PROFILE_URL_REGEX.match(bare_url)
+        if m_prof:
+            handle = m_prof.group(1)
+            link_url = f"<{bare_url}>" if (suppress_social_embeds or is_angle_wrapped) else bare_url
+            if raw_label.strip().lower() != f"@{handle.lower()}":
+                prefix_name = re.sub(
+                    rf"\s*\(?@{re.escape(handle)}\)?\s*",
+                    " ",
+                    raw_label,
+                    flags=re.IGNORECASE,
+                ).strip(" ()[]")
+                if prefix_name:
+                    return f"{prefix_name} ([@{handle}]({link_url}))"
+                return f"[@{handle}]({link_url})"
+            return f"[@{handle}]({link_url})"
+
+        # 3. Suppress social preview cards on normal post summaries
+        if suppress_social_embeds and not is_angle_wrapped and _SOCIAL_DOMAIN_URL_REGEX.match(bare_url):
+            return f"[{raw_label}](<{bare_url}>)"
+        return f"[{raw_label}]({raw_url})"
+
+    out = _MD_LINK_REGEX.sub(_clean_md_link, prose)
+
+    # Strip any bare duplicate posted URL (outside existing markdown links)
+    if exact_urls or x_status_ids or pixiv_ids:
+        segs = re.split(r"(\[[^\]\n]+\]\([^)\s]+\))", out)
+        for idx in range(0, len(segs), 2):
+            seg = segs[idx]
+            if "http" not in seg:
+                continue
+
+            def _clean_bare_url(bm: re.Match) -> str:
+                u_tok = bm.group(0)
+                if _is_duplicate_of_posted_url(u_tok, exact_urls, x_status_ids, pixiv_ids):
+                    return ""
+                if suppress_social_embeds and _SOCIAL_DOMAIN_URL_REGEX.match(u_tok) and not u_tok.startswith("<"):
+                    return f"<{u_tok}>"
+                return u_tok
+
+            seg = re.sub(r"<?https?://[^\s<>()\[\]]+>?", _clean_bare_url, seg)
+            seg = re.sub(r"\(\s*\)", "", seg)
+            segs[idx] = seg
+        out = "".join(segs)
+
+    return out
+
+
+def detect_mixed_script_corruption(text: str, user_prompt: str = "") -> list[str]:
+    """
+    Detects multilingual BPE script-bleeding tokens in Thai/English prose (strictly outside
+    fenced code blocks, inline code, URLs, and @handles):
+    - Korean Hangul characters leaking into non-Korean turns (e.g. `ส이เซ이`)
+    - Mid-word Thai+lowercase-Latin hybrids (e.g. `โฮชิมachi`, `คisaki`)
+    Returns up to 6 unique corrupted token snippets (empty list if clean).
+    """
+    if not text:
+        return []
+    allow_hangul = bool(
+        _HANGUL_CHAR_REGEX.search(user_prompt or "")
+        or _KOREAN_TOPIC_HINT_REGEX.search(user_prompt or "")
+    )
+    masked = _INLINE_CODE_OR_LINK_MASK_REGEX.sub(" ", text)
+    corrupted: list[str] = []
+    seen: set[str] = set()
+
+    if not allow_hangul:
+        for m in re.finditer(r"\S*[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF]\S*", masked):
+            tok = m.group(0).strip(".,!?()[]{}\"'`~*")
+            if tok and tok not in seen:
+                seen.add(tok)
+                corrupted.append(tok)
+
+    for m in _THAI_LATIN_HYBRID_REGEX.finditer(masked):
+        tok = m.group(0)
+        lat_part = "".join(re.findall(r"[a-z]+", tok)).lower()
+        if lat_part in _SAFE_THAI_GLUED_LATIN_WORDS:
+            continue
+        if tok not in seen:
+            seen.add(tok)
+            corrupted.append(tok)
+
+    return corrupted[:6]
 
 # Defensive Thai syllable-cluster newline healers (never valid line breaks in Thai prose)
 _THAI_BROKEN_COMBINING_NL_REGEX = re.compile(
@@ -255,7 +460,7 @@ def get_speaker_identity_context(
             "- ผู้ที่กำลังคุยกับคุณคือ **คู่หูคนคุ้นเคยของคุณในชมรมบริการ (และผู้สร้างของคุณเอง)** ไม่ใช่คนแปลกหน้า\n"
             "- **ห้ามเรียกหรือพิมพ์ชื่อของเขาในคำตอบเด็ดขาดไม่ว่ากรณีใดๆ!**\n"
             '- สรรพนามบุรุษที่ 2: โดยปกติให้ใช้คำว่า **"นาย"** (ภาษาไทย) หรือ **"you"** (ภาษาอังกฤษ) เท่านั้น (และห้ามเติมคำว่า `, นายค่ะ?` ต่อท้ายประโยค)\n'
-            '- **ข้อยกเว้นเชิงวาทศิลป์**: หากอยู่ในบริบทที่ต้องการประชดประชัน เหน็บแนม หรือสร้างระยะห่างอย่างเย็นชา สามารถใช้คำว่า **"คุณ"** เดี่ยวๆ ด้วยน้ำเสียงห่างเหินได้ แต่ **ห้ามใช้คำว่า "คุณ" นำหน้าชื่อใครเด็ดขาด**'
+            '- **ข้อยกเว้นเชิงวาทศิลป์**: หากอยู่ในบริบทที่ต้องการประชดประชัน เหน็บแนม หรือสร้างระยะห่างอย่างเย็นชา สามารถใช้คำว่า **"คุณ"** เดี่ยวๆ ด้วยน้ำเสียงห่างเหินได้ แต่ **ห้ามใช้คำว่า "คุณ" นำหน้าชื่อสมาชิกใน Discord** (ส่วนศิลปิน ผู้วาด หรือบุคคลภายนอกบนโซเชียล/ข่าว สามารถใช้ "คุณ" นำหน้าได้ตามธรรมชาติ)'
             f"{mem_section}{memo_instruction}"
         ).strip()
 
@@ -285,6 +490,9 @@ def _sanitize_prose_segment(
     allow_cjk: bool,
     is_owner_context: bool,
     clean_other_name: str,
+    user_prompt: str = "",
+    allow_hangul: bool = False,
+    suppress_social_embeds: bool = False,
 ) -> str:
     """Applies Yukino persona cleanup strictly to non-code prose so code indentation & strings stay 100% untouched."""
     s = segment
@@ -297,9 +505,21 @@ def _sanitize_prose_segment(
     s = _THAI_BROKEN_COMBINING_NL_REGEX.sub("", s)
     s = _THAI_BROKEN_LEADING_VOWEL_NL_REGEX.sub("", s)
 
-    # 2. Strip stray Chinese CJK leaks while preserving Japanese Kanji embedded in Kana words (e.g. お兄さん)
+    # 1C. Strip unrenderable Private Use Area / replacement tofu glyphs & stray leading degree/bullet glitches ('°- ')
+    s = _TOFU_PUA_REGEX.sub("", s)
+    s = _LEADING_GLITCH_INTRO_REGEX.sub("", s)
+    s = _LINE_GLITCH_BULLET_REGEX.sub("- ", s)
+
+    # 1D. Strip duplicate posted status URLs & suppress duplicate social previews on normal post summaries
+    s = _clean_links_and_suppress_duplicate_previews(
+        s, user_prompt=user_prompt, suppress_social_embeds=suppress_social_embeds
+    )
+
+    # 2. Strip stray Chinese CJK leaks (preserving Japanese Kanji in Kana) and stray Hangul leaks on non-Korean turns
     if not allow_cjk:
         s = _strip_stray_cjk_preserving_japanese(s)
+    if not allow_hangul:
+        s = _HANGUL_CHAR_REGEX.sub("", s)
 
     def _replace_glued_katakana(m: re.Match) -> str:
         ch = m.group(1) or m.group(2) or ""
@@ -337,19 +557,30 @@ def _sanitize_prose_segment(
         s = re.sub(r"นาย\s+นาย", "นาย", s)
         s = re.sub(r"(?:ค่ะ|นะคะ)\s*[,،]?\s*นาย\s*(?:ค่ะ|คะ|นะคะ)?\s*\??(?=$|\s*\n)", "ค่ะ", s)
     elif clean_other_name:
-        s = re.sub(rf"คุณ\s*{re.escape(clean_other_name)}", clean_other_name, s, flags=re.IGNORECASE)
+        # Strip 'คุณ' before the Discord member's name (even if bolded/backticked), while preserving 1 space if glued to Thai
+        _member_khun_pat = re.compile(
+            rf"คุณ[ \t]*(?=(?:\*{{1,2}}|_|`)*[ \t]*{re.escape(clean_other_name)}(?!\w))",
+            flags=re.IGNORECASE,
+        )
 
-    # Strip 'คุณ' before Discord @mentions or third-party Latin names while keeping 1 space if glued to Thai text
-    s = re.sub(r"คุณ\s*(?=<@)", "", s)
+        def _strip_member_khun(m: re.Match) -> str:
+            if m.start() > 0:
+                prev_ch = s[m.start() - 1]
+                if not prev_ch.isspace() and prev_ch not in "([{\"'`*_~-":
+                    return " "
+            return ""
 
-    def _strip_khun_preserving_space(m: re.Match) -> str:
+        s = _member_khun_pat.sub(_strip_member_khun, s)
+
+    # Strip 'คุณ' before Discord <@user_id> mentions ONLY (artists/people on X/social may keep 'คุณ' naturally)
+    def _strip_mention_khun(m: re.Match) -> str:
         if m.start() > 0:
             prev_ch = s[m.start() - 1]
             if not prev_ch.isspace() and prev_ch not in "([{\"'`*_~-":
                 return " "
         return ""
 
-    s = _KHUN_BEFORE_LATIN_NAME_REGEX.sub(_strip_khun_preserving_space, s)
+    s = re.sub(r"คุณ[ \t]*(?=<@)", _strip_mention_khun, s)
 
     # 5. Strip awkward openings, meta-persona headings, repetition tics, and out-of-character emojis
     s = re.sub(r"^สวัสดีค่ะ\s*(?:คุณ|นาย)?\s*(?=\n|\r|\d+\.)", "", s)
@@ -374,12 +605,14 @@ def sanitize_yukino_output(
     speaker_user=None,
     speaker_name: str = "",
     allow_cjk_override: bool = False,
+    suppress_social_embeds: bool = False,
 ) -> str:
     """
     Normalizes Discord Markdown code fences first (fixing inline/inverted/unclosed fences),
     then sanitizes prose segments strictly OUTSIDE fenced code blocks (```...```) so Python,
     YAML, Java, SQL, and React indentation/strings are preserved 100% verbatim while enforcing
-    Yukino's persona, female particles, pronoun rules, and anti-CJK/Katakana-glue protections.
+    Yukino's persona, female particles, pronoun rules, duplicate-link preview suppression,
+    and anti-CJK/Hangul/Katakana-glue protections.
     """
     if not text:
         return ""
@@ -387,6 +620,10 @@ def sanitize_yukino_output(
     normalized = normalize_markdown_code_fences(text)
 
     allow_cjk = bool(allow_cjk_override or CJK_LEAK_REGEX.search(user_prompt or ""))
+    allow_hangul = bool(
+        _HANGUL_CHAR_REGEX.search(user_prompt or "")
+        or _KOREAN_TOPIC_HINT_REGEX.search(user_prompt or "")
+    )
     is_owner_ctx = bool(
         is_owner_user(speaker_user)
         or "krint" in (speaker_name or "").lower()
@@ -399,7 +636,15 @@ def sanitize_yukino_output(
 
     parts = _CODE_FENCE_SPLIT_REGEX.split(normalized)
     if len(parts) == 1:
-        return _sanitize_prose_segment(normalized, allow_cjk, is_owner_ctx, clean_other).strip()
+        return _sanitize_prose_segment(
+            normalized,
+            allow_cjk,
+            is_owner_ctx,
+            clean_other,
+            user_prompt=user_prompt,
+            allow_hangul=allow_hangul,
+            suppress_social_embeds=suppress_social_embeds,
+        ).strip()
 
     rebuilt = []
     for idx, part in enumerate(parts):
@@ -407,7 +652,17 @@ def sanitize_yukino_output(
             # Odd indices are fenced ```...``` blocks — preserve verbatim!
             rebuilt.append(part)
         else:
-            rebuilt.append(_sanitize_prose_segment(part, allow_cjk, is_owner_ctx, clean_other))
+            rebuilt.append(
+                _sanitize_prose_segment(
+                    part,
+                    allow_cjk,
+                    is_owner_ctx,
+                    clean_other,
+                    user_prompt=user_prompt,
+                    allow_hangul=allow_hangul,
+                    suppress_social_embeds=suppress_social_embeds,
+                )
+            )
     return "".join(rebuilt).strip()
 
 
@@ -530,11 +785,11 @@ FAST_SYSTEM_PROMPT = """
      * ห้ามจบทุกข้อความด้วยคำถามสัมภาษณ์แบบเดิมๆ เช่น *"แล้วนายจะ...อย่างไรล่ะคะ?"* หรือ *"นายคิดยังไงล่ะคะ?"* ให้จบประโยคอย่างเป็นธรรมชาติเหมือนคนคุยกันจริงๆ
 2. กฎด้านความถูกต้องของภาษาและการคัดกรองข่าว (Language & Natural Thai Vocabulary):
    - หากผู้ใช้พิมพ์ภาษาไทย ให้ตอบเป็น **"ภาษาไทยที่สละสลวยและเป็นธรรมชาติ"** — **ห้ามทับศัพท์ภาษาอังกฤษแบบฝืนธรรมชาติ** เช่น ห้ามใช้ "ภาพดิจิทัลอิลลัสเตรชัน" (ใช้ **"ภาพวาด"**), ห้ามใช้ "อาร์ตเวิร์ก" (ใช้ **"งานวาด"**), ห้ามใช้ "ซิลลูเอต" (ใช้ **"โครงร่าง"**), ห้ามใช้ "พาเนล" (ใช้ **"ช่องการ์ตูน"**), ห้ามใช้ "แอตโมสเฟียร์" (ใช้ **"บรรยากาศ"**) ยกเว้นชื่อเฉพาะ ชื่ออนิเมะ/เกม ชื่อรุ่น หรือศัพท์เทคนิคโค้ด
-   - **ห้ามเขียนชื่อตัวละครแบบผสมตัวอักษรข้ามภาษาในคำเดียวกันเด็ดขาด** (เช่น ห้ามเขียน `คิสาキ` หรือ `คisaki` ให้เขียน `คิซากิ` หรือ `Kisaki` เท่านั้น) และห้ามหลุดตัวอักษรภาษาจีน (เช่น 才行, 呢) เด็ดขาด
+   - **ห้ามเขียนชื่อตัวละครหรือคำใดๆ แบบผสมตัวอักษรข้ามภาษาในคำเดียวกันเด็ดขาด** (เช่น ห้ามเขียน `คิสาキ`, `โฮชิมachi`, `ส이เซ이` ให้เขียนภาษาไทยล้วน `โฮชิมาจิ ซุยเซย์` หรือ Romaji ล้วน `Hoshimachi Suisei` เท่านั้น) และห้ามหลุดตัวอักษรภาษาจีน (เช่น 才行, 呢) หรือเกาหลี (Hangul) รวมถึงห้ามขึ้นต้นประโยคด้วยสัญลักษณ์แปลกๆ อย่าง `°- ` เด็ดขาด
    - เมื่อสรุปข่าวหรือข้อมูลจากผลการค้นหา: จงใช้วิจารณญาณคัดกรองแหล่งข่าว หากเห็นพาดหัวที่เป็นข่าวลือไร้สาระ ข่าวคลิกเบตจากโซเชียล หรือเรื่องซุบซิบที่ไม่มีมูลความจริง ให้ตัดทิ้งหรือชี้ชัดทันทีว่าเป็นแค่ข่าวลือไร้สาระ ไม่นำมาสรุปเป็นประเด็นหลัก
 3. สรรพนามและหางเสียง (Pronouns & Tone):
    - แทนตัวเองว่า **"ฉัน"** เสมอ
-   - สรรพนามบุรุษที่ 2: ใช้คำว่า **"นาย"** (ภาษาไทย) หรือ **"you"** (ภาษาอังกฤษ) หรือละสรรพนามแล้วพูดเข้าประเด็นโดยตรงได้เลย (ไม่ต้องใส่คำว่า "นาย" ซ้ำทุกประโยคจนดูเกร็ง) หากคุยกับสมาชิกคนอื่นให้เรียกชื่อเขาตรงๆ โดย **ห้ามใส่คำว่า "คุณ" นำหน้าชื่อเด็ดขาด**
+   - สรรพนามบุรุษที่ 2: ใช้คำว่า **"นาย"** (ภาษาไทย) หรือ **"you"** (ภาษาอังกฤษ) หรือละสรรพนามแล้วพูดเข้าประเด็นโดยตรงได้เลย (ไม่ต้องใส่คำว่า "นาย" ซ้ำทุกประโยคจนดูเกร็ง) หากคุยกับสมาชิกคนอื่นในเซิร์ฟเวอร์ Discord ให้เรียกชื่อเขาตรงๆ โดย **ห้ามใส่คำว่า "คุณ" นำหน้าชื่อสมาชิกใน Discord** (ส่วนศิลปิน ผู้วาด หรือบุคคลภายนอกบนโซเชียลสามารถใช้ "คุณ" นำหน้าชื่อได้ตามปกติ)
    - ในบริบทที่ต้องการประชดประชันหรือเหน็บแนมแบบไว้ตัว สามารถใช้คำว่า **"คุณ"** เดี่ยวๆ (โดยไม่มีชื่อตามหลัง) ได้
    - ใช้หางเสียงตามธรรมชาติของยูกิโนะ เช่น "ค่ะ", "นะคะ", "หรอกนะ", "สินะ", "นะ", "ล่ะ" **ห้ามใช้ "ครับ", "ครับ/ค่ะ", "จ้า", "จ๊ะ", "จ้ะ", "นะจ๊ะ", "น้า" เด็ดขาด!**
    - ห้ามใช้คำพูดของ AI เช่น "ฉันขออภัยค่ะ", "ในระบบของฉัน", หรือ "ในฐานะ AI" เด็ดขาด
@@ -569,7 +824,7 @@ FAST_SYSTEM_PROMPT = """
 ## [Multimodal & Discord Formatting Rules]
 - **OCR / การแปลภาษาและโพสต์โซเชียล (X / Pixiv / Manga)**: เชื่อมโยงแคปชันของโพสต์ (`Post Caption / Title Text`), ชื่อผู้วาด และบทสนทนาในภาพตามลำดับช่องอ่าน (ขวาไปซ้าย บนลงล่าง) เล่าเหตุการณ์และแปลบทพูดด้วยสำนวนที่ลื่นไหลตรงตามบริบทของเรื่อง (เช่น คงคำเรียกเฉพาะทางอย่าง "ท่านเจ้าสำนัก", "รุ่นพี่", "อาจารย์") แล้วพูดความรู้สึกส่วนตัวต่อพฤติกรรมของตัวละครในฉากนั้นอย่างเป็นธรรมชาติในย่อหน้าสนทนา (ห้ามตั้งหัวข้อว่า *"ความคิดเห็นในสไตล์ยูกิโนะ"* และห้ามสร้างตารางสำหรับการสรุปโพสต์โซเชียล รีวิวภาพ ประวัติตัวละคร หรือช่องทางติดตามศิลปิน)
 - **ความสม่ำเสมอของชื่อตัวละครและศัพท์เฉพาะ (Canonical Name & Term Consistency)**: สำหรับชื่อตัวละคร ชื่อศิลปิน และศัพท์เฉพาะญี่ปุ่น/อนิเมะ/มังงะ ให้คงการสะกดให้สอดคล้องกันทั้งการสรุปโพสต์ คำแปล เจาะลึกตัวละคร และค้นหาศิลปิน โดยใช้การทับศัพท์ภาษาไทยตามเสียงคานะญี่ปุ่นที่ถูกต้อง (เช่น `あおい` = `อาโออิ` ไม่ใช่ `อาออย`, `せな` = `เซนะ` ไม่ใช่ `เซนา`, `なつき` = `นัตสึกิ`) หรือใช้ Romaji ตามต้นฉบับ **ห้ามแปลชื่อตัวละครหรือศัพท์เฉพาะทางเป็นภาษาไทยแบบตรงตัวตามความหมายคันจิเด็ดขาด**
-- **Discord Formatting & Links**: ใช้ย่อหน้าสั้นๆ หรือหัวข้อย่อย (`-` / `1.`) เป็นหลัก เมื่อระบุบัญชี X (Twitter) ของศิลปินหรือผู้สร้างผลงาน ให้ทำเป็นลิงก์คลิกได้ในรูปแบบ `[@username](https://x.com/username)` เสมอ และสร้างตาราง Markdown มาตรฐาน (`| หัวข้อ | ... |` ไม่เกิน 4-5 คอลัมน์กระชับ) ได้เฉพาะเมื่อผู้ใช้ขอเปรียบเทียบสินค้า/สเปค/ราคา/ตัวเลือก หรือขอให้สรุปเป็นตารางเท่านั้น
+- **Discord Formatting & Links**: ใช้ย่อหน้าสั้นๆ หรือหัวข้อย่อย (`-` / `1.`) เป็นหลัก **สำหรับการสรุปโพสต์/ลิงก์ปกติที่ผู้ใช้เพิ่งส่งมา ห้ามวางลิงก์โพสต์ซ้ำหรือสร้างไฮเปอร์ลิงก์กลับไปยังโพสต์เดิม** (เอ่ยถึงผู้วาดด้วยชื่อหรือ `@username` แบบข้อความธรรมดาเพื่อไม่ให้ Discord แสดงพรีวิวซ้ำ) ให้ทำลิงก์บัญชี X เป็น `[@username](https://x.com/username)` (ใส่เฉพาะ `@username` ในวงเล็บเหลี่ยม ห้ามใส่ชื่อแสดงผลหรือลิงก์ `/status/...`) เฉพาะเมื่อผู้ใช้ขอหาผลงาน/ช่องทางติดตามศิลปินหรือถามหาที่มาเท่านั้น และสร้างตาราง Markdown มาตรฐาน (`| หัวข้อ | ... |` ไม่เกิน 4-5 คอลัมน์กระชับ) ได้เฉพาะเมื่อผู้ใช้ขอเปรียบเทียบสินค้า/สเปค/ราคา/ตัวเลือก หรือขอให้สรุปเป็นตารางเท่านั้น
 """.strip()
 
 YUKIPEDIA_SYSTEM_PROMPT = """
@@ -585,8 +840,8 @@ YUKIPEDIA_SYSTEM_PROMPT = """
    - แปลและเรียบเรียงให้สละสลวย พร้อมช่วยสังเกตคำผิดหรือจุดบกพร่องในต้นฉบับอย่างเป็นธรรมชาติ
    - ใช้คำไทยที่เป็นธรรมชาติแทนการทับศัพท์ฝืนๆ (เช่น ใช้ "ภาพวาด", "งานวาด", "ช่องการ์ตูน", "บรรยากาศ" แทน "อิลลัสเตรชัน", "อาร์ตเวิร์ก", "พาเนล") และห้ามเขียนชื่อตัวละครแบบผสมตัวอักษรข้ามภาษาในคำเดียวกันเด็ดขาด
 3. น้ำเสียงและการจัดรูปแบบ:
-   - ใช้ภาษาพูดที่สุภาพ คมคาย เป็นธรรมชาติ (แทนตัวเองว่า "ฉัน" เรียกคู่สนทนาว่า "นาย" หรือใช้ "คุณ" เดี่ยวๆ เมื่อประชดประชัน ห้ามใช้ "คุณ" นำหน้าชื่อคน ห้ามใช้คำราชการอย่าง "รับทราบ"/"ดำเนินการ"/"กรุณา" และห้ามใช้ "จ้า"/"จ๊ะ")
-   - คงชื่อตัวละคร ชื่อศิลปิน และศัพท์เฉพาะญี่ปุ่นให้สอดคล้องกันด้วยเสียงทับศัพท์ญี่ปุ่นที่ถูกต้องหรือ Romaji (ห้ามแปลชื่อเฉพาะตรงตัว) และเมื่อระบุบัญชี X (Twitter) ให้ทำเป็นลิงก์คลิกได้ `[@username](https://x.com/username)` เสมอ
+   - ใช้ภาษาพูดที่สุภาพ คมคาย เป็นธรรมชาติ (แทนตัวเองว่า "ฉัน" เรียกคู่สนทนาว่า "นาย" หรือใช้ "คุณ" เดี่ยวๆ เมื่อประชดประชัน ห้ามใช้ "คุณ" นำหน้าชื่อสมาชิกใน Discord (ใช้กับศิลปินหรือบุคคลภายนอกบนโซเชียลได้ตามปกติ) ห้ามใช้คำราชการอย่าง "รับทราบ"/"ดำเนินการ"/"กรุณา" และห้ามใช้ "จ้า"/"จ๊ะ")
+   - คงชื่อตัวละคร ชื่อศิลปิน และศัพท์เฉพาะญี่ปุ่นให้สอดคล้องกันด้วยเสียงทับศัพท์ญี่ปุ่นที่ถูกต้องหรือ Romaji (ห้ามแปลชื่อเฉพาะตรงตัว ห้ามผสมอักษรไทย-อังกฤษ-เกาหลีกลางคำ และห้ามขึ้นต้นด้วย `°- `) และเมื่อระบุบัญชี X (Twitter) ในการค้นหาศิลปิน ให้ทำเป็นลิงก์คลิกได้ `[@username](https://x.com/username)` (ใส่เฉพาะ `@username` ใน `[...]` และห้ามวางลิงก์ `/status/...` ซ้ำกับโพสต์เดิม)
    - ห้ามเขียนหัวข้อว่า "ความคิดเห็นในสไตล์ยูกิโนะ" ห้ามปิดท้ายด้วยการเทศนาสั่งสอนแบบไลฟ์โค้ช และห้ามสร้างตารางสำหรับข้อมูลศิลปิน ช่องทางติดตาม หรือประวัติตัวละคร (สร้างตารางได้เฉพาะเมื่อผู้ใช้ขอเปรียบเทียบสเปค/ราคา/ตัวเลือก หรือขอสรุปเป็นตารางเท่านั้น)
 """.strip()
 
@@ -627,6 +882,6 @@ CODE_SYSTEM_PROMPT = """
    - **กฎเหล็ก Code Block (ห้ามทำโค้ดบล็อกพังเด็ดขาด!)**:
      * แท็กเปิด ` ```lang ` (เช่น ` ```tsx `, ` ```java `, ` ```sql `) **ต้องขึ้นบรรทัดใหม่ชิดซ้ายเสมอ** ห้ามพิมพ์ต่อท้ายข้อความหรือหัวข้อย่อยในบรรทัดเดียวกัน (ผิด: `- **วิธีแก้** ```tsx` | ถูก: ขึ้นบรรทัดใหม่แล้วค่อยพิมพ์ ` ```tsx `) และห้ามเว้นวรรคระหว่าง ` ``` ` กับชื่อภาษา
      * เนื้อหาโค้ดต้องเริ่มในบรรทัดถัดจาก ` ```lang ` และแท็กปิด ` ``` ` **ต้องอยู่บนบรรทัดเดี่ยวชิดซ้ายของตัวเองเสมอ**
-   - ตอบเป็นภาษาไทยที่สุภาพ สุขุม เฉียบคม (แทนตัวเองว่า "ฉัน" เรียกคู่สนทนาว่า "นาย" หรือชื่อตรงๆ โดยห้ามใส่ "คุณ" นำหน้าชื่อ หรือใช้ "คุณ" เดี่ยวๆ เมื่อประชดประชัน ลงท้ายด้วย "ค่ะ"/"นะคะ") ห้ามใช้คำราชการอย่าง "รับทราบ"/"ดำเนินการ"/"กรุณา" ห้ามใช้ "จ้า"/"จ๊ะ" และห้ามหลุดตัวอักษรภาษาจีนเด็ดขาด
+   - ตอบเป็นภาษาไทยที่สุภาพ สุขุม เฉียบคม (แทนตัวเองว่า "ฉัน" เรียกคู่สนทนาว่า "นาย" หรือชื่อตรงๆ โดยห้ามใส่ "คุณ" นำหน้าชื่อสมาชิกใน Discord หรือใช้ "คุณ" เดี่ยวๆ เมื่อประชดประชัน ลงท้ายด้วย "ค่ะ"/"นะคะ") ห้ามใช้คำราชการอย่าง "รับทราบ"/"ดำเนินการ"/"กรุณา" ห้ามใช้ "จ้า"/"จ๊ะ" และห้ามหลุดตัวอักษรภาษาจีนเด็ดขาด
    - ใช้หัวข้อย่อยและโค้ดบล็อกเป็นหลัก สร้างตาราง Markdown มาตรฐาน (ไม่เกิน 4-5 คอลัมน์กระชับ) ได้เฉพาะเมื่อผู้ใช้ขอเปรียบเทียบหรือขอตาราง
 """.strip()
