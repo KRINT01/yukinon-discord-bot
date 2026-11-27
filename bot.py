@@ -64,6 +64,7 @@ from config import (
     OT_INLINE_CUE_REGEX,
     URL_REGEX,
     CODE_AND_LOG_EXTENSIONS,
+    STACK_TRACE_SIGNATURE_REGEX,
     intents,
     channel_memory,
     channel_last_attachment,
@@ -1223,9 +1224,20 @@ async def on_message(message: discord.Message):
             message.channel.id,
             extracted_ctx=extracted_ctx,
         )
-        if decision_plan and decision_plan.get("route") == "code" and decision_plan.get("route_confidence", 0.0) >= 0.72:
+        dec_route = (decision_plan or {}).get("route", "")
+        dec_conf = float((decision_plan or {}).get("route_confidence") or 0.0)
+        has_hard_code_evidence = bool(
+            has_code_att
+            or "```" in (clean_prompt or "")
+            or STACK_TRACE_SIGNATURE_REGEX.search(clean_prompt or "")
+            or STACK_TRACE_SIGNATURE_REGEX.search(extracted_ctx or "")
+        )
+        if dec_route == "code" and dec_conf >= 0.72:
             use_coder = True
-        elif decision_plan and decision_plan.get("route") == "compound":
+        elif dec_route == "compound":
+            use_coder = False
+        elif dec_route and dec_route != "code" and dec_conf >= 0.72 and not has_hard_code_evidence:
+            # Trust confident Decision-1 non-code routing (e.g. game class/build web_search) over ambiguous regex words
             use_coder = False
         else:
             use_coder = regex_coder

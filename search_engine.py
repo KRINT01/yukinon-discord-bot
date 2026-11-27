@@ -7,7 +7,7 @@ import ipaddress
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from urllib.parse import urlparse, quote_plus, urljoin
+from urllib.parse import urlparse, quote_plus
 
 import aiohttp
 import trafilatura
@@ -150,6 +150,22 @@ def _strip_context_and_system_blocks(text: str) -> str:
     return head.strip()
 
 
+_STRONG_CODE_ONLY_REGEX = re.compile(
+    r"(```|\b(?:python|java|maven|pom\.xml|spring|springboot|spring\s*boot|hibernate|jpa|jpql|autowired|"
+    r"javascript|typescript|react|bootstrap|vue|nextjs|nodejs|node\.js|express|tsx|jsx|"
+    r"oracle|pl/?sql|sql|stored\s*procedure|explain\s*plan|tablespace|ddl|dml|"
+    r"rust|golang|c\+\+|html|css|scss|bash|shell|dockerfile|docker|docker-compose|kubernetes|k8s|kubectl|"
+    r"helm|ingress|configmap|microservice|microservices|rabbitmq|kafka|redis|nginx|weblogic|tomcat|systemd|"
+    r"regex|json|yaml|yml|xml|graphql|jwt|oauth|cors|useeffect|usestate|usememo|usecallback|"
+    r"async|await|completablefuture|deadlock|memory\s*leak|oomkilled|crashloopbackoff|"
+    r"traceback|stack\s*trace|stacktrace|nullpointerexception|sqlexception|beancreationexception|"
+    r"segfault|refactor|compile|algorithm|leetcode|git|diff|pip|npm|yarn|gradle)\b|"
+    r"ORA-\d{4,5}|TNS-\d{4,5}|HTTP\s*[45]\d{2}|"
+    r"โค้ด|เขียนโปรแกรม|แก้บั๊ก|รันไม่ผ่าน|สคริปต์|ฟังก์ชัน|แก้โค้ด|คิวรี|ฐานข้อมูล|คอนเทนเนอร์)",
+    re.IGNORECASE,
+)
+
+
 def detect_coding_intent(
     text: str,
     attachments: list,
@@ -164,8 +180,16 @@ def detect_coding_intent(
     user_text_no_urls = URL_REGEX.sub(" ", clean_user_text).strip()
 
     if user_text_no_urls:
-        if CODE_INTENT_PATTERN.search(user_text_no_urls) or STACK_TRACE_SIGNATURE_REGEX.search(user_text_no_urls):
+        if STACK_TRACE_SIGNATURE_REGEX.search(user_text_no_urls):
             return True
+        if CODE_INTENT_PATTERN.search(user_text_no_urls):
+            # Gaming/anime queries often contain ambiguous English words (`class`, `build`, `patch`, `bug`, `render`, `button`).
+            # Only treat them as coding when an unmistakable programming/infra keyword or code fence is also present.
+            if (GAME_QUERY_REGEX.search(user_text_no_urls) or ANIME_MANGA_QUERY_REGEX.search(user_text_no_urls)):
+                if _STRONG_CODE_ONLY_REGEX.search(user_text_no_urls):
+                    return True
+            else:
+                return True
 
     if extracted_ctx and STACK_TRACE_SIGNATURE_REGEX.search(extracted_ctx):
         return True
@@ -475,8 +499,8 @@ async def fetch_live_weather_context(user_text: str, channel_id: int = None) -> 
                     f"สภาพอากาศปัจจุบัน: {curr_desc} | อุณหภูมิ: {c.get('temperature_2m')}°C (รู้สึกเหมือน {c.get('apparent_temperature')}°C)\n"
                     f"ความชื้นสัมพัทธ์: {c.get('relative_humidity_2m')}% | ลม: {c.get('wind_speed_10m')} km/h | ปริมาณฝนขณะนี้: {c.get('precipitation')} มม.\n"
                     f"อุณหภูมิต่ำสุด-สูงสุดวันนี้: {t_min}°C ถึง {t_max}°C | โอกาสเกิดฝนตกสูงสุดของวันนี้: {rain_prob_max}%\n"
-                    "แนวโน้มรายชั่วโมงวันนี้ (เช้า/บ่าย/เย็น/กลางคืน):\n" + "\n".join(hourly_lines) + "\n"
-                    "</live_weather_report>"
+                    f"แนวโน้มรายชั่วโมงวันนี้ (เช้า/บ่าย/เย็น/กลางคืน):\n" + "\n".join(hourly_lines) + "\n"
+                    f"</live_weather_report>"
                 )
                 if channel_id:
                     channel_last_weather[channel_id] = {"report": report, "timestamp": time.time()}
@@ -527,8 +551,8 @@ async def fetch_live_weather_context(user_text: str, channel_id: int = None) -> 
                     f"สภาพอากาศปัจจุบัน ({loc_display}): {cond_desc}\n"
                     f"อุณหภูมิปัจจุบัน: {temp_c}°C (รู้สึกเหมือน {feels_c}°C) | ความชื้น: {humidity}% | น้ำฝน: {precip_mm} มม.\n"
                     f"โอกาสเกิดฝนตกสูงสุดของวันนี้: {max_rain_chance}%\n"
-                    "แนวโน้มรายชั่วโมงวันนี้ (เช้า/บ่าย/เย็น/กลางคืน):\n" + "\n".join(hourly_lines) + "\n"
-                    "</live_weather_report>"
+                    f"แนวโน้มรายชั่วโมงวันนี้ (เช้า/บ่าย/เย็น/กลางคืน):\n" + "\n".join(hourly_lines) + "\n"
+                    f"</live_weather_report>"
                 )
                 if channel_id:
                     channel_last_weather[channel_id] = {"report": report, "timestamp": time.time()}
@@ -589,39 +613,29 @@ async def validate_safe_public_url_async(url: str) -> str:
     return cleaned
 
 
-_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
-
-
-async def open_safe_public_url_async(
-    session: aiohttp.ClientSession, url: str, max_redirects: int = 3, **get_kwargs
-) -> aiohttp.ClientResponse:
-    """
-    SSRF-safe GET: validates the initial URL AND every redirect hop (aiohttp's automatic
-    redirect following would otherwise reach private/metadata IPs unchecked).
-    Caller owns the returned response: use `async with await open_safe_public_url_async(...) as resp:`.
-    Known ceiling: DNS can still change between validation and connect (rebinding); closing that
-    needs a custom aiohttp resolver that pins the validated IPs.
-    """
-    current = await validate_safe_public_url_async(url)
-    for _ in range(max_redirects + 1):
-        resp = await session.get(current, allow_redirects=False, **get_kwargs)
-        location = resp.headers.get("Location")
-        if resp.status not in _REDIRECT_STATUSES or not location:
-            return resp
-        resp.release()
-        current = await validate_safe_public_url_async(urljoin(current, location))
-    raise ValueError(f"Too many redirects (> {max_redirects}).")
+def fetch_webpage_sync(url: str, max_chars: int = 14000) -> str:
+    safe_url = validate_safe_public_url(url)
+    downloaded = trafilatura.fetch_url(safe_url)
+    if not downloaded:
+        raise RuntimeError("Could not download URL content.")
+    extracted = trafilatura.extract(
+        downloaded, include_tables=True, include_comments=False, favor_precision=True
+    )
+    if not extracted:
+        raise RuntimeError("No readable article text found on page.")
+    return extracted[:max_chars]
 
 
 async def fetch_webpage_async(url: str, max_chars: int = 14000, timeout_sec: float = 6.0) -> str:
     """Async SSRF-validated webpage fetcher using pooled aiohttp + trafilatura HTML extraction."""
+    safe_url = await validate_safe_public_url_async(url)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
     session = get_http_session()
-    async with await open_safe_public_url_async(
-        session, url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout_sec)
+    async with session.get(
+        safe_url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout_sec)
     ) as resp:
         if resp.status != 200:
             raise RuntimeError(f"HTTP {resp.status} downloading URL.")
@@ -925,22 +939,46 @@ async def _search_tavily_async(query: str, max_results: int = 5) -> list[dict]:
     hits = []
     try:
         session = get_http_session()
+        payload = {
+            "api_key": TAVILY_API_KEY,
+            "query": query,
+            "max_results": max_results,
+            "search_depth": "basic",
+            "chunks_per_source": 3,
+            "include_answer": True,
+        }
         async with session.post(
             clean_url(f"{HTTPS}api.tavily.com/search"),
-            json={"api_key": TAVILY_API_KEY, "query": query, "max_results": max_results},
+            json=payload,
             timeout=aiohttp.ClientTimeout(total=7),
         ) as resp:
             if resp.status != 200:
                 return []
             t_data = await resp.json()
+            ans_text = re.sub(r"\s+", " ", str(t_data.get("answer") or "")).strip()
+            if len(ans_text) >= 40:
+                hits.append({
+                    "title": f"Tavily Synthesized Overview: {query[:60]}",
+                    "href": "",
+                    "body": ans_text[:1000],
+                    "skip_scrape": True,
+                    "is_tavily_answer": True,
+                })
             for r in t_data.get("results", []):
                 hits.append({
                     "title": r.get("title", ""),
                     "href": r.get("url", ""),
                     "body": r.get("content", ""),
+                    "is_tavily": True,
                 })
         if hits:
-            api_log(f"Search (Tavily) -> {len(hits)} hits ({time.monotonic() - t0:.2f}s)")
+            url_cnt = sum(1 for h in hits if not h.get("is_tavily_answer"))
+            has_ans = any(h.get("is_tavily_answer") for h in hits)
+            api_log(
+                f"Search (Tavily) -> {url_cnt} hits"
+                + (" + synthesized answer" if has_ans else "")
+                + f" ({time.monotonic() - t0:.2f}s)"
+            )
     except Exception as e:
         api_log(f"Search (Tavily) -> failed ({type(e).__name__})")
     return hits
@@ -1097,10 +1135,20 @@ async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
     if not hits:
         return ""
 
-    # Deduplicate up to 8 candidates so Decision-1 can rank and drop clickbait/irrelevant hits BEFORE scraping
+    # Separate Tavily's synthesized answer so it never displaces a real URL slot in SearchFilter
+    tavily_overview_text = ""
+    url_hits: list[dict] = []
+    for item in hits:
+        if item.get("is_tavily_answer"):
+            if not tavily_overview_text and item.get("body"):
+                tavily_overview_text = str(item["body"]).strip()[:1000]
+            continue
+        url_hits.append(item)
+
+    # Deduplicate up to 8 URL candidates so Decision-1 can rank and drop clickbait/irrelevant hits BEFORE scraping
     deduped_candidates: list[dict] = []
     seen_urls: set[str] = set()
-    for item in hits:
+    for item in url_hits:
         if len(deduped_candidates) >= max(8, max_results):
             break
         href = (item.get("href") or item.get("url") or "").strip()
@@ -1123,7 +1171,9 @@ async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
     else:
         selected_items = deduped_candidates[:max_results]
 
-    # Phase 2: Concurrently deep-scrape up to 2 surviving short-snippet web articles
+    # Phase 2: Concurrently deep-scrape up to 2 surviving web articles.
+    # Tavily basic returns 1,200-1,500 chars of fragmented `[...]` chunks; scrape whenever <2200 chars or fragmented
+    # so game guides/wikis retain full detail instead of getting cut short!
     scrape_targets: list[tuple[int, str]] = []
     for idx, item in enumerate(selected_items):
         if len(scrape_targets) >= 2:
@@ -1132,9 +1182,15 @@ async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
             continue
         href = (item.get("href") or item.get("url") or "").strip()
         snippet = (item.get("body") or "").strip()
+        needs_deep_scrape = (
+            len(snippet) < 2200
+            or "[...]" in snippet
+            or "..." in snippet
+            or bool(item.get("is_tavily"))
+        )
         if (
             href
-            and len(snippet) < 1200
+            and needs_deep_scrape
             and not any(skip in href for skip in ("news.google.com", "myanimelist.net", "steampowered.com", "youtube.com", "wikipedia.org"))
         ):
             scrape_targets.append((idx, href))
@@ -1153,11 +1209,23 @@ async def run_safe_web_search_async(query: str, max_results: int = 5) -> str:
             if txt:
                 scraped_excerpts[i] = txt
 
+    # When specific web guides/wikis survived alongside generic Wikipedia pages, cap each Wikipedia snippet
+    # to 1,600 chars so Wikipedia never crowds out deep-scraped guide tables within the total char budget!
+    has_non_wiki_web = any(
+        "wikipedia.org" not in (it.get("href") or it.get("url") or "").lower()
+        for it in selected_items
+    )
+
     formatted_entries = []
+    if tavily_overview_text:
+        formatted_entries.append(f"[Quick Overview (Tavily)]: {tavily_overview_text}")
+
     for idx, item in enumerate(selected_items):
         title = (item.get("title") or "Untitled").strip()
         href = (item.get("href") or item.get("url") or "").strip()
         snippet = (item.get("body") or "").strip()
+        if has_non_wiki_web and "wikipedia.org" in href.lower() and len(snippet) > 1600:
+            snippet = snippet[:1600].rstrip() + "..."
         entry_text = f"[{idx + 1}] Title: {title}\nURL: {href}\nSnippet: {snippet}"
         if idx in scraped_excerpts:
             entry_text += f"\nFull Page Excerpt:\n{scraped_excerpts[idx]}"
