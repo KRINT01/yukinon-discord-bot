@@ -52,6 +52,7 @@ GROQ_EXCLUDED_SUBSTRINGS = (
 _GROQ_MODEL_COOLDOWN_UNTIL: dict[str, float] = {}
 _GROQ_AVAILABLE_MODELS_CACHE: list[str] = []
 _GROQ_MODELS_LAST_FETCH_TS: float = 0.0
+_GROQ_MODELS_FAIL_UNTIL: float = 0.0  # negative cache: no discovery request until this time after a failed fetch
 
 _GEMINI_MODEL_COOLDOWN_UNTIL: dict[str, float] = {}
 _AI_STUDIO_MODEL_COOLDOWN_UNTIL: dict[str, float] = {}
@@ -640,11 +641,13 @@ async def _fetch_google_ai_studio_model_names(force_remote: bool = False) -> lis
 
 
 async def discover_available_groq_models(force_refresh: bool = False) -> list[str]:
-    global _GROQ_AVAILABLE_MODELS_CACHE, _GROQ_MODELS_LAST_FETCH_TS
+    global _GROQ_AVAILABLE_MODELS_CACHE, _GROQ_MODELS_LAST_FETCH_TS, _GROQ_MODELS_FAIL_UNTIL
     if not GROQ_API_KEY:
         return []
 
     now = time.time()
+    if not force_refresh and now < _GROQ_MODELS_FAIL_UNTIL:
+        return _GROQ_AVAILABLE_MODELS_CACHE
     if (
         not force_refresh
         and _GROQ_AVAILABLE_MODELS_CACHE
@@ -679,6 +682,8 @@ async def discover_available_groq_models(force_refresh: bool = False) -> list[st
     except Exception as e:
         print(f"Groq model auto-discovery warning: {e}")
 
+    # Reached only on exception, non-200, or zero models: back off so every call does not re-hit /models
+    _GROQ_MODELS_FAIL_UNTIL = time.time() + 120.0
     return _GROQ_AVAILABLE_MODELS_CACHE
 
 
@@ -713,7 +718,12 @@ async def get_groq_search_and_chat_candidates() -> list[str]:
         if mod != GROQ_CODE_MODEL and not _is_reserved_groq_vision_model(mod) and mod not in candidates:
             candidates.append(mod)
 
-    return candidates
+    # Drop cooling models first so they cannot occupy the capped slots (call_groq_chat would skip them anyway)
+    now = time.time()
+    candidates = [m for m in candidates if now >= _GROQ_MODEL_COOLDOWN_UNTIL.get(m, 0.0)]
+    # Ceiling: only 3 Groq models are tried per call to bound fallback latency.
+    # Upgrade path: raise the cap if Groq rate limits per model and more fallbacks are needed.
+    return candidates[:3]
 
 
 async def discover_active_groq_vision_models() -> list[str]:
