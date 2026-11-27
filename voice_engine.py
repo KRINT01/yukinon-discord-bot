@@ -2206,21 +2206,26 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
 
     async def _process_user_pcm(self, user, pcm_bytes: bytes, utterance_ts: float):
         try:
+            spoken_text = ""
+            # Semaphore covers only STT; holding it through the LLM/TTS reply would starve other speakers.
+            # Ceiling: reply pipelines (Decision-1 + LLM) now run unbounded in parallel, one per utterance;
+            # only playback is serialized by tts_lock. Upgrade path: a small separate reply semaphore if
+            # provider rate limits get hit in busy voice channels.
             async with voice_stt_semaphore:
                 compact_wav = await asyncio.to_thread(convert_pcm48k_stereo_to_wav16k_sync, pcm_bytes)
                 if not compact_wav:
                     return
                 spoken_text = await transcribe_wav_bytes_hybrid(compact_wav)
-                if spoken_text:
-                    await handle_spoken_voice_command(
-                        self.guild,
-                        self.text_channel,
-                        user,
-                        user.display_name,
-                        spoken_text,
-                        utterance_ts=utterance_ts,
-                    )
-                else:
-                    print(f"[Voice STT] Audio captured from {user.display_name}, but STT returned empty text.", flush=True)
+            if spoken_text:
+                await handle_spoken_voice_command(
+                    self.guild,
+                    self.text_channel,
+                    user,
+                    user.display_name,
+                    spoken_text,
+                    utterance_ts=utterance_ts,
+                )
+            else:
+                print(f"[Voice STT] Audio captured from {user.display_name}, but STT returned empty text.", flush=True)
         except Exception as e:
             print(f"Voice PCM processing error ({getattr(user, 'display_name', '?')}): {e}", flush=True)

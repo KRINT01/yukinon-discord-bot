@@ -165,28 +165,32 @@ def _parse_image_triage_answers(answers: dict) -> dict | None:
     """Normalizes the 4 `_IMAGE_TRIAGE_DECISION_QUESTIONS` answers into a reusable triage dict."""
     if not isinstance(answers, dict) or "image_type" not in answers:
         return None
-    type_ans = answers.get("image_type") or {}
-    if not isinstance(type_ans, dict) or not type_ans.get("choice"):
-        return None
-    jp_ans = answers.get("has_japanese_dialogue") or {}
-    lookup_ans = answers.get("needs_source_lookup") or {}
-    anime_ss_ans = answers.get("is_anime_screenshot") or {}
+    try:
+        type_ans = answers.get("image_type") or {}
+        if not isinstance(type_ans, dict) or not type_ans.get("choice"):
+            return None
+        jp_ans = answers.get("has_japanese_dialogue") or {}
+        lookup_ans = answers.get("needs_source_lookup") or {}
+        anime_ss_ans = answers.get("is_anime_screenshot") or {}
 
-    img_type = str(type_ans.get("choice") or "meme_casual")
-    img_type_conf = float(type_ans.get("confidence") or 0.0)
-    jp_prob = float(jp_ans.get("noul") or 0.0)
-    lookup_prob = float(lookup_ans.get("noul") or 0.0)
-    anime_ss_prob = float(anime_ss_ans.get("noul") or 0.0)
-    return {
-        "image_type": img_type,
-        "image_type_confidence": img_type_conf,
-        "has_japanese_dialogue": jp_prob >= 0.55,
-        "jp_dialogue_prob": jp_prob,
-        "needs_source_lookup": lookup_prob >= 0.50,
-        "source_lookup_prob": lookup_prob,
-        "is_anime_screenshot": anime_ss_prob >= 0.55,
-        "anime_screenshot_prob": anime_ss_prob,
-    }
+        img_type = str(type_ans.get("choice") or "meme_casual")
+        img_type_conf = float(type_ans.get("confidence") or 0.0)
+        jp_prob = float(jp_ans.get("noul") or 0.0)
+        lookup_prob = float(lookup_ans.get("noul") or 0.0)
+        anime_ss_prob = float(anime_ss_ans.get("noul") or 0.0)
+        return {
+            "image_type": img_type,
+            "image_type_confidence": img_type_conf,
+            "has_japanese_dialogue": jp_prob >= 0.55,
+            "jp_dialogue_prob": jp_prob,
+            "needs_source_lookup": lookup_prob >= 0.50,
+            "source_lookup_prob": lookup_prob,
+            "is_anime_screenshot": anime_ss_prob >= 0.55,
+            "anime_screenshot_prob": anime_ss_prob,
+        }
+    except (AttributeError, TypeError, ValueError) as e:
+        api_log(f"ImageTriage -> malformed Decision-1 answers ({type(e).__name__})")
+        return None
 
 
 def _build_recent_channel_history_preview(channel_id: int | None, max_chars: int = 1200) -> str:
@@ -548,122 +552,126 @@ async def orchestrate_message_with_decision_1(
     if not answers:
         return None
 
-    route_ans = answers.get("route") or {}
-    search_ans = answers.get("needs_web_search") or {}
-    tool_ans = answers.get("needs_tool_use") or {}
-    comp_ans = answers.get("complexity") or {}
-    inj_ans = answers.get("is_prompt_injection") or {}
-    corr_ans = answers.get("is_user_correction") or {}
-    fact_ans = answers.get("has_durable_user_fact") or {}
-    tone_ans = answers.get("yukino_tone_cue") or {}
-    btn_ans = answers.get("attach_buttons") or {}
-    domain_ans = answers.get("button_domain") or {}
+    try:
+        route_ans = answers.get("route") or {}
+        search_ans = answers.get("needs_web_search") or {}
+        tool_ans = answers.get("needs_tool_use") or {}
+        comp_ans = answers.get("complexity") or {}
+        inj_ans = answers.get("is_prompt_injection") or {}
+        corr_ans = answers.get("is_user_correction") or {}
+        fact_ans = answers.get("has_durable_user_fact") or {}
+        tone_ans = answers.get("yukino_tone_cue") or {}
+        btn_ans = answers.get("attach_buttons") or {}
+        domain_ans = answers.get("button_domain") or {}
 
-    chosen_route = route_ans.get("choice") or "chat"
-    route_conf = float(route_ans.get("confidence") or 0.0)
-    raw_route_probs = route_ans.get("probabilities") or {}
-    route_probs = (
-        {str(k): float(v) for k, v in raw_route_probs.items() if isinstance(v, (int, float))}
-        if isinstance(raw_route_probs, dict)
-        else {}
-    )
+        chosen_route = route_ans.get("choice") or "chat"
+        route_conf = float(route_ans.get("confidence") or 0.0)
+        raw_route_probs = route_ans.get("probabilities") or {}
+        route_probs = (
+            {str(k): float(v) for k, v in raw_route_probs.items() if isinstance(v, (int, float))}
+            if isinstance(raw_route_probs, dict)
+            else {}
+        )
 
-    # Probability-distribution multi-intent promotion: 2+ distinct action routes >= 0.22 -> compound
-    if not has_code_attachment and chosen_route != "compound":
-        multi_action_hits = [
-            k for k, p in route_probs.items()
-            if k in _ACTION_ROUTES_FOR_MULTI_INTENT and p >= 0.22
-        ]
-        if len(multi_action_hits) >= 2 or route_probs.get("compound", 0.0) >= 0.45:
-            chosen_route = "compound"
-            route_conf = max(route_conf, 0.80)
+        # Probability-distribution multi-intent promotion: 2+ distinct action routes >= 0.22 -> compound
+        if not has_code_attachment and chosen_route != "compound":
+            multi_action_hits = [
+                k for k, p in route_probs.items()
+                if k in _ACTION_ROUTES_FOR_MULTI_INTENT and p >= 0.22
+            ]
+            if len(multi_action_hits) >= 2 or route_probs.get("compound", 0.0) >= 0.45:
+                chosen_route = "compound"
+                route_conf = max(route_conf, 0.80)
 
-    search_prob = float(search_ans.get("noul") or 0.0)
-    search_conf = float(search_ans.get("confidence") or max(search_prob, 1.0 - search_prob))
-    needs_search = search_prob >= 0.55
+        search_prob = float(search_ans.get("noul") or 0.0)
+        search_conf = float(search_ans.get("confidence") or max(search_prob, 1.0 - search_prob))
+        needs_search = search_prob >= 0.55
 
-    tool_prob = float(tool_ans.get("noul") or 0.0)
-    tool_conf = float(tool_ans.get("confidence") or max(tool_prob, 1.0 - tool_prob))
-    needs_tools = tool_prob >= 0.45
+        tool_prob = float(tool_ans.get("noul") or 0.0)
+        tool_conf = float(tool_ans.get("confidence") or max(tool_prob, 1.0 - tool_prob))
+        needs_tools = tool_prob >= 0.45
 
-    complexity_score = float(comp_ans.get("score") if comp_ans.get("score") is not None else 1.0)
-    complexity_conf = float(comp_ans.get("confidence") or 0.0)
+        complexity_score = float(comp_ans.get("score") if comp_ans.get("score") is not None else 1.0)
+        complexity_conf = float(comp_ans.get("confidence") or 0.0)
 
-    injection_prob = float(inj_ans.get("noul") or 0.0)
-    is_injection = injection_prob >= 0.88
+        injection_prob = float(inj_ans.get("noul") or 0.0)
+        is_injection = injection_prob >= 0.88
 
-    correction_prob = float(corr_ans.get("noul") or 0.0)
-    correction_conf = float(corr_ans.get("confidence") or max(correction_prob, 1.0 - correction_prob))
-    is_correction = correction_prob >= 0.72
+        correction_prob = float(corr_ans.get("noul") or 0.0)
+        correction_conf = float(corr_ans.get("confidence") or max(correction_prob, 1.0 - correction_prob))
+        is_correction = correction_prob >= 0.72
 
-    durable_fact_prob = float(fact_ans.get("noul") or 0.0)
-    has_durable_fact = durable_fact_prob >= 0.80
+        durable_fact_prob = float(fact_ans.get("noul") or 0.0)
+        has_durable_fact = durable_fact_prob >= 0.80
 
-    tone_cue = str(tone_ans.get("choice") or "normal")
-    tone_conf = float(tone_ans.get("confidence") or 0.0)
+        tone_cue = str(tone_ans.get("choice") or "normal")
+        tone_conf = float(tone_ans.get("confidence") or 0.0)
 
-    btn_prob = float(btn_ans.get("noul") or 0.0)
-    buttons_conf = float(btn_ans.get("confidence") or max(btn_prob, 1.0 - btn_prob))
-    attach_btns = btn_prob >= 0.50
+        btn_prob = float(btn_ans.get("noul") or 0.0)
+        buttons_conf = float(btn_ans.get("confidence") or max(btn_prob, 1.0 - btn_prob))
+        attach_btns = btn_prob >= 0.50
 
-    btn_domain = str(domain_ans.get("choice") or "general")
-    domain_conf = float(domain_ans.get("confidence") or 0.0)
+        btn_domain = str(domain_ans.get("choice") or "general")
+        domain_conf = float(domain_ans.get("confidence") or 0.0)
 
-    button_scores: dict[str, float] = {}
-    for q_key in _DYNAMIC_FOLLOWUP_BUTTON_QUESTIONS:
-        b_ans = answers.get(q_key)
-        if isinstance(b_ans, dict) and b_ans.get("noul") is not None:
-            button_scores[q_key[4:]] = round(float(b_ans.get("noul") or 0.0), 3)
+        button_scores: dict[str, float] = {}
+        for q_key in _DYNAMIC_FOLLOWUP_BUTTON_QUESTIONS:
+            b_ans = answers.get(q_key)
+            if isinstance(b_ans, dict) and b_ans.get("noul") is not None:
+                button_scores[q_key[4:]] = round(float(b_ans.get("noul") or 0.0), 3)
 
-    image_triage = _parse_image_triage_answers(answers) if has_inline_images else None
+        image_triage = _parse_image_triage_answers(answers) if has_inline_images else None
 
-    if has_code_attachment:
-        chosen_route = "code"
-        route_conf = 0.99
-        btn_domain = "code"
-        domain_conf = 0.99
-        needs_search = False
-        search_conf = 0.99
+        if has_code_attachment:
+            chosen_route = "code"
+            route_conf = 0.99
+            btn_domain = "code"
+            domain_conf = 0.99
+            needs_search = False
+            search_conf = 0.99
 
-    triage_log = (
-        f", img_triage={image_triage['image_type']}({image_triage['image_type_confidence']:.2f})"
-        if image_triage
-        else ""
-    )
-    api_log(
-        f"Orchestrator Plan ({purpose}) -> route={chosen_route} ({route_conf:.2f}), "
-        f"complexity={complexity_score:.2f} ({complexity_conf:.2f}), "
-        f"search={needs_search} ({search_conf:.2f}), tools={needs_tools} ({tool_conf:.2f}), "
-        f"buttons={attach_btns} ({buttons_conf:.2f}/{btn_domain}:{domain_conf:.2f}), tone={tone_cue}{triage_log}"
-    )
-    return {
-        "route": chosen_route,
-        "route_confidence": route_conf,
-        "route_probabilities": route_probs,
-        "needs_web_search": needs_search,
-        "search_prob": search_prob,
-        "search_confidence": search_conf,
-        "needs_tool_use": needs_tools,
-        "tool_prob": tool_prob,
-        "tool_confidence": tool_conf,
-        "complexity_score": complexity_score,
-        "complexity_confidence": complexity_conf,
-        "is_prompt_injection": is_injection,
-        "injection_prob": injection_prob,
-        "is_user_correction": is_correction,
-        "correction_prob": correction_prob,
-        "correction_confidence": correction_conf,
-        "has_durable_user_fact": has_durable_fact,
-        "durable_fact_prob": durable_fact_prob,
-        "yukino_tone_cue": tone_cue,
-        "tone_confidence": tone_conf,
-        "attach_buttons": attach_btns,
-        "buttons_confidence": buttons_conf,
-        "button_domain": btn_domain,
-        "domain_confidence": domain_conf,
-        "button_scores": button_scores,
-        "image_triage": image_triage,
-    }
+        triage_log = (
+            f", img_triage={image_triage['image_type']}({image_triage['image_type_confidence']:.2f})"
+            if image_triage
+            else ""
+        )
+        api_log(
+            f"Orchestrator Plan ({purpose}) -> route={chosen_route} ({route_conf:.2f}), "
+            f"complexity={complexity_score:.2f} ({complexity_conf:.2f}), "
+            f"search={needs_search} ({search_conf:.2f}), tools={needs_tools} ({tool_conf:.2f}), "
+            f"buttons={attach_btns} ({buttons_conf:.2f}/{btn_domain}:{domain_conf:.2f}), tone={tone_cue}{triage_log}"
+        )
+        return {
+            "route": chosen_route,
+            "route_confidence": route_conf,
+            "route_probabilities": route_probs,
+            "needs_web_search": needs_search,
+            "search_prob": search_prob,
+            "search_confidence": search_conf,
+            "needs_tool_use": needs_tools,
+            "tool_prob": tool_prob,
+            "tool_confidence": tool_conf,
+            "complexity_score": complexity_score,
+            "complexity_confidence": complexity_conf,
+            "is_prompt_injection": is_injection,
+            "injection_prob": injection_prob,
+            "is_user_correction": is_correction,
+            "correction_prob": correction_prob,
+            "correction_confidence": correction_conf,
+            "has_durable_user_fact": has_durable_fact,
+            "durable_fact_prob": durable_fact_prob,
+            "yukino_tone_cue": tone_cue,
+            "tone_confidence": tone_conf,
+            "attach_buttons": attach_btns,
+            "buttons_confidence": buttons_conf,
+            "button_domain": btn_domain,
+            "domain_confidence": domain_conf,
+            "button_scores": button_scores,
+            "image_triage": image_triage,
+        }
+    except (AttributeError, TypeError, ValueError) as e:
+        api_log(f"Orchestrator -> malformed Decision-1 answers ({type(e).__name__})")
+        return None
 
 
 async def orchestrate_voice_utterance_with_decision_1(
@@ -815,90 +823,94 @@ async def orchestrate_voice_utterance_with_decision_1(
     if not answers:
         return None
 
-    addr_ans = answers.get("addressed_to_bot") or {}
-    vact_ans = answers.get("voice_action") or {}
-    route_ans = answers.get("route") or {}
-    search_ans = answers.get("needs_web_search") or {}
-    tool_ans = answers.get("needs_tool_use") or {}
-    comp_ans = answers.get("complexity") or {}
-    inj_ans = answers.get("is_prompt_injection") or {}
-    corr_ans = answers.get("is_user_correction") or {}
-    fact_ans = answers.get("has_durable_user_fact") or {}
-    tone_ans = answers.get("yukino_tone_cue") or {}
+    try:
+        addr_ans = answers.get("addressed_to_bot") or {}
+        vact_ans = answers.get("voice_action") or {}
+        route_ans = answers.get("route") or {}
+        search_ans = answers.get("needs_web_search") or {}
+        tool_ans = answers.get("needs_tool_use") or {}
+        comp_ans = answers.get("complexity") or {}
+        inj_ans = answers.get("is_prompt_injection") or {}
+        corr_ans = answers.get("is_user_correction") or {}
+        fact_ans = answers.get("has_durable_user_fact") or {}
+        tone_ans = answers.get("yukino_tone_cue") or {}
 
-    addressed_prob = float(addr_ans.get("noul") or 0.0)
-    addressed_conf = float(addr_ans.get("confidence") or max(addressed_prob, 1.0 - addressed_prob))
+        addressed_prob = float(addr_ans.get("noul") or 0.0)
+        addressed_conf = float(addr_ans.get("confidence") or max(addressed_prob, 1.0 - addressed_prob))
 
-    voice_action = str(vact_ans.get("choice") or "reply_chat")
-    voice_action_conf = float(vact_ans.get("confidence") or 0.0)
+        voice_action = str(vact_ans.get("choice") or "reply_chat")
+        voice_action_conf = float(vact_ans.get("confidence") or 0.0)
 
-    chosen_route = str(route_ans.get("choice") or "chat")
-    route_conf = float(route_ans.get("confidence") or 0.0)
-    raw_route_probs = route_ans.get("probabilities") or {}
-    route_probs = (
-        {str(k): float(v) for k, v in raw_route_probs.items() if isinstance(v, (int, float))}
-        if isinstance(raw_route_probs, dict)
-        else {}
-    )
-    if chosen_route != "compound":
-        multi_hits = [
-            k for k, p in route_probs.items()
-            if k in _ACTION_ROUTES_FOR_MULTI_INTENT and p >= 0.22
-        ]
-        if len(multi_hits) >= 2 or route_probs.get("compound", 0.0) >= 0.45:
-            chosen_route = "compound"
-            route_conf = max(route_conf, 0.80)
+        chosen_route = str(route_ans.get("choice") or "chat")
+        route_conf = float(route_ans.get("confidence") or 0.0)
+        raw_route_probs = route_ans.get("probabilities") or {}
+        route_probs = (
+            {str(k): float(v) for k, v in raw_route_probs.items() if isinstance(v, (int, float))}
+            if isinstance(raw_route_probs, dict)
+            else {}
+        )
+        if chosen_route != "compound":
+            multi_hits = [
+                k for k, p in route_probs.items()
+                if k in _ACTION_ROUTES_FOR_MULTI_INTENT and p >= 0.22
+            ]
+            if len(multi_hits) >= 2 or route_probs.get("compound", 0.0) >= 0.45:
+                chosen_route = "compound"
+                route_conf = max(route_conf, 0.80)
 
-    search_prob = float(search_ans.get("noul") or 0.0)
-    search_conf = float(search_ans.get("confidence") or max(search_prob, 1.0 - search_prob))
-    tool_prob = float(tool_ans.get("noul") or 0.0)
-    tool_conf = float(tool_ans.get("confidence") or max(tool_prob, 1.0 - tool_prob))
-    complexity_score = float(comp_ans.get("score") if comp_ans.get("score") is not None else 1.0)
-    complexity_conf = float(comp_ans.get("confidence") or 0.0)
-    injection_prob = float(inj_ans.get("noul") or 0.0)
-    correction_prob = float(corr_ans.get("noul") or 0.0)
-    correction_conf = float(corr_ans.get("confidence") or max(correction_prob, 1.0 - correction_prob))
-    durable_fact_prob = float(fact_ans.get("noul") or 0.0)
-    tone_cue = str(tone_ans.get("choice") or "normal")
-    tone_conf = float(tone_ans.get("confidence") or 0.0)
+        search_prob = float(search_ans.get("noul") or 0.0)
+        search_conf = float(search_ans.get("confidence") or max(search_prob, 1.0 - search_prob))
+        tool_prob = float(tool_ans.get("noul") or 0.0)
+        tool_conf = float(tool_ans.get("confidence") or max(tool_prob, 1.0 - tool_prob))
+        complexity_score = float(comp_ans.get("score") if comp_ans.get("score") is not None else 1.0)
+        complexity_conf = float(comp_ans.get("confidence") or 0.0)
+        injection_prob = float(inj_ans.get("noul") or 0.0)
+        correction_prob = float(corr_ans.get("noul") or 0.0)
+        correction_conf = float(corr_ans.get("confidence") or max(correction_prob, 1.0 - correction_prob))
+        durable_fact_prob = float(fact_ans.get("noul") or 0.0)
+        tone_cue = str(tone_ans.get("choice") or "normal")
+        tone_conf = float(tone_ans.get("confidence") or 0.0)
 
-    api_log(
-        f"VoiceOrchestrator ({purpose} | vc_humans={human_count_in_vc}) -> "
-        f"addressed={addressed_prob:.2f}, action={voice_action} ({voice_action_conf:.2f}), "
-        f"route={chosen_route} ({route_conf:.2f}), complexity={complexity_score:.2f}, "
-        f"search={search_prob >= 0.55}, tools={tool_prob >= 0.45}"
-    )
-    return {
-        "addressed_to_bot": addressed_prob >= 0.50,
-        "addressed_prob": addressed_prob,
-        "addressed_confidence": addressed_conf,
-        "voice_action": voice_action,
-        "voice_action_confidence": voice_action_conf,
-        "route": chosen_route,
-        "route_confidence": route_conf,
-        "route_probabilities": route_probs,
-        "needs_web_search": search_prob >= 0.55,
-        "search_prob": search_prob,
-        "search_confidence": search_conf,
-        "needs_tool_use": tool_prob >= 0.45,
-        "tool_prob": tool_prob,
-        "tool_confidence": tool_conf,
-        "complexity_score": complexity_score,
-        "complexity_confidence": complexity_conf,
-        "is_prompt_injection": injection_prob >= 0.88,
-        "injection_prob": injection_prob,
-        "is_user_correction": correction_prob >= 0.72,
-        "correction_prob": correction_prob,
-        "correction_confidence": correction_conf,
-        "has_durable_user_fact": durable_fact_prob >= 0.80,
-        "durable_fact_prob": durable_fact_prob,
-        "yukino_tone_cue": tone_cue,
-        "tone_confidence": tone_conf,
-        "attach_buttons": False,
-        "buttons_confidence": 0.99,
-        "button_domain": "general",
-        "domain_confidence": 0.99,
-    }
+        api_log(
+            f"VoiceOrchestrator ({purpose} | vc_humans={human_count_in_vc}) -> "
+            f"addressed={addressed_prob:.2f}, action={voice_action} ({voice_action_conf:.2f}), "
+            f"route={chosen_route} ({route_conf:.2f}), complexity={complexity_score:.2f}, "
+            f"search={search_prob >= 0.55}, tools={tool_prob >= 0.45}"
+        )
+        return {
+            "addressed_to_bot": addressed_prob >= 0.50,
+            "addressed_prob": addressed_prob,
+            "addressed_confidence": addressed_conf,
+            "voice_action": voice_action,
+            "voice_action_confidence": voice_action_conf,
+            "route": chosen_route,
+            "route_confidence": route_conf,
+            "route_probabilities": route_probs,
+            "needs_web_search": search_prob >= 0.55,
+            "search_prob": search_prob,
+            "search_confidence": search_conf,
+            "needs_tool_use": tool_prob >= 0.45,
+            "tool_prob": tool_prob,
+            "tool_confidence": tool_conf,
+            "complexity_score": complexity_score,
+            "complexity_confidence": complexity_conf,
+            "is_prompt_injection": injection_prob >= 0.88,
+            "injection_prob": injection_prob,
+            "is_user_correction": correction_prob >= 0.72,
+            "correction_prob": correction_prob,
+            "correction_confidence": correction_conf,
+            "has_durable_user_fact": durable_fact_prob >= 0.80,
+            "durable_fact_prob": durable_fact_prob,
+            "yukino_tone_cue": tone_cue,
+            "tone_confidence": tone_conf,
+            "attach_buttons": False,
+            "buttons_confidence": 0.99,
+            "button_domain": "general",
+            "domain_confidence": 0.99,
+        }
+    except (AttributeError, TypeError, ValueError) as e:
+        api_log(f"VoiceOrchestrator -> malformed Decision-1 answers ({type(e).__name__})")
+        return None
 
 
 async def check_voice_scribe_stop_with_decision_1(
@@ -956,20 +968,24 @@ async def check_voice_scribe_stop_with_decision_1(
     if not answers:
         return None
 
-    stop_ans = answers.get("is_stop_scribe_command") or {}
-    addr_ans = answers.get("addressed_to_bot") or {}
-    stop_prob = float(stop_ans.get("noul") or 0.0)
-    addr_prob = float(addr_ans.get("noul") or 0.0)
+    try:
+        stop_ans = answers.get("is_stop_scribe_command") or {}
+        addr_ans = answers.get("addressed_to_bot") or {}
+        stop_prob = float(stop_ans.get("noul") or 0.0)
+        addr_prob = float(addr_ans.get("noul") or 0.0)
 
-    api_log(
-        f"ScribeStopCheck -> stop={stop_prob >= 0.78} ({stop_prob:.2f}), "
-        f"addressed={addr_prob >= 0.65} ({addr_prob:.2f})"
-    )
-    return {
-        "is_stop_scribe_command": stop_prob >= 0.78 and addr_prob >= 0.65,
-        "stop_prob": stop_prob,
-        "addressed_prob": addr_prob,
-    }
+        api_log(
+            f"ScribeStopCheck -> stop={stop_prob >= 0.78} ({stop_prob:.2f}), "
+            f"addressed={addr_prob >= 0.65} ({addr_prob:.2f})"
+        )
+        return {
+            "is_stop_scribe_command": stop_prob >= 0.78 and addr_prob >= 0.65,
+            "stop_prob": stop_prob,
+            "addressed_prob": addr_prob,
+        }
+    except (AttributeError, TypeError, ValueError) as e:
+        api_log(f"ScribeStopCheck -> malformed Decision-1 answers ({type(e).__name__})")
+        return None
 
 
 async def filter_search_snippets_with_decision_1(
@@ -1026,55 +1042,59 @@ async def filter_search_snippets_with_decision_1(
     if not answers:
         return list(candidates[:max_keep])
 
-    scored_rows: list[tuple[float, float, float, int, dict]] = []
-    survivors: list[tuple[float, int, dict]] = []
-    dropped_cnt = 0
+    try:
+        scored_rows: list[tuple[float, float, float, int, dict]] = []
+        survivors: list[tuple[float, int, dict]] = []
+        dropped_cnt = 0
 
-    for idx, item in enumerate(candidates, 1):
-        r_ans = answers.get(f"rel_{idx}") or {}
-        c_ans = answers.get(f"clickbait_{idx}") or {}
-        rel_score = float(r_ans.get("score") if r_ans.get("score") is not None else 1.5)
-        cb_prob = float(c_ans.get("noul") if c_ans.get("noul") is not None else 0.1)
+        for idx, item in enumerate(candidates, 1):
+            r_ans = answers.get(f"rel_{idx}") or {}
+            c_ans = answers.get(f"clickbait_{idx}") or {}
+            rel_score = float(r_ans.get("score") if r_ans.get("score") is not None else 1.5)
+            cb_prob = float(c_ans.get("noul") if c_ans.get("noul") is not None else 0.1)
 
-        title_u = str(item.get("title") or "")
-        is_grounded = title_u.startswith("[Google Search Grounded Summary]")
-        is_authoritative = (
-            is_grounded
-            or title_u.startswith("[Wikipedia ")
-            or title_u.startswith("[MyAnimeList ")
-            or title_u.startswith("[Steam Store ")
-        )
-        auth_bonus = 0.30 if is_grounded else (0.18 if is_authoritative else 0.0)
-        eff_score = rel_score - (0.90 * cb_prob) + auth_bonus
-        scored_rows.append((eff_score, rel_score, cb_prob, idx, item))
+            title_u = str(item.get("title") or "")
+            is_grounded = title_u.startswith("[Google Search Grounded Summary]")
+            is_authoritative = (
+                is_grounded
+                or title_u.startswith("[Wikipedia ")
+                or title_u.startswith("[MyAnimeList ")
+                or title_u.startswith("[Steam Store ")
+            )
+            auth_bonus = 0.30 if is_grounded else (0.18 if is_authoritative else 0.0)
+            eff_score = rel_score - (0.90 * cb_prob) + auth_bonus
+            scored_rows.append((eff_score, rel_score, cb_prob, idx, item))
 
-        # Keep grounded summaries unless clearly off-topic; drop low-rel (<1.15) or clickbait (>=0.75)
-        if is_grounded and rel_score >= 0.80:
-            survivors.append((eff_score, idx, item))
-        elif rel_score >= 1.15 and cb_prob < 0.75:
-            survivors.append((eff_score, idx, item))
-        else:
-            dropped_cnt += 1
+            # Keep grounded summaries unless clearly off-topic; drop low-rel (<1.15) or clickbait (>=0.75)
+            if is_grounded and rel_score >= 0.80:
+                survivors.append((eff_score, idx, item))
+            elif rel_score >= 1.15 and cb_prob < 0.75:
+                survivors.append((eff_score, idx, item))
+            else:
+                dropped_cnt += 1
 
-    if not survivors:
-        # Safety fallback: never return empty when search returned raw hits — keep top 2 by effective score
-        scored_rows.sort(key=lambda x: (-x[0], x[3]))
-        kept = [row[4] for row in scored_rows[: min(2, max_keep)]]
-        state.record_search_filter_stats(len(kept), max(0, len(candidates) - len(kept)))
+        if not survivors:
+            # Safety fallback: never return empty when search returned raw hits — keep top 2 by effective score
+            scored_rows.sort(key=lambda x: (-x[0], x[3]))
+            kept = [row[4] for row in scored_rows[: min(2, max_keep)]]
+            state.record_search_filter_stats(len(kept), max(0, len(candidates) - len(kept)))
+            api_log(
+                f"SearchFilter -> fallback kept {len(kept)}/{len(candidates)} snippets "
+                f"(all scored low; best_rel={scored_rows[0][1]:.2f})"
+            )
+            return kept
+
+        survivors.sort(key=lambda x: (-x[0], x[1]))
+        kept = [row[2] for row in survivors[:max_keep]]
+        state.record_search_filter_stats(len(kept), dropped_cnt)
         api_log(
-            f"SearchFilter -> fallback kept {len(kept)}/{len(candidates)} snippets "
-            f"(all scored low; best_rel={scored_rows[0][1]:.2f})"
+            f"SearchFilter -> kept {len(kept)}/{len(candidates)} snippets "
+            f"(dropped {dropped_cnt} clickbait/low-rel)"
         )
         return kept
-
-    survivors.sort(key=lambda x: (-x[0], x[1]))
-    kept = [row[2] for row in survivors[:max_keep]]
-    state.record_search_filter_stats(len(kept), dropped_cnt)
-    api_log(
-        f"SearchFilter -> kept {len(kept)}/{len(candidates)} snippets "
-        f"(dropped {dropped_cnt} clickbait/low-rel)"
-    )
-    return kept
+    except (AttributeError, TypeError, ValueError) as e:
+        api_log(f"SearchFilter -> malformed Decision-1 answers ({type(e).__name__})")
+        return list(candidates[:max_keep])
 
 
 async def arbitrate_fact_check_with_decision_1(
@@ -1129,22 +1149,26 @@ async def arbitrate_fact_check_with_decision_1(
     if not answers:
         return None
 
-    v_ans = answers.get("verdict") or {}
-    e_ans = answers.get("evidence_sufficient") or {}
-    verdict = str(v_ans.get("choice") or "inconclusive")
-    verdict_conf = float(v_ans.get("confidence") or 0.0)
-    ev_prob = float(e_ans.get("noul") or 0.0)
+    try:
+        v_ans = answers.get("verdict") or {}
+        e_ans = answers.get("evidence_sufficient") or {}
+        verdict = str(v_ans.get("choice") or "inconclusive")
+        verdict_conf = float(v_ans.get("confidence") or 0.0)
+        ev_prob = float(e_ans.get("noul") or 0.0)
 
-    api_log(
-        f"FactCheckArbitrator -> verdict={verdict} ({verdict_conf:.2f}), "
-        f"evidence_sufficient={ev_prob >= 0.55} ({ev_prob:.2f})"
-    )
-    return {
-        "verdict": verdict,
-        "confidence": verdict_conf,
-        "evidence_sufficient": ev_prob >= 0.55,
-        "evidence_prob": ev_prob,
-    }
+        api_log(
+            f"FactCheckArbitrator -> verdict={verdict} ({verdict_conf:.2f}), "
+            f"evidence_sufficient={ev_prob >= 0.55} ({ev_prob:.2f})"
+        )
+        return {
+            "verdict": verdict,
+            "confidence": verdict_conf,
+            "evidence_sufficient": ev_prob >= 0.55,
+            "evidence_prob": ev_prob,
+        }
+    except (AttributeError, TypeError, ValueError) as e:
+        api_log(f"FactCheckArbitrator -> malformed Decision-1 answers ({type(e).__name__})")
+        return None
 
 
 async def triage_image_with_decision_1(

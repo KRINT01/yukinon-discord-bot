@@ -576,6 +576,26 @@ async def query_ai_chat(
 
         messages.append({"role": "user", "content": user_content})
 
+        def _build_fallback_msgs_with_obs() -> tuple[list, bool]:
+            """Carries any tool/search results already fetched by an earlier provider into fallback turns."""
+            obs_pairs = getattr(active_tool_ctx, "_collected_observations", None) if active_tool_ctx else None
+            if not obs_pairs:
+                return messages, False
+            obs_joined = "\n\n".join(obs for _, obs in obs_pairs)[:8500]
+            fb_msgs = [dict(m) for m in messages]
+            fb_msgs[-1]["content"] = (
+                f"{fb_msgs[-1]['content']}\n\n"
+                f"=== Already-Fetched Live Tool / Search Results (Use Directly — Do Not Re-Search) ===\n"
+                f"{obs_joined}"
+            )
+            return fb_msgs, True
+
+        def _fallback_args() -> tuple[list, object]:
+            # Once any tool observation was collected, later providers get the results as text and
+            # no tools, so side-effect tools (overtime, memory, image) cannot run twice.
+            fb_msgs, has_obs = _build_fallback_msgs_with_obs()
+            return fb_msgs, (None if has_obs else active_tool_ctx)
+
         # PATH A: Coding (escalates to Gemini 4 Hydrogen on large code OR high Decision-1 complexity >= 2.35!)
         if is_coding:
             use_hydrogen_code = (
@@ -584,11 +604,12 @@ async def query_ai_chat(
             )
             if use_hydrogen_code and _can_use_gemini_hydrogen():
                 await _notify_heavy("❄️ ขอเวลาไล่ดูโค้ดละเอียดสักครู่นะคะ...")
+                fb_messages, fb_tool_ctx = _fallback_args()
                 ans = await call_gemini_hydrogen_chat(
-                    messages,
+                    fb_messages,
                     thinking_level="MEDIUM",
                     purpose="HeavyCode",
-                    tool_ctx=active_tool_ctx,
+                    tool_ctx=fb_tool_ctx,
                     on_heavy_status=on_heavy_status,
                 )
                 if ans:
@@ -598,42 +619,48 @@ async def query_ai_chat(
                 code_candidates = [GROQ_CODE_MODEL] + await get_groq_search_and_chat_candidates()
                 for c_mod in code_candidates:
                     try:
+                        fb_messages, fb_tool_ctx = _fallback_args()
                         ans = await call_groq_chat(
-                            messages, c_mod, temperature, is_coding=True, purpose="Code", tool_ctx=active_tool_ctx
+                            fb_messages, c_mod, temperature, is_coding=True, purpose="Code", tool_ctx=fb_tool_ctx
                         )
                         if ans:
                             return ans
                     except Exception as e:
                         print(f"Groq coding ({c_mod}) warning: {e}")
 
+            fb_messages, fb_tool_ctx = _fallback_args()
             ans = await call_cloudflare_gpt_oss(
-                messages, cf_model=CF_CODE_MODEL, temperature=temperature, is_coding=True, purpose="Code", tool_ctx=active_tool_ctx
+                fb_messages, cf_model=CF_CODE_MODEL, temperature=temperature, is_coding=True, purpose="Code", tool_ctx=fb_tool_ctx
             )
             if ans:
                 return ans
 
             if CF_CHAT_FAST_MODEL and CF_CHAT_FAST_MODEL != CF_CODE_MODEL:
+                fb_messages, fb_tool_ctx = _fallback_args()
                 ans = await call_cloudflare_gpt_oss(
-                    messages, cf_model=CF_CHAT_FAST_MODEL, temperature=temperature, is_coding=True, purpose="CodeGLM", tool_ctx=active_tool_ctx
+                    fb_messages, cf_model=CF_CHAT_FAST_MODEL, temperature=temperature, is_coding=True, purpose="CodeGLM", tool_ctx=fb_tool_ctx
                 )
                 if ans:
                     return ans
 
             if GEMINI_API_KEY:
+                fb_messages, fb_tool_ctx = _fallback_args()
                 ans = await call_gemini_chat_messages(
-                    messages, temperature=temperature, purpose="CodeGemini", thinking_level="LOW", tool_ctx=active_tool_ctx
+                    fb_messages, temperature=temperature, purpose="CodeGemini", thinking_level="LOW", tool_ctx=fb_tool_ctx
                 )
                 if ans:
                     return ans
 
+            fb_messages, fb_tool_ctx = _fallback_args()
             ans = await call_gemma_ai_studio_chat(
-                messages, temperature=temperature, max_output_tokens=4096, purpose="Code", tool_ctx=active_tool_ctx
+                fb_messages, temperature=temperature, max_output_tokens=4096, purpose="Code", tool_ctx=fb_tool_ctx
             )
             if ans:
                 return ans
 
+            fb_messages, fb_tool_ctx = _fallback_args()
             ans = await call_cloudflare_gemma_chat(
-                messages, temperature=temperature, max_tokens=4096, purpose="Code", tool_ctx=active_tool_ctx
+                fb_messages, temperature=temperature, max_tokens=4096, purpose="Code", tool_ctx=fb_tool_ctx
             )
             if ans:
                 return ans
@@ -650,11 +677,12 @@ async def query_ai_chat(
         )
         if use_hydrogen_heavy and _can_use_gemini_hydrogen():
             await _notify_heavy("❄️ ขอเวลาอ่านรายละเอียดสักครู่นะคะ...")
+            fb_messages, fb_tool_ctx = _fallback_args()
             ans = await call_gemini_hydrogen_chat(
-                messages,
+                fb_messages,
                 thinking_level="LOW",
                 purpose="HeavyDoc",
-                tool_ctx=active_tool_ctx,
+                tool_ctx=fb_tool_ctx,
                 on_heavy_status=on_heavy_status,
             )
             if ans:
@@ -683,12 +711,13 @@ async def query_ai_chat(
                     else None
                 )
                 try:
+                    fb_messages, fb_tool_ctx = _fallback_args()
                     ans = await call_gemini_chat_messages(
-                        messages,
+                        fb_messages,
                         temperature=target_temp,
                         purpose=b_purpose,
                         thinking_level="MINIMAL" if (is_voice_mode and not active_tool_ctx) else flash_thinking_level,
-                        tool_ctx=active_tool_ctx,
+                        tool_ctx=fb_tool_ctx,
                         preferred_models=manga_prose_models,
                     )
                     if ans:
@@ -696,23 +725,7 @@ async def query_ai_chat(
                 except Exception as e:
                     print(f"Gemini {b_purpose} fallback warning: {e}")
 
-            def _build_fallback_msgs_with_obs() -> tuple[list, bool]:
-                """Carries any tool/search results already fetched by an earlier provider into fallback turns."""
-                obs_pairs = getattr(active_tool_ctx, "_collected_observations", None) if active_tool_ctx else None
-                if not obs_pairs:
-                    return messages, False
-                obs_joined = "\n\n".join(obs for _, obs in obs_pairs)[:8500]
-                fb_msgs = [dict(m) for m in messages]
-                fb_msgs[-1]["content"] = (
-                    f"{fb_msgs[-1]['content']}\n\n"
-                    f"=== Already-Fetched Live Tool / Search Results (Use Directly — Do Not Re-Search) ===\n"
-                    f"{obs_joined}"
-                )
-                return fb_msgs, True
-
-            fb_messages, has_collected_obs = _build_fallback_msgs_with_obs()
-            # If Gemini already fetched search hits before Round-2 503, disable redundant tool loops for synthesis
-            fb_tool_ctx = None if (has_collected_obs and active_tool_ctx and active_tool_ctx.did_search) else active_tool_ctx
+            fb_messages, fb_tool_ctx = _fallback_args()
 
             # 2. Gemma 4 AI Studio (`gemma-4-31b-it` -> `gemma-4-26b-a4b-it`), skipped if AI Studio is in a 503 storm
             if GEMINI_API_KEY and not is_google_ai_studio_congested():
@@ -726,8 +739,7 @@ async def query_ai_chat(
                 )
                 if ans:
                     return ans
-                fb_messages, has_collected_obs = _build_fallback_msgs_with_obs()
-                fb_tool_ctx = None if (has_collected_obs and active_tool_ctx and active_tool_ctx.did_search) else active_tool_ctx
+                fb_messages, fb_tool_ctx = _fallback_args()
 
             # 3. Cloudflare Gemma 4 (`@cf/google/gemma-4-26b-a4b-it`) with native parallel tool calling!
             #    Runs directly with tools when `fb_tool_ctx` is active; when tool-free, hedges with
@@ -745,8 +757,7 @@ async def query_ai_chat(
             )
             if ans:
                 return ans
-            fb_messages, has_collected_obs = _build_fallback_msgs_with_obs()
-            fb_tool_ctx = None if (has_collected_obs and active_tool_ctx and active_tool_ctx.did_search) else active_tool_ctx
+            fb_messages, fb_tool_ctx = _fallback_args()
 
             # 4. Cloudflare Fast Multilingual Fallback (`@cf/zai-org/glm-4.7-flash`, 131K ctx, native tools)
             ans = await call_cloudflare_gpt_oss(
@@ -759,16 +770,14 @@ async def query_ai_chat(
             )
             if ans:
                 return ans
-            fb_messages, has_collected_obs = _build_fallback_msgs_with_obs()
-            fb_tool_ctx = None if (has_collected_obs and active_tool_ctx and active_tool_ctx.did_search) else active_tool_ctx
+            fb_messages, fb_tool_ctx = _fallback_args()
 
             # 5. Groq LPU Chat Fallback (`openai/gpt-oss-20b`; `qwen/qwen3.8-27b` is reserved strictly for Vision)
             if GROQ_API_KEY:
                 groq_search_candidates = await get_groq_search_and_chat_candidates()
                 for g_mod in groq_search_candidates:
                     try:
-                        fb_messages, has_collected_obs = _build_fallback_msgs_with_obs()
-                        fb_tool_ctx = None if (has_collected_obs and active_tool_ctx and active_tool_ctx.did_search) else active_tool_ctx
+                        fb_messages, fb_tool_ctx = _fallback_args()
                         ans = await call_groq_chat(
                             fb_messages,
                             g_mod,
@@ -787,23 +796,25 @@ async def query_ai_chat(
         c_purpose = "VoiceChat" if is_voice_mode else "Chat"
 
         if is_voice_mode and GEMINI_API_KEY:
+            fb_messages, fb_tool_ctx = _fallback_args()
             ans = await call_gemini_chat_messages(
-                messages,
+                fb_messages,
                 temperature=chat_temp,
                 purpose="VoiceChat",
                 thinking_level="MINIMAL",
-                tool_ctx=active_tool_ctx,
+                tool_ctx=fb_tool_ctx,
             )
             if ans:
                 return ans
 
+        fb_messages, fb_tool_ctx = _fallback_args()
         ans = await _call_cf_gemma_hedged_with_groq(
-            messages,
+            fb_messages,
             temperature=chat_temp,
             max_tokens=1024,
             purpose=c_purpose,
             hedge_delay_sec=6.5,
-            tool_ctx=active_tool_ctx,
+            tool_ctx=fb_tool_ctx,
             hedge_with_cf_fast=True,
             allow_groq_hedge_fallback=True,
         )
@@ -811,24 +822,26 @@ async def query_ai_chat(
             return ans
 
         if GEMINI_API_KEY and not is_google_ai_studio_congested():
+            fb_messages, fb_tool_ctx = _fallback_args()
             ans = await call_gemma_ai_studio_chat(
-                messages,
+                fb_messages,
                 temperature=chat_temp,
                 max_output_tokens=1024,
                 purpose=c_purpose,
-                tool_ctx=active_tool_ctx,
+                tool_ctx=fb_tool_ctx,
                 prefer_fast_26b=is_voice_mode,
             )
             if ans:
                 return ans
 
+        fb_messages, fb_tool_ctx = _fallback_args()
         ans = await call_cloudflare_gpt_oss(
-            messages,
+            fb_messages,
             cf_model=CF_CHAT_FAST_MODEL,
             temperature=chat_temp,
             is_coding=False,
             purpose="VoiceChatFallback" if is_voice_mode else "ChatFallback",
-            tool_ctx=active_tool_ctx,
+            tool_ctx=fb_tool_ctx,
         )
         if ans:
             return ans
@@ -836,13 +849,14 @@ async def query_ai_chat(
         if GROQ_API_KEY:
             for g_mod in await get_groq_search_and_chat_candidates():
                 try:
+                    fb_messages, fb_tool_ctx = _fallback_args()
                     ans = await call_groq_chat(
-                        messages,
+                        fb_messages,
                         g_mod,
                         chat_temp,
                         is_coding=False,
                         purpose="VoiceChatFallback" if is_voice_mode else "ChatFallback",
-                        tool_ctx=active_tool_ctx,
+                        tool_ctx=fb_tool_ctx,
                     )
                     if ans:
                         return ans
@@ -850,12 +864,13 @@ async def query_ai_chat(
                     continue
 
         if GEMINI_API_KEY and not is_voice_mode:
+            fb_messages, fb_tool_ctx = _fallback_args()
             ans = await call_gemini_chat_messages(
-                messages,
+                fb_messages,
                 temperature=chat_temp,
                 purpose="ChatGeminiFallback",
                 thinking_level="MINIMAL",
-                tool_ctx=active_tool_ctx,
+                tool_ctx=fb_tool_ctx,
             )
             if ans:
                 return ans
