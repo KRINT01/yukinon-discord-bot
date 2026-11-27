@@ -978,56 +978,110 @@ class _LowRamParadeeEngine:
         raw_ipa = re.sub(r"\s+", " ", raw_ipa).strip()
         return self._ipa_to_kokoro(raw_ipa)
 
-    def synthesize_waveform(self, text: str, speed: float = 1.10):
-        phonemes = self._text_to_phonemes(text)
-        if not phonemes:
+    @staticmethod
+    def _split_natural_clauses(text: str) -> list[str]:
+        """
+        Splits multi-sentence Thai/English text at natural sentence boundaries (`นะคะ `, `ค่ะ `, `. `, `! `, `? `)
+        so each sentence gets a calm end-of-utterance cadence and a 220ms breath pause instead of rushing
+        directly into closing phrases like `ลาก่อนค่ะ`.
+        """
+        cleaned = re.sub(r"\s+", " ", (text or "")).strip()
+        if not cleaned:
+            return []
+        raw_parts = re.split(r"(?<=[.!?])\s+|(?<=นะคะ)\s+|(?<=ค่ะ)\s+|\n+", cleaned)
+        clauses: list[str] = []
+        for part in raw_parts:
+            p = part.strip()
+            if not p:
+                continue
+            # Merge ultra-tiny 1-2 char fragments into previous clause, but keep real phrases like `ลาก่อนค่ะ` separate
+            if clauses and len(p) <= 3:
+                clauses[-1] = f"{clauses[-1]} {p}"
+            else:
+                clauses.append(p)
+        return clauses or [cleaned]
+
+    def _run_onnx_ids(self, ch_ids: list[int], speed: float):
+        seq = [0] + ch_ids + [0]
+        feed = {
+            self._ids_input_name: np.array([seq], dtype=np.int64),
+            self._speed_input_name: np.array([float(speed)], dtype=np.float32),
+        }
+        out = self.session.run(None, feed)[0]
+        return np.asarray(out, dtype=np.float32).reshape(-1)
+
+    def synthesize_waveform(self, text: str, speed: float = 1.00):
+        clauses = self._split_natural_clauses(text)
+        if not clauses:
             return np.zeros(0, dtype=np.float32)
 
-        all_ids = [self.vocab[c] for c in phonemes if c in self.vocab]
-        if not all_ids:
-            return np.zeros(0, dtype=np.float32)
-
-        # Paradee / Kokoro max sequence length is 510 tokens; chunk safely at <=420
         chunk_limit = 420
         space_id = self.vocab.get(" ")
-        id_chunks: list[list[int]] = []
-        start = 0
-        total = len(all_ids)
-        while start < total:
-            end = min(total, start + chunk_limit)
-            if end < total and space_id is not None:
-                cut = end
-                while cut > start + 120 and all_ids[cut - 1] != space_id:
-                    cut -= 1
-                if cut > start + 120:
-                    end = cut
-            id_chunks.append(all_ids[start:end])
-            start = end
+        comma_id = self.vocab.get(",")
+        clause_gap = np.zeros(int(self.sample_rate * 0.22), dtype=np.float32)
+        chunk_gap = np.zeros(int(self.sample_rate * 0.06), dtype=np.float32)
+        tail_pad = np.zeros(int(self.sample_rate * 0.22), dtype=np.float32)
 
-        speed_arr = np.array([float(speed)], dtype=np.float32)
-        wav_parts: list = []
-        for ch_ids in id_chunks:
-            seq = [0] + ch_ids + [0]
-            feed = {
-                self._ids_input_name: np.array([seq], dtype=np.int64),
-                self._speed_input_name: speed_arr,
-            }
-            out = self.session.run(None, feed)[0]
-            arr = np.asarray(out, dtype=np.float32).reshape(-1)
-            if arr.size > 0:
-                wav_parts.append(arr)
+        clause_wavs: list = []
+        for c_idx, clause_text in enumerate(clauses):
+            # Insert a mild comma pause after `แล้ว ` mid-clause if `,` is supported in vocab
+            prepped_clause = clause_text
+            if comma_id is not None:
+                prepped_clause = re.sub(r"(แล้ว)\s+", r"\1 , ", prepped_clause)
 
-        if not wav_parts:
+            phonemes = self._text_to_phonemes(prepped_clause)
+            if not phonemes:
+                continue
+            all_ids = [self.vocab[c] for c in phonemes if c in self.vocab]
+            if not all_ids:
+                continue
+
+            # Gentle deceleration (0.93x) on very short standalone phrases (e.g. `ลาก่อนค่ะ`) so they never sound rushed
+            eff_speed = float(speed) * (0.93 if len(all_ids) <= 22 else 1.0)
+            eff_speed = max(0.75, min(1.50, eff_speed))
+
+            id_chunks: list[list[int]] = []
+            start = 0
+            total = len(all_ids)
+            while start < total:
+                end = min(total, start + chunk_limit)
+                if end < total and space_id is not None:
+                    cut = end
+                    while cut > start + 120 and all_ids[cut - 1] != space_id:
+                        cut -= 1
+                    if cut > start + 120:
+                        end = cut
+                id_chunks.append(all_ids[start:end])
+                start = end
+
+            sub_parts: list = []
+            for ch_ids in id_chunks:
+                arr = self._run_onnx_ids(ch_ids, eff_speed)
+                if arr.size > 0:
+                    sub_parts.append(arr)
+
+            if not sub_parts:
+                continue
+            if len(sub_parts) == 1:
+                clause_wavs.append(sub_parts[0])
+            else:
+                stitched_sub: list = []
+                for si, sp in enumerate(sub_parts):
+                    if si > 0:
+                        stitched_sub.append(chunk_gap)
+                    stitched_sub.append(sp)
+                clause_wavs.append(np.concatenate(stitched_sub))
+
+        if not clause_wavs:
             return np.zeros(0, dtype=np.float32)
-        if len(wav_parts) == 1:
-            return wav_parts[0]
-        gap = np.zeros(int(self.sample_rate * 0.04), dtype=np.float32)
-        stitched: list = []
-        for idx, part in enumerate(wav_parts):
+
+        final_parts: list = []
+        for idx, cwav in enumerate(clause_wavs):
             if idx > 0:
-                stitched.append(gap)
-            stitched.append(part)
-        return np.concatenate(stitched)
+                final_parts.append(clause_gap)
+            final_parts.append(cwav)
+        final_parts.append(tail_pad)
+        return np.concatenate(final_parts)
 
 
 def _resolve_paradee_model_files_sync() -> tuple[str, str]:
@@ -1260,12 +1314,18 @@ async def _paradee_tts_with_mastering(
     if not raw_wav or len(raw_wav) <= 44:
         return b""
 
-    pitch = max(0.85, min(1.15, float(TTS_PARADEE_PITCH)))
+    pitch = max(0.82, min(1.15, float(TTS_PARADEE_PITCH)))
     af_parts: list[str] = []
     if abs(pitch - 1.0) >= 0.005:
         comp_atempo = max(0.50, min(2.00, 1.0 / pitch))
         af_parts.append(f"asetrate=24000*{pitch:.4f},aresample=48000,atempo={comp_atempo:.4f}")
-    af_parts.append("lowpass=f=9500")
+    # Cool, calm Yukino timbre: grounded warmth, softened cheerful upper-mids, restrained silky top end
+    af_parts.extend([
+        "equalizer=f=220:t=q:w=1.0:g=2.0",
+        "equalizer=f=2500:t=q:w=1.3:g=-4.0",
+        "treble=g=-3.0:f=5000",
+        "lowpass=f=9000",
+    ])
     paradee_af = ",".join(af_parts)
 
     _schedule_paradee_idle_unload()
@@ -1275,8 +1335,9 @@ async def _paradee_tts_with_mastering(
             _master_tts_audio_sync,
             raw_wav,
             paradee_af,
-            True,
+            False,
             output_format,
+            False,
         )
         if mastered:
             state.active_tts_engine = "paradee"
@@ -1474,12 +1535,13 @@ def _master_tts_audio_sync(
     extra_af: str = "",
     trim_internal_pauses: bool = True,
     output_format: str = "pcm",
+    apply_default_eq: bool = True,
 ) -> bytes:
     """
     Single-pass FFmpeg audio mastering chain tuned for Yukino's calm, cool kuudere voice:
-    - `silenceremove`: tightens dead gaps >160ms (including chunk seams) down to a natural 70ms breath
+    - `silenceremove` (Google/Edge only): tightens dead gaps >160ms down to 70ms; disabled on Paradee to preserve natural clause breaths
     - `adelay=220:all=1`: prevents Discord Opus from clipping opening syllables
-    - Subtle warmth (+1.5dB @ 240Hz) + de-harshing (-3.0dB @ 3.2kHz) + gentle compression
+    - Default EQ (+1.5dB @ 240Hz, -3.0dB @ 3.2kHz) when `apply_default_eq=True`, or custom Paradee cool EQ via `extra_af`
     - `output_format="pcm"` emits raw 48kHz stereo `s16le` directly for `discord.PCMAudio` (1 ffmpeg spawn total, zero disk I/O).
     - `output_format="mp3"` emits 128kbps MP3 for text-channel fallback file attachments.
     """
@@ -1490,10 +1552,13 @@ def _master_tts_audio_sync(
         stages.append(
             "silenceremove=stop_periods=-1:stop_duration=0.16:stop_threshold=-40dB:stop_silence=0.07"
         )
+    stages.append("adelay=220:all=1")
+    if apply_default_eq:
+        stages.extend([
+            "equalizer=f=240:t=q:w=1.1:g=1.5",
+            "equalizer=f=3200:t=q:w=1.2:g=-3.0",
+        ])
     stages.extend([
-        "adelay=220:all=1",
-        "equalizer=f=240:t=q:w=1.1:g=1.5",
-        "equalizer=f=3200:t=q:w=1.2:g=-3.0",
         "acompressor=threshold=-18dB:ratio=2:attack=15:release=150",
         "volume=1.35",
     ])
@@ -1629,7 +1694,7 @@ async def synthesize_tts_audio_bytes(text: str, output_format: str = "pcm") -> b
     """
     Consistent in-memory hybrid voice synthesis (zero temp files):
     - Default (`TTS_PRIMARY_ENGINE=paradee`):
-      * Thai / Thai-English mixed: Offline `MakHamTTSParadee` 1.1 INT8 (speed=1.10, pitch=0.96)
+      * Thai / Thai-English mixed: Offline `MakHamTTSParadee` 1.1 INT8 (speed=1.00, pitch=0.91)
         -> Google TTS -> Edge-TTS fallback.
       * Pure English: Google TTS (`tl=en`) -> Edge-TTS (`en-US-AriaNeural`).
     - Optional (`TTS_PRIMARY_ENGINE=edge`): Edge-TTS -> Google TTS -> Paradee (Thai).

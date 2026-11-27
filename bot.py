@@ -1474,6 +1474,7 @@ async def leave_voice(ctx):
         await speak_in_voice_channel(
             ctx.guild, "ถ้าหมดธุระแล้ว ฉันขอตัวกลับไปอ่านหนังสือต่อนะคะ ลาก่อนค่ะ"
         )
+        await asyncio.sleep(0.25)
         await vc.disconnect(force=True)
         unregister_voice_sink(ctx.guild.id)
     else:
