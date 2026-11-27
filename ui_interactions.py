@@ -50,6 +50,7 @@ from user_memory import (
     process_memory_request,
     process_ot_request,
     build_monthly_ot_summary_markdown,
+    is_user_ot_auto_report_enabled,
     _parse_stored_ot_date,
     save_user_profiles_local_async,
     backup_user_profiles_to_discord,
@@ -1534,7 +1535,9 @@ class OTActionView(AutoDisappearingView):
             pk = _parse_stored_ot_date(self.record_date)
             if pk:
                 target_y, target_m = pk[0], pk[1]
-        summary_md = build_monthly_ot_summary_markdown(ot_logs, target_y, target_m)
+        summary_md = build_monthly_ot_summary_markdown(
+            ot_logs, target_y, target_m, auto_report_enabled=is_user_ot_auto_report_enabled(user_profiles.get(uid_str))
+        )
         display_summary = format_markdown_tables_for_discord(summary_md)
         if len(display_summary) <= 1950:
             await interaction.response.send_message(display_summary, ephemeral=True)
@@ -1791,6 +1794,7 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             app_commands.Choice(name="ดูตารางสรุป OT เดือนที่แล้ว", value="prev_summary"),
             app_commands.Choice(name="แก้รายละเอียดงาน OT", value="edit"),
             app_commands.Choice(name="ลบรายการ OT", value="delete"),
+            app_commands.Choice(name="เปิด/ปิด สรุป OT อัตโนมัติทาง DM", value="auto_toggle"),
         ]
     )
     async def slash_ot(
@@ -1811,6 +1815,8 @@ def register_app_commands(bot: discord.ext.commands.Bot):
             cmd_text = f"ลบ OT {date}".strip()
         elif action == "edit":
             cmd_text = f"แก้ OT {date} {detail}".strip()
+        elif action == "auto_toggle":
+            cmd_text = "สลับสรุป OT อัตโนมัติ"
         else:
             parts = ["จด OT", date.strip(), time_range.strip(), detail.strip()]
             cmd_text = " ".join(p for p in parts if p)

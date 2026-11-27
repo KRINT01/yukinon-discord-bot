@@ -101,9 +101,9 @@ from user_memory import (
     user_profiles,
     META_KEY,
     user_profile_count,
-    get_last_ot_report_ym,
-    set_last_ot_report_ym,
-    is_ot_work_channel_name,
+    is_user_ot_auto_report_enabled,
+    get_user_last_ot_report_ym,
+    mark_user_ot_report_sent,
 )
 from search_engine import detect_coding_intent, run_safe_web_search_async
 from llm import (
@@ -127,20 +127,21 @@ from image_engine import (
     send_generated_image_to_channel,
     process_manga_translation_request,
 )
+from tts_engine import (
+    speak_in_voice_channel,
+    unload_paradee_tts,
+    has_baked_paradee_model,
+)
 from voice_engine import (
     HAS_VOICE_RECV,
     voice_recv,
     SilenceGatedVoiceSink,
-    speak_in_voice_channel,
     is_voice_scribe_active,
     start_voice_scribe_session,
     stop_voice_scribe_session,
     clear_voice_scribe_session,
     register_voice_sink,
     unregister_voice_sink,
-    prewarm_paradee_tts_bg,
-    unload_paradee_tts,
-    has_baked_paradee_model,
 )
 from ui_interactions import (
     CodeReviewActionView,
@@ -237,18 +238,23 @@ _last_mass_ping_at: dict[int, float] = {}
 def _resolve_mass_ping(message: discord.Message, user_text: str, answer: str) -> tuple[discord.AllowedMentions | None, str]:
     """
     Opt-in @everyone/@here/role pings for ONE reply when the user explicitly asked for a ping.
-    Mirrors Discord's own rules (author needs `mention_everyone`, or the role must be mentionable)
-    so members cannot use the bot to ping beyond their own permissions, and enforces a per-guild
-    cooldown (`MASS_PING_COOLDOWN_SEC`, default 600s) against spam.
+    Mirrors Discord's own rules (both author and bot need `mention_everyone`, or the role must be
+    mentionable), checks post-table-formatted length before consuming cooldown, and enforces a
+    per-guild cooldown (`MASS_PING_COOLDOWN_SEC`, default 600s) against spam.
     Returns `(allowed_mentions_override_or_None, answer_with_optional_note)`.
     """
     guild = message.guild
     if guild is None or not answer or not _MASS_PING_REQUEST_REGEX.search(user_text or ""):
         return None, answer
-    wants_everyone = bool(re.search(r"@(?:everyone|here)\b", answer))
+    # ASCII lookahead so `@everyoneทุกคน` / `@hereมาดูหน่อย` without a space still matches cleanly
+    wants_everyone = bool(re.search(r"@(?:everyone|here)(?![A-Za-z0-9_])", answer))
     role_ids = {int(r) for r in re.findall(r"<@&(\d+)>", answer)}
-    # Override is only applied on single-message replies, so multi-chunk answers never multi-ping
-    if (not wants_everyone and not role_ids) or len(answer) > 1900:
+    if not wants_everyone and not role_ids:
+        return None, answer
+
+    # Check post-table-formatted length BEFORE burning cooldown (override only applies to <=1900 single replies)
+    formatted_len = len(format_markdown_tables_for_discord(answer)) if len(answer) <= 7500 else len(answer)
+    if formatted_len > 1900:
         return None, answer
 
     perms = message.channel.permissions_for(message.author)
@@ -259,6 +265,17 @@ def _resolve_mass_ping(message: discord.Message, user_text: str, answer: str) ->
     ]
     if not allow_everyone and not roles:
         return None, f"{answer}\n-# (ผู้สั่งไม่มีสิทธิ์แท็กทุกคน/แท็กยศนี้ในห้องนี้ ครั้งนี้เลยไม่ได้ส่งแจ้งเตือนนะคะ)"
+
+    # Also verify the bot itself can ping @everyone/unmentionable roles before consuming cooldown
+    bot_member = getattr(guild, "me", None)
+    if bot_member is not None:
+        bot_perms = message.channel.permissions_for(bot_member)
+        bot_can_everyone = allow_everyone and bot_perms.mention_everyone
+        bot_roles = [r for r in roles if r.mentionable or bot_perms.mention_everyone]
+        if not bot_can_everyone and not bot_roles:
+            return None, f"{answer}\n-# (บอทไม่มีสิทธิ์แท็กทุกคน/แท็กยศนี้ในห้องนี้ ครั้งนี้เลยไม่ได้ส่งแจ้งเตือนนะคะ)"
+        allow_everyone = bot_can_everyone
+        roles = bot_roles
 
     now = time.monotonic()
     last_ts = _last_mass_ping_at.get(guild.id)
@@ -356,7 +373,6 @@ def _collect_health_metrics() -> dict:
     openrouter_cd = max(0, int(getattr(state, "openrouter_manga_cooldown_until", 0.0) - now))
     hydrogen_cd = max(0, int(state.gemini_hydrogen_cooldown_until - now))
     live_stt_cd = max(0, int(state.gemini_transcribe_live_cooldown_until - now))
-    edge_cd = max(0, int(state.edge_tts_cooldown_until - now))
     paradee_cd = max(0, int(state.paradee_tts_cooldown_until - now))
     cached_files_count = sum(len(q) for q in channel_last_attachment.values())
     active_scribe_count = sum(1 for s in voice_scribe_sessions.values() if s.get("active"))
@@ -430,7 +446,6 @@ def _collect_health_metrics() -> dict:
             "tts_paradee_cooldown_sec": paradee_cd,
             "tts_google_pitch": TTS_GOOGLE_PITCH,
             "tts_google_speed": TTS_GOOGLE_SPEED,
-            "edge_tts_cooldown_sec": edge_cd,
         },
     }
 
@@ -456,8 +471,6 @@ async def handle_root(request: web.Request) -> web.Response:
             f" | TTS: MakHamTTS Paradee INT8 (pitch={ai['tts_paradee_pitch']}, speed={ai['tts_paradee_speed']}x, "
             f"baked={ai['tts_paradee_baked']}, loaded={ai['tts_paradee_loaded']})"
         )
-    elif ai["tts_primary_engine"] == "edge":
-        tts_note = " | TTS: Edge-TTS Neural"
     else:
         tts_note = f" | TTS: Google Yukino (pitch={ai['tts_google_pitch']}, speed={ai['tts_google_speed']}x)"
 
@@ -504,22 +517,30 @@ async def handle_healthz(request: web.Request) -> web.Response:
     )
 
 
-def _resolve_ot_report_channel(prof: dict):
-    """Scopes OT monthly reports to OT_REPORT_CHANNEL_ID -> user's saved ot_channel_id -> #work/#ot fallback."""
-    if OT_REPORT_CHANNEL_ID:
+async def _resolve_ot_report_dm_channel(uid_str: str, prof: dict):
+    """
+    Delivers monthly OT reports privately via Direct Message (DM) so each person only sees their own data.
+    If DMs are closed (`discord.Forbidden`), falls back to `OT_REPORT_CHANNEL_ID` ONLY for the Owner
+    (never leaks another member's private OT log into a public server channel).
+    """
+    if uid_str.isdigit():
+        uid_int = int(uid_str)
+        target_user = bot.get_user(uid_int)
+        if target_user is None:
+            try:
+                target_user = await bot.fetch_user(uid_int)
+            except Exception:
+                target_user = None
+        if target_user is not None:
+            try:
+                return await target_user.create_dm(), True
+            except Exception:
+                pass
+    if prof.get("is_owner") and OT_REPORT_CHANNEL_ID:
         ch = bot.get_channel(OT_REPORT_CHANNEL_ID)
-        if ch:
-            return ch
-    saved_cid = prof.get("ot_channel_id")
-    if saved_cid:
-        ch = bot.get_channel(int(saved_cid))
-        if ch:
-            return ch
-    for guild in bot.guilds:
-        for ch in guild.text_channels:
-            if is_ot_work_channel_name(ch.name):
-                return ch
-    return None
+        if ch is not None:
+            return ch, False
+    return None, False
 
 
 @tasks.loop(minutes=15)
@@ -527,18 +548,20 @@ async def monthly_ot_auto_report_task():
     if not bot.is_ready():
         return
     now_th = datetime.now(ZoneInfo("Asia/Bangkok"))
+    if now_th.day != 1 or now_th.hour < 9:
+        return
+
     prev_year, prev_month, prev_month_label = get_previous_month_info(now_th)
     ym_key = f"{prev_year:04d}-{prev_month:02d}"
 
-    if now_th.day != 1 or now_th.hour < 9 or get_last_ot_report_ym() == ym_key:
-        return
-
-    # At-most-once: persisted before sending so a crash mid-send never causes a duplicate report on restart.
-    await set_last_ot_report_ym(ym_key)
-
     for uid_str, prof in list(user_profiles.items()):
-        if uid_str == META_KEY:
+        if uid_str == META_KEY or not isinstance(prof, dict):
             continue
+        if not is_user_ot_auto_report_enabled(prof):
+            continue
+        if get_user_last_ot_report_ym(prof) == ym_key:
+            continue
+
         ot_logs = prof.get("ot_logs") or []
         has_prev_month_data = any(
             (pk := _parse_stored_ot_date(e.get("date", ""))) is not None
@@ -546,15 +569,40 @@ async def monthly_ot_auto_report_task():
             and pk[1] == prev_month
             for e in ot_logs
         )
-        if has_prev_month_data:
-            target_channel = _resolve_ot_report_channel(prof)
-            if not target_channel:
-                continue
-            summary_md = build_monthly_ot_summary_markdown(ot_logs, prev_year, prev_month)
-            report_text = f"📅 **[สรุปยอด OT ประจำเดือน{prev_month_label} — รายงานอัตโนมัติวันที่ 1 ของเดือนใหม่]**\n{summary_md}"
-            if len(report_text) <= 7500:
-                report_text = format_markdown_tables_for_discord(report_text)
+        # Do nothing for users who have no OT entries for the previous month
+        if not has_prev_month_data:
+            continue
+
+        target_channel, is_dm_dest = await _resolve_ot_report_dm_channel(uid_str, prof)
+        if not target_channel:
+            continue
+
+        # At-most-once per user: persisted right before sending so restarts never resend duplicate DMs
+        await mark_user_ot_report_sent(uid_str, ym_key)
+        summary_md = build_monthly_ot_summary_markdown(
+            ot_logs, prev_year, prev_month, auto_report_enabled=True
+        )
+        report_text = f"📅 **[สรุปยอด OT ประจำเดือน{prev_month_label} — รายงานอัตโนมัติวันที่ 1 ของเดือนใหม่]**\n{summary_md}"
+        if len(report_text) <= 7500:
+            report_text = format_markdown_tables_for_discord(report_text)
+
+        try:
             await send_chunked_response(target_channel, report_text)
+            api_log(f"OT Auto-Report -> sent {ym_key} to uid={uid_str[-4:]} ({'DM' if is_dm_dest else 'OwnerChannel'})")
+        except discord.Forbidden:
+            # User closed server DMs: fallback to OT_REPORT_CHANNEL_ID only for Owner; never leak others publicly
+            if is_dm_dest and prof.get("is_owner") and OT_REPORT_CHANNEL_ID:
+                fallback_ch = bot.get_channel(OT_REPORT_CHANNEL_ID)
+                if fallback_ch is not None:
+                    try:
+                        await send_chunked_response(fallback_ch, report_text)
+                        api_log(f"OT Auto-Report -> DM closed for owner; sent {ym_key} to OT_REPORT_CHANNEL_ID")
+                        continue
+                    except Exception:
+                        pass
+            api_log(f"OT Auto-Report -> skipped uid={uid_str[-4:]} (DMs disabled)")
+        except Exception as e:
+            api_log(f"OT Auto-Report -> send note uid={uid_str[-4:]} ({type(e).__name__}: {str(e)[:100]})")
 
 
 class YukinonBot(commands.Bot):
@@ -619,6 +667,8 @@ class YukinonBot(commands.Bot):
             loop = asyncio.get_running_loop()
 
             def _on_sigterm():
+                if getattr(self, "_sigterm_close_task", None) is not None:
+                    return
                 api_log("Received SIGTERM from host — initiating graceful flush & shutdown...")
                 # Keep a strong reference so the shutdown task cannot be garbage-collected mid-flush
                 self._sigterm_close_task = loop.create_task(self.close())
@@ -1815,7 +1865,11 @@ async def calc_exp(ctx, *, expr: str = ""):
 @bot.command(name="ot")
 async def ot_command(ctx, *, args: str = ""):
     query = args.strip()
-    if query and not is_ot_command_text(query, channel_id=ctx.channel.id, user_id=ctx.author.id):
+    if (
+        query
+        and not query.lower().startswith("auto")
+        and not is_ot_command_text(query, channel_id=ctx.channel.id, user_id=ctx.author.id)
+    ):
         query = f"จด OT {query}"
     reply = await process_ot_request(ctx.message, query or "สรุป OT")
     rec_date, rec_slot, rec_detail = parse_ot_record_metadata(reply)

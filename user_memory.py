@@ -199,18 +199,47 @@ def _is_blocked_favorite_topic(topic: str, user=None, profile: dict | None = Non
     return False
 
 
-# Lowercased names of members each speaker recently @mentioned, so their names are not saved into the
-# speaker's own memory (pinned_facts / custom_notes / favorite_topics / recent_topics).
-# Ceiling: in-RAM only (lost on restart), only covers Discord @mentions in text chat (not plain-typed
-# names or voice), names shorter than 3 chars are not recorded. Upgrade path: persist mention ids per message.
-_MENTIONED_NAMES_BY_SPEAKER: dict[str, list[str]] = {}
+# Lowercased names of members each speaker recently @mentioned, with a 15-minute TTL so short Thai
+# display names (e.g. "เกม", "งาน") never permanently block the speaker's own future memories until restart.
+_MENTIONED_NAME_TTL_SEC = 900.0
+_MENTIONED_NAMES_BY_SPEAKER: dict[str, dict[str, float]] = {}
+
+
+def _get_active_mentioned_names(uid_str: str) -> list[str]:
+    bucket = _MENTIONED_NAMES_BY_SPEAKER.get(uid_str)
+    if not bucket:
+        return []
+    now = time.time()
+    expired = [n for n, ts in bucket.items() if (now - ts) > _MENTIONED_NAME_TTL_SEC]
+    for n in expired:
+        bucket.pop(n, None)
+    if not bucket:
+        _MENTIONED_NAMES_BY_SPEAKER.pop(uid_str, None)
+        return []
+    return list(bucket.keys())
+
+
+def _record_mentioned_names_for_speaker(speaker_id: str, candidates: list[str]) -> None:
+    if not speaker_id or not candidates:
+        return
+    now = time.time()
+    bucket = _MENTIONED_NAMES_BY_SPEAKER.setdefault(speaker_id, {})
+    for n in list(bucket.keys()):
+        if (now - bucket[n]) > _MENTIONED_NAME_TTL_SEC:
+            bucket.pop(n, None)
+    for raw_n in candidates:
+        nl = str(raw_n or "").strip().lower()
+        if len(nl) >= 3 and nl != "partner (owner)":
+            bucket[nl] = now
+    if len(bucket) > 20:
+        for old_k, _ in sorted(bucket.items(), key=lambda kv: kv[1])[:-20]:
+            bucket.pop(old_k, None)
 
 
 def _mentioned_name_regex(uid_str: str) -> re.Pattern:
-    """Matches raw `<@id>` tags and any name the speaker recently @mentioned (case-insensitive)."""
-    names = sorted(_MENTIONED_NAMES_BY_SPEAKER.get(uid_str) or [], key=len, reverse=True)
-    # ASCII-only boundaries so a Latin name glued to Thai text still matches; a Thai name may also
-    # match inside a longer Thai word, which only over-filters (drops a note) and never leaks.
+    """Matches raw `<@id>` tags and any name the speaker @mentioned within the last 15 minutes."""
+    names = sorted(_get_active_mentioned_names(uid_str), key=len, reverse=True)
+    # ASCII-only boundaries so a Latin name glued to Thai text still matches; short TTL limits Thai over-filtering.
     alts = [r"<@!?\d+>"] + [rf"(?<![A-Za-z0-9_])@?{re.escape(n)}(?![A-Za-z0-9_])" for n in names]
     return re.compile("|".join(alts), re.IGNORECASE)
 
@@ -419,7 +448,7 @@ def get_last_ot_report_ym() -> str:
 
 
 async def set_last_ot_report_ym(pa_ym: str) -> None:
-    """Persists the last auto-sent OT report month locally and to the cloud backup so restarts do not resend."""
+    """Legacy bot-wide helper kept for backward compatibility; prefer per-user `mark_user_ot_report_sent`."""
     global _DIRTY_SINCE_LAST_BACKUP
     user_profiles.setdefault(META_KEY, {})["last_ot_report_ym"] = pa_ym
     _DIRTY_SINCE_LAST_BACKUP = True
@@ -427,10 +456,52 @@ async def set_last_ot_report_ym(pa_ym: str) -> None:
     await backup_user_profiles_to_discord(force=True)
 
 
+def is_user_ot_auto_report_enabled(prof: dict | None) -> bool:
+    """Per-user monthly DM OT auto-report preference (defaults to ON once a user logs OT data)."""
+    if not isinstance(prof, dict):
+        return False
+    if "ot_auto_report" in prof:
+        return bool(prof["ot_auto_report"])
+    # Existing/new OT users default to ON; users who never logged OT do nothing
+    return bool(prof.get("ot_logs"))
+
+
+def get_user_last_ot_report_ym(prof: dict | None) -> str:
+    if not isinstance(prof, dict):
+        return ""
+    return str(prof.get("last_ot_report_ym") or "")
+
+
+async def set_user_ot_auto_report(uid_str: str, enabled: bool) -> bool:
+    """Updates and persists a user's per-person monthly DM OT auto-report preference."""
+    global _DIRTY_SINCE_LAST_BACKUP
+    prof = ensure_user_profile_exists(str(uid_str))
+    prof["ot_auto_report"] = bool(enabled)
+    _DIRTY_SINCE_LAST_BACKUP = True
+    await save_user_profiles_local_async()
+    await backup_user_profiles_to_discord(force=True)
+    return bool(enabled)
+
+
+async def mark_user_ot_report_sent(uid_str: str, ym_key: str) -> None:
+    """Persists per-user monthly OT report completion so restarts never send duplicate DMs."""
+    global _DIRTY_SINCE_LAST_BACKUP
+    prof = user_profiles.get(str(uid_str))
+    if not isinstance(prof, dict):
+        return
+    prof["last_ot_report_ym"] = str(ym_key)
+    _DIRTY_SINCE_LAST_BACKUP = True
+    await save_user_profiles_local_async()
+    await backup_user_profiles_to_discord(force=True)
+
+
 def is_ot_work_channel_name(pa_name: str) -> bool:
-    """Matches work/ot as whole name tokens (so #bot, #photos, #robot do not match) or the Thai substring."""
-    n = pa_name.lower()
-    return "งาน" in n or any(t in ("work", "ot") for t in re.split(r"[-_ ]+", n))
+    """
+    Matches `work`/`ot` as whole ASCII word tokens (handles emoji-prefixed channels like `#💼work` / `#⏱️ot`
+    while rejecting `#bot`, `#photos`, `#robot`) or the Thai substring `งาน`.
+    """
+    n = (pa_name or "").lower()
+    return "งาน" in n or any(t in ("work", "ot") for t in re.split(r"[^a-z0-9]+", n))
 
 
 def has_dirty_user_profiles() -> bool:
@@ -531,7 +602,7 @@ async def restore_user_profiles_from_discord(bot: discord.Client):
     on startup, auto-scrubs polluted entries from favorite_topics, recent_topics, and custom_notes,
     and scans #work channels to recover any OT logs so records survive Render redeploys.
     """
-    global _DIRTY_SINCE_LAST_BACKUP
+    global user_profiles, _DIRTY_SINCE_LAST_BACKUP
     # Read in a worker thread, mutate the shared dict on the event loop (no cross-thread dict mutation)
     _apply_loaded_user_profiles(await asyncio.to_thread(_read_user_profiles_local_sync))
     ch = _find_backup_channel(bot)
@@ -852,7 +923,6 @@ async def consolidate_user_memory_async(uid_str: str):
         if not m_json:
             return
         parsed = json.loads(m_json.group(0))
-
         # The LLM await can take seconds; if the user (or a tool) changed memory meanwhile, writing
         # the stale snapshot would silently drop that change. Skip and let the next trigger retry.
         cur = user_profiles.get(uid_str)
@@ -871,7 +941,6 @@ async def consolidate_user_memory_async(uid_str: str):
             mention_re = _mentioned_name_regex(uid_str)
 
             def _key(x) -> str:
-                # Same normalization as _dedupe_clean_list
                 return re.sub(r"\s+", " ", str(x or "")).strip()[:150].lower()
 
             # Exact copies of existing entries are exempt from the mention filter so notes saved by an
@@ -883,14 +952,9 @@ async def consolidate_user_memory_async(uid_str: str):
 
             clean_pinned = [x for x in new_pinned if _keep(x)]
             clean_notes = [x for x in new_notes if _keep(x)]
-            # Existing pinned facts are never removed: they come first and the cap only limits additions.
-            # Ceiling: dedupe is exact (case/whitespace-insensitive), so a reworded duplicate of an existing
-            # pinned fact can be added alongside the original. Upgrade path: fuzzy matching.
             prof["pinned_facts"] = _dedupe_clean_list(
                 pinned + clean_pinned, max_items=max(15, len(pinned)), max_item_len=150
             )
-            # Promotions cut by the pinned cap go back to notes (first, as they are durable), since the LLM
-            # already removed them from custom_notes. Ceiling: at 8 notes, older transient notes are dropped.
             kept_pinned = {_key(x) for x in prof["pinned_facts"]}
             overflow = [x for x in clean_pinned if _key(x) not in kept_pinned]
             prof["custom_notes"] = _dedupe_clean_list(overflow + clean_notes, max_items=8, max_item_len=150)
@@ -911,6 +975,18 @@ async def consolidate_user_memory_async(uid_str: str):
 _BG_TASKS: set[asyncio.Task] = set()
 
 
+def _on_bg_task_done(task: asyncio.Task) -> None:
+    _BG_TASKS.discard(task)
+    if task.cancelled():
+        return
+    try:
+        exc = task.exception()
+    except Exception:
+        return
+    if exc is not None:
+        api_log(f"UserMemory BG task error -> {type(exc).__name__}: {str(exc)[:140]}")
+
+
 def _schedule_bg_task(coro) -> bool:
     try:
         task = asyncio.get_running_loop().create_task(coro)
@@ -921,7 +997,7 @@ def _schedule_bg_task(coro) -> bool:
             coro.close()
             return False
     _BG_TASKS.add(task)
-    task.add_done_callback(_BG_TASKS.discard)
+    task.add_done_callback(_on_bg_task_done)
     return True
 
 
@@ -963,14 +1039,15 @@ def record_user_interaction(
     profile["last_seen"] = now_str
 
     _scrub_profile_memory(profile, user=user)
-    # Names of members the speaker @mentioned must not land in the speaker's own memory
+    # Names of members the speaker recently @mentioned must not land in the speaker's own memory
     mention_re = _mentioned_name_regex(uid_str)
     memo_prompt = re.sub(r"[ \t]{2,}", " ", mention_re.sub("", str(user_prompt or ""))).strip()
     favs = list(profile.get("favorite_topics") or [])
     if not is_button_followup and channel_id and channel_id in channel_active_topic:
         act_t = channel_active_topic[channel_id].get("topic", "").strip()
         if (
-            act_t and act_t not in favs
+            act_t
+            and act_t not in favs
             and not _is_blocked_favorite_topic(act_t, user=user, profile=profile)
             and not mention_re.search(act_t)
         ):
@@ -1113,14 +1190,7 @@ def resolve_user_mentions_and_build_dossier(
             if not is_target_owner:
                 raw_n = (member.display_name if member else None) or (prof or {}).get("display_name") or ""
                 cand.append(re.sub(r"[^\w\u0E00-\u0E7F\s.-]", "", raw_n).strip()[:32])
-            known = _MENTIONED_NAMES_BY_SPEAKER.setdefault(speaker_id, [])
-            for n in cand:
-                nl = str(n or "").strip().lower()
-                if len(nl) >= 3 and nl != "partner (owner)":
-                    if nl in known:
-                        known.remove(nl)
-                    known.append(nl)
-            del known[:-20]
+            _record_mentioned_names_for_speaker(speaker_id, cand)
 
         if is_target_owner:
             readable_tag = "@[คู่หูชมรมบริการ / ผู้สร้างของฉัน]"
@@ -1577,8 +1647,15 @@ async def process_memory_request(message, raw_text: str) -> tuple[str, str]:
 # ==============================================================================
 # OVERTIME (OT) TRACKER & MONTHLY TABLE SUMMARIZER
 # ==============================================================================
+OT_AUTO_REPORT_REGEX = re.compile(
+    r"^(?:(?:เปิด|ปิด|สลับ|ตั้งค่า|เช็ค|ดู)\s*(?:การ)?(?:แจ้งเตือน|ส่ง|สรุป|รายงาน)?\s*(?:เวลา\s*)?(?:ot|โอที)\s*(?:อัตโนมัติ|รายเดือน|ทาง\s*dm|dm)|"
+    r"(?:เปิด|ปิด|สลับ)\s*(?:สรุป|รายงาน)\s*(?:ot|โอที)\s*(?:อัตโนมัติ|รายเดือน)?|"
+    r"(?:ot|โอที)\s*(?:auto|อัตโนมัติ)(?:\s+(?:on|off|toggle|status|เปิด|ปิด))?|"
+    r"auto(?:\s+(?:on|off|toggle|status|เปิด|ปิด))?)$",
+    re.IGNORECASE,
+)
 OT_TRIGGER_REGEX = re.compile(
-    r"^(?:จด|บันทึก|ลง|เพิ่ม|แก้|อัปเดต|สรุป|ดู|เช็ค|ตาราง|ยอด|ลบ|ยกเลิก)\s*(?:เวลา\s*)?(?:ot|โอที)\b",
+    r"^(?:จด|บันทึก|ลง|เพิ่ม|แก้|อัปเดต|สรุป|ดู|เช็ค|ตาราง|ยอด|ลบ|ยกเลิก|เปิด|ปิด|สลับ)\s*(?:สรุป\s*|รายงาน\s*|เวลา\s*)?(?:ot|โอที)\b",
     re.IGNORECASE,
 )
 OT_SUMMARY_REGEX = re.compile(
@@ -1598,8 +1675,16 @@ WEEKEND_TIME_REPLY_REGEX = re.compile(
 pending_weekend_ot: dict[tuple[int, int], dict] = {}
 
 _OT_INVALID_TIME_REPLY = (
-    "เวลาที่พิมพ์มาไม่ถูกต้องนะคะ ใส่เป็น `HH.MM` หรือ `HH:MM` เช่น `09.00` หรือ `18.00 - 20.00` ค่ะ"
+    "เวลาที่พิมพ์มาไม่ถูกต้องนะคะ ใส่เป็น `HH.MM` หรือ `HH:MM` (00.00 - 23.59) เช่น `09.00` หรือ `18.00 - 20.00` ค่ะ"
 )
+
+
+def _is_valid_ot_hhmm(hour: int, minute: int, allow_24: bool = False) -> bool:
+    if not (0 <= minute <= 59):
+        return False
+    if 0 <= hour <= 23:
+        return True
+    return bool(allow_24 and hour == 24 and minute == 0)
 
 THAI_MONTH_NAME_TO_NUM = {name: idx for idx, name in enumerate(THAI_MONTHS) if idx > 0}
 THAI_SHORT_MONTHS = {
@@ -1866,7 +1951,7 @@ def is_ot_command_text(text: str, channel_id: int = None, user_id: int = None) -
     if not text:
         return False
     cleaned = re.sub(r"^<@!?\d+>\s*", "", text.strip()).strip()
-    if OT_TRIGGER_REGEX.search(cleaned):
+    if OT_TRIGGER_REGEX.search(cleaned) or OT_AUTO_REPORT_REGEX.search(cleaned):
         return True
     if _has_active_pending_weekend_ot(channel_id, user_id):
         norm_c = _normalize_colloquial_thai_times_in_ot_text(cleaned)
@@ -1925,7 +2010,7 @@ async def recover_ot_logs_from_work_channels(bot: discord.Client):
 
     if recovered_count > 0:
         for prof in user_profiles.values():
-            if "ot_logs" in prof:  # META_KEY dict has no ot_logs, so it is safely skipped
+            if isinstance(prof, dict) and "ot_logs" in prof:
                 prof["ot_logs"].sort(key=lambda x: _parse_stored_ot_date(x.get("date", "")) or (0, 0, 0))
         await save_user_profiles_local_async()
         print(f"[OT Tracker] Recovered {recovered_count} OT record(s) from #work channel history.", flush=True)
@@ -1981,6 +2066,8 @@ async def _save_and_format_ot_entry(
 
     ot_logs.sort(key=lambda x: _parse_stored_ot_date(x.get("date", "")) or (0, 0, 0))
     prof["ot_logs"] = ot_logs
+    # Default monthly DM auto-report to ON as soon as a user logs OT data (respects explicit user opt-out)
+    prof.setdefault("ot_auto_report", True)
     if channel_id:
         prof["ot_channel_id"] = int(channel_id)
     _DIRTY_SINCE_LAST_BACKUP = True
@@ -2011,7 +2098,7 @@ async def _save_and_format_ot_entry(
     )
 
 
-def build_monthly_ot_summary_markdown(ot_logs: list[dict], target_year: int, target_month: int) -> str:
+def build_monthly_ot_summary_markdown(ot_logs: list[dict], target_year: int, target_month: int, auto_report_enabled: bool | None = None) -> str:
     month_entries = []
     for e in ot_logs:
         pk = _parse_stored_ot_date(e.get("date", ""))
@@ -2056,7 +2143,11 @@ def build_monthly_ot_summary_markdown(ot_logs: list[dict], target_year: int, tar
         "**📌 สรุปยอดรวมประจำเดือน:**",
         f"- **จำนวนวันที่ทำ OT:** `{days_count} วัน`",
         f"- **รวมชั่วโมง OT ทั้งสิ้น:** **`{total_human}`** (เฉลี่ยวันละ `{avg_hours:.1f} ชม.`)",
-        "-# อย่าหักโหมจนเสียงานวันพรุ่งนี้ก็แล้วกันนะคะ",
+        (
+            f"-# ส่งสรุป OT อัตโนมัติทาง DM วันที่ 1 ของเดือน: {'เปิดอยู่ (พิมพ์ `!ot auto off` เพื่อปิด)' if auto_report_enabled else 'ปิดอยู่ (พิมพ์ `!ot auto on` เพื่อเปิด)'}"
+            if auto_report_enabled is not None
+            else "-# อย่าหักโหมจนเสียงานวันพรุ่งนี้ก็แล้วกันนะคะ"
+        ),
     ])
     return "\n".join(table_lines)
 
@@ -2098,7 +2189,7 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
             eh_str, em_str = tm_match.group(3), tm_match.group(4)
             extra_detail = (tm_match.group(5) or "").strip(" -:")
 
-            if not (0 <= sh <= 23 and 0 <= sm <= 59) or int(em_str or 0) > 59:
+            if not _is_valid_ot_hhmm(sh, sm, allow_24=False):
                 pending_weekend_ot[pending_key] = pending_data
                 return _OT_INVALID_TIME_REPLY
 
@@ -2106,6 +2197,9 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
             if eh_str is not None:
                 eh = int(eh_str)
                 em = int(em_str or 0)
+                if not _is_valid_ot_hhmm(eh, em, allow_24=True):
+                    pending_weekend_ot[pending_key] = pending_data
+                    return _OT_INVALID_TIME_REPLY
                 end_dt = saved_work_dt.replace(hour=eh % 24, minute=em, second=0, microsecond=0)
                 if end_dt <= start_dt:
                     end_dt += timedelta(days=1)
@@ -2141,6 +2235,26 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
                 time_note=note_label,
                 channel_id=chan_id or None,
             )
+
+    if OT_AUTO_REPORT_REGEX.search(text):
+        low_t = text.lower()
+        cur_enabled = is_user_ot_auto_report_enabled(prof)
+        if any(tok in low_t for tok in ("ปิด", "off", "disable")):
+            await set_user_ot_auto_report(uid_str, False)
+            return "🔕 ปิดการส่งสรุป OT อัตโนมัติทาง DM ประจำวันที่ 1 ของเดือนให้คุณแล้วค่ะ (ยังพิมพ์ `!ot` หรือ `สรุป OT` ดูเองได้ตลอดนะคะ)"
+        if any(tok in low_t for tok in ("เปิด", "on", "enable")):
+            await set_user_ot_auto_report(uid_str, True)
+            return "🔔 เปิดการส่งสรุป OT อัตโนมัติทาง DM ประจำวันที่ 1 ของเดือนให้คุณเรียบร้อยแล้วค่ะ (จะส่งเฉพาะเดือนที่มีรายการ OT เท่านั้นนะคะ)"
+        if any(tok in low_t for tok in ("สลับ", "toggle")):
+            new_state = await set_user_ot_auto_report(uid_str, not cur_enabled)
+            if new_state:
+                return "🔔 สลับเป็น **เปิดใช้งาน** ส่งสรุป OT อัตโนมัติทาง DM วันที่ 1 ของเดือนแล้วค่ะ (จะส่งเฉพาะเดือนที่มีรายการ OT เท่านั้น)"
+            return "🔕 สลับเป็น **ปิดใช้งาน** ส่งสรุป OT อัตโนมัติทาง DM แล้วค่ะ"
+        status_th = "**เปิดอยู่** (ส่งทาง DM อัตโนมัติวันที่ 1 เฉพาะเดือนที่มีข้อมูล OT)" if cur_enabled else "**ปิดอยู่**"
+        return (
+            f"⚙️ สถานะการส่งสรุป OT อัตโนมัติทาง DM ของคุณตอนนี้: {status_th}\n"
+            "-# พิมพ์ `!ot auto on` เพื่อเปิด หรือ `!ot auto off` เพื่อปิดได้ตลอดเวลาค่ะ"
+        )
 
     if OT_DELETE_REGEX.search(text) or text.lower().startswith(("delete ", "remove ", "ลบ")):
         pending_weekend_ot.pop(pending_key, None)
@@ -2190,7 +2304,9 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
                         target_month = m_idx
                         break
 
-        return build_monthly_ot_summary_markdown(ot_logs, target_year, target_month)
+        return build_monthly_ot_summary_markdown(
+            ot_logs, target_year, target_month, auto_report_enabled=is_user_ot_auto_report_enabled(prof)
+        )
 
     detail_str = re.sub(
         r"^(?:จด|บันทึก|ลง|เพิ่ม|แก้|อัปเดต)\s*(?:เวลา\s*)?(?:ot|โอที)\b\s*",
@@ -2216,11 +2332,11 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
     if range_time_m:
         sh, sm = int(range_time_m.group(1)), int(range_time_m.group(2))
         eh, em = int(range_time_m.group(3)), int(range_time_m.group(4))
-        if sm > 59 or em > 59:
+        if not (_is_valid_ot_hhmm(sh, sm, allow_24=False) and _is_valid_ot_hhmm(eh, em, allow_24=True)):
             return _OT_INVALID_TIME_REPLY
         pending_weekend_ot.pop(pending_key, None)
         rem_detail = range_time_m.group(5).strip(" -:")
-        start_dt = work_dt.replace(hour=sh % 24, minute=sm, second=0, microsecond=0)
+        start_dt = work_dt.replace(hour=sh, minute=sm, second=0, microsecond=0)
         end_dt = work_dt.replace(hour=eh % 24, minute=em, second=0, microsecond=0)
         if end_dt <= start_dt:
             end_dt += timedelta(days=1)
@@ -2255,11 +2371,11 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
         if wknd_start_m:
             sh = int(wknd_start_m.group(1))
             sm = int(wknd_start_m.group(2) or 0)
-            if sm > 59:
+            if not _is_valid_ot_hhmm(sh, sm, allow_24=False):
                 return _OT_INVALID_TIME_REPLY
             pending_weekend_ot.pop(pending_key, None)
             rem_detail = (wknd_start_m.group(3) or "").strip(" -:")
-            start_dt = work_dt.replace(hour=sh % 24, minute=sm, second=0, microsecond=0)
+            start_dt = work_dt.replace(hour=sh, minute=sm, second=0, microsecond=0)
 
             dur_m = re.match(
                 r"^(\d+(?:\.\d+)?)\s*(?:ชั่วโมง|ชม\.?|hrs?\.?|hours?|h)\b\s*(.*)",
@@ -2343,7 +2459,7 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
         actual_finish_str = _format_time_dot(end_dt - timedelta(hours=1))
     elif until_time_m:
         fin_h, fin_m = int(until_time_m.group(1)), int(until_time_m.group(2))
-        if fin_m > 59:
+        if not _is_valid_ot_hhmm(fin_h, fin_m, allow_24=True):
             return _OT_INVALID_TIME_REPLY
         detail_str = until_time_m.group(3).strip()
         finish_dt = work_dt.replace(hour=fin_h % 24, minute=fin_m, second=0, microsecond=0)

@@ -127,19 +127,15 @@ SAUCENAO_API_KEY = os.getenv("SAUCENAO_API_KEY", "").strip()
 # Render Free Web Service dynamically injects PORT (defaults to 10000)
 PORT = int(os.getenv("PORT", "10000"))
 
-# Yukino Yukinoshita Voice Profile (Cool, calm, slightly brisk, smooth pause trimming)
-# TTS_PRIMARY_ENGINE: "paradee" (offline MakHamTTS Paradee 1.1 INT8 for Thai + Google/Edge for EN), "google", or "edge"
+# Yukino Yukinoshita Voice Profile (Cool, calm, crisp articulation)
+# TTS_PRIMARY_ENGINE: "paradee" (offline MakHamTTS Paradee 1.1 INT8 for Thai + Google TTS for EN/fallback) or "google"
 TTS_PRIMARY_ENGINE = os.getenv("TTS_PRIMARY_ENGINE", "paradee").strip().lower()
-TTS_PARADEE_SPEED = float(os.getenv("TTS_PARADEE_SPEED", "1.00"))
-TTS_PARADEE_PITCH = float(os.getenv("TTS_PARADEE_PITCH", "0.91"))
+TTS_PARADEE_SPEED = float(os.getenv("TTS_PARADEE_SPEED", "1.05"))
+TTS_PARADEE_PITCH = float(os.getenv("TTS_PARADEE_PITCH", "0.94"))
 TTS_PARADEE_MODEL_DIR = os.getenv("TTS_PARADEE_MODEL_DIR", "/app/models/paradee_thai").strip()
 TTS_PARADEE_IDLE_UNLOAD_SEC = max(30, int(os.getenv("TTS_PARADEE_IDLE_UNLOAD_SEC", "180") or "180"))
 TTS_PARADEE_RAM_GUARD_MB = max(220, int(os.getenv("TTS_PARADEE_RAM_GUARD_MB", "340") or "340"))
 TTS_PARADEE_TIMEOUT_SEC = max(3.0, float(os.getenv("TTS_PARADEE_TIMEOUT_SEC", "12.0") or "12.0"))
-TTS_VOICE_TH = os.getenv("TTS_VOICE_TH", "th-TH-PremwadeeNeural")
-TTS_VOICE_EN = os.getenv("TTS_VOICE_EN", "en-US-AriaNeural")
-TTS_PITCH = os.getenv("TTS_PITCH", "-2Hz")
-TTS_RATE = os.getenv("TTS_RATE", "-12%")
 TTS_GOOGLE_PITCH = float(os.getenv("TTS_GOOGLE_PITCH", "0.97"))
 TTS_GOOGLE_SPEED = float(os.getenv("TTS_GOOGLE_SPEED", "1.24"))
 TTS_SILENCE_TRIM = os.getenv("TTS_SILENCE_TRIM", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -248,7 +244,6 @@ class RuntimeState:
         self.gemini_hydrogen_call_timestamps: deque = deque(maxlen=5)
         self.cf_gpt_oss_cooldown_until: float = 0.0
         self.openrouter_manga_cooldown_until: float = 0.0
-        self.edge_tts_cooldown_until: float = 0.0
         self.paradee_tts_cooldown_until: float = 0.0
         self.paradee_tts_loaded: bool = False
         self.active_tts_engine: str = TTS_PRIMARY_ENGINE
