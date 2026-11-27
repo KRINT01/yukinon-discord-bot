@@ -40,6 +40,7 @@ from search_engine import (
     fetch_webpage_async,
     run_safe_web_search_async,
     validate_safe_public_url_async,
+    open_safe_public_url_async,
 )
 from llm import (
     get_google_model_cooldown,
@@ -452,6 +453,7 @@ async def _download_remote_image_safe(url: str, referer: str = "") -> tuple[byte
     except Exception as e:
         api_log(f"Embed Image SSRF/URL skip ({url[:60]}): {e}")
         return None
+    # `safe_url` validated above only decides headers/filename; the fetch below re-validates every redirect hop
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -465,8 +467,8 @@ async def _download_remote_image_safe(url: str, referer: str = "") -> tuple[byte
 
     try:
         session = get_http_session()
-        async with session.get(
-            safe_url, headers=headers, timeout=aiohttp.ClientTimeout(total=12)
+        async with await open_safe_public_url_async(
+            session, safe_url, headers=headers, timeout=aiohttp.ClientTimeout(total=12)
         ) as resp:
             if resp.status != 200:
                 api_log(f"Embed Image HTTP {resp.status} -> {safe_url[:70]}")

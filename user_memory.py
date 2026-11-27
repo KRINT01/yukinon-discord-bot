@@ -401,18 +401,31 @@ def _get_cloud_backup_lock() -> asyncio.Lock:
     return _CLOUD_BACKUP_LOCK
 
 
+def _read_user_profiles_local_sync() -> dict | None:
+    """Reads user_profiles.json from local disk (safe to run in a worker thread; does not touch shared state)."""
+    if not os.path.exists(USER_PROFILES_FILE):
+        return None
+    try:
+        with open(USER_PROFILES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception as e:
+        print(f"[User Memory] Local load warning: {e}", flush=True)
+        return None
+
+
+def _apply_loaded_user_profiles(data: dict | None) -> None:
+    """Mutates `user_profiles` in place so bot.py / ui_interactions.py references stay on the same dict object."""
+    if data is None:
+        return
+    user_profiles.clear()
+    user_profiles.update(data)
+    print(f"[User Memory] Loaded {len(user_profiles)} user profile(s) from local disk.", flush=True)
+
+
 def load_user_profiles_local():
     """Loads user_profiles.json from local disk if present."""
-    global user_profiles
-    if os.path.exists(USER_PROFILES_FILE):
-        try:
-            with open(USER_PROFILES_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                user_profiles = data
-                print(f"[User Memory] Loaded {len(user_profiles)} user profile(s) from local disk.", flush=True)
-        except Exception as e:
-            print(f"[User Memory] Local load warning: {e}", flush=True)
+    _apply_loaded_user_profiles(_read_user_profiles_local_sync())
 
 
 def _write_profiles_json_atomic_sync(serialized_json: str) -> None:
@@ -474,8 +487,9 @@ async def restore_user_profiles_from_discord(bot: discord.Client):
     on startup, auto-scrubs polluted entries from favorite_topics, recent_topics, and custom_notes,
     and scans #work channels to recover any OT logs so records survive Render redeploys.
     """
-    global user_profiles, _DIRTY_SINCE_LAST_BACKUP
-    await asyncio.to_thread(load_user_profiles_local)
+    global _DIRTY_SINCE_LAST_BACKUP
+    # Read in a worker thread, mutate the shared dict on the event loop (no cross-thread dict mutation)
+    _apply_loaded_user_profiles(await asyncio.to_thread(_read_user_profiles_local_sync))
     ch = _find_backup_channel(bot)
     if ch:
         try:
@@ -811,16 +825,22 @@ async def consolidate_user_memory_async(uid_str: str):
         _CONSOLIDATION_IN_PROGRESS.discard(uid_str)
 
 
+# Strong references to fire-and-forget tasks: asyncio only keeps weak refs, so unreferenced tasks can be GC'd mid-run
+_BG_TASKS: set[asyncio.Task] = set()
+
+
 def _schedule_bg_task(coro) -> bool:
     try:
-        asyncio.get_running_loop().create_task(coro)
-        return True
+        task = asyncio.get_running_loop().create_task(coro)
     except RuntimeError:
         if state.bot and getattr(state.bot, "loop", None) and state.bot.loop.is_running():
-            state.bot.loop.create_task(coro)
-            return True
-        coro.close()
-        return False
+            task = state.bot.loop.create_task(coro)
+        else:
+            coro.close()
+            return False
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return True
 
 
 def record_user_interaction(
@@ -1478,6 +1498,10 @@ WEEKEND_TIME_REPLY_REGEX = re.compile(
 
 pending_weekend_ot: dict[tuple[int, int], dict] = {}
 
+_OT_INVALID_TIME_REPLY = (
+    "เวลาที่พิมพ์มาไม่ถูกต้องนะคะ ใส่เป็น `HH.MM` หรือ `HH:MM` เช่น `09.00` หรือ `18.00 - 20.00` ค่ะ"
+)
+
 THAI_MONTH_NAME_TO_NUM = {name: idx for idx, name in enumerate(THAI_MONTHS) if idx > 0}
 THAI_SHORT_MONTHS = {
     "ม.ค.": 1, "ม.ค": 1, "มค": 1,
@@ -1975,8 +1999,9 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
             eh_str, em_str = tm_match.group(3), tm_match.group(4)
             extra_detail = (tm_match.group(5) or "").strip(" -:")
 
-            if not (0 <= sh <= 23 and 0 <= sm <= 59):
-                return "เวลาที่พิมพ์มาไม่ถูกต้องนะคะ ใส่เป็น `HH.MM` หรือ `HH:MM` เช่น `09.00` หรือ `18.00 - 20.00` ค่ะ"
+            if not (0 <= sh <= 23 and 0 <= sm <= 59) or int(em_str or 0) > 59:
+                pending_weekend_ot[pending_key] = pending_data
+                return _OT_INVALID_TIME_REPLY
 
             start_dt = saved_work_dt.replace(hour=sh, minute=sm, second=0, microsecond=0)
             if eh_str is not None:
@@ -2090,9 +2115,11 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
         flags=re.IGNORECASE,
     )
     if range_time_m:
-        pending_weekend_ot.pop(pending_key, None)
         sh, sm = int(range_time_m.group(1)), int(range_time_m.group(2))
         eh, em = int(range_time_m.group(3)), int(range_time_m.group(4))
+        if sm > 59 or em > 59:
+            return _OT_INVALID_TIME_REPLY
+        pending_weekend_ot.pop(pending_key, None)
         rem_detail = range_time_m.group(5).strip(" -:")
         start_dt = work_dt.replace(hour=sh % 24, minute=sm, second=0, microsecond=0)
         end_dt = work_dt.replace(hour=eh % 24, minute=em, second=0, microsecond=0)
@@ -2127,9 +2154,11 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
         )
 
         if wknd_start_m:
-            pending_weekend_ot.pop(pending_key, None)
             sh = int(wknd_start_m.group(1))
             sm = int(wknd_start_m.group(2) or 0)
+            if sm > 59:
+                return _OT_INVALID_TIME_REPLY
+            pending_weekend_ot.pop(pending_key, None)
             rem_detail = (wknd_start_m.group(3) or "").strip(" -:")
             start_dt = work_dt.replace(hour=sh % 24, minute=sm, second=0, microsecond=0)
 
@@ -2215,6 +2244,8 @@ async def process_ot_request(message: discord.Message, raw_text: str) -> str:
         actual_finish_str = _format_time_dot(end_dt - timedelta(hours=1))
     elif until_time_m:
         fin_h, fin_m = int(until_time_m.group(1)), int(until_time_m.group(2))
+        if fin_m > 59:
+            return _OT_INVALID_TIME_REPLY
         detail_str = until_time_m.group(3).strip()
         finish_dt = work_dt.replace(hour=fin_h % 24, minute=fin_m, second=0, microsecond=0)
         if fin_h < 5:

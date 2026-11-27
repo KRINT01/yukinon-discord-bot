@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import math
 import time
 import signal
 import asyncio
@@ -212,6 +213,51 @@ def _looks_like_compound_request(text: str) -> bool:
     if re.search(r"(ข่าว|ราคา|ค้นหา|สรุป|เช็คข้อมูล|\bsearch\b|\bnews\b|\bprice\b)", text, re.IGNORECASE):
         hit_domains += 1
     return hit_domains >= 2
+
+
+MASS_PING_COOLDOWN_SEC = max(0, int(os.getenv("MASS_PING_COOLDOWN_SEC", "600") or "600"))
+_MASS_PING_REQUEST_REGEX = re.compile(
+    r"(@everyone|@here|<@&\d+>|แท็กทุกคน|เรียกทุกคน|ปิงทุกคน|"
+    r"\b(?:ping|tag|mention)\s+(?:everyone|all|here)\b)",
+    re.IGNORECASE,
+)
+_last_mass_ping_at: dict[int, float] = {}
+
+
+def _resolve_mass_ping(message: discord.Message, user_text: str, answer: str) -> tuple[discord.AllowedMentions | None, str]:
+    """
+    Opt-in @everyone/@here/role pings for ONE reply when the user explicitly asked for a ping.
+    Mirrors Discord's own rules (author needs `mention_everyone`, or the role must be mentionable)
+    so members cannot use the bot to ping beyond their own permissions, and enforces a per-guild
+    cooldown (`MASS_PING_COOLDOWN_SEC`, default 600s) against spam.
+    Returns `(allowed_mentions_override_or_None, answer_with_optional_note)`.
+    """
+    guild = message.guild
+    if guild is None or not answer or not _MASS_PING_REQUEST_REGEX.search(user_text or ""):
+        return None, answer
+    wants_everyone = bool(re.search(r"@(?:everyone|here)\b", answer))
+    role_ids = {int(r) for r in re.findall(r"<@&(\d+)>", answer)}
+    # Override is only applied on single-message replies, so multi-chunk answers never multi-ping
+    if (not wants_everyone and not role_ids) or len(answer) > 1900:
+        return None, answer
+
+    perms = message.channel.permissions_for(message.author)
+    allow_everyone = wants_everyone and perms.mention_everyone
+    roles = [
+        r for r in (guild.get_role(rid) for rid in role_ids)
+        if r is not None and (r.mentionable or perms.mention_everyone)
+    ]
+    if not allow_everyone and not roles:
+        return None, f"{answer}\n-# (ผู้สั่งไม่มีสิทธิ์แท็กทุกคน/แท็กยศนี้ในห้องนี้ ครั้งนี้เลยไม่ได้ส่งแจ้งเตือนนะคะ)"
+
+    now = time.monotonic()
+    last_ts = _last_mass_ping_at.get(guild.id)
+    if last_ts is not None and (now - last_ts) < MASS_PING_COOLDOWN_SEC:
+        wait_min = max(1, math.ceil((MASS_PING_COOLDOWN_SEC - (now - last_ts)) / 60))
+        return None, f"{answer}\n-# (การแท็กทุกคน/แท็กยศติดคูลดาวน์อีกประมาณ {wait_min} นาที ครั้งนี้เลยไม่ได้ส่งแจ้งเตือนนะคะ)"
+
+    _last_mass_ping_at[guild.id] = now
+    return discord.AllowedMentions(everyone=allow_everyone, roles=roles, users=True), answer
 
 
 def _format_uptime(seconds: int) -> str:
@@ -545,7 +591,8 @@ class YukinonBot(commands.Bot):
 
             def _on_sigterm():
                 api_log("Received SIGTERM from host — initiating graceful flush & shutdown...")
-                loop.create_task(self.close())
+                # Keep a strong reference so the shutdown task cannot be garbage-collected mid-flush
+                self._sigterm_close_task = loop.create_task(self.close())
 
             loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
         except (NotImplementedError, RuntimeError, ValueError):
@@ -566,7 +613,14 @@ class YukinonBot(commands.Bot):
         await super().close()
 
 
-bot = YukinonBot(command_prefix="!", intents=intents, help_command=None)
+# Bot-wide safe default: LLM output / echoed user text can never ping @everyone, @here, or roles.
+# Explicit user-requested mass pings are opted in per message by `_resolve_mass_ping()` (permission + cooldown).
+bot = YukinonBot(
+    command_prefix="!",
+    intents=intents,
+    help_command=None,
+    allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
+)
 state.bot = bot
 
 
@@ -676,19 +730,23 @@ async def _send_response_with_interactive_view(
     answer: str,
     view: discord.ui.View | None,
     reply_to: discord.Message | None = None,
+    allowed_mentions: discord.AllowedMentions | None = None,
 ):
     if not answer or not answer.strip():
         return
     display_answer = format_markdown_tables_for_discord(answer) if len(answer) <= 7500 else answer
     if len(display_answer) <= 1900:
+        # `allowed_mentions=None` keeps the bot-wide safe default (no @everyone/@here/role pings)
         sent_msg = None
         if reply_to is not None:
             try:
-                sent_msg = await reply_to.reply(display_answer, view=view, mention_author=False)
+                sent_msg = await reply_to.reply(
+                    display_answer, view=view, mention_author=False, allowed_mentions=allowed_mentions
+                )
             except Exception:
                 sent_msg = None
         if sent_msg is None:
-            sent_msg = await channel.send(display_answer, view=view)
+            sent_msg = await channel.send(display_answer, view=view, allowed_mentions=allowed_mentions)
         if view is not None and hasattr(view, "message"):
             view.message = sent_msg
             view.delete_message_on_timeout = False
@@ -1197,7 +1255,10 @@ async def on_message(message: discord.Message):
                     decision_plan=decision_plan,
                 )
 
-        await _send_response_with_interactive_view(message.channel, answer, action_view, reply_to=reply_target)
+        mass_ping_mentions, send_answer = _resolve_mass_ping(message, clean_prompt, answer)
+        await _send_response_with_interactive_view(
+            message.channel, send_answer, action_view, reply_to=reply_target, allowed_mentions=mass_ping_mentions
+        )
         await _dispatch_post_tool_side_effects(message.channel, message, answer, user_request, tool_ctx)
         if has_audio and not use_coder:
             await speak_in_voice_channel(message.guild, answer, fallback_channel=message.channel)
