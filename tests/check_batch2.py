@@ -8,6 +8,7 @@ import sys
 import json
 import time
 import asyncio
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -137,10 +138,64 @@ async def check_memory_consolidation():
         user_memory._CONSOLIDATION_COOLDOWN.pop(uid, None)
 
 
+async def check_mentioned_names_not_saved():
+    real = (
+        user_memory.save_user_profiles_local,
+        user_memory.save_user_profiles_local_async,
+        user_memory.backup_user_profiles_to_discord,
+        user_memory._schedule_bg_task,
+    )
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    def _no_bg(coro):
+        coro.close()
+        return True
+
+    user_memory.save_user_profiles_local = lambda: None
+    user_memory.save_user_profiles_local_async = _noop
+    user_memory.backup_user_profiles_to_discord = _noop
+    user_memory._schedule_bg_task = _no_bg
+    member = SimpleNamespace(display_name="Bobby", name="bobby_x", global_name="Bobby", roles=[])
+    guild = SimpleNamespace(get_member=lambda i: member if i == 555 else None)
+    speaker = SimpleNamespace(id=777, bot=False, display_name="Speaker", name="speaker_y")
+    try:
+        user_memory.user_profiles["555"] = {"display_name": "Bobby", "interaction_count": 3}
+        resolved, _ = user_memory.resolve_user_mentions_and_build_dossier(
+            "<@555> ชอบกินอะไร", guild, 1, speaker_user=speaker
+        )
+        assert "@Bobby" in resolved, resolved
+
+        user_memory.record_user_interaction(speaker, resolved, learned_memo="Bobby เป็นเพื่อนสนิท")
+        prof = user_memory.user_profiles["777"]
+        for key in ("recent_topics", "custom_notes", "favorite_topics"):
+            assert not any("bobby" in str(x).lower() for x in prof.get(key) or []), (key, prof.get(key))
+        assert "ชอบกินอะไร" in (prof.get("recent_topics") or []), prof.get("recent_topics")
+
+        _, target = await user_memory.apply_tool_memory_action(speaker, "pin_fact", "Bobby ชอบแมว")
+        assert target == "" and not prof.get("pinned_facts"), prof.get("pinned_facts")
+        _, target = await user_memory.apply_tool_memory_action(speaker, "pin_fact", "ชอบกินราเมงร้อนๆ")
+        assert target == "777" and user_memory.user_profiles["777"]["pinned_facts"] == ["ชอบกินราเมงร้อนๆ"]
+        _, target = await user_memory.apply_tool_memory_action(speaker, "add_note", "ไปเที่ยวกับ @bobby_x")
+        assert target == "" and not user_memory.user_profiles["777"].get("custom_notes")
+    finally:
+        (
+            user_memory.save_user_profiles_local,
+            user_memory.save_user_profiles_local_async,
+            user_memory.backup_user_profiles_to_discord,
+            user_memory._schedule_bg_task,
+        ) = real
+        user_memory.user_profiles.pop("555", None)
+        user_memory.user_profiles.pop("777", None)
+        user_memory._MENTIONED_NAMES_BY_SPEAKER.pop("777", None)
+
+
 async def _main():
     await check_groq_discovery_negative_cache()
     await check_malformed_decision_answers()
     await check_memory_consolidation()
+    await check_mentioned_names_not_saved()
     print("Batch 2 checks passed.")
 
 

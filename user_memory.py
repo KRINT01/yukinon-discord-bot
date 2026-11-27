@@ -199,6 +199,22 @@ def _is_blocked_favorite_topic(topic: str, user=None, profile: dict | None = Non
     return False
 
 
+# Lowercased names of members each speaker recently @mentioned, so their names are not saved into the
+# speaker's own memory (pinned_facts / custom_notes / favorite_topics / recent_topics).
+# Ceiling: in-RAM only (lost on restart), only covers Discord @mentions in text chat (not plain-typed
+# names or voice), names shorter than 3 chars are not recorded. Upgrade path: persist mention ids per message.
+_MENTIONED_NAMES_BY_SPEAKER: dict[str, list[str]] = {}
+
+
+def _mentioned_name_regex(uid_str: str) -> re.Pattern:
+    """Matches raw `<@id>` tags and any name the speaker recently @mentioned (case-insensitive)."""
+    names = sorted(_MENTIONED_NAMES_BY_SPEAKER.get(uid_str) or [], key=len, reverse=True)
+    # ASCII-only boundaries so a Latin name glued to Thai text still matches; a Thai name may also
+    # match inside a longer Thai word, which only over-filters (drops a note) and never leaks.
+    alts = [r"<@!?\d+>"] + [rf"(?<![A-Za-z0-9_])@?{re.escape(n)}(?![A-Za-z0-9_])" for n in names]
+    return re.compile("|".join(alts), re.IGNORECASE)
+
+
 def _is_valid_custom_note(note: str) -> bool:
     """
     Validates rolling `custom_notes` and auto-saved facts:
@@ -708,6 +724,9 @@ async def _summarize_recent_topic_bg(
             return
         parsed = json.loads(m_json.group(0))
         summary = re.sub(r"\s+", " ", str(parsed.get("topic") or "")).strip()[:70]
+        if _mentioned_name_regex(uid_str).search(summary):
+            # The bot reply can still carry a mentioned member's name; keep the name-free placeholder
+            return
 
         prof = user_profiles.get(uid_str)
         if not isinstance(prof, dict):
@@ -821,8 +840,9 @@ async def consolidate_user_memory_async(uid_str: str):
         new_pinned = parsed.get("pinned_facts")
         new_notes = parsed.get("custom_notes")
         if isinstance(new_pinned, list) and isinstance(new_notes, list):
-            clean_pinned = [x for x in new_pinned if _is_valid_custom_note(x)]
-            clean_notes = [x for x in new_notes if _is_valid_custom_note(x)]
+            mention_re = _mentioned_name_regex(uid_str)
+            clean_pinned = [x for x in new_pinned if _is_valid_custom_note(x) and not mention_re.search(str(x))]
+            clean_notes = [x for x in new_notes if _is_valid_custom_note(x) and not mention_re.search(str(x))]
             # Existing pinned facts are never removed: they come first and the cap only limits additions.
             # Ceiling: dedupe is exact (case/whitespace-insensitive), so a reworded duplicate of an existing
             # pinned fact can be added alongside the original. Upgrade path: fuzzy matching.
@@ -899,10 +919,17 @@ def record_user_interaction(
     profile["last_seen"] = now_str
 
     _scrub_profile_memory(profile, user=user)
+    # Names of members the speaker @mentioned must not land in the speaker's own memory
+    mention_re = _mentioned_name_regex(uid_str)
+    memo_prompt = re.sub(r"[ \t]{2,}", " ", mention_re.sub("", str(user_prompt or ""))).strip()
     favs = list(profile.get("favorite_topics") or [])
     if not is_button_followup and channel_id and channel_id in channel_active_topic:
         act_t = channel_active_topic[channel_id].get("topic", "").strip()
-        if act_t and act_t not in favs and not _is_blocked_favorite_topic(act_t, user=user, profile=profile):
+        if (
+            act_t and act_t not in favs
+            and not _is_blocked_favorite_topic(act_t, user=user, profile=profile)
+            and not mention_re.search(act_t)
+        ):
             favs.append(act_t)
 
     if not is_button_followup and not _looks_like_internal_bot_or_button_prompt(user_prompt):
@@ -913,7 +940,7 @@ def record_user_interaction(
     profile["favorite_topics"] = favs[-12:]
 
     condensed_recent, wants_bg_summary = _condense_recent_topic_sync(
-        user_prompt,
+        memo_prompt,
         is_coding=is_coding,
         is_button_followup=is_button_followup,
     )
@@ -924,12 +951,12 @@ def record_user_interaction(
         profile["recent_topics"] = _dedupe_clean_list(recents, max_items=6, max_item_len=80)
         if wants_bg_summary:
             _schedule_bg_task(
-                _summarize_recent_topic_bg(uid_str, condensed_recent, user_prompt, assistant_reply)
+                _summarize_recent_topic_bg(uid_str, condensed_recent, memo_prompt, assistant_reply)
             )
 
     if learned_memo:
         clean_memo = re.sub(r"\s+", " ", learned_memo).strip()[:150]
-        if _is_valid_custom_note(clean_memo):
+        if _is_valid_custom_note(clean_memo) and not mention_re.search(clean_memo):
             notes = list(profile.get("custom_notes") or [])
             if clean_memo.lower() not in {n.lower() for n in notes}:
                 notes.append(clean_memo)
@@ -1028,11 +1055,28 @@ def resolve_user_mentions_and_build_dossier(
 
     resolved_text = raw_text
     dossier_entries = []
+    speaker_id = str(getattr(speaker_user, "id", "")) if speaker_user is not None else ""
 
     for uid_str in mentioned_ids[:4]:
         member = guild.get_member(int(uid_str)) if (guild and uid_str.isdigit()) else None
         prof = user_profiles.get(uid_str)
         is_target_owner = is_owner_user(member) if member else (prof.get("is_owner", False) if prof else False)
+
+        if speaker_id and uid_str != speaker_id:
+            cand = [getattr(member, a, "") for a in ("display_name", "name", "global_name")] if member else []
+            cand += [(prof or {}).get("display_name"), (prof or {}).get("username")]
+            cand += ["[คู่หูชมรมบริการ / ผู้สร้างของฉัน]", "คู่หูชมรมบริการ"] if is_target_owner else []
+            if not is_target_owner:
+                raw_n = (member.display_name if member else None) or (prof or {}).get("display_name") or ""
+                cand.append(re.sub(r"[^\w\u0E00-\u0E7F\s.-]", "", raw_n).strip()[:32])
+            known = _MENTIONED_NAMES_BY_SPEAKER.setdefault(speaker_id, [])
+            for n in cand:
+                nl = str(n or "").strip().lower()
+                if len(nl) >= 3 and nl != "partner (owner)":
+                    if nl in known:
+                        known.remove(nl)
+                    known.append(nl)
+            del known[:-20]
 
         if is_target_owner:
             readable_tag = "@[คู่หูชมรมบริการ / ผู้สร้างของฉัน]"
@@ -1208,6 +1252,12 @@ async def apply_tool_memory_action(speaker_user, action: str, value: str = "") -
     if act == "view":
         return format_user_memory_card(uid_str), uid_str
 
+    # Also covers the passive fact extractor, which saves through add_note
+    mention_re = _mentioned_name_regex(uid_str)
+    if act in ("pin_fact", "add_note") and val and mention_re.search(val):
+        field = "pinned_facts" if act == "pin_fact" else "custom_notes"
+        return f"[Memory Notice: Skipped saving another member's name into {field}.]", ""
+
     if act == "pin_fact" and val:
         if not _is_valid_custom_note(val):
             return "[Memory Notice: Skipped saving non-personal code/log/table/URL noise into pinned_facts.]", ""
@@ -1230,7 +1280,7 @@ async def apply_tool_memory_action(speaker_user, action: str, value: str = "") -
         raw_items = [x.strip() for x in re.split(r"[,;،]+", val) if x.strip()]
         new_items = [
             x for x in raw_items
-            if not _is_blocked_favorite_topic(x, user=speaker_user, profile=prof)
+            if not _is_blocked_favorite_topic(x, user=speaker_user, profile=prof) and not mention_re.search(x)
         ]
         if not new_items:
             return "[Memory Notice: Skipped adding blocked/code/table noise into favorite_topics.]", ""
