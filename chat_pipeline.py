@@ -290,7 +290,7 @@ async def query_ai_chat(
             "ห้ามสร้างตาราง Markdown หรือตารางข้อความเด็ดขาดในคำตอบนี้ ให้ใช้ย่อหน้าสั้นๆ หรือหัวข้อย่อย (`-`) แทนเพื่อให้ลิงก์คลิกได้และอ่านง่าย"
             if no_tables_flag
             else (
-                "\n\n[Discord Table Auto-Formatter Rule — Overrides Blanket Table Ban]: "
+                "\n\n[Discord Table Auto-Formatter Rule — Authoritative]: "
                 "สำหรับแชททั่วไป การเล่าเรื่อง รีวิวภาพ/มังงะ/โพสต์โซเชียล ประวัติตัวละคร หรือช่องทางติดตามศิลปิน ให้ตอบเป็นย่อหน้าสนทนาหรือหัวข้อย่อยโดยห้ามสร้างตาราง "
                 "สร้างตาราง Markdown มาตรฐาน (`| หัวข้อ | ... |` ไม่เกิน 4-5 คอลัมน์กระชับ) ได้เฉพาะเมื่อผู้ใช้ขอเปรียบเทียบสินค้า/สเปค/ราคา/ตัวเลือก หรือขอให้สรุปเป็นตารางเท่านั้น "
                 "ระบบจะจัดแนวให้แสดงผลสวยงามบน Discord อัตโนมัติ (ห้ามจัดเว้นวรรค ASCII เองในบล็อกโค้ด)"
@@ -498,11 +498,17 @@ async def query_ai_chat(
                             "บอกตามตรงว่าข้อมูลจากการค้นหายังไม่เพียงพอจะฟันธง และหลีกเลี่ยงการแต่งข้อมูลเพิ่ม"
                         )
 
+        if "<untrusted_web_search_results" in working_prompt:
+            fact_check_evidence_line = "ตรวจสอบกับหลักฐานใน `<untrusted_web_search_results>` ด้านบนอย่างตรงไปตรงมา (หรือเรียก `web_search` เพิ่มได้หากจำเป็น):"
+        elif active_tool_ctx:
+            fact_check_evidence_line = "ยังไม่มีผลการค้นหาในบริบท ให้เรียก `web_search` ตรวจสอบก่อนตอบอย่างตรงไปตรงมา:"
+        else:
+            fact_check_evidence_line = "ยังไม่มีหลักฐานจากการค้นหาในบริบท ห้ามแต่งข้อมูลยืนยันหรือแย้งเอง ให้บอกตามตรงว่าหลักฐานยังไม่เพียงพอ:"
         working_prompt = (
             f"{working_prompt}\n\n"
             f"[คำสั่งระบบสำหรับการตรวจสอบข้อเท็จจริง (Fact-Check Arbitrator Mode — หัวข้อ: {active_topic or 'ตามบริบทสนทนา'})]:\n"
             "1. ผู้ใช้กำลังโต้แย้งหรือชี้ข้อผิดพลาดในคำตอบก่อนหน้าของคุณ\n"
-            "2. ตรวจสอบกับหลักฐานใน `<untrusted_web_search_results>` ด้านบนอย่างตรงไปตรงมา (หรือเรียก `web_search` เพิ่มได้หากจำเป็น):\n"
+            f"2. {fact_check_evidence_line}\n"
             "   - หากคำตอบก่อนหน้าของคุณมีข้อมูลที่แต่งขึ้นเองหรือผิดพลาดจริง: จงยอมรับอย่างตรงไปตรงมาและแก้ไขเฉพาะจุดที่ผิดให้ถูกต้องตามหลักฐานทันที\n"
             "   - หากหลักฐานจากการค้นหายืนยันว่าสิ่งที่คุณพูดถูกต้องอยู่แล้วและผู้ใช้เข้าใจผิดเอง: จงยืนยันตามข้อเท็จจริงจากผลการค้นหา\n"
             "3. ห้ามเบี่ยงประเด็นไปอธิบายประวัติของบริษัทที่ไม่เกี่ยวข้อง และห้ามใช้คำลงท้ายว่า 'ครับ' เด็ดขาด"
@@ -901,6 +907,7 @@ async def query_ai_chat(
 
     from user_memory import AGENTIC_MEMO_TAG_REGEX, record_user_interaction
 
+    # Defensive fallback for non-tool models that emit a legacy [MEMO: ...] tag despite the prompt ban; sanitizer strips the tag.
     memo_match = AGENTIC_MEMO_TAG_REGEX.search(raw_answer or "")
     learned_memo = memo_match.group(1).strip() if memo_match else ""
 

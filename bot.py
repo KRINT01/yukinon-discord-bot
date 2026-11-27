@@ -1,5 +1,4 @@
 import os
-import io
 import re
 import math
 import time
@@ -97,6 +96,11 @@ from user_memory import (
     build_monthly_ot_summary_markdown,
     _parse_stored_ot_date,
     user_profiles,
+    META_KEY,
+    user_profile_count,
+    get_last_ot_report_ym,
+    set_last_ot_report_ym,
+    is_ot_work_channel_name,
 )
 from search_engine import detect_coding_intent, run_safe_web_search_async
 from llm import (
@@ -373,7 +377,7 @@ def _collect_health_metrics() -> dict:
             "active_chat_channels": len(channel_memory),
             "max_cached_channels": MAX_CACHED_CHANNELS,
             "cached_attachments": cached_files_count,
-            "stored_user_profiles": len(user_profiles),
+            "stored_user_profiles": user_profile_count(),
         },
         "runtime_limits": {
             "ram_limit_mb": CONTAINER_RAM_LIMIT_MB,
@@ -491,7 +495,7 @@ def _resolve_ot_report_channel(prof: dict):
             return ch
     for guild in bot.guilds:
         for ch in guild.text_channels:
-            if any(k in ch.name.lower() for k in ("work", "ot", "งาน")):
+            if is_ot_work_channel_name(ch.name):
                 return ch
     return None
 
@@ -504,12 +508,15 @@ async def monthly_ot_auto_report_task():
     prev_year, prev_month, prev_month_label = get_previous_month_info(now_th)
     ym_key = f"{prev_year:04d}-{prev_month:02d}"
 
-    if now_th.day != 1 or now_th.hour < 9 or state.last_ot_auto_report_ym == ym_key:
+    if now_th.day != 1 or now_th.hour < 9 or get_last_ot_report_ym() == ym_key:
         return
 
-    state.last_ot_auto_report_ym = ym_key
+    # At-most-once: persisted before sending so a crash mid-send never causes a duplicate report on restart.
+    await set_last_ot_report_ym(ym_key)
 
     for uid_str, prof in list(user_profiles.items()):
+        if uid_str == META_KEY:
+            continue
         ot_logs = prof.get("ot_logs") or []
         has_prev_month_data = any(
             (pk := _parse_stored_ot_date(e.get("date", ""))) is not None

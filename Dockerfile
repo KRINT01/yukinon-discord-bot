@@ -24,6 +24,10 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 COPY *.py ./
 
+# Run as non-root. Writes go only to /app (user_profiles.json) and the system temp dir.
+RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /app
+USER appuser
+
 # Render injects the PORT environment variable dynamically (defaults to 10000)
 EXPOSE 10000
 
