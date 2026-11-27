@@ -90,7 +90,27 @@ def check_fact_check_block_conditional():
     assert '"2. ตรวจสอบกับหลักฐานใน `<untrusted_web_search_results>` ด้านบน' not in src
 
 
+def check_ot_channel_matcher_and_meta_key():
+    import user_memory as um
+    for ok in ("work", "ot", "ot-report", "my_work", "daily ot", "แจ้งงาน-ot"):
+        assert um.is_ot_work_channel_name(ok), ok
+    for bad in ("bot", "photos", "robot", "bot-commands", "general"):
+        assert not um.is_ot_work_channel_name(bad), bad
+    saved = dict(um.user_profiles)
+    try:
+        um.user_profiles.clear()
+        um.user_profiles["123"] = {"ot_logs": []}
+        assert um.user_profile_count() == 1 and um.get_last_ot_report_ym() == ""
+        um.user_profiles[um.META_KEY] = {"last_ot_report_ym": "2026-10"}
+        assert um.user_profile_count() == 1 and um.get_last_ot_report_ym() == "2026-10"
+        assert not um.META_KEY.isdigit()  # cannot collide with Discord user ids
+    finally:
+        um.user_profiles.clear()
+        um.user_profiles.update(saved)
+
+
 async def _main():
+    check_ot_channel_matcher_and_meta_key()
     check_code_prompt_language()
     check_fast_prompt_tools()
     check_table_rule_single_source()

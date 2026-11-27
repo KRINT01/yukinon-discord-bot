@@ -241,7 +241,6 @@ class RuntimeState:
         self.cf_gpt_oss_cooldown_until: float = 0.0
         self.openrouter_manga_cooldown_until: float = 0.0
         self.edge_tts_cooldown_until: float = 0.0
-        self.last_ot_auto_report_ym: str = ""
 
         # Lightweight zero-RAM runtime telemetry counters
         self.decision_calls: int = 0

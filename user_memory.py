@@ -405,6 +405,34 @@ def _scrub_profile_memory(profile: dict, user=None) -> bool:
     return changed
 
 
+# Reserved top-level key in user_profiles.json for bot-wide state. Real keys are numeric Discord ids,
+# so "_meta" cannot collide. Everything that iterates or counts user_profiles must skip it.
+META_KEY = "_meta"
+
+
+def user_profile_count() -> int:
+    return len(user_profiles) - (META_KEY in user_profiles)
+
+
+def get_last_ot_report_ym() -> str:
+    return str((user_profiles.get(META_KEY) or {}).get("last_ot_report_ym", ""))
+
+
+async def set_last_ot_report_ym(pa_ym: str) -> None:
+    """Persists the last auto-sent OT report month locally and to the cloud backup so restarts do not resend."""
+    global _DIRTY_SINCE_LAST_BACKUP
+    user_profiles.setdefault(META_KEY, {})["last_ot_report_ym"] = pa_ym
+    _DIRTY_SINCE_LAST_BACKUP = True
+    await save_user_profiles_local_async()
+    await backup_user_profiles_to_discord(force=True)
+
+
+def is_ot_work_channel_name(pa_name: str) -> bool:
+    """Matches work/ot as whole name tokens (so #bot, #photos, #robot do not match) or the Thai substring."""
+    n = pa_name.lower()
+    return "งาน" in n or any(t in ("work", "ot") for t in re.split(r"[-_ ]+", n))
+
+
 def has_dirty_user_profiles() -> bool:
     """Returns True if local in-RAM user_profiles has changes not yet flushed to Discord cloud backup."""
     return bool(_DIRTY_SINCE_LAST_BACKUP)
@@ -436,7 +464,7 @@ def _apply_loaded_user_profiles(data: dict | None) -> None:
         return
     user_profiles.clear()
     user_profiles.update(data)
-    print(f"[User Memory] Loaded {len(user_profiles)} user profile(s) from local disk.", flush=True)
+    print(f"[User Memory] Loaded {user_profile_count()} user profile(s) from local disk.", flush=True)
 
 
 def load_user_profiles_local():
@@ -520,7 +548,7 @@ async def restore_user_profiles_from_discord(bot: discord.Client):
                                 user_profiles.update(data)
                                 await save_user_profiles_local_async()
                                 print(
-                                    f"[User Memory] Restored {len(user_profiles)} user profile(s) "
+                                    f"[User Memory] Restored {user_profile_count()} user profile(s) "
                                     f"from Discord channel #{ch.name}",
                                     flush=True,
                                 )
@@ -534,8 +562,8 @@ async def restore_user_profiles_from_discord(bot: discord.Client):
     await recover_ot_logs_from_work_channels(bot)
 
     scrubbed_any = False
-    for prof in user_profiles.values():
-        if isinstance(prof, dict) and _scrub_profile_memory(prof):
+    for uid_key, prof in user_profiles.items():
+        if uid_key != META_KEY and isinstance(prof, dict) and _scrub_profile_memory(prof):
             scrubbed_any = True
     if scrubbed_any:
         _DIRTY_SINCE_LAST_BACKUP = True
@@ -575,7 +603,7 @@ async def backup_user_profiles_to_discord(force: bool = False):
 
             # Upload new backup FIRST, then delete older `user_profiles.json` backup messages ONLY
             new_msg = await ch.send(
-                content=f"💾 **[Yukinon Persistent User Memory Backup]** (`{len(user_profiles)}` users | `{get_current_thai_datetime_str()}`)",
+                content=f"💾 **[Yukinon Persistent User Memory Backup]** (`{user_profile_count()}` users | `{get_current_thai_datetime_str()}`)",
                 file=discord.File(io.BytesIO(payload_bytes), filename="user_profiles.json"),
             )
 
@@ -1865,7 +1893,7 @@ async def recover_ot_logs_from_work_channels(bot: discord.Client):
     )
     for guild in bot.guilds:
         for ch in guild.text_channels:
-            if not any(k in ch.name.lower() for k in ("work", "ot", "งาน")):
+            if not is_ot_work_channel_name(ch.name):
                 continue
             try:
                 async for msg in ch.history(limit=120):
@@ -1897,7 +1925,7 @@ async def recover_ot_logs_from_work_channels(bot: discord.Client):
 
     if recovered_count > 0:
         for prof in user_profiles.values():
-            if "ot_logs" in prof:
+            if "ot_logs" in prof:  # META_KEY dict has no ot_logs, so it is safely skipped
                 prof["ot_logs"].sort(key=lambda x: _parse_stored_ot_date(x.get("date", "")) or (0, 0, 0))
         await save_user_profiles_local_async()
         print(f"[OT Tracker] Recovered {recovered_count} OT record(s) from #work channel history.", flush=True)

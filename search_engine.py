@@ -475,8 +475,8 @@ async def fetch_live_weather_context(user_text: str, channel_id: int = None) -> 
                     f"สภาพอากาศปัจจุบัน: {curr_desc} | อุณหภูมิ: {c.get('temperature_2m')}°C (รู้สึกเหมือน {c.get('apparent_temperature')}°C)\n"
                     f"ความชื้นสัมพัทธ์: {c.get('relative_humidity_2m')}% | ลม: {c.get('wind_speed_10m')} km/h | ปริมาณฝนขณะนี้: {c.get('precipitation')} มม.\n"
                     f"อุณหภูมิต่ำสุด-สูงสุดวันนี้: {t_min}°C ถึง {t_max}°C | โอกาสเกิดฝนตกสูงสุดของวันนี้: {rain_prob_max}%\n"
-                    f"แนวโน้มรายชั่วโมงวันนี้ (เช้า/บ่าย/เย็น/กลางคืน):\n" + "\n".join(hourly_lines) + "\n"
-                    f"</live_weather_report>"
+                    "แนวโน้มรายชั่วโมงวันนี้ (เช้า/บ่าย/เย็น/กลางคืน):\n" + "\n".join(hourly_lines) + "\n"
+                    "</live_weather_report>"
                 )
                 if channel_id:
                     channel_last_weather[channel_id] = {"report": report, "timestamp": time.time()}
@@ -527,8 +527,8 @@ async def fetch_live_weather_context(user_text: str, channel_id: int = None) -> 
                     f"สภาพอากาศปัจจุบัน ({loc_display}): {cond_desc}\n"
                     f"อุณหภูมิปัจจุบัน: {temp_c}°C (รู้สึกเหมือน {feels_c}°C) | ความชื้น: {humidity}% | น้ำฝน: {precip_mm} มม.\n"
                     f"โอกาสเกิดฝนตกสูงสุดของวันนี้: {max_rain_chance}%\n"
-                    f"แนวโน้มรายชั่วโมงวันนี้ (เช้า/บ่าย/เย็น/กลางคืน):\n" + "\n".join(hourly_lines) + "\n"
-                    f"</live_weather_report>"
+                    "แนวโน้มรายชั่วโมงวันนี้ (เช้า/บ่าย/เย็น/กลางคืน):\n" + "\n".join(hourly_lines) + "\n"
+                    "</live_weather_report>"
                 )
                 if channel_id:
                     channel_last_weather[channel_id] = {"report": report, "timestamp": time.time()}
@@ -611,19 +611,6 @@ async def open_safe_public_url_async(
         resp.release()
         current = await validate_safe_public_url_async(urljoin(current, location))
     raise ValueError(f"Too many redirects (> {max_redirects}).")
-
-
-def fetch_webpage_sync(url: str, max_chars: int = 14000) -> str:
-    safe_url = validate_safe_public_url(url)
-    downloaded = trafilatura.fetch_url(safe_url)
-    if not downloaded:
-        raise RuntimeError("Could not download URL content.")
-    extracted = trafilatura.extract(
-        downloaded, include_tables=True, include_comments=False, favor_precision=True
-    )
-    if not extracted:
-        raise RuntimeError("No readable article text found on page.")
-    return extracted[:max_chars]
 
 
 async def fetch_webpage_async(url: str, max_chars: int = 14000, timeout_sec: float = 6.0) -> str:
