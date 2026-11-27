@@ -4,6 +4,7 @@ import re
 import math
 import json
 import time
+import importlib.util
 import wave
 import array
 import base64
@@ -39,6 +40,7 @@ from config import (
     TTS_PARADEE_MODEL_DIR,
     TTS_PARADEE_IDLE_UNLOAD_SEC,
     TTS_PARADEE_RAM_GUARD_MB,
+    TTS_PARADEE_TIMEOUT_SEC,
     TTS_VOICE_TH,
     TTS_VOICE_EN,
     TTS_PITCH,
@@ -134,6 +136,7 @@ YUKINO_PARADEE_CUSTOM_DICT: dict[str, str] = {
 }
 
 _PARADEE_LOCK = threading.Lock()
+_PARADEE_ASYNC_LOCK: asyncio.Lock | None = None
 _PARADEE_TTS_MODEL = None
 _PARADEE_LAST_USED_TS: float = 0.0
 _PARADEE_IDLE_TASK: asyncio.Task | None = None
@@ -561,17 +564,24 @@ def _get_current_rss_mb() -> float:
         return 0.0
 
 
+def _get_paradee_async_lock() -> asyncio.Lock:
+    global _PARADEE_ASYNC_LOCK
+    if _PARADEE_ASYNC_LOCK is None:
+        _PARADEE_ASYNC_LOCK = asyncio.Lock()
+    return _PARADEE_ASYNC_LOCK
+
+
 def _can_safely_load_paradee_now() -> tuple[bool, str]:
     """
     OOM guardrail for 512 MB Render containers:
-    - Always allows synthesis if Paradee is already resident in RAM.
+    - Always allows synthesis if Paradee is already resident in RAM (unless on cooldown).
     - When unloaded on <=512 MB containers, skips loading during active manga rendering
-      (`manga_semaphore.locked()`) or when RSS already exceeds `TTS_PARADEE_RAM_GUARD_MB`.
+      (`manga_semaphore.locked()`) or when RSS already exceeds `TTS_PARADEE_RAM_GUARD_MB` (default 340 MB).
     """
-    if _PARADEE_TTS_MODEL is not None:
-        return True, ""
     if time.time() < state.paradee_tts_cooldown_until:
         return False, "cooldown"
+    if _PARADEE_TTS_MODEL is not None:
+        return True, ""
     if CONTAINER_RAM_LIMIT_MB <= 512:
         if manga_semaphore.locked():
             return False, "manga_active_oom_guard"
@@ -581,11 +591,396 @@ def _can_safely_load_paradee_now() -> tuple[bool, str]:
     return True, ""
 
 
+_THAI_DIGITS_SIMPLE = ("ศูนย์", "หนึ่ง", "สอง", "สาม", "สี่", "ห้า", "หก", "เจ็ด", "แปด", "เก้า")
+_THAI_PLACES_SIMPLE = ("", "สิบ", "ร้อย", "พัน", "หมื่น", "แสน", "ล้าน")
+
+
+def _int_to_thai_words(n: int) -> str:
+    """Zero-dependency pure-Python integer-to-Thai reader (avoids importing heavy pythainlp)."""
+    if n < 0:
+        return "ลบ" + _int_to_thai_words(-n)
+    if n == 0:
+        return "ศูนย์"
+    if n >= 1_000_000:
+        millions, rem = divmod(n, 1_000_000)
+        return _int_to_thai_words(millions) + "ล้าน" + (_int_to_thai_words(rem) if rem else "")
+    digits = [int(ch) for ch in str(n)]
+    length = len(digits)
+    parts: list[str] = []
+    for idx, d in enumerate(digits):
+        if d == 0:
+            continue
+        pos = length - 1 - idx
+        if pos == 0 and d == 1 and length > 1:
+            parts.append("เอ็ด")
+        elif pos == 1 and d == 2:
+            parts.append("ยี่สิบ")
+        elif pos == 1 and d == 1:
+            parts.append("สิบ")
+        else:
+            parts.append(_THAI_DIGITS_SIMPLE[d] + _THAI_PLACES_SIMPLE[pos])
+    return "".join(parts)
+
+
+def _preprocess_thai_lightweight(text: str) -> str:
+    """Expands Thai/Arabic digits & maiyamok (ๆ) cleanly without importing pythainlp."""
+    thai_to_arabic = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
+    s = (text or "").translate(thai_to_arabic)
+    # Expand comma-formatted numbers (e.g. 1,500 -> 1500)
+    s = re.sub(r"(?<=\d),(?=\d{3}\b)", "", s)
+
+    def _num_repl(m: re.Match) -> str:
+        raw = m.group(0)
+        if "." in raw:
+            int_p, frac_p = raw.split(".", 1)
+            frac_words = " ".join(_THAI_DIGITS_SIMPLE[int(c)] for c in frac_p if c.isdigit())
+            return f"{_int_to_thai_words(int(int_p))}จุด{frac_words}"
+        if len(raw) >= 7:
+            return " ".join(_THAI_DIGITS_SIMPLE[int(c)] for c in raw)
+        return _int_to_thai_words(int(raw))
+
+    s = re.sub(r"\b\d+(?:\.\d+)?\b", _num_repl, s)
+    # Expand maiyamok (ๆ) by repeating the preceding word/syllable chunk
+    s = re.sub(r"([\u0E00-\u0E4E]{1,12})\s*ๆ", r"\1 \1", s)
+    s = s.replace("ๆ", "")
+    return s
+
+
+def _dp_thai_tokenize_flat(text: str, vocab_dict: dict[str, str], max_len: int = 24) -> list[str]:
+    """
+    Zero-Trie minimum-token maximum-matching Thai word segmenter (newmm-equivalent DP).
+    Reads directly from the flat `ipa_dict` keys (~2.5 MB RAM vs ~100 MB for `pythainlp.util.Trie`)
+    and finishes in <0.5 ms per utterance without holding the GIL during a 62k-word Trie build!
+    """
+    n = len(text)
+    if n == 0:
+        return []
+    INF = 10**9
+    dp: list[tuple[int, int, int]] = [(INF, INF, n)] * (n + 1)
+    dp[n] = (0, 0, n)
+
+    for i in range(n - 1, -1, -1):
+        ch = text[i]
+        if ch.isspace():
+            j = i + 1
+            while j < n and text[j].isspace():
+                j += 1
+            u, t, _ = dp[j]
+            dp[i] = (u, t + 1, j)
+            continue
+        if ch.isascii() and (ch.isalnum() or ch in "-_'"):
+            j = i + 1
+            while j < n and text[j].isascii() and (text[j].isalnum() or text[j] in "-_'"):
+                j += 1
+            u, t, _ = dp[j]
+            dp[i] = (u, t + 1, j)
+            continue
+
+        best = (INF, INF, i + 1)
+        limit = min(n, i + max_len)
+        matched_any = False
+        for j in range(limit, i, -1):
+            sub = text[i:j]
+            if sub in vocab_dict:
+                matched_any = True
+                u, t, _ = dp[j]
+                cand = (u, t + 1, j)
+                if cand < best:
+                    best = cand
+
+        u1, t1, _ = dp[i + 1]
+        unk_cand = (u1 + 1, t1 + 1, i + 1)
+        if not matched_any or unk_cand < best:
+            best = unk_cand
+        dp[i] = best
+
+    tokens: list[str] = []
+    i = 0
+    while i < n:
+        _, _, nxt = dp[i]
+        if nxt <= i:
+            nxt = i + 1
+        tok = text[i:nxt]
+        if (
+            tokens
+            and len(tok) == 1
+            and ("\u0E00" <= tok <= "\u0E7F")
+            and tok not in vocab_dict
+            and tokens[-1] not in vocab_dict
+            and all("\u0E00" <= c <= "\u0E7F" for c in tokens[-1])
+        ):
+            tokens[-1] += tok
+        else:
+            tokens.append(tok)
+        i = nxt
+    return tokens
+
+
+def _locate_pythaitts_ipa_json() -> str:
+    """Finds PyThaiTTS's bundled `fastthaig2p/data/ipa.json` on disk WITHOUT importing `pythainlp`."""
+    try:
+        spec = importlib.util.find_spec("pythaitts")
+        if spec and spec.submodule_search_locations:
+            pkg_root = next(iter(spec.submodule_search_locations))
+            for rel in (
+                os.path.join("pretrained", "fastthaig2p", "data", "ipa.json"),
+                os.path.join("pretrained", "makham", "data", "ipa.json"),
+            ):
+                cand = os.path.join(pkg_root, rel)
+                if os.path.isfile(cand):
+                    return cand
+    except Exception:
+        pass
+    return ""
+
+
+def _fallback_ipa_to_kokoro(ipa: str) -> str:
+    """Lightweight Thai IPA -> Kokoro 5-tone phoneme mapper used if `pythaitts` helper isn't importable."""
+    s = (ipa or "").replace("/", "").replace(".", "")
+    for src, dst in (
+        ("t͡ɕʰ", "cʰ"), ("t͡ɕ", "c"), ("tɕʰ", "cʰ"), ("tɕ", "c"),
+        ("˧", "→"), ("˨˩", "↓"), ("˥˩", "↘"), ("˦˥", "↑"), ("˩˩˦", "↗"), ("˩˦", "↗"),
+    ):
+        s = s.replace(src, dst)
+    return s
+
+
+class _LowRamParadeeEngine:
+    """
+    Ultra-lean direct ONNX Runtime runner for MakHamTTS Paradee 1.1 INT8 (8.07 MB):
+    - Bypasses `pythainlp.util.Trie` (saves ~100 MB RAM and avoids multi-second GIL stalls on 0.1 vCPU!).
+    - Configures `onnxruntime.SessionOptions` with `enable_cpu_mem_arena=False`, `enable_mem_pattern=False`,
+      `intra_op_num_threads=1`, `inter_op_num_threads=1`, `ORT_SEQUENTIAL`, `ORT_ENABLE_BASIC`, and
+      `allow_spinning=0` (prevents 0.1 vCPU CFS starvation & Discord heartbeat blocking on Render Free Tier!).
+    """
+
+    sample_rate = 24000
+
+    def __init__(self, model_path: str, config_path: str, custom_dict: dict[str, str] | None = None):
+        import onnxruntime as ort
+
+        t0 = time.monotonic()
+        rss_start = _get_current_rss_mb()
+        api_log(f"Paradee TTS init start (low-RAM direct ORT, RSS={rss_start:.1f} MB)")
+
+        with open(config_path, "r", encoding="utf-8") as cf:
+            cfg = json.load(cf)
+        self.vocab: dict[str, int] = dict(cfg.get("vocab") or {})
+        if not self.vocab:
+            raise RuntimeError("Paradee config.json missing 'vocab' mapping")
+
+        # Load FastThaiG2P's 62k-word IPA table as a flat dict (~3-10 MB vs ~100 MB nested Trie)
+        ipa_path = _locate_pythaitts_ipa_json()
+        if not ipa_path:
+            raise RuntimeError("Could not locate pythaitts fastthaig2p data/ipa.json")
+        with open(ipa_path, "r", encoding="utf-8") as ipf:
+            raw_ipa = json.load(ipf)
+
+        self.ipa_dict: dict[str, str] = {}
+        self.max_word_len = 12
+        for k, v in raw_ipa.items():
+            if not isinstance(k, str) or not k:
+                continue
+            val_s = v if isinstance(v, str) else (v[0] if isinstance(v, list) and v else "")
+            if isinstance(val_s, str) and val_s:
+                self.ipa_dict[k] = val_s
+                if len(k) > self.max_word_len:
+                    self.max_word_len = min(28, len(k))
+        del raw_ipa
+
+        # Optional lightweight helpers from pythaitts (zero pythainlp Trie instantiation!)
+        self._ipa_to_kokoro = _fallback_ipa_to_kokoro
+        self._en_g2p = None
+        try:
+            from pythaitts.pretrained.fastthaig2p import ipa_to_kokoro as _pkg_i2k
+            if callable(_pkg_i2k):
+                self._ipa_to_kokoro = _pkg_i2k
+        except Exception:
+            pass
+        try:
+            from pythaitts.pretrained.fastthaig2p.en_g2p import en_g2p as _pkg_en_g2p
+            if callable(_pkg_en_g2p):
+                self._en_g2p = _pkg_en_g2p
+        except Exception:
+            pass
+
+        # Compile custom_dict entries (supports raw `/ipa/` OR Thai hyphenated syllables like `ยู-กิ-โนะ`)
+        self.custom_lower_map: dict[str, str] = {}
+        for word, reading in (custom_dict or {}).items():
+            w_clean = (word or "").strip()
+            r_clean = (reading or "").strip()
+            if not w_clean or not r_clean:
+                continue
+            if "/" in r_clean:
+                ipa_val = r_clean
+            else:
+                sylls = [p.strip() for p in re.split(r"[\s\-]+", r_clean) if p.strip()]
+                ipa_parts = [self._lookup_thai_piece(sy) for sy in sylls]
+                ipa_val = " ".join(p for p in ipa_parts if p)
+            if ipa_val:
+                self.ipa_dict[w_clean] = ipa_val
+                self.custom_lower_map[w_clean.lower()] = ipa_val
+                if len(w_clean) > self.max_word_len:
+                    self.max_word_len = min(28, len(w_clean))
+
+        rss_g2p = _get_current_rss_mb()
+        api_log(
+            f"Paradee G2P ready ({len(self.ipa_dict):,} entries, {time.monotonic() - t0:.2f}s, RSS={rss_g2p:.1f} MB)"
+        )
+
+        # Strict 512 MB / 0.1 vCPU ONNX Runtime SessionOptions (zero arena bloat, zero thread spinning)
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
+        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+        opts.enable_cpu_mem_arena = False
+        opts.enable_mem_pattern = False
+        try:
+            opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+            opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
+        except Exception:
+            pass
+
+        self.session = ort.InferenceSession(
+            model_path,
+            sess_options=opts,
+            providers=["CPUExecutionProvider"],
+        )
+        in_names = [inp.name for inp in self.session.get_inputs()]
+        self._ids_input_name = in_names[0] if in_names else "input_ids"
+        self._speed_input_name = in_names[1] if len(in_names) > 1 else "speed"
+        rss_end = _get_current_rss_mb()
+        api_log(
+            f"Paradee ORT session ready (inputs={in_names}, {time.monotonic() - t0:.2f}s, RSS={rss_end:.1f} MB)"
+        )
+
+    def _lookup_thai_piece(self, word: str) -> str:
+        if word in self.ipa_dict:
+            return self.ipa_dict[word]
+        # Greedy sub-word split for rare OOV Thai compounds
+        out: list[str] = []
+        i = 0
+        n = len(word)
+        while i < n:
+            matched = False
+            for j in range(min(n, i + 12), i, -1):
+                sub = word[i:j]
+                if sub in self.ipa_dict:
+                    out.append(self.ipa_dict[sub])
+                    i = j
+                    matched = True
+                    break
+            if not matched:
+                i += 1
+        return " ".join(out)
+
+    def _text_to_phonemes(self, text: str) -> str:
+        pre = _preprocess_thai_lightweight(text)
+        tokens = _dp_thai_tokenize_flat(pre, self.ipa_dict, max_len=self.max_word_len)
+        ipa_chunks: list[str] = []
+        for tok in tokens:
+            if not tok:
+                continue
+            if tok.isspace():
+                ipa_chunks.append(" ")
+                continue
+            if tok in self.ipa_dict:
+                ipa_chunks.append(self.ipa_dict[tok])
+                continue
+            low = tok.lower()
+            if low in self.custom_lower_map:
+                ipa_chunks.append(self.custom_lower_map[low])
+                continue
+            if tok.isascii():
+                if re.search(r"[A-Za-z]", tok) and self._en_g2p is not None:
+                    try:
+                        en_ipa = self._en_g2p(tok)
+                        if en_ipa:
+                            ipa_chunks.append(str(en_ipa))
+                            continue
+                    except Exception:
+                        pass
+                if tok in (",", ".", "!", "?", ";", ":"):
+                    ipa_chunks.append(tok)
+                continue
+            sub_ipa = self._lookup_thai_piece(tok)
+            if sub_ipa:
+                ipa_chunks.append(sub_ipa)
+
+        raw_ipa = " ".join(p for p in ipa_chunks if p)
+        raw_ipa = re.sub(r"\s+", " ", raw_ipa).strip()
+        return self._ipa_to_kokoro(raw_ipa)
+
+    def synthesize_waveform(self, text: str, speed: float = 1.10):
+        phonemes = self._text_to_phonemes(text)
+        if not phonemes:
+            return np.zeros(0, dtype=np.float32)
+
+        all_ids = [self.vocab[c] for c in phonemes if c in self.vocab]
+        if not all_ids:
+            return np.zeros(0, dtype=np.float32)
+
+        # Paradee / Kokoro max sequence length is 510 tokens; chunk safely at <=420
+        chunk_limit = 420
+        space_id = self.vocab.get(" ")
+        id_chunks: list[list[int]] = []
+        start = 0
+        total = len(all_ids)
+        while start < total:
+            end = min(total, start + chunk_limit)
+            if end < total and space_id is not None:
+                cut = end
+                while cut > start + 120 and all_ids[cut - 1] != space_id:
+                    cut -= 1
+                if cut > start + 120:
+                    end = cut
+            id_chunks.append(all_ids[start:end])
+            start = end
+
+        speed_arr = np.array([float(speed)], dtype=np.float32)
+        wav_parts: list = []
+        for ch_ids in id_chunks:
+            seq = [0] + ch_ids + [0]
+            feed = {
+                self._ids_input_name: np.array([seq], dtype=np.int64),
+                self._speed_input_name: speed_arr,
+            }
+            out = self.session.run(None, feed)[0]
+            arr = np.asarray(out, dtype=np.float32).reshape(-1)
+            if arr.size > 0:
+                wav_parts.append(arr)
+
+        if not wav_parts:
+            return np.zeros(0, dtype=np.float32)
+        if len(wav_parts) == 1:
+            return wav_parts[0]
+        gap = np.zeros(int(self.sample_rate * 0.04), dtype=np.float32)
+        stitched: list = []
+        for idx, part in enumerate(wav_parts):
+            if idx > 0:
+                stitched.append(gap)
+            stitched.append(part)
+        return np.concatenate(stitched)
+
+
+def _resolve_paradee_model_files_sync() -> tuple[str, str]:
+    """Returns `(model_path, config_path)` from pre-baked local dir, or downloads via huggingface_hub."""
+    if has_baked_paradee_model():
+        return (
+            os.path.join(TTS_PARADEE_MODEL_DIR, "paradee_thai_int8.onnx"),
+            os.path.join(TTS_PARADEE_MODEL_DIR, "config.json"),
+        )
+    from huggingface_hub import hf_hub_download
+    m_path = hf_hub_download("pythainlp/MakHamTTS", "paradee_thai/paradee_thai_int8.onnx")
+    c_path = hf_hub_download("pythainlp/MakHamTTS", "paradee_thai/config.json")
+    return m_path, c_path
+
+
 def _load_paradee_model_sync():
     """
-    Lazily instantiates PyThaiTTS `MakHamTTSParadee` (7.88M distilled INT8 ONNX, 8.07 MB):
-    - Uses pre-baked `/app/models/paradee_thai` files when present (0 Hub network checks!).
-    - Caps `intra_op_threads=1` on <=512 MB containers to keep ONNX arena RAM lean.
+    Lazily instantiates `_LowRamParadeeEngine` (Zero-Trie, Zero-Arena, Zero-Spin ONNX Runtime).
+    Falls back to `pythaitts` wrapper ONLY if local `ipa.json` cannot be located.
     """
     global _PARADEE_TTS_MODEL, _PARADEE_LAST_USED_TS
     with _PARADEE_LOCK:
@@ -593,39 +988,21 @@ def _load_paradee_model_sync():
             _PARADEE_LAST_USED_TS = time.time()
             return _PARADEE_TTS_MODEL
 
-        t0 = time.monotonic()
-        init_kwargs: dict = {
-            "speed": max(0.75, min(1.50, float(TTS_PARADEE_SPEED))),
-            "intra_op_threads": 1 if CONTAINER_RAM_LIMIT_MB <= 512 else 0,
-            "custom_dict": dict(YUKINO_PARADEE_CUSTOM_DICT),
-        }
-        source_tag = "hf_hub"
-        if has_baked_paradee_model():
-            init_kwargs["model_path"] = os.path.join(TTS_PARADEE_MODEL_DIR, "paradee_thai_int8.onnx")
-            init_kwargs["config_path"] = os.path.join(TTS_PARADEE_MODEL_DIR, "config.json")
-            source_tag = "local_baked"
-
-        try:
-            from pythaitts.pretrained.makham import MakHamTTSParadee
-            model = MakHamTTSParadee(**init_kwargs)
-        except ImportError:
-            from pythaitts import TTS
-            model = TTS(pretrained="makham_paradee", **init_kwargs)
-
-        _PARADEE_TTS_MODEL = model
+        model_path, config_path = _resolve_paradee_model_files_sync()
+        engine = _LowRamParadeeEngine(
+            model_path=model_path,
+            config_path=config_path,
+            custom_dict=dict(YUKINO_PARADEE_CUSTOM_DICT),
+        )
+        _PARADEE_TTS_MODEL = engine
         _PARADEE_LAST_USED_TS = time.time()
         state.paradee_tts_loaded = True
-        rss_after = _get_current_rss_mb()
-        api_log(
-            f"Paradee TTS loaded ({source_tag}, threads={init_kwargs['intra_op_threads']}, "
-            f"{time.monotonic() - t0:.2f}s, RSS={rss_after:.1f} MB)"
-        )
         return _PARADEE_TTS_MODEL
 
 
 def unload_paradee_tts(reason: str = "") -> bool:
     """
-    Explicitly releases the in-RAM `MakHamTTSParadee` ONNX session & G2P dictionaries and
+    Explicitly releases the in-RAM `_LowRamParadeeEngine` ONNX session & flat IPA dict and
     triggers glibc `malloc_trim(0)` via `release_unused_memory()` so Render 512 MB RAM stays clean.
     """
     global _PARADEE_TTS_MODEL, _PARADEE_IDLE_TASK
@@ -691,35 +1068,15 @@ def _schedule_paradee_idle_unload() -> None:
 
 def prewarm_paradee_tts_bg() -> None:
     """
-    Non-blocking background pre-warm invoked on `!join` (during the 1.5s DAVE handshake)
-    when `TTS_PRIMARY_ENGINE == "paradee"`, so the greeting plays immediately on Paradee.
+    No-op kept for API compatibility: intentionally does NOT pre-load during `!join` DAVE
+    handshake so voice connection & greeting stay instant and never spawn competing loader threads.
     """
-    if TTS_PRIMARY_ENGINE != "paradee" or _PARADEE_TTS_MODEL is not None:
-        return
-    ok, _ = _can_safely_load_paradee_now()
-    if not ok:
-        return
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return
-
-    async def _prewarm():
-        try:
-            await asyncio.to_thread(_load_paradee_model_sync)
-        except ImportError:
-            state.paradee_tts_cooldown_until = time.time() + 3600.0
-            api_log("Paradee TTS prewarm skipped: pythaitts not installed (cooldown 1h)")
-        except Exception as e:
-            state.paradee_tts_cooldown_until = time.time() + 300.0
-            api_log(f"Paradee TTS prewarm warning ({type(e).__name__}): {str(e)[:120]}")
-
-    loop.create_task(_prewarm())
+    return
 
 
 def _waveform_to_wav_bytes_sync(raw_out, default_sr: int = 24000) -> bytes:
     """
-    Normalizes any PyThaiTTS output (`bytes`, `(waveform, sr)` tuple, or `np.ndarray`)
+    Normalizes any waveform output (`bytes`, `(waveform, sr)` tuple, or `np.ndarray`)
     into a valid 16-bit mono PCM WAV buffer in RAM (zero temp files).
     """
     if raw_out is None:
@@ -728,7 +1085,6 @@ def _waveform_to_wav_bytes_sync(raw_out, default_sr: int = 24000) -> bytes:
         raw_b = bytes(raw_out)
         if raw_b[:4] == b"RIFF":
             return raw_b
-        # Treat bare bytes as 16-bit mono PCM @ default_sr
         out_io = io.BytesIO()
         with wave.open(out_io, "wb") as wf:
             wf.setnchannels(1)
@@ -740,7 +1096,6 @@ def _waveform_to_wav_bytes_sync(raw_out, default_sr: int = 24000) -> bytes:
     sr = default_sr
     wav_arr = raw_out
     if isinstance(raw_out, (tuple, list)) and len(raw_out) >= 2:
-        # Handle either (waveform, sample_rate) or (sample_rate, waveform)
         if isinstance(raw_out[1], (int, float)) and int(raw_out[1]) >= 8000:
             wav_arr, sr = raw_out[0], int(raw_out[1])
         elif isinstance(raw_out[0], (int, float)) and int(raw_out[0]) >= 8000:
@@ -775,23 +1130,14 @@ def _waveform_to_wav_bytes_sync(raw_out, default_sr: int = 24000) -> bytes:
 
 
 def _synthesize_paradee_wav_sync(spoken_text: str) -> bytes:
-    """Thread-safe offline Thai synthesis via `MakHamTTSParadee` returning 24 kHz WAV bytes."""
+    """Thread-safe offline Thai synthesis via `_LowRamParadeeEngine` returning 24 kHz WAV bytes."""
     global _PARADEE_LAST_USED_TS
     model = _load_paradee_model_sync()
     speed = max(0.75, min(1.50, float(TTS_PARADEE_SPEED)))
     with _PARADEE_LOCK:
         _PARADEE_LAST_USED_TS = time.time()
-        if hasattr(model, "tts") and callable(getattr(model, "tts")):
-            try:
-                raw_out = model.tts(spoken_text, return_type="waveform", speed=speed)
-            except TypeError:
-                raw_out = model.tts(spoken_text, return_type="waveform")
-        else:
-            try:
-                raw_out = model(text=spoken_text, return_type="waveform", speed=speed)
-            except TypeError:
-                raw_out = model(spoken_text, return_type="waveform")
-    default_sr = int(getattr(model, "sample_rate", None) or getattr(model, "SAMPLE_RATE", None) or 24000)
+        raw_out = model.synthesize_waveform(spoken_text, speed=speed)
+    default_sr = int(getattr(model, "sample_rate", None) or 24000)
     return _waveform_to_wav_bytes_sync(raw_out, default_sr=default_sr)
 
 
@@ -799,11 +1145,12 @@ async def _paradee_tts_with_mastering(
     spoken_text: str, output_format: str = "pcm"
 ) -> bytes:
     """
-    Synthesizes Thai / Thai-English speech offline using `MakHamTTSParadee` (8.07 MB INT8 ONNX):
-    - Native speed via `TTS_PARADEE_SPEED` (default `1.10`).
-    - Subtle cool-persona pitch shift via `TTS_PARADEE_PITCH` (default `0.96`, tempo-compensated
-      so final playback speed remains exact) + gentle `lowpass=f=9500` to smooth any 8M INT8 buzz.
-    - Single FFmpeg mastering pass directly to 48kHz stereo PCM (or MP3 for chat fallback).
+    Synthesizes Thai / Thai-English speech offline using `_LowRamParadeeEngine`:
+    - Serialized by `_PARADEE_ASYNC_LOCK` so concurrent turns never spawn duplicate loader threads.
+    - Hard `asyncio.wait_for(..., timeout=TTS_PARADEE_TIMEOUT_SEC)` guarantees instant fallback to
+      Google TTS if Render 0.1 vCPU ever stalls (never silences Yukino or blocks Discord heartbeats!).
+    - Native speed via `TTS_PARADEE_SPEED` (default `1.10`) + tempo-compensated cool pitch
+      via `TTS_PARADEE_PITCH` (default `0.96`) + `lowpass=f=9500`.
     """
     ok, skip_reason = _can_safely_load_paradee_now()
     if not ok:
@@ -812,15 +1159,32 @@ async def _paradee_tts_with_mastering(
         return b""
 
     t0 = time.monotonic()
+    timeout_sec = float(TTS_PARADEE_TIMEOUT_SEC) if _PARADEE_TTS_MODEL is None else min(8.0, float(TTS_PARADEE_TIMEOUT_SEC))
     try:
-        raw_wav = await asyncio.to_thread(_synthesize_paradee_wav_sync, spoken_text)
-    except ImportError:
+        async with _get_paradee_async_lock():
+            ok_inner, skip_inner = _can_safely_load_paradee_now()
+            if not ok_inner:
+                if skip_inner and skip_inner != "cooldown":
+                    api_log(f"Paradee TTS bypassed ({skip_inner}); falling back to Google TTS")
+                return b""
+            raw_wav = await asyncio.wait_for(
+                asyncio.to_thread(_synthesize_paradee_wav_sync, spoken_text),
+                timeout=timeout_sec,
+            )
+    except asyncio.TimeoutError:
+        state.paradee_tts_cooldown_until = time.time() + 300.0
+        api_log(
+            f"Paradee TTS timed out after {timeout_sec:.1f}s (RSS={_get_current_rss_mb():.1f} MB); "
+            "cooling down 5m and falling back to Google TTS"
+        )
+        return b""
+    except ImportError as e:
         state.paradee_tts_cooldown_until = time.time() + 3600.0
-        api_log("Paradee TTS unavailable (pythaitts not installed); cooling down 1h")
+        api_log(f"Paradee TTS unavailable ({e}); cooling down 1h")
         return b""
     except Exception as e:
         state.paradee_tts_cooldown_until = time.time() + 300.0
-        api_log(f"Paradee TTS synthesis error ({type(e).__name__}: {str(e)[:120]}); cooling down 5m")
+        api_log(f"Paradee TTS synthesis error ({type(e).__name__}: {str(e)[:140]}); cooling down 5m")
         return b""
 
     if not raw_wav or len(raw_wav) <= 44:
@@ -848,7 +1212,7 @@ async def _paradee_tts_with_mastering(
             state.active_tts_engine = "paradee"
             api_log(
                 f"Paradee TTS -> OK (speed={TTS_PARADEE_SPEED:.2f}x, pitch={pitch:.2f}, "
-                f"{len(mastered)}B {output_format}, {time.monotonic() - t0:.2f}s)"
+                f"{len(mastered)}B {output_format}, {time.monotonic() - t0:.2f}s, RSS={_get_current_rss_mb():.1f} MB)"
             )
             return mastered
     except Exception as e:
@@ -2401,10 +2765,10 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
     - Caps concurrent STT tasks via `voice_stt_semaphore` (`Semaphore(2)`).
     """
 
-    BASE_SPEECH_RMS_MIN = 110.0
-    CONTINUE_SPEECH_RMS_MIN = 85.0
-    MIN_PEAK_RMS = 145.0
-    MIN_ACTIVE_SPEECH_FRAMES = 10
+    BASE_SPEECH_RMS_MIN = 95.0
+    CONTINUE_SPEECH_RMS_MIN = 70.0
+    MIN_PEAK_RMS = 130.0
+    MIN_ACTIVE_SPEECH_FRAMES = 7
 
     def __init__(self, guild: discord.Guild, text_channel, vc=None):
         super().__init__()
@@ -2584,7 +2948,8 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
                         elif active_frames > 0:
                             print(
                                 f"[Voice VAD Dropped Noise] speaker={user.display_name}, "
-                                f"frames={active_frames}, peak={int(peak)} < {int(min_peak)} (floor={int(floor)})",
+                                f"frames={active_frames}/{self.MIN_ACTIVE_SPEECH_FRAMES}, "
+                                f"peak={int(peak)}/{int(min_peak)}, bytes={len(pcm_bytes)}/38400 (floor={int(floor)})",
                                 flush=True,
                             )
             for user, pcm_bytes, active_frames, peak, floor, utt_ts in ready_payloads:

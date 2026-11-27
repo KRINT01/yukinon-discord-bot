@@ -1347,7 +1347,6 @@ async def _connect_bot_to_voice_channel(ctx, target_channel, greet: bool = True)
         )
     )
 
-    prewarm_paradee_tts_bg()
     await asyncio.sleep(1.5)
 
     if HAS_VOICE_RECV and hasattr(vc, "listen"):
