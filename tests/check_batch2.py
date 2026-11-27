@@ -161,11 +161,22 @@ async def check_mentioned_names_not_saved():
     guild = SimpleNamespace(get_member=lambda i: member if i == 555 else None)
     speaker = SimpleNamespace(id=777, bot=False, display_name="Speaker", name="speaker_y")
     try:
-        user_memory.user_profiles["555"] = {"display_name": "Bobby", "interaction_count": 3}
-        resolved, _ = user_memory.resolve_user_mentions_and_build_dossier(
+        secrets = ["SecretPinnedFact", "SecretNoteText", "SecretFavTopic", "SecretRecentTopic"]
+        user_memory.user_profiles["555"] = {
+            "display_name": "Bobby", "interaction_count": 3,
+            "pinned_facts": [secrets[0]], "custom_notes": [secrets[1]],
+            "favorite_topics": [secrets[2]], "recent_topics": [secrets[3]],
+        }
+        user_memory.user_profiles["556"] = {
+            "is_owner": True, "custom_notes": ["OwnerSecretNote"], "favorite_topics": ["OwnerSecretFav"],
+        }
+        resolved, dossier = user_memory.resolve_user_mentions_and_build_dossier(
             "<@555> ชอบกินอะไร", guild, 1, speaker_user=speaker
         )
         assert "@Bobby" in resolved, resolved
+        assert "Bobby" in dossier and not any(s in dossier for s in secrets), dossier
+        _, owner_dossier = user_memory.resolve_user_mentions_and_build_dossier("<@556> คือใคร", guild, 1)
+        assert "คู่หูชมรมบริการ" in owner_dossier and "OwnerSecret" not in owner_dossier, owner_dossier
 
         user_memory.record_user_interaction(speaker, resolved, learned_memo="Bobby เป็นเพื่อนสนิท")
         prof = user_memory.user_profiles["777"]
@@ -187,6 +198,7 @@ async def check_mentioned_names_not_saved():
             user_memory._schedule_bg_task,
         ) = real
         user_memory.user_profiles.pop("555", None)
+        user_memory.user_profiles.pop("556", None)
         user_memory.user_profiles.pop("777", None)
         user_memory._MENTIONED_NAMES_BY_SPEAKER.pop("777", None)
 

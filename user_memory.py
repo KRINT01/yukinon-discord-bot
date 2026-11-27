@@ -1081,15 +1081,10 @@ def resolve_user_mentions_and_build_dossier(
         if is_target_owner:
             readable_tag = "@[คู่หูชมรมบริการ / ผู้สร้างของฉัน]"
             resolved_text = re.sub(rf"<@!?{uid_str}>", readable_tag, resolved_text)
-            favs = ", ".join((prof or {}).get("favorite_topics") or ["การเขียนโค้ด", "เกม", "เทคโนโลยี"])
-            all_notes = list((prof or {}).get("pinned_facts") or []) + list((prof or {}).get("custom_notes") or [])
-            notes = "; ".join(all_notes[:10])
             asking_about_self = (speaker_user and str(getattr(speaker_user, "id", "")) == uid_str)
             dossier_entries.append(
                 f"- ข้อมูลของ {readable_tag}: เขาคือคู่หูคนสำคัญในชมรมบริการและผู้ดูแลของฉันเองค่ะ "
-                f"{'(ซึ่งก็คือตัวนายที่กำลังถามฉันอยู่นี่แหละ!)' if asking_about_self else ''} "
-                f"ความสนใจของเขาคือ: {favs}"
-                + (f" | บันทึกเพิ่มเติม: {notes}" if notes else "")
+                f"{'(ซึ่งก็คือตัวนายที่กำลังถามฉันอยู่นี่แหละ!)' if asking_about_self else ''}"
                 + "\n  [กฎเหล็ก: ห้ามเอ่ยหรือพิมพ์ชื่อจริงของเขาเด็ดขาด ให้พูดถึงเขาในฐานะ 'นาย' (หากเขาถามเอง) หรือ 'เขา / คู่หูชมรมบริการของฉัน' (หากคนอื่นถามถึง)]"
             )
             continue
@@ -1107,22 +1102,14 @@ def resolve_user_mentions_and_build_dossier(
             roles_list = [r.name for r in member.roles if r.name != "@everyone"][-4:]
         roles_str = ", ".join(roles_list) if roles_list else "สมาชิกในเซิร์ฟเวอร์"
 
+        # A mentioned member's memory (pinned facts, notes, topics) is intentionally not exposed to other members
         if prof and int(prof.get("interaction_count", 0)) > 0:
             cnt = prof.get("interaction_count", 1)
             last_t = prof.get("last_seen", "ไม่ระบุ")
-            favs = ", ".join(prof.get("favorite_topics") or []) or "คุยเรื่องทั่วไป"
-            all_notes = list(prof.get("pinned_facts") or []) + list(prof.get("custom_notes") or [])
-            notes = "; ".join(all_notes[:10])
-            recents = " / ".join(prof.get("recent_topics") or [])
-            entry = (
+            dossier_entries.append(
                 f"- ข้อมูลของสมาชิกชื่อ **{clean_name}** (ยศในเซิร์ฟเวอร์: {roles_str}):\n"
-                f"  * สถานะความคุ้นเคย: **รู้จักและเคยคุยกับฉันมาแล้ว {cnt} ครั้ง** (คุยกันล่าสุดเมื่อ: {last_t})\n"
-                f"  * ความสนใจ/หัวข้อที่ชอบคุย: {favs}\n"
-                f"  * เรื่องที่เคยถามฉันล่าสุด: `{recents}`"
+                f"  * สถานะความคุ้นเคย: **รู้จักและเคยคุยกับฉันมาแล้ว {cnt} ครั้ง** (คุยกันล่าสุดเมื่อ: {last_t})"
             )
-            if notes:
-                entry += f"\n  * บันทึกความจำเกี่ยวกับคนนี้: {notes}"
-            dossier_entries.append(entry)
         else:
             dossier_entries.append(
                 f"- ข้อมูลของสมาชิกชื่อ **{clean_name}** (ยศในเซิร์ฟเวอร์: {roles_str}):\n"
