@@ -805,12 +805,30 @@ async def consolidate_user_memory_async(uid_str: str):
         if not m_json:
             return
         parsed = json.loads(m_json.group(0))
+
+        # The LLM await can take seconds; if the user (or a tool) changed memory meanwhile, writing
+        # the stale snapshot would silently drop that change. Skip and let the next trigger retry.
+        cur = user_profiles.get(uid_str)
+        if (
+            cur is not prof
+            or list(cur.get("custom_notes") or []) != notes
+            or list(cur.get("pinned_facts") or []) != pinned
+        ):
+            api_log(f"MemoryConsolidate -> uid={uid_str[-4:]} skipped (profile changed during consolidation)")
+            _CONSOLIDATION_COOLDOWN.pop(uid_str, None)
+            return
+
         new_pinned = parsed.get("pinned_facts")
         new_notes = parsed.get("custom_notes")
         if isinstance(new_pinned, list) and isinstance(new_notes, list):
             clean_pinned = [x for x in new_pinned if _is_valid_custom_note(x)]
             clean_notes = [x for x in new_notes if _is_valid_custom_note(x)]
-            prof["pinned_facts"] = _dedupe_clean_list(clean_pinned, max_items=15, max_item_len=150)
+            # Existing pinned facts are never removed: they come first and the cap only limits additions.
+            # Ceiling: dedupe is exact (case/whitespace-insensitive), so a reworded duplicate of an existing
+            # pinned fact can be added alongside the original. Upgrade path: fuzzy matching.
+            prof["pinned_facts"] = _dedupe_clean_list(
+                pinned + clean_pinned, max_items=max(15, len(pinned)), max_item_len=150
+            )
             prof["custom_notes"] = _dedupe_clean_list(clean_notes, max_items=8, max_item_len=150)
             _DIRTY_SINCE_LAST_BACKUP = True
             await save_user_profiles_local_async()
