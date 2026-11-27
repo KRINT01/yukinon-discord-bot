@@ -7,7 +7,7 @@ import ipaddress
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from urllib.parse import urlparse, quote_plus
+from urllib.parse import urlparse, quote_plus, urljoin
 
 import aiohttp
 import trafilatura
@@ -613,29 +613,39 @@ async def validate_safe_public_url_async(url: str) -> str:
     return cleaned
 
 
-def fetch_webpage_sync(url: str, max_chars: int = 14000) -> str:
-    safe_url = validate_safe_public_url(url)
-    downloaded = trafilatura.fetch_url(safe_url)
-    if not downloaded:
-        raise RuntimeError("Could not download URL content.")
-    extracted = trafilatura.extract(
-        downloaded, include_tables=True, include_comments=False, favor_precision=True
-    )
-    if not extracted:
-        raise RuntimeError("No readable article text found on page.")
-    return extracted[:max_chars]
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+
+async def open_safe_public_url_async(
+    session: aiohttp.ClientSession, url: str, max_redirects: int = 3, **get_kwargs
+) -> aiohttp.ClientResponse:
+    """
+    SSRF-safe GET: validates the initial URL AND every redirect hop (aiohttp's automatic
+    redirect following would otherwise reach private/metadata IPs unchecked).
+    Caller owns the returned response: use `async with await open_safe_public_url_async(...) as resp:`.
+    Known ceiling: DNS can still change between validation and connect (rebinding); closing that
+    needs a custom aiohttp resolver that pins the validated IPs.
+    """
+    current = await validate_safe_public_url_async(url)
+    for _ in range(max_redirects + 1):
+        resp = await session.get(current, allow_redirects=False, **get_kwargs)
+        location = resp.headers.get("Location")
+        if resp.status not in _REDIRECT_STATUSES or not location:
+            return resp
+        resp.release()
+        current = await validate_safe_public_url_async(urljoin(current, location))
+    raise ValueError(f"Too many redirects (> {max_redirects}).")
 
 
 async def fetch_webpage_async(url: str, max_chars: int = 14000, timeout_sec: float = 6.0) -> str:
     """Async SSRF-validated webpage fetcher using pooled aiohttp + trafilatura HTML extraction."""
-    safe_url = await validate_safe_public_url_async(url)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
     session = get_http_session()
-    async with session.get(
-        safe_url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout_sec)
+    async with await open_safe_public_url_async(
+        session, url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout_sec)
     ) as resp:
         if resp.status != 200:
             raise RuntimeError(f"HTTP {resp.status} downloading URL.")
