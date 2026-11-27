@@ -1,5 +1,7 @@
 import os
 import io
+import sys
+import ast
 import re
 import math
 import json
@@ -716,33 +718,94 @@ def _dp_thai_tokenize_flat(text: str, vocab_dict: dict[str, str], max_len: int =
     return tokens
 
 
-def _locate_pythaitts_ipa_json() -> str:
-    """Finds PyThaiTTS's bundled `fastthaig2p/data/ipa.json` on disk WITHOUT importing `pythainlp`."""
+def _locate_pythaitts_pkg_root() -> str:
+    """Finds the installed `pythaitts` folder on disk purely via filesystem scan (ZERO Python import!)."""
+    for base in sys.path:
+        if not base or not isinstance(base, str):
+            continue
+        cand = os.path.join(base, "pythaitts")
+        if os.path.isdir(cand):
+            return cand
     try:
         spec = importlib.util.find_spec("pythaitts")
         if spec and spec.submodule_search_locations:
-            pkg_root = next(iter(spec.submodule_search_locations))
-            for rel in (
-                os.path.join("pretrained", "fastthaig2p", "data", "ipa.json"),
-                os.path.join("pretrained", "makham", "data", "ipa.json"),
-            ):
-                cand = os.path.join(pkg_root, rel)
-                if os.path.isfile(cand):
-                    return cand
+            return next(iter(spec.submodule_search_locations))
     except Exception:
         pass
     return ""
 
 
+def _locate_pythaitts_ipa_json() -> str:
+    """Finds PyThaiTTS's bundled `fastthaig2p/data/ipa.json` on disk WITHOUT importing `pythaitts` or `pythainlp`."""
+    if TTS_PARADEE_MODEL_DIR:
+        baked_ipa = os.path.join(TTS_PARADEE_MODEL_DIR, "ipa.json")
+        if os.path.isfile(baked_ipa):
+            return baked_ipa
+    pkg_root = _locate_pythaitts_pkg_root()
+    if pkg_root:
+        for rel in (
+            os.path.join("pretrained", "fastthaig2p", "data", "ipa.json"),
+            os.path.join("pretrained", "makham", "data", "ipa.json"),
+        ):
+            cand = os.path.join(pkg_root, rel)
+            if os.path.isfile(cand):
+                return cand
+    return ""
+
+
+_FORBIDDEN_LEAF_IMPORTS = frozenset({
+    "pythaitts", "pythainlp", "torch", "torchaudio", "transformers",
+    "soundfile", "scipy", "tltk", "huggingface_hub", "onnxruntime",
+})
+
+
+def _load_stdlib_leaf_module_safely(file_path: str, alias_name: str):
+    """
+    Loads a single leaf `.py` file (e.g. `kokoro.py` or `en_g2p.py`) directly by file path
+    ONLY after AST verification proves it has NO relative imports and NO heavy dependencies
+    (`pythainlp`, `pythaitts`, `torch`, `tltk`, `soundfile`, etc.).
+    Completely bypasses `pythaitts/__init__.py` so zero heavy NLP packages enter `sys.modules`!
+    """
+    if not file_path or not os.path.isfile(file_path):
+        return None
+    try:
+        with open(file_path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        tree = ast.parse(src, filename=file_path)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    root_mod = (a.name or "").split(".", 1)[0]
+                    if root_mod in _FORBIDDEN_LEAF_IMPORTS:
+                        return None
+            elif isinstance(node, ast.ImportFrom):
+                if getattr(node, "level", 0) > 0:
+                    return None
+                root_mod = (node.module or "").split(".", 1)[0]
+                if root_mod in _FORBIDDEN_LEAF_IMPORTS:
+                    return None
+        spec = importlib.util.spec_from_file_location(alias_name, file_path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
 def _fallback_ipa_to_kokoro(ipa: str) -> str:
-    """Lightweight Thai IPA -> Kokoro 5-tone phoneme mapper used if `pythaitts` helper isn't importable."""
-    s = (ipa or "").replace("/", "").replace(".", "")
+    """
+    Zero-dependency Thai Wiktionary IPA -> Kokoro 5-tone phoneme mapper matching FastThaiG2P's
+    `kokoro.py` (strips slashes/dots/unreleased markers, maps affricates & all 5 Chao tone marks).
+    """
+    s = (ipa or "").replace("/", "").replace(".", "").replace("̚", "").replace("̯", "")
     for src, dst in (
         ("t͡ɕʰ", "cʰ"), ("t͡ɕ", "c"), ("tɕʰ", "cʰ"), ("tɕ", "c"),
-        ("˧", "→"), ("˨˩", "↓"), ("˥˩", "↘"), ("˦˥", "↑"), ("˩˩˦", "↗"), ("˩˦", "↗"),
+        ("˩˩˦", "↗"), ("˩˦", "↗"), ("˨˩", "↓"), ("˥˩", "↘"), ("˦˥", "↑"), ("˧", "→"),
     ):
         s = s.replace(src, dst)
-    return s
+    return re.sub(r"\s+", " ", s).strip()
 
 
 class _LowRamParadeeEngine:
@@ -788,21 +851,23 @@ class _LowRamParadeeEngine:
                     self.max_word_len = min(28, len(k))
         del raw_ipa
 
-        # Optional lightweight helpers from pythaitts (zero pythainlp Trie instantiation!)
+        # Load ONLY stdlib-safe leaf files (`kokoro.py`, `en_g2p.py`) directly by path —
+        # NEVER execute `from pythaitts...` (which imports `pythainlp` + ~270 MB into sys.modules!)
         self._ipa_to_kokoro = _fallback_ipa_to_kokoro
         self._en_g2p = None
-        try:
-            from pythaitts.pretrained.fastthaig2p import ipa_to_kokoro as _pkg_i2k
-            if callable(_pkg_i2k):
-                self._ipa_to_kokoro = _pkg_i2k
-        except Exception:
-            pass
-        try:
-            from pythaitts.pretrained.fastthaig2p.en_g2p import en_g2p as _pkg_en_g2p
-            if callable(_pkg_en_g2p):
-                self._en_g2p = _pkg_en_g2p
-        except Exception:
-            pass
+        pkg_root = _locate_pythaitts_pkg_root()
+        if pkg_root:
+            f2p_dir = os.path.join(pkg_root, "pretrained", "fastthaig2p")
+            leaf_kokoro = _load_stdlib_leaf_module_safely(
+                os.path.join(f2p_dir, "kokoro.py"), "_paradee_leaf_kokoro"
+            )
+            if leaf_kokoro is not None and callable(getattr(leaf_kokoro, "ipa_to_kokoro", None)):
+                self._ipa_to_kokoro = leaf_kokoro.ipa_to_kokoro
+            leaf_eng2p = _load_stdlib_leaf_module_safely(
+                os.path.join(f2p_dir, "en_g2p.py"), "_paradee_leaf_eng2p"
+            )
+            if leaf_eng2p is not None and callable(getattr(leaf_eng2p, "en_g2p", None)):
+                self._en_g2p = leaf_eng2p.en_g2p
 
         # Compile custom_dict entries (supports raw `/ipa/` OR Thai hyphenated syllables like `ยู-กิ-โนะ`)
         self.custom_lower_map: dict[str, str] = {}
@@ -825,7 +890,8 @@ class _LowRamParadeeEngine:
 
         rss_g2p = _get_current_rss_mb()
         api_log(
-            f"Paradee G2P ready ({len(self.ipa_dict):,} entries, {time.monotonic() - t0:.2f}s, RSS={rss_g2p:.1f} MB)"
+            f"Paradee G2P ready ({len(self.ipa_dict):,} entries, en_g2p={self._en_g2p is not None}, "
+            f"{time.monotonic() - t0:.2f}s, RSS={rss_g2p:.1f} MB)"
         )
 
         # Strict 512 MB / 0.1 vCPU ONNX Runtime SessionOptions (zero arena bloat, zero thread spinning)
@@ -994,6 +1060,10 @@ def _load_paradee_model_sync():
             config_path=config_path,
             custom_dict=dict(YUKINO_PARADEE_CUSTOM_DICT),
         )
+        if time.time() < state.paradee_tts_cooldown_until:
+            del engine
+            release_unused_memory()
+            raise RuntimeError("Paradee init finished after timeout cooldown; released to save RAM")
         _PARADEE_TTS_MODEL = engine
         _PARADEE_LAST_USED_TS = time.time()
         state.paradee_tts_loaded = True
