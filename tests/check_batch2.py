@@ -46,7 +46,15 @@ async def check_groq_discovery_negative_cache():
         llm_providers._GROQ_MODELS_LAST_FETCH_TS = time.time()
         cands = await llm_providers.get_groq_search_and_chat_candidates()
         assert 0 < len(cands) <= 3, cands
+
+        # Cooling models do not take the capped slots
+        for m in cands:
+            llm_providers._GROQ_MODEL_COOLDOWN_UNTIL[m] = time.time() + 3600.0
+        cands2 = await llm_providers.get_groq_search_and_chat_candidates()
+        assert len(cands2) == 3 and not set(cands2) & set(cands), (cands, cands2)
     finally:
+        for m in [f"vendor/model-{i}" for i in range(10)]:
+            llm_providers._GROQ_MODEL_COOLDOWN_UNTIL.pop(m, None)
         llm_providers.get_http_session = real_session
         llm_providers.GROQ_API_KEY = real_key
         llm_providers._GROQ_AVAILABLE_MODELS_CACHE = []
@@ -129,7 +137,33 @@ async def check_memory_consolidation():
         assert prof["pinned_facts"] == pinned, prof["pinned_facts"]
         assert prof["custom_notes"] == notes + ["Added while consolidating"], prof["custom_notes"]
         assert uid not in user_memory._CONSOLIDATION_COOLDOWN, "skip must allow a retry"
+
+        # Case 3: pinned is full -> the promoted fact is moved back to notes instead of being lost
+        mutate["on"] = False
+        full_pinned = [f"Durable fact number {i}" for i in range(15)]
+        user_memory.user_profiles[uid] = {"custom_notes": list(notes), "pinned_facts": list(full_pinned)}
+        user_memory._CONSOLIDATION_COOLDOWN.pop(uid, None)
+        await user_memory.consolidate_user_memory_async(uid)
+        prof = user_memory.user_profiles[uid]
+        assert prof["pinned_facts"] == full_pinned, prof["pinned_facts"]
+        assert "Works as a Java backend developer" in prof["custom_notes"], prof["custom_notes"]
+        assert "Has a cat named Mochi" in prof["custom_notes"], prof["custom_notes"]
+
+        # Case 4: mention filter drops new LLM text with a mentioned name but keeps exact existing notes
+        user_memory._MENTIONED_NAMES_BY_SPEAKER[uid] = ["bobby"]
+        own_note = "Plays games with Bobby every Friday"
+        llm_out = json.dumps({
+            "pinned_facts": ["Bobby is a close friend"],
+            "custom_notes": [own_note, "Talked about Bobby today"],
+        })
+        user_memory.user_profiles[uid] = {"custom_notes": notes + [own_note], "pinned_facts": list(pinned)}
+        user_memory._CONSOLIDATION_COOLDOWN.pop(uid, None)
+        await user_memory.consolidate_user_memory_async(uid)
+        prof = user_memory.user_profiles[uid]
+        assert prof["pinned_facts"] == pinned, prof["pinned_facts"]
+        assert prof["custom_notes"] == [own_note], prof["custom_notes"]
     finally:
+        user_memory._MENTIONED_NAMES_BY_SPEAKER.pop(uid, None)
         config.GROQ_API_KEY = real_groq_key
         llm.call_gemma_ai_studio_chat = real_gemma
         user_memory.save_user_profiles_local_async = real_save

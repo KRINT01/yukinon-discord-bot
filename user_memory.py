@@ -841,15 +841,31 @@ async def consolidate_user_memory_async(uid_str: str):
         new_notes = parsed.get("custom_notes")
         if isinstance(new_pinned, list) and isinstance(new_notes, list):
             mention_re = _mentioned_name_regex(uid_str)
-            clean_pinned = [x for x in new_pinned if _is_valid_custom_note(x) and not mention_re.search(str(x))]
-            clean_notes = [x for x in new_notes if _is_valid_custom_note(x) and not mention_re.search(str(x))]
+
+            def _key(x) -> str:
+                # Same normalization as _dedupe_clean_list
+                return re.sub(r"\s+", " ", str(x or "")).strip()[:150].lower()
+
+            # Exact copies of existing entries are exempt from the mention filter so notes saved by an
+            # explicit memory command survive; only new LLM-written text is filtered.
+            orig_keys = {_key(x) for x in notes + pinned}
+
+            def _keep(x) -> bool:
+                return _is_valid_custom_note(x) and (_key(x) in orig_keys or not mention_re.search(str(x)))
+
+            clean_pinned = [x for x in new_pinned if _keep(x)]
+            clean_notes = [x for x in new_notes if _keep(x)]
             # Existing pinned facts are never removed: they come first and the cap only limits additions.
             # Ceiling: dedupe is exact (case/whitespace-insensitive), so a reworded duplicate of an existing
             # pinned fact can be added alongside the original. Upgrade path: fuzzy matching.
             prof["pinned_facts"] = _dedupe_clean_list(
                 pinned + clean_pinned, max_items=max(15, len(pinned)), max_item_len=150
             )
-            prof["custom_notes"] = _dedupe_clean_list(clean_notes, max_items=8, max_item_len=150)
+            # Promotions cut by the pinned cap go back to notes (first, as they are durable), since the LLM
+            # already removed them from custom_notes. Ceiling: at 8 notes, older transient notes are dropped.
+            kept_pinned = {_key(x) for x in prof["pinned_facts"]}
+            overflow = [x for x in clean_pinned if _key(x) not in kept_pinned]
+            prof["custom_notes"] = _dedupe_clean_list(overflow + clean_notes, max_items=8, max_item_len=150)
             _DIRTY_SINCE_LAST_BACKUP = True
             await save_user_profiles_local_async()
             api_log(

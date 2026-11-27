@@ -718,6 +718,9 @@ async def get_groq_search_and_chat_candidates() -> list[str]:
         if mod != GROQ_CODE_MODEL and not _is_reserved_groq_vision_model(mod) and mod not in candidates:
             candidates.append(mod)
 
+    # Drop cooling models first so they cannot occupy the capped slots (call_groq_chat would skip them anyway)
+    now = time.time()
+    candidates = [m for m in candidates if now >= _GROQ_MODEL_COOLDOWN_UNTIL.get(m, 0.0)]
     # Ceiling: only 3 Groq models are tried per call to bound fallback latency.
     # Upgrade path: raise the cap if Groq rate limits per model and more fallbacks are needed.
     return candidates[:3]

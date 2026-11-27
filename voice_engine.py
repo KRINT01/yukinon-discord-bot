@@ -2207,7 +2207,10 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
     async def _process_user_pcm(self, user, pcm_bytes: bytes, utterance_ts: float):
         try:
             spoken_text = ""
-            # Semaphore covers only STT; holding it through the LLM/TTS reply would starve other speakers
+            # Semaphore covers only STT; holding it through the LLM/TTS reply would starve other speakers.
+            # Ceiling: reply pipelines (Decision-1 + LLM) now run unbounded in parallel, one per utterance;
+            # only playback is serialized by tts_lock. Upgrade path: a small separate reply semaphore if
+            # provider rate limits get hit in busy voice channels.
             async with voice_stt_semaphore:
                 compact_wav = await asyncio.to_thread(convert_pcm48k_stereo_to_wav16k_sync, pcm_bytes)
                 if not compact_wav:
