@@ -128,6 +128,13 @@ SAUCENAO_API_KEY = os.getenv("SAUCENAO_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 
 # Yukino Yukinoshita Voice Profile (Cool, calm, slightly brisk, smooth pause trimming)
+# TTS_PRIMARY_ENGINE: "paradee" (offline MakHamTTS Paradee 1.1 INT8 for Thai + Google/Edge for EN), "google", or "edge"
+TTS_PRIMARY_ENGINE = os.getenv("TTS_PRIMARY_ENGINE", "paradee").strip().lower()
+TTS_PARADEE_SPEED = float(os.getenv("TTS_PARADEE_SPEED", "1.10"))
+TTS_PARADEE_PITCH = float(os.getenv("TTS_PARADEE_PITCH", "0.96"))
+TTS_PARADEE_MODEL_DIR = os.getenv("TTS_PARADEE_MODEL_DIR", "/app/models/paradee_thai").strip()
+TTS_PARADEE_IDLE_UNLOAD_SEC = max(30, int(os.getenv("TTS_PARADEE_IDLE_UNLOAD_SEC", "180") or "180"))
+TTS_PARADEE_RAM_GUARD_MB = max(256, int(os.getenv("TTS_PARADEE_RAM_GUARD_MB", "400") or "400"))
 TTS_VOICE_TH = os.getenv("TTS_VOICE_TH", "th-TH-PremwadeeNeural")
 TTS_VOICE_EN = os.getenv("TTS_VOICE_EN", "en-US-AriaNeural")
 TTS_PITCH = os.getenv("TTS_PITCH", "-2Hz")
@@ -241,6 +248,9 @@ class RuntimeState:
         self.cf_gpt_oss_cooldown_until: float = 0.0
         self.openrouter_manga_cooldown_until: float = 0.0
         self.edge_tts_cooldown_until: float = 0.0
+        self.paradee_tts_cooldown_until: float = 0.0
+        self.paradee_tts_loaded: bool = False
+        self.active_tts_engine: str = TTS_PRIMARY_ENGINE
 
         # Lightweight zero-RAM runtime telemetry counters
         self.decision_calls: int = 0

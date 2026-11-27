@@ -32,6 +32,13 @@ import speech_recognition as sr
 
 from config import (
     HTTPS,
+    CONTAINER_RAM_LIMIT_MB,
+    TTS_PRIMARY_ENGINE,
+    TTS_PARADEE_SPEED,
+    TTS_PARADEE_PITCH,
+    TTS_PARADEE_MODEL_DIR,
+    TTS_PARADEE_IDLE_UNLOAD_SEC,
+    TTS_PARADEE_RAM_GUARD_MB,
     TTS_VOICE_TH,
     TTS_VOICE_EN,
     TTS_PITCH,
@@ -53,6 +60,7 @@ from config import (
     CAT_TOPIC_REGEX,
     STUTTER_REGEX,
     tts_lock,
+    manga_semaphore,
     voice_stt_semaphore,
     voice_wake_word_enabled,
     voice_scribe_sessions,
@@ -94,13 +102,41 @@ INTERACTIVE_HANGOVER_SEC = 0.75
 SCRIBE_SILENCE_FLUSH_SEC = 1.20
 SCRIBE_HANGOVER_SEC = 1.00
 
-# Consistent TTS voice selection: defaults to steady Google TTS + Yukino filter (set TTS_PRIMARY_ENGINE=edge to override)
-TTS_PRIMARY_ENGINE = os.getenv("TTS_PRIMARY_ENGINE", "google").strip().lower()
-
 # Host constants split to prevent chat/markdown auto-linkers from mangling URLs
 GTRANS_HOST = "translate." + "googleapis.com"
 GROQ_API_HOST = "api." + "groq.com"
 GEMINI_WS_HOST = "generativelanguage." + "googleapis.com"
+
+# ==============================================================================
+# MAKHAMTTS PARADEE 1.1 INT8 (OFFLINE THAI NEURAL TTS — LAZY LOAD + RAM GUARD)
+# ==============================================================================
+YUKINO_PARADEE_CUSTOM_DICT: dict[str, str] = {
+    "ยูกิโนะชิตะ": "ยู-กิ-โนะ-ชิ-ตะ",
+    "ยูกิโนะ": "ยู-กิ-โนะ",
+    "ยูกิน่อน": "ยู-กิ-น่อน",
+    "แพนซัง": "แพน-ซัง",
+    "ยูกิพีเดีย": "ยู-กิ-พี-เดีย",
+    "Yukipedia": "ยู-กิ-พี-เดีย",
+    "Yukino": "ยู-กิ-โนะ",
+    "Yukinon": "ยู-กิ-น่อน",
+    "OT": "โอ-ที",
+    "e-Tax": "อี-แท็กซ์",
+    "PDF": "พี-ดี-เอฟ",
+    "API": "เอ-พี-ไอ",
+    "SQL": "เอส-คิว-แอล",
+    "VPN": "วี-พี-เอ็น",
+    "UniFi": "ยู-นิ-ไฟ",
+    "Kiro": "คิ-โระ",
+    "Docker": "ด็อก-เกอร์",
+    "Discord": "ดิส-คอร์ด",
+    "PSO2": "พี-เอส-โอ-ทู",
+    "NGS": "เอ็น-จี-เอส",
+}
+
+_PARADEE_LOCK = threading.Lock()
+_PARADEE_TTS_MODEL = None
+_PARADEE_LAST_USED_TS: float = 0.0
+_PARADEE_IDLE_TASK: asyncio.Task | None = None
 
 # Active voice sink registry (keyed by guild_id) so Scribe Stop can flush mid-sentence buffers cleanly
 _ACTIVE_VOICE_SINKS: dict[int, "SilenceGatedVoiceSink"] = {}
@@ -508,6 +544,323 @@ except ImportError:
 state.has_voice_recv = HAS_VOICE_RECV
 
 
+def has_baked_paradee_model() -> bool:
+    """True when both pre-baked INT8 ONNX model and vocab config exist locally on disk."""
+    if not TTS_PARADEE_MODEL_DIR:
+        return False
+    m_path = os.path.join(TTS_PARADEE_MODEL_DIR, "paradee_thai_int8.onnx")
+    c_path = os.path.join(TTS_PARADEE_MODEL_DIR, "config.json")
+    return os.path.isfile(m_path) and os.path.isfile(c_path)
+
+
+def _get_current_rss_mb() -> float:
+    try:
+        import psutil
+        return round(psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2), 1)
+    except Exception:
+        return 0.0
+
+
+def _can_safely_load_paradee_now() -> tuple[bool, str]:
+    """
+    OOM guardrail for 512 MB Render containers:
+    - Always allows synthesis if Paradee is already resident in RAM.
+    - When unloaded on <=512 MB containers, skips loading during active manga rendering
+      (`manga_semaphore.locked()`) or when RSS already exceeds `TTS_PARADEE_RAM_GUARD_MB`.
+    """
+    if _PARADEE_TTS_MODEL is not None:
+        return True, ""
+    if time.time() < state.paradee_tts_cooldown_until:
+        return False, "cooldown"
+    if CONTAINER_RAM_LIMIT_MB <= 512:
+        if manga_semaphore.locked():
+            return False, "manga_active_oom_guard"
+        rss_mb = _get_current_rss_mb()
+        if rss_mb >= float(TTS_PARADEE_RAM_GUARD_MB):
+            return False, f"high_rss_{rss_mb:.0f}MB"
+    return True, ""
+
+
+def _load_paradee_model_sync():
+    """
+    Lazily instantiates PyThaiTTS `MakHamTTSParadee` (7.88M distilled INT8 ONNX, 8.07 MB):
+    - Uses pre-baked `/app/models/paradee_thai` files when present (0 Hub network checks!).
+    - Caps `intra_op_threads=1` on <=512 MB containers to keep ONNX arena RAM lean.
+    """
+    global _PARADEE_TTS_MODEL, _PARADEE_LAST_USED_TS
+    with _PARADEE_LOCK:
+        if _PARADEE_TTS_MODEL is not None:
+            _PARADEE_LAST_USED_TS = time.time()
+            return _PARADEE_TTS_MODEL
+
+        t0 = time.monotonic()
+        init_kwargs: dict = {
+            "speed": max(0.75, min(1.50, float(TTS_PARADEE_SPEED))),
+            "intra_op_threads": 1 if CONTAINER_RAM_LIMIT_MB <= 512 else 0,
+            "custom_dict": dict(YUKINO_PARADEE_CUSTOM_DICT),
+        }
+        source_tag = "hf_hub"
+        if has_baked_paradee_model():
+            init_kwargs["model_path"] = os.path.join(TTS_PARADEE_MODEL_DIR, "paradee_thai_int8.onnx")
+            init_kwargs["config_path"] = os.path.join(TTS_PARADEE_MODEL_DIR, "config.json")
+            source_tag = "local_baked"
+
+        try:
+            from pythaitts.pretrained.makham import MakHamTTSParadee
+            model = MakHamTTSParadee(**init_kwargs)
+        except ImportError:
+            from pythaitts import TTS
+            model = TTS(pretrained="makham_paradee", **init_kwargs)
+
+        _PARADEE_TTS_MODEL = model
+        _PARADEE_LAST_USED_TS = time.time()
+        state.paradee_tts_loaded = True
+        rss_after = _get_current_rss_mb()
+        api_log(
+            f"Paradee TTS loaded ({source_tag}, threads={init_kwargs['intra_op_threads']}, "
+            f"{time.monotonic() - t0:.2f}s, RSS={rss_after:.1f} MB)"
+        )
+        return _PARADEE_TTS_MODEL
+
+
+def unload_paradee_tts(reason: str = "") -> bool:
+    """
+    Explicitly releases the in-RAM `MakHamTTSParadee` ONNX session & G2P dictionaries and
+    triggers glibc `malloc_trim(0)` via `release_unused_memory()` so Render 512 MB RAM stays clean.
+    """
+    global _PARADEE_TTS_MODEL, _PARADEE_IDLE_TASK
+    if _PARADEE_IDLE_TASK is not None and not _PARADEE_IDLE_TASK.done():
+        try:
+            if asyncio.current_task() is not _PARADEE_IDLE_TASK:
+                _PARADEE_IDLE_TASK.cancel()
+        except RuntimeError:
+            _PARADEE_IDLE_TASK.cancel()
+    _PARADEE_IDLE_TASK = None
+
+    dropped = False
+    with _PARADEE_LOCK:
+        if _PARADEE_TTS_MODEL is not None:
+            _PARADEE_TTS_MODEL = None
+            dropped = True
+    state.paradee_tts_loaded = False
+    if dropped:
+        before_mb, after_mb = release_unused_memory()
+        api_log(
+            f"Paradee TTS unloaded ({reason or 'cleanup'}) -> RAM {before_mb} MB -> {after_mb} MB"
+        )
+    return dropped
+
+
+def _has_any_active_voice_client() -> bool:
+    bot = state.bot
+    if not bot or not getattr(bot, "voice_clients", None):
+        return False
+    return any(vc and vc.is_connected() for vc in bot.voice_clients)
+
+
+def _schedule_paradee_idle_unload() -> None:
+    """Auto-unloads Paradee after `TTS_PARADEE_IDLE_UNLOAD_SEC` when no voice channels are active."""
+    global _PARADEE_IDLE_TASK
+    if _PARADEE_TTS_MODEL is None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _PARADEE_IDLE_TASK is not None and not _PARADEE_IDLE_TASK.done():
+        return
+
+    async def _idle_watcher():
+        global _PARADEE_IDLE_TASK
+        try:
+            while _PARADEE_TTS_MODEL is not None:
+                await asyncio.sleep(30.0)
+                if _has_any_active_voice_client():
+                    continue
+                idle_for = time.time() - _PARADEE_LAST_USED_TS
+                if idle_for >= float(TTS_PARADEE_IDLE_UNLOAD_SEC):
+                    unload_paradee_tts(reason=f"idle {int(idle_for)}s")
+                    return
+        except asyncio.CancelledError:
+            return
+        finally:
+            _PARADEE_IDLE_TASK = None
+
+    _PARADEE_IDLE_TASK = loop.create_task(_idle_watcher())
+
+
+def prewarm_paradee_tts_bg() -> None:
+    """
+    Non-blocking background pre-warm invoked on `!join` (during the 1.5s DAVE handshake)
+    when `TTS_PRIMARY_ENGINE == "paradee"`, so the greeting plays immediately on Paradee.
+    """
+    if TTS_PRIMARY_ENGINE != "paradee" or _PARADEE_TTS_MODEL is not None:
+        return
+    ok, _ = _can_safely_load_paradee_now()
+    if not ok:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    async def _prewarm():
+        try:
+            await asyncio.to_thread(_load_paradee_model_sync)
+        except ImportError:
+            state.paradee_tts_cooldown_until = time.time() + 3600.0
+            api_log("Paradee TTS prewarm skipped: pythaitts not installed (cooldown 1h)")
+        except Exception as e:
+            state.paradee_tts_cooldown_until = time.time() + 300.0
+            api_log(f"Paradee TTS prewarm warning ({type(e).__name__}): {str(e)[:120]}")
+
+    loop.create_task(_prewarm())
+
+
+def _waveform_to_wav_bytes_sync(raw_out, default_sr: int = 24000) -> bytes:
+    """
+    Normalizes any PyThaiTTS output (`bytes`, `(waveform, sr)` tuple, or `np.ndarray`)
+    into a valid 16-bit mono PCM WAV buffer in RAM (zero temp files).
+    """
+    if raw_out is None:
+        return b""
+    if isinstance(raw_out, (bytes, bytearray)):
+        raw_b = bytes(raw_out)
+        if raw_b[:4] == b"RIFF":
+            return raw_b
+        # Treat bare bytes as 16-bit mono PCM @ default_sr
+        out_io = io.BytesIO()
+        with wave.open(out_io, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(default_sr)
+            wf.writeframes(raw_b)
+        return out_io.getvalue()
+
+    sr = default_sr
+    wav_arr = raw_out
+    if isinstance(raw_out, (tuple, list)) and len(raw_out) >= 2:
+        # Handle either (waveform, sample_rate) or (sample_rate, waveform)
+        if isinstance(raw_out[1], (int, float)) and int(raw_out[1]) >= 8000:
+            wav_arr, sr = raw_out[0], int(raw_out[1])
+        elif isinstance(raw_out[0], (int, float)) and int(raw_out[0]) >= 8000:
+            sr, wav_arr = int(raw_out[0]), raw_out[1]
+
+    if not _HAS_NUMPY:
+        return b""
+
+    arr = np.asarray(wav_arr)
+    if arr.size == 0:
+        return b""
+    if arr.ndim > 1:
+        arr = np.squeeze(arr)
+        if arr.ndim > 1:
+            arr = arr[0]
+
+    if np.issubdtype(arr.dtype, np.floating):
+        arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=-1.0)
+        pcm16 = np.clip(np.rint(arr * 32767.0), -32768.0, 32767.0).astype(np.int16)
+    elif arr.dtype != np.int16:
+        pcm16 = np.clip(arr, -32768, 32767).astype(np.int16)
+    else:
+        pcm16 = arr
+
+    out_io = io.BytesIO()
+    with wave.open(out_io, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(int(sr))
+        wf.writeframes(pcm16.tobytes())
+    return out_io.getvalue()
+
+
+def _synthesize_paradee_wav_sync(spoken_text: str) -> bytes:
+    """Thread-safe offline Thai synthesis via `MakHamTTSParadee` returning 24 kHz WAV bytes."""
+    global _PARADEE_LAST_USED_TS
+    model = _load_paradee_model_sync()
+    speed = max(0.75, min(1.50, float(TTS_PARADEE_SPEED)))
+    with _PARADEE_LOCK:
+        _PARADEE_LAST_USED_TS = time.time()
+        if hasattr(model, "tts") and callable(getattr(model, "tts")):
+            try:
+                raw_out = model.tts(spoken_text, return_type="waveform", speed=speed)
+            except TypeError:
+                raw_out = model.tts(spoken_text, return_type="waveform")
+        else:
+            try:
+                raw_out = model(text=spoken_text, return_type="waveform", speed=speed)
+            except TypeError:
+                raw_out = model(spoken_text, return_type="waveform")
+    default_sr = int(getattr(model, "sample_rate", None) or getattr(model, "SAMPLE_RATE", None) or 24000)
+    return _waveform_to_wav_bytes_sync(raw_out, default_sr=default_sr)
+
+
+async def _paradee_tts_with_mastering(
+    spoken_text: str, output_format: str = "pcm"
+) -> bytes:
+    """
+    Synthesizes Thai / Thai-English speech offline using `MakHamTTSParadee` (8.07 MB INT8 ONNX):
+    - Native speed via `TTS_PARADEE_SPEED` (default `1.10`).
+    - Subtle cool-persona pitch shift via `TTS_PARADEE_PITCH` (default `0.96`, tempo-compensated
+      so final playback speed remains exact) + gentle `lowpass=f=9500` to smooth any 8M INT8 buzz.
+    - Single FFmpeg mastering pass directly to 48kHz stereo PCM (or MP3 for chat fallback).
+    """
+    ok, skip_reason = _can_safely_load_paradee_now()
+    if not ok:
+        if skip_reason and skip_reason != "cooldown":
+            api_log(f"Paradee TTS bypassed ({skip_reason}); falling back to Google TTS for this turn")
+        return b""
+
+    t0 = time.monotonic()
+    try:
+        raw_wav = await asyncio.to_thread(_synthesize_paradee_wav_sync, spoken_text)
+    except ImportError:
+        state.paradee_tts_cooldown_until = time.time() + 3600.0
+        api_log("Paradee TTS unavailable (pythaitts not installed); cooling down 1h")
+        return b""
+    except Exception as e:
+        state.paradee_tts_cooldown_until = time.time() + 300.0
+        api_log(f"Paradee TTS synthesis error ({type(e).__name__}: {str(e)[:120]}); cooling down 5m")
+        return b""
+
+    if not raw_wav or len(raw_wav) <= 44:
+        return b""
+
+    pitch = max(0.85, min(1.15, float(TTS_PARADEE_PITCH)))
+    af_parts: list[str] = []
+    if abs(pitch - 1.0) >= 0.005:
+        comp_atempo = max(0.50, min(2.00, 1.0 / pitch))
+        af_parts.append(f"asetrate=24000*{pitch:.4f},aresample=48000,atempo={comp_atempo:.4f}")
+    af_parts.append("lowpass=f=9500")
+    paradee_af = ",".join(af_parts)
+
+    _schedule_paradee_idle_unload()
+
+    try:
+        mastered = await asyncio.to_thread(
+            _master_tts_audio_sync,
+            raw_wav,
+            paradee_af,
+            True,
+            output_format,
+        )
+        if mastered:
+            state.active_tts_engine = "paradee"
+            api_log(
+                f"Paradee TTS -> OK (speed={TTS_PARADEE_SPEED:.2f}x, pitch={pitch:.2f}, "
+                f"{len(mastered)}B {output_format}, {time.monotonic() - t0:.2f}s)"
+            )
+            return mastered
+    except Exception as e:
+        api_log(f"Paradee TTS mastering fallback ({type(e).__name__}): {str(e)[:80]}")
+        try:
+            if output_format == "pcm":
+                return await asyncio.to_thread(_decode_audio_to_pcm48k_sync, raw_wav)
+        except Exception:
+            pass
+    return b""
+
+
 def register_voice_sink(guild_id: int, sink: "SilenceGatedVoiceSink") -> None:
     _ACTIVE_VOICE_SINKS[int(guild_id)] = sink
 
@@ -517,6 +870,8 @@ def unregister_voice_sink(guild_id: int) -> None:
     _ACTIVE_VOICE_SINKS.pop(gid, None)
     _VOICE_ROOM_HISTORY.pop(gid, None)
     _VOICE_LAST_BOT_REPLY_TS.pop(gid, None)
+    if not _ACTIVE_VOICE_SINKS and not _has_any_active_voice_client():
+        unload_paradee_tts(reason="voice disconnected")
 
 
 def _record_voice_room_turn(guild_id: int | None, speaker_label: str, text: str, is_bot: bool = False) -> None:
@@ -681,7 +1036,7 @@ def _decode_audio_to_pcm48k_sync(audio_bytes: bytes) -> bytes:
 
 
 def _master_tts_audio_sync(
-    mp3_bytes: bytes,
+    audio_bytes: bytes,
     extra_af: str = "",
     trim_internal_pauses: bool = True,
     output_format: str = "pcm",
@@ -716,7 +1071,7 @@ def _master_tts_audio_sync(
 
     proc = subprocess.run(
         ["ffmpeg", "-threads", "1", "-i", "pipe:0", "-af", full_af, *out_args, "-loglevel", "error"],
-        input=mp3_bytes,
+        input=audio_bytes,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=30,
@@ -767,18 +1122,25 @@ async def _google_tts_with_yukino_filter(
     atempo = max(0.50, min(2.00, speed / pitch))
     steady_af = f"asetrate=24000*{pitch:.4f},aresample=48000,atempo={atempo:.4f}"
     try:
-        return await asyncio.to_thread(
+        out = await asyncio.to_thread(
             _master_tts_audio_sync,
             raw_mp3,
             steady_af,
             True,
             output_format,
         )
+        if out:
+            state.active_tts_engine = "google"
+        return out
     except Exception:
         if output_format == "mp3":
+            state.active_tts_engine = "google"
             return raw_mp3
         try:
-            return await asyncio.to_thread(_decode_audio_to_pcm48k_sync, raw_mp3)
+            out = await asyncio.to_thread(_decode_audio_to_pcm48k_sync, raw_mp3)
+            if out:
+                state.active_tts_engine = "google"
+            return out
         except Exception:
             return b""
 
@@ -808,12 +1170,19 @@ async def _edge_tts_with_mastering(
         raw_edge_mp3 = await asyncio.wait_for(_collect_stream(), timeout=4.5)
         if len(raw_edge_mp3) > 256:
             try:
-                return await asyncio.to_thread(_master_tts_audio_sync, raw_edge_mp3, "", True, output_format)
+                out = await asyncio.to_thread(_master_tts_audio_sync, raw_edge_mp3, "", True, output_format)
+                if out:
+                    state.active_tts_engine = "edge"
+                return out
             except Exception:
                 if output_format == "mp3":
+                    state.active_tts_engine = "edge"
                     return raw_edge_mp3
                 try:
-                    return await asyncio.to_thread(_decode_audio_to_pcm48k_sync, raw_edge_mp3)
+                    out = await asyncio.to_thread(_decode_audio_to_pcm48k_sync, raw_edge_mp3)
+                    if out:
+                        state.active_tts_engine = "edge"
+                    return out
                 except Exception:
                     return b""
     except Exception as e:
@@ -824,10 +1193,13 @@ async def _edge_tts_with_mastering(
 
 async def synthesize_tts_audio_bytes(text: str, output_format: str = "pcm") -> bytes:
     """
-    Consistent in-memory voice synthesis (zero temp files):
-    - Default (`TTS_PRIMARY_ENGINE=google`): Google TTS (parallel chunks) + tuned cool Yukino filter,
-      falling back to Edge-TTS only if Google TTS fails.
-    - Optional (`TTS_PRIMARY_ENGINE=edge`): Edge-TTS primary with Google TTS fallback.
+    Consistent in-memory hybrid voice synthesis (zero temp files):
+    - Default (`TTS_PRIMARY_ENGINE=paradee`):
+      * Thai / Thai-English mixed: Offline `MakHamTTSParadee` 1.1 INT8 (speed=1.10, pitch=0.96)
+        -> Google TTS -> Edge-TTS fallback.
+      * Pure English: Google TTS (`tl=en`) -> Edge-TTS (`en-US-AriaNeural`).
+    - Optional (`TTS_PRIMARY_ENGINE=edge`): Edge-TTS -> Google TTS -> Paradee (Thai).
+    - Optional (`TTS_PRIMARY_ENGINE=google`): Google TTS -> Edge-TTS.
     - `output_format="pcm"` returns 48kHz stereo 16-bit PCM ready for `discord.PCMAudio`.
     - `output_format="mp3"` returns 128kbps MP3 for Discord text-channel attachments.
     """
@@ -837,11 +1209,26 @@ async def synthesize_tts_audio_bytes(text: str, output_format: str = "pcm") -> b
     is_thai = bool(THAI_CHAR_REGEX.search(spoken_text))
     lang_code = "th" if is_thai else "en"
 
+    if TTS_PRIMARY_ENGINE == "paradee":
+        if is_thai:
+            paradee_bytes = await _paradee_tts_with_mastering(spoken_text, output_format=output_format)
+            if paradee_bytes:
+                return paradee_bytes
+        google_bytes = await _google_tts_with_yukino_filter(spoken_text, lang_code, output_format=output_format)
+        if google_bytes:
+            return google_bytes
+        return await _edge_tts_with_mastering(spoken_text, is_thai, output_format=output_format)
+
     if TTS_PRIMARY_ENGINE == "edge":
         edge_bytes = await _edge_tts_with_mastering(spoken_text, is_thai, output_format=output_format)
         if edge_bytes:
             return edge_bytes
-        return await _google_tts_with_yukino_filter(spoken_text, lang_code, output_format=output_format)
+        google_bytes = await _google_tts_with_yukino_filter(spoken_text, lang_code, output_format=output_format)
+        if google_bytes:
+            return google_bytes
+        if is_thai:
+            return await _paradee_tts_with_mastering(spoken_text, output_format=output_format)
+        return b""
 
     google_bytes = await _google_tts_with_yukino_filter(spoken_text, lang_code, output_format=output_format)
     if google_bytes:
@@ -898,7 +1285,11 @@ async def speak_in_voice_channel(guild: discord.Guild, text: str, fallback_chann
                     pass
                 loop.call_soon_threadsafe(done_event.set)
 
-            print(f"[Voice TTS] Playing {len(pcm_bytes)} PCM bytes in '{vc.channel.name}' (in-memory)...", flush=True)
+            print(
+                f"[Voice TTS] Playing {len(pcm_bytes)} PCM bytes ({state.active_tts_engine}) "
+                f"in '{vc.channel.name}' (in-memory)...",
+                flush=True,
+            )
             audio_source = discord.PCMAudio(pcm_stream)
             vc.play(audio_source, after=_after_play)
             await asyncio.wait_for(done_event.wait(), timeout=60)
@@ -2111,13 +2502,13 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
                     self.noise_floors[speaker] = max(15.0, min(95.0, updated_floor))
                 self.pre_roll_buffers[speaker].append(data.pcm)
 
-        if frame_rms > 25.0 and (now - self._last_rms_log > 5.0):
-            self._last_rms_log = now
-            print(
-                f"[Voice Mic Level] speaker={speaker.display_name}, "
-                f"rms={int(frame_rms)}, floor={int(self.noise_floors[speaker])}, thresh={int(start_thresh)}",
-                flush=True,
-            )
+            if frame_rms > 25.0 and (now - self._last_rms_log > 5.0):
+                self._last_rms_log = now
+                print(
+                    f"[Voice Mic Level] speaker={speaker.display_name}, "
+                    f"rms={int(frame_rms)}, floor={int(self.noise_floors[speaker])}, thresh={int(start_thresh)}",
+                    flush=True,
+                )
 
     def _spawn_pcm_task(self, user, pcm_bytes: bytes, utterance_ts: float) -> asyncio.Task:
         task = self._loop.create_task(self._process_user_pcm(user, pcm_bytes, utterance_ts))
@@ -2228,4 +2619,4 @@ class SilenceGatedVoiceSink(voice_recv.AudioSink if HAS_VOICE_RECV else object):
             else:
                 print(f"[Voice STT] Audio captured from {user.display_name}, but STT returned empty text.", flush=True)
         except Exception as e:
-            print(f"Voice PCM processing error ({getattr(user, 'display_name', '?')}): {e}", flush=True)
+            print(f"Voice PCM processing error ({getattr(user, 'display_name', 'unknown')}): {e}", flush=True)

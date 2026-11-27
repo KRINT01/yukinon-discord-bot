@@ -45,6 +45,9 @@ from config import (
     GEMINI_TRANSCRIBE_LIVE_MODEL,
     OPENROUTER_API_KEY,
     OPENROUTER_MANGA_MODEL,
+    TTS_PRIMARY_ENGINE,
+    TTS_PARADEE_SPEED,
+    TTS_PARADEE_PITCH,
     TTS_GOOGLE_PITCH,
     TTS_GOOGLE_SPEED,
     AUDIO_EXTENSIONS,
@@ -135,6 +138,9 @@ from voice_engine import (
     clear_voice_scribe_session,
     register_voice_sink,
     unregister_voice_sink,
+    prewarm_paradee_tts_bg,
+    unload_paradee_tts,
+    has_baked_paradee_model,
 )
 from ui_interactions import (
     CodeReviewActionView,
@@ -351,6 +357,7 @@ def _collect_health_metrics() -> dict:
     hydrogen_cd = max(0, int(state.gemini_hydrogen_cooldown_until - now))
     live_stt_cd = max(0, int(state.gemini_transcribe_live_cooldown_until - now))
     edge_cd = max(0, int(state.edge_tts_cooldown_until - now))
+    paradee_cd = max(0, int(state.paradee_tts_cooldown_until - now))
     cached_files_count = sum(len(q) for q in channel_last_attachment.values())
     active_scribe_count = sum(1 for s in voice_scribe_sessions.values() if s.get("active"))
     telemetry = state.get_telemetry_summary()
@@ -414,6 +421,13 @@ def _collect_health_metrics() -> dict:
             "gemma_active_model": getattr(state, "active_gemma_model", None) if GEMINI_API_KEY else None,
             "gemini_active_model": state.active_gemini_model if GEMINI_API_KEY else None,
             "gemini_grounding_cooldown_sec": gemini_cd,
+            "tts_primary_engine": TTS_PRIMARY_ENGINE,
+            "tts_active_engine": state.active_tts_engine,
+            "tts_paradee_speed": TTS_PARADEE_SPEED,
+            "tts_paradee_pitch": TTS_PARADEE_PITCH,
+            "tts_paradee_baked": has_baked_paradee_model(),
+            "tts_paradee_loaded": state.paradee_tts_loaded,
+            "tts_paradee_cooldown_sec": paradee_cd,
             "tts_google_pitch": TTS_GOOGLE_PITCH,
             "tts_google_speed": TTS_GOOGLE_SPEED,
             "edge_tts_cooldown_sec": edge_cd,
@@ -437,7 +451,15 @@ async def handle_root(request: web.Request) -> web.Response:
         else "🟡 Connecting to Discord Gateway..."
     )
     gemini_cd_note = f" (Grounding Cooldown: {ai['gemini_grounding_cooldown_sec']}s)" if ai["gemini_grounding_cooldown_sec"] else ""
-    tts_note = f" | TTS: Google Yukino (pitch={ai['tts_google_pitch']}, speed={ai['tts_google_speed']}x)"
+    if ai["tts_primary_engine"] == "paradee":
+        tts_note = (
+            f" | TTS: MakHamTTS Paradee INT8 (pitch={ai['tts_paradee_pitch']}, speed={ai['tts_paradee_speed']}x, "
+            f"baked={ai['tts_paradee_baked']}, loaded={ai['tts_paradee_loaded']})"
+        )
+    elif ai["tts_primary_engine"] == "edge":
+        tts_note = " | TTS: Edge-TTS Neural"
+    else:
+        tts_note = f" | TTS: Google Yukino (pitch={ai['tts_google_pitch']}, speed={ai['tts_google_speed']}x)"
 
     html = f"""
     <html>
@@ -612,6 +634,7 @@ class YukinonBot(commands.Bot):
             pass
         for gid in list(voice_scribe_sessions.keys()):
             clear_voice_scribe_session(gid)
+        unload_paradee_tts(reason="shutdown")
         if monthly_ot_auto_report_task.is_running():
             monthly_ot_auto_report_task.cancel()
         await close_http_session()
@@ -1324,6 +1347,7 @@ async def _connect_bot_to_voice_channel(ctx, target_channel, greet: bool = True)
         )
     )
 
+    prewarm_paradee_tts_bg()
     await asyncio.sleep(1.5)
 
     if HAS_VOICE_RECV and hasattr(vc, "listen"):
@@ -1448,11 +1472,11 @@ async def leave_voice(ctx):
                 vc.stop_listening()
             except Exception:
                 pass
-        unregister_voice_sink(ctx.guild.id)
         await speak_in_voice_channel(
             ctx.guild, "ถ้าหมดธุระแล้ว ฉันขอตัวกลับไปอ่านหนังสือต่อนะคะ ลาก่อนค่ะ"
         )
         await vc.disconnect(force=True)
+        unregister_voice_sink(ctx.guild.id)
     else:
         await ctx.send("ตอนนี้ฉันไม่ได้อยู่ในห้องเสียงค่ะ")
 
@@ -1504,8 +1528,13 @@ async def voice_status_command(ctx):
         f"🎙️ **สถานะห้องเสียง (`{vc.channel.name}`):**\n"
         f"- **Voice Scribe:** {scribe_line}\n"
         f"- **Primary Live STT:** `{GEMINI_TRANSCRIBE_LIVE_MODEL}` (Fallback: Groq Whisper-v3 + Google STT)\n"
-        f"- **TTS Yukino Filter:** `pitch={TTS_GOOGLE_PITCH}`, `speed={TTS_GOOGLE_SPEED}x`\n"
-        f"- **DAVE E2EE Status:** `{status}` | **Ready:** `{ready}` | **Can Encrypt:** `{can_enc}`\n"
+        + (
+            f"- **TTS Engine:** `MakHamTTS Paradee INT8` (`pitch={TTS_PARADEE_PITCH}`, `speed={TTS_PARADEE_SPEED}x`, "
+            f"`baked={has_baked_paradee_model()}`, `loaded={state.paradee_tts_loaded}`)\n"
+            if TTS_PRIMARY_ENGINE == "paradee"
+            else f"- **TTS Engine:** `{TTS_PRIMARY_ENGINE}` (`pitch={TTS_GOOGLE_PITCH}`, `speed={TTS_GOOGLE_SPEED}x`)\n"
+        )
+        + f"- **DAVE E2EE Status:** `{status}` | **Ready:** `{ready}` | **Can Encrypt:** `{can_enc}`\n"
         f"- **MLS Group User IDs:** `{uids}`"
     )
 
@@ -1716,8 +1745,13 @@ async def status_command(ctx):
         f"❄️ **สถานะระบบ (Yukinon System Status)**\n"
         f"- **เวลาปัจจุบัน:** `{m['system_time_th']}`\n"
         f"- **Uptime:** `{m['uptime_human']}` | **Ping:** `{ping_str}`\n"
-        f"- **Voice & Scribe:** `{d['active_voice_sessions']}` ห้องเสียง | `{d['active_scribe_sessions']}` จดบันทึก | TTS `{ai['tts_google_pitch']}p / {ai['tts_google_speed']}x`\n"
-        f"- **Native Tools:** `{len(ai['registered_tools'])}` เครื่องมือ (`{', '.join(ai['registered_tools'])}`)\n"
+        f"- **Voice & Scribe:** `{d['active_voice_sessions']}` ห้องเสียง | `{d['active_scribe_sessions']}` จดบันทึก | "
+        + (
+            f"TTS `paradee {ai['tts_paradee_pitch']}p / {ai['tts_paradee_speed']}x` (`loaded={ai['tts_paradee_loaded']}`)\n"
+            if ai["tts_primary_engine"] == "paradee"
+            else f"TTS `{ai['tts_primary_engine']} {ai['tts_google_pitch']}p / {ai['tts_google_speed']}x`\n"
+        )
+        + f"- **Native Tools:** `{len(ai['registered_tools'])}` เครื่องมือ (`{', '.join(ai['registered_tools'])}`)\n"
         f"- **Container RAM:** `{mem['bot_ram_mb']} MB / {mem['ram_limit_mb']} MB ({mem['ram_usage_pct']}%)`\n"
         f"- **Runtime Limits:** OpenCV `{rl['opencv_threads']}t` | Manga `{rl['manga_concurrency']}` | STT `{rl['voice_stt_concurrency']}` | Channel LRU `{rl['max_cached_channels']}`\n"
         f"- **Cached Contexts:** `{mem['active_chat_channels']}/{mem['max_cached_channels']}` แชท | "

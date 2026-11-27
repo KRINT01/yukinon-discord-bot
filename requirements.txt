@@ -1,6 +1,7 @@
 discord.py[voice]>=2.7.0,<3
 davey>=0.1.6,<1
 discord-ext-voice-recv>=0.5.2a179,<1
+pythaitts>=1.0.0,<2
 edge-tts>=7.3.0,<8
 SpeechRecognition>=3.17.0,<4
 ddgs>=9.16.1,<10
