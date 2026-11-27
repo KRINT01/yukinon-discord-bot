@@ -425,15 +425,13 @@ def _strip_stray_cjk_preserving_japanese(text: str) -> str:
 
 
 def is_owner_user(user) -> bool:
-    """Checks if the Discord user is the bot owner by ID or username/display_name."""
-    if user is None:
+    """
+    Checks if the Discord user is the bot owner strictly by `OWNER_USER_ID`.
+    Names are user-controlled and spoofable, so owner features are disabled when the env is unset.
+    """
+    if user is None or not OWNER_USER_ID:
         return False
-    if OWNER_USER_ID and str(getattr(user, "id", "")) == OWNER_USER_ID:
-        return True
-    uname = (getattr(user, "name", "") or "").lower()
-    dname = (getattr(user, "display_name", "") or "").lower()
-    gname = (getattr(user, "global_name", "") or "").lower()
-    return any("krint" in n for n in (uname, dname, gname))
+    return str(getattr(user, "id", "")) == OWNER_USER_ID
 
 
 def get_speaker_identity_context(
@@ -461,7 +459,7 @@ def get_speaker_identity_context(
         "ให้เรียกใช้เครื่องมือ `manage_user_memory` (ใช้ `action='pin_fact'` สำหรับข้อมูลถาวรที่สำคัญ หรือ `add_note` สำหรับบันทึกสั้นๆ)"
     )
 
-    if is_owner_user(user) or "krint" in (fallback_name or "").lower():
+    if is_owner_user(user):
         return (
             "### [กฎการเรียกคู่สนทนาปัจจุบัน (Current Speaker Rules — OWNER / PARTNER)]:\n"
             "- ผู้ที่กำลังคุยกับคุณคือ **คู่หูคนคุ้นเคยของคุณในชมรมบริการ (และผู้สร้างของคุณเอง)** ไม่ใช่คนแปลกหน้า\n"
@@ -643,7 +641,6 @@ def sanitize_yukino_output(
     )
     is_owner_ctx = False if preserve_owner_name else bool(
         is_owner_user(speaker_user)
-        or "krint" in (speaker_name or "").lower()
         or speaker_user is None
     )
     clean_other = ""

@@ -1,7 +1,6 @@
 import re
 import json
 import time
-import asyncio
 
 from config import (
     GEMINI_API_KEY,
@@ -975,12 +974,8 @@ async def query_ai_chat(
             and not learned_memo
             and not (tool_ctx and tool_ctx.memory_updated_uid)
         ):
-            try:
-                asyncio.get_running_loop().create_task(
-                    _extract_and_save_durable_fact_bg(speaker_user, raw_user_query)
-                )
-            except RuntimeError:
-                pass
+            from user_memory import _schedule_bg_task
+            _schedule_bg_task(_extract_and_save_durable_fact_bg(speaker_user, raw_user_query))
 
     if channel_id is not None and answer:
         if is_user_correction:
