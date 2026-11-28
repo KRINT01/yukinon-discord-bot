@@ -796,8 +796,20 @@ async def _summarize_recent_topic_bg(
             + (f"Bot reply snippet: {clean_a}" if clean_a else "")
         )
         msgs = [{"role": "user", "content": sum_prompt}]
-        raw_out = ""
-        if GROQ_API_KEY:
+        # Background utility routing: Cloudflare Gemma 4 first (300 RPM, ~4 Neurons/call, zero reasoning waste),
+        # then Google AI Studio Gemma 4 26B, keeping Groq's tight 8K TPM bucket as last-resort fallback.
+        raw_out = await call_cloudflare_gemma_chat(
+            msgs, temperature=0.0, max_tokens=120, purpose="TopicSummarize"
+        )
+        if not raw_out:
+            raw_out = await call_gemma_ai_studio_chat(
+                msgs,
+                temperature=0.0,
+                max_output_tokens=120,
+                purpose="TopicSummarize",
+                prefer_fast_26b=True,
+            )
+        if not raw_out and GROQ_API_KEY:
             for g_mod in await get_groq_search_and_chat_candidates():
                 try:
                     raw_out = await call_groq_chat(
@@ -807,14 +819,6 @@ async def _summarize_recent_topic_bg(
                         break
                 except Exception:
                     continue
-        if not raw_out:
-            raw_out = await call_gemma_ai_studio_chat(
-                msgs, temperature=0.0, max_output_tokens=120, purpose="TopicSummarize"
-            )
-        if not raw_out:
-            raw_out = await call_cloudflare_gemma_chat(
-                msgs, temperature=0.0, max_tokens=120, purpose="TopicSummarize"
-            )
         if not raw_out:
             return
 
@@ -901,8 +905,20 @@ async def consolidate_user_memory_async(uid_str: str):
         )
         msgs = [{"role": "user", "content": consolidation_prompt}]
 
-        raw_out = ""
-        if GROQ_API_KEY:
+        # Background utility routing: Cloudflare Gemma 4 first, then Google AI Studio Gemma 4 26B,
+        # preserving Groq's 8K TPM org-wide bucket for interactive fallbacks.
+        raw_out = await call_cloudflare_gemma_chat(
+            msgs, temperature=0.0, max_tokens=768, purpose="MemoryConsolidate"
+        )
+        if not raw_out:
+            raw_out = await call_gemma_ai_studio_chat(
+                msgs,
+                temperature=0.0,
+                max_output_tokens=768,
+                purpose="MemoryConsolidate",
+                prefer_fast_26b=True,
+            )
+        if not raw_out and GROQ_API_KEY:
             for g_mod in await get_groq_search_and_chat_candidates():
                 try:
                     raw_out = await call_groq_chat(
@@ -912,10 +928,6 @@ async def consolidate_user_memory_async(uid_str: str):
                         break
                 except Exception:
                     continue
-        if not raw_out:
-            raw_out = await call_gemma_ai_studio_chat(msgs, temperature=0.0, max_output_tokens=768, purpose="MemoryConsolidate")
-        if not raw_out:
-            raw_out = await call_cloudflare_gemma_chat(msgs, temperature=0.0, max_tokens=768, purpose="MemoryConsolidate")
 
         if not raw_out:
             return
