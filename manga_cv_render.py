@@ -1292,7 +1292,10 @@ def _clean_exact_cv_bubble_and_build_render_slots_cv2(
         p75_g = float(np.percentile(sub_g_raw, 75))
         white_bg_ratio = float(np.count_nonzero((sub_g_raw >= 235) & (sub_ch_raw <= 18))) / float(max(1, sub_g_raw.size))
 
-        # Clean white paper (character sheets / open white panels): erase dark ink directly to pure white
+        # Clean white paper (character sheets / open white panels): erase ONLY compact text glyphs
+        # to pure white while shielding BOTH colored artwork AND large dark artwork blobs (e.g. dark
+        # tights/legs or portrait frames intruding into a corner/edge of the text bounding box)!
+        safe_tx1, safe_ty1, safe_tx2, safe_ty2 = x1, y1, x2, y2
         if p75_g >= 245.0 and white_bg_ratio >= 0.52:
             pad_w = 4
             ex1, ey1 = max(0, x1 - pad_w), max(0, y1 - pad_w)
@@ -1301,9 +1304,38 @@ def _clean_exact_cv_bubble_and_build_render_slots_cv2(
             sub_g = base_gray[ey1:ey2, ex1:ex2]
             sub_ch = sub_bgr.max(axis=2) - sub_bgr.min(axis=2)
             non_chroma = _build_true_chroma_art_shield_cv2(sub_bgr, chroma_thresh=30, is_dark=False)
-            dark_ink = np.where((sub_g < 240) & (sub_ch < 35), np.uint8(255), np.uint8(0))
-            erase_u8 = cv2.dilate(dark_ink, _CV2_K5, iterations=1)
-            sub_bgr[(erase_u8 > 0) & (non_chroma > 0)] = (255, 255, 255)
+
+            max_gly_dim = max(44, int(max(width, height) * 0.045))
+            max_gly_area = max(650, int(max_gly_dim * max_gly_dim * 0.35))
+            dark_all = np.where((sub_g < 240) & (sub_ch < 35), np.uint8(255), np.uint8(0))
+            dn_cc, d_lbls, d_st, _ = cv2.connectedComponentsWithStats(dark_all, connectivity=8)
+            glyph_only = np.zeros_like(dark_all)
+            dark_art = np.zeros_like(dark_all)
+            for dk in range(1, dn_cc):
+                dgw = int(d_st[dk, cv2.CC_STAT_WIDTH])
+                dgh = int(d_st[dk, cv2.CC_STAT_HEIGHT])
+                dga = int(d_st[dk, cv2.CC_STAT_AREA])
+                if dgw > max_gly_dim or dgh > max_gly_dim or dga > max_gly_area:
+                    dark_art[d_lbls == dk] = 255
+                else:
+                    glyph_only[d_lbls == dk] = 255
+
+            art_shield = np.where((non_chroma == 0) | (dark_art > 0), np.uint8(255), np.uint8(0))
+            if np.any(art_shield):
+                art_shield = cv2.dilate(art_shield, _CV2_K7, iterations=1)
+            erase_u8 = cv2.dilate(glyph_only, _CV2_K5, iterations=1)
+            sub_bgr[(erase_u8 > 0) & (art_shield == 0)] = (255, 255, 255)
+
+            # Trim text placement box away from intruding legs/ribbons/portrait frames
+            art_in_box = art_shield[y1 - ey1 : y2 - ey1, x1 - ex1 : x2 - ex1]
+            if np.any(art_in_box):
+                safe_place = np.where(art_in_box == 0, np.uint8(255), np.uint8(0))
+                inscribed = _largest_inscribed_rect_in_mask_cv2(safe_place)
+                if inscribed and (inscribed[2] - inscribed[0]) >= max(24, int(bw_c * 0.45)) and (inscribed[3] - inscribed[1]) >= max(14, int(bh_c * 0.35)):
+                    safe_tx1 = x1 + inscribed[0]
+                    safe_ty1 = y1 + inscribed[1]
+                    safe_tx2 = x1 + inscribed[2]
+                    safe_ty2 = y1 + inscribed[3]
             fg_rgb = (15, 15, 15)
             stroke_rgb = (255, 255, 255)
         else:
@@ -1348,13 +1380,15 @@ def _clean_exact_cv_bubble_and_build_render_slots_cv2(
                 stroke_rgb = (250, 250, 250)
 
         # Only widen horizontally when the source cluster is a vertical JP column (`bh > bw * 1.15`)
-        if bh_c > int(bw_c * 1.15):
+        # AND no artwork was trimmed from the bounding box!
+        box_was_trimmed = (safe_tx1, safe_ty1, safe_tx2, safe_ty2) != (x1, y1, x2, y2)
+        if (not box_was_trimmed) and bh_c > int(bw_c * 1.15):
             extra_x = min(28, max(16, int(bw_c * 0.28)))
-            tx1 = max(4, x1 - extra_x)
-            tx2 = min(width - 4, x2 + extra_x)
+            tx1 = max(4, safe_tx1 - extra_x)
+            tx2 = min(width - 4, safe_tx2 + extra_x)
         else:
-            tx1, tx2 = x1, x2
-        hb = (tx1, y1, tx2, y2)
+            tx1, tx2 = safe_tx1, safe_tx2
+        hb = (tx1, safe_ty1, tx2, safe_ty2)
         return [[hb[0], hb[1], hb[2], hb[3], fg_rgb, stroke_rgb, trans_text, hb]]
 
     rx1, ry1, rx2, ry2, mask_full, rect_fill = _refine_cv_bubble_mask_locally_cv2(

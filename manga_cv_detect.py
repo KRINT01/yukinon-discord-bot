@@ -20,7 +20,7 @@ except ImportError:
     cv2 = None
     HAS_CV2 = False
 
-MANGA_CV_RENDER_VERSION = "v21"
+MANGA_CV_RENDER_VERSION = "v22"
 SOM_CV_MAX_DIM = 360  # Fast 360px grid derived from single 1024px resize (~1-2.5s for 10 pages with OpenCV+NumPy!)
 # Bundle 2 RAM & Discord upload optimization: quality=90 with standard 4:2:0 subsampling (~50% smaller than 94/4:4:4)
 MANGA_RENDER_JPEG_QUALITY = 90
@@ -1108,6 +1108,15 @@ def _detect_white_outlined_text_clusters_cv2(
         gly_fill = float(np.count_nonzero(sub_g)) / float(max(1, tw * th))
         if gly_fill < min_gly_fill:
             continue
+        # Character-sheet artwork guard: printed sheet text sits on clean white paper (`col_rat <= 0.22`);
+        # rejects portrait-border hair/blouse/gap clusters (e.g. `col_rat=0.24..0.57`, `w_rat=0.25..0.50`, `n_gly <= 6`)!
+        if has_sheet_ui:
+            sub_g_box = vis_gray[ty1:ty2, tx1:tx2]
+            sub_c_box = vis_chroma[ty1:ty2, tx1:tx2]
+            col_rat = float(np.count_nonzero(sub_c_box >= 28)) / float(max(1, sub_c_box.size))
+            white_rat = float(np.count_nonzero((sub_g_box >= 235) & (sub_c_box <= 18))) / float(max(1, sub_g_box.size))
+            if col_rat > 0.22 or (n_gly <= 6 and white_rat < 0.55):
+                continue
         if covered_vis_mask is not None:
             cov_ov = float(np.count_nonzero(covered_vis_mask[ty1:ty2, tx1:tx2])) / float(max(1, tw * th))
             if cov_ov >= 0.25:

@@ -49,7 +49,7 @@ from manga_cv_render import (
     _release_cv_page_masks,
 )
 
-MANGA_TRANSLATOR_VERSION = "v17.8"
+MANGA_TRANSLATOR_VERSION = "v17.9"
 MANGA_CV_VER = getattr(_mcr_mod, "MANGA_CV_RENDER_VERSION", "old")
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
 # Bundle 2 dynamic parallel hedge: faster 15s recovery on typical 2-4p X threads, patient 25s on 5-12p batches
@@ -507,8 +507,21 @@ def _dedupe_hallucinated_page_bubbles(
             sol = float(c.get("solidity") or 0.90)
             return (gly * 2.0) + (rf * 10.0) + (sol * 10.0)
 
+        # Collect exact short labels owned by real UI banners (`嬉`, `怒`, `通常`, `基本情報`, etc.)
+        # so an adjacent non-banner false positive duplicating a 1-3 char banner label is always dropped!
+        banner_src_keys: set[str] = set()
+        for b_item in bubbles:
+            bid = b_item.get("bubble_id")
+            if bid is None:
+                continue
+            if (cv_by_id.get(int(bid)) or {}).get("is_ui_banner"):
+                sk = re.sub(r"[\s\.…!！?？~〜～、。,，・\-―—\x27\x22「」『』()（）]+", "", b_item.get("source_text") or "")
+                if sk:
+                    banner_src_keys.add(sk)
+
         # Group by normalized `source_text` (ignore whitespace & common punctuation)
         groups: dict[str, list[int]] = {}
+        drop_idx: set[int] = set()
         for idx_b, b_item in enumerate(bubbles):
             bid = b_item.get("bubble_id")
             if bid is None:
@@ -518,10 +531,12 @@ def _dedupe_hallucinated_page_bubbles(
             if cv_meta.get("is_ui_banner") or cv_meta.get("is_pastel_label"):
                 continue
             src_key = re.sub(r"[\s\.…!！?？~〜～、。,，・\-―—\x27\x22「」『』()（）]+", "", b_item.get("source_text") or "")
+            if src_key and src_key in banner_src_keys and cv_meta.get("is_outlined_text"):
+                drop_idx.add(idx_b)
+                continue
             if len(src_key) >= 4:
                 groups.setdefault(src_key, []).append(idx_b)
 
-        drop_idx: set[int] = set()
         for src_key, idxs in groups.items():
             if len(idxs) <= 1:
                 continue
@@ -930,7 +945,8 @@ async def _polish_single_chunk_gemma_async(
         lang_guidance = (
             "- แปลและเกลาทุกช่องให้เป็นภาษาไทยธรรมชาติ ลื่นไหล สะกดถูกต้อง 100% (ไม่มีคำสะกดผิด ไม่มีสระ/วรรณยุกต์สลับตำแหน่ง)\n"
             "- ใช้เฉพาะอักษรไทยและเครื่องหมาย ASCII มาตรฐาน (`...`, `~`, `-`, `!`, `?`, `\"`, `'`, `(`, `)`) — แปลงวงเล็บญี่ปุ่น `「」『』` เป็น `\"...\"` เสมอ ห้ามใส่อีโมจิ สัญลักษณ์หัวใจ/โน้ตเพลง หรือภาษาเกาหลี/จีน/อาหรับ\n"
-            "- หากในต้นฉบับ `src` มีคำภาษาอังกฤษ/ชื่อภาษาอังกฤษอยู่แล้ว (เช่น `Kairi Yui`, `Iwato Pharmaceutical`, `OK`, `HP`) ให้คงคำภาษาอังกฤษเหล่านั้นไว้ตามเดิมพร้อมเว้นวรรคให้สวยงาม ห้ามแปลหรือทับศัพท์คำอังกฤษที่มีอยู่ในต้นฉบับเป็นไทย (ส่วนเสียงอุทาน/คำพูดญี่ปุ่นเช่น `えへへ` = `เอะเฮะ`, `…っ!!` = `...อ๊ะ!!`, `コイツ` = `ไอ้หมอนี่` ให้แปลเป็นไทยล้วน)\n"
+            "- หากในต้นฉบับ `src` มีคำภาษาอังกฤษ/ชื่อภาษาอังกฤษอยู่แล้ว (เช่น `Kairi Yui`, `Iwato Pharmaceutical`, `OK`, `HP`) ให้คงคำภาษาอังกฤษเหล่านั้นไว้ตามเดิมพร้อมเว้นวรรคให้สวยงาม ห้ามแปลหรือทับศัพท์คำอังกฤษที่มีอยู่ในต้นฉบับเป็นไทย\n"
+            "- ศัพท์เฉพาะ/ศัพท์เทคนิคในเรื่อง ชื่อระบบ ชื่ออาวุธ และชื่อสกิลที่มาจากคำทับศัพท์คาตาคานะภาษาอังกฤษ (เช่น `レリック`/`レリクス` = `Relic`/`Relics`, `スート:ハート` = `Suit: Heart`, `ハートビート` = `Heartbeat`, `ブースト` = `Boost`, `レイピア` = `Rapier`, `マナアクセラレーション` = `Mana Acceleration`) ให้ใช้เป็นคำภาษาอังกฤษที่สม่ำเสมอเหมือนกันทุกแบนเนอร์ ป้ายหัวข้อ และย่อหน้าในทุกหน้า ห้ามปนกันระหว่างภาษาอังกฤษ (`Relic`) กับคำทับศัพท์ไทย (`รีลิกส์`) ส่วนเสียงอุทาน/คำพูดญี่ปุ่นทั่วไป (เช่น `えへへ` = `เอะเฮะ`, `…っ!!` = `...อ๊ะ!!`, `コイツ` = `ไอ้หมอนี่`) ให้แปลเป็นไทยล้วน\n"
             "- สำหรับหัวข้อแบนเนอร์ ป้ายตาราง หรือป้ายสีหน้าสั้นๆ (เช่น `基本情報`, `年齢`, `通常`, `嬉`, `怒`, `能力`, `必殺技`) ให้แปลเป็นภาษาไทยที่สั้น กระชับที่สุด (1-3 คำ) เพื่อไม่ให้ล้นกรอบป้าย\n"
             "- ใช้คำลงท้ายให้ตรงเพศและบุคลิกของตัวละคร (ตัวละครหญิง/แต่งหญิงใช้ `ค่ะ`/`คะ`/`นะคะ`/`นะ` ตัวเอกชายพูดกับเพื่อนสนิทใช้ภาษาเป็นกันเอง)\n"
             "- คงชื่อศิลปิน/ผู้วาดตามต้นฉบับทุกตัวอักษรโดยห้ามแปลหรือทับศัพท์เป็นไทย ส่วนชื่อตัวละครและศัพท์เฉพาะญี่ปุ่นให้คงตาม Series context / เสียงอ่านทางการหรือเสียงคานะญี่ปุ่นที่ถูกต้อง (เช่น `あおい` = `อาโออิ`, `せな` = `เซนะ`, `なつき` = `นัตสึกิ`) หรือ Romaji ให้สม่ำเสมอ ห้ามแปลชื่อเฉพาะตรงตัว\n"
@@ -1700,6 +1716,9 @@ def _build_english_preservation_prompt_rule(target_lang_name: str) -> str:
         "(e.g. `Character Profile`, `Kairi Yui`, `170cm`) with NO Japanese/East Asian text, set `\"should_translate\": false`, "
         "`\"source_text\": \"<exact English text>\"`, `\"translated_text\": \"\"` so the original crisp English typography stays untouched on the image! "
         "If a single badge mixes Japanese + English (e.g. `浬 結衣 Kairi Yui`), translate ONLY the Japanese part and keep the English part verbatim with a clean space.\n"
+        " - CONSISTENT ENGLISH TECHNICAL TERMS: For in-world English katakana technical terms, system/class/weapon/skill/code names "
+        "(e.g. `レリック`/`レリクス` -> `Relic`/`Relics`, `スート:ハート` -> `Suit: Heart`, `ハートビート` -> `Heartbeat`, `ブースト` -> `Boost`, `レイピア` -> `Rapier`, `マナアクセラレーション` -> `Mana Acceleration`), "
+        "keep them consistently in English across EVERY section banner, label, and body paragraph on ALL pages — NEVER mix English (`Relic`) in one bubble with Thai transliteration (`รีลิกส์`) in another!\n"
     )
 
 
