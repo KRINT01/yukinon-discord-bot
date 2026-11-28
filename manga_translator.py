@@ -49,7 +49,7 @@ from manga_cv_render import (
     _release_cv_page_masks,
 )
 
-MANGA_TRANSLATOR_VERSION = "v17.7"
+MANGA_TRANSLATOR_VERSION = "v17.8"
 MANGA_CV_VER = getattr(_mcr_mod, "MANGA_CV_RENDER_VERSION", "old")
 MAX_MANGA_BATCH_PAGES = 12  # Supports up to 12 pages across multi-part threads (split into <=10 files per Discord message)
 # Bundle 2 dynamic parallel hedge: faster 15s recovery on typical 2-4p X threads, patient 25s on 5-12p batches
@@ -289,6 +289,21 @@ def _detect_target_translation_lang(user_prompt: str) -> tuple[str, str]:
     return "en", "English"
 
 
+def _is_pure_english_or_latin_source(src_text: str) -> bool:
+    """
+    True when `src_text` contains English/Latin text (or numbers+Latin units like `170cm`,
+    `Character Profile`, `Kairi Yui`, `HP 100`) and NO East Asian (JP/ZH/KR) or Thai characters.
+    Used when translating to a non-English target (e.g. Thai) so original crisp English typography
+    on character sheets/posters is preserved untouched on the image!
+    """
+    s = (src_text or "").strip()
+    if not s:
+        return False
+    if _SOURCE_EAST_ASIAN_REGEX.search(s) or THAI_CHAR_REGEX.search(s):
+        return False
+    return bool(re.search(r"[A-Za-z]", s))
+
+
 def _parse_flash_lite_version(model_id: str) -> tuple[int, int]:
     m = re.search(r"gemini-(\d+)(?:\.(\d+))?-flash-lite", (model_id or "").lower())
     if not m:
@@ -495,7 +510,12 @@ def _dedupe_hallucinated_page_bubbles(
         # Group by normalized `source_text` (ignore whitespace & common punctuation)
         groups: dict[str, list[int]] = {}
         for idx_b, b_item in enumerate(bubbles):
-            if b_item.get("bubble_id") is None:
+            bid = b_item.get("bubble_id")
+            if bid is None:
+                continue
+            cv_meta = cv_by_id.get(int(bid)) or {}
+            # Never dedupe legitimate repeated UI banners/table headers on character sheets
+            if cv_meta.get("is_ui_banner") or cv_meta.get("is_pastel_label"):
                 continue
             src_key = re.sub(r"[\s\.…!！?？~〜～、。,，・\-―—\x27\x22「」『』()（）]+", "", b_item.get("source_text") or "")
             if len(src_key) >= 4:
@@ -554,11 +574,16 @@ async def _recover_omitted_pages_async(
         returned_bids = {
             int(b["bubble_id"]) for b in bubbles if b.get("bubble_id") is not None
         }
+        # Exclude character-sheet UI banners / pastel labels / white-paper clusters so intentionally-preserved
+        # English labels (e.g. `Character Profile`, `Kairi Yui`, `170cm`) never trigger unnecessary retries!
         missing_rect_boxes = [
             int(c["bubble_id"])
             for c in page_cv
             if (not c.get("is_pastel"))
             and (not c.get("is_dark"))
+            and (not c.get("is_ui_banner"))
+            and (not c.get("is_pastel_label"))
+            and (not c.get("is_outlined_text"))
             and float(c.get("rect_fill") or 0.0) >= 0.90
             and int(c["bubble_id"]) not in returned_bids
         ]
@@ -904,7 +929,9 @@ async def _polish_single_chunk_gemma_async(
     if target_lang_name.lower() == "thai":
         lang_guidance = (
             "- แปลและเกลาทุกช่องให้เป็นภาษาไทยธรรมชาติ ลื่นไหล สะกดถูกต้อง 100% (ไม่มีคำสะกดผิด ไม่มีสระ/วรรณยุกต์สลับตำแหน่ง)\n"
-            "- ใช้เฉพาะอักษรไทยและเครื่องหมาย ASCII มาตรฐาน (`...`, `~`, `-`, `!`, `?`, `'`) ห้ามมีอีโมจิ สัญลักษณ์หัวใจ/โน้ตเพลง ภาษาเกาหลี/จีน/อาหรับ หรือทับศัพท์อังกฤษปนกลางประโยคไทย (เช่น แปล `えへへ` เป็น `เอะเฮะ`, `…っ!!` เป็น `...อ๊ะ!!`, `コイツ` เป็น `ไอ้หมอนี่` ยกเว้นคำย่อสากลที่มีในต้นฉบับจริงเช่น OK/DM/HP)\n"
+            "- ใช้เฉพาะอักษรไทยและเครื่องหมาย ASCII มาตรฐาน (`...`, `~`, `-`, `!`, `?`, `\"`, `'`, `(`, `)`) — แปลงวงเล็บญี่ปุ่น `「」『』` เป็น `\"...\"` เสมอ ห้ามใส่อีโมจิ สัญลักษณ์หัวใจ/โน้ตเพลง หรือภาษาเกาหลี/จีน/อาหรับ\n"
+            "- หากในต้นฉบับ `src` มีคำภาษาอังกฤษ/ชื่อภาษาอังกฤษอยู่แล้ว (เช่น `Kairi Yui`, `Iwato Pharmaceutical`, `OK`, `HP`) ให้คงคำภาษาอังกฤษเหล่านั้นไว้ตามเดิมพร้อมเว้นวรรคให้สวยงาม ห้ามแปลหรือทับศัพท์คำอังกฤษที่มีอยู่ในต้นฉบับเป็นไทย (ส่วนเสียงอุทาน/คำพูดญี่ปุ่นเช่น `えへへ` = `เอะเฮะ`, `…っ!!` = `...อ๊ะ!!`, `コイツ` = `ไอ้หมอนี่` ให้แปลเป็นไทยล้วน)\n"
+            "- สำหรับหัวข้อแบนเนอร์ ป้ายตาราง หรือป้ายสีหน้าสั้นๆ (เช่น `基本情報`, `年齢`, `通常`, `嬉`, `怒`, `能力`, `必殺技`) ให้แปลเป็นภาษาไทยที่สั้น กระชับที่สุด (1-3 คำ) เพื่อไม่ให้ล้นกรอบป้าย\n"
             "- ใช้คำลงท้ายให้ตรงเพศและบุคลิกของตัวละคร (ตัวละครหญิง/แต่งหญิงใช้ `ค่ะ`/`คะ`/`นะคะ`/`นะ` ตัวเอกชายพูดกับเพื่อนสนิทใช้ภาษาเป็นกันเอง)\n"
             "- คงชื่อศิลปิน/ผู้วาดตามต้นฉบับทุกตัวอักษรโดยห้ามแปลหรือทับศัพท์เป็นไทย ส่วนชื่อตัวละครและศัพท์เฉพาะญี่ปุ่นให้คงตาม Series context / เสียงอ่านทางการหรือเสียงคานะญี่ปุ่นที่ถูกต้อง (เช่น `あおい` = `อาโออิ`, `せな` = `เซนะ`, `なつき` = `นัตสึกิ`) หรือ Romaji ให้สม่ำเสมอ ห้ามแปลชื่อเฉพาะตรงตัว\n"
             "- หากต้นฉบับ `src` มีอักษรญี่ปุ่น OCR เพี้ยนเล็กน้อย หรือ `draft` ขาดหายกลางประโยค ให้ดูบริบทช่องก่อนหน้าแล้วแปลให้ครบสมบูรณ์\n"
@@ -913,7 +940,8 @@ async def _polish_single_chunk_gemma_async(
     else:
         lang_guidance = (
             f"- Proofread and polish every bubble into natural, idiomatic, accurately spelled {target_lang_name} manga dialogue.\n"
-            f"- Use ONLY pure {target_lang_name} script and standard ASCII punctuation (`...`, `~`, `-`, `!`, `?`, `'`) — no emojis or heart/music symbols.\n"
+            f"- Use ONLY pure {target_lang_name} script and standard ASCII punctuation (`...`, `~`, `-`, `!`, `?`, `\"`, `'`) — convert Japanese brackets `「」『』` to standard quotes `\"...\"`, with no emojis or heart/music symbols.\n"
+            "- Keep section banners, table labels, and expression tags concise (1-3 words) so they fit cleanly inside compact label boxes.\n"
             "- Preserve Japanese honorifics directly attached with a hyphen (`-san`, `-kun`, `-chan`, `-sama`, `-sensei`, `-senpai`).\n"
             "- If `src` has a minor OCR typo or `draft` is truncated/mistranslated, infer the true meaning from surrounding dialogue and complete it cleanly.\n"
             f"- Also polish each page's 1-sentence `sum` into clean {target_lang_name}."
@@ -924,7 +952,7 @@ async def _polish_single_chunk_gemma_async(
         "Review EVERY bubble `i` (`src` = Japanese OCR, `draft` = initial translation) and EVERY page `sum` in the JSON input, "
         f"and return polished, natural, typo-free {target_lang_name}.\n"
         f"RULES:\n{lang_guidance}\n"
-        "- Keep lines concise enough to fit cleanly inside manga speech bubbles.\n"
+        "- Keep lines concise enough to fit cleanly inside manga speech bubbles and compact UI banners.\n"
         "- Return ONLY valid JSON with this exact compact flat-string schema (include EVERY bubble index `i` and page number `p` present in INPUT; values MUST be plain strings, NEVER nested objects):\n"
         '{"s": {"1": "polished summary"}, "b": {"0": "polished bubble 0"}}'
     )
@@ -1198,8 +1226,13 @@ async def _polish_manga_translations_gemma_async(
     return polished_batch
 
 
-def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
+def _normalize_and_validate_bubbles(
+    raw_bubbles: list,
+    target_lang_name: str = "",
+) -> list[dict]:
     valid = []
+    preserve_english_only = bool(target_lang_name and target_lang_name.lower() != "english")
+
     for idx, item in enumerate(raw_bubbles, 1):
         if not isinstance(item, dict):
             continue
@@ -1207,12 +1240,27 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
         flag_val = item.get("should_translate")
         if flag_val is None:
             flag_val = item.get("is_dialogue")
+        _tmp_src = str(
+            item.get("source_text")
+            or item.get("original_text")
+            or item.get("japanese_text")
+            or item.get("source")
+            or ""
+        ).strip()
+
+        # When translating to a non-English target (e.g. Thai), keep standalone pure-English/Latin
+        # banners, names, and unit labels (e.g. `Character Profile`, `Kairi Yui`, `170cm`) untouched on the image!
+        if preserve_english_only and _is_pure_english_or_latin_source(_tmp_src):
+            continue
+
         if flag_val is False:
-            # Safety guard: only skip if there is truly no translated sentence OR explicitly marked SFX/blank!
+            # Safety guard: only skip if there is truly no translated sentence OR explicitly marked SFX/blank/English!
             _tmp_spk = str(item.get("speaker_or_note") or item.get("speaker") or "").lower()
             _tmp_tr = str(item.get("translated_text") or item.get("translation") or "").strip()
-            _tmp_src = str(item.get("source_text") or item.get("original_text") or "").strip()
-            _is_explicit_non_speech = any(k in _tmp_spk for k in ("sfx", "sound", "blank", "empty", "background", "artwork", "sleeve", "เอฟเฟกต์"))
+            _is_explicit_non_speech = any(
+                k in _tmp_spk
+                for k in ("sfx", "sound", "blank", "empty", "background", "artwork", "sleeve", "english", "เอฟเฟกต์")
+            )
             if _is_explicit_non_speech or not _tmp_tr or not _tmp_src:
                 continue
 
@@ -1222,13 +1270,7 @@ def _normalize_and_validate_bubbles(raw_bubbles: list) -> list[dict]:
             or item.get("character")
             or f"Bubble {idx}"
         )
-        src_txt = (
-            item.get("source_text")
-            or item.get("original_text")
-            or item.get("japanese_text")
-            or item.get("source")
-            or ""
-        )
+        src_txt = _tmp_src
         tr_txt = (
             item.get("translated_text")
             or item.get("translation")
@@ -1304,7 +1346,9 @@ def _repair_truncated_manga_batch_json(raw_target: str) -> dict | None:
 
 
 def _parse_manga_pages_batch_json(
-    raw_text: str, expected_pages: int
+    raw_text: str,
+    expected_pages: int,
+    target_lang_name: str = "",
 ) -> list[tuple[list[dict], str]]:
     if not raw_text:
         return [([], "") for _ in range(expected_pages)]
@@ -1343,25 +1387,32 @@ def _parse_manga_pages_batch_json(
                 p_idx = int(p_obj.get("page_index") or (idx + 1)) - 1
                 if not (0 <= p_idx < expected_pages):
                     p_idx = min(idx, expected_pages - 1)
-                bubbles = _normalize_and_validate_bubbles(p_obj.get("bubbles") or [])
+                bubbles = _normalize_and_validate_bubbles(
+                    p_obj.get("bubbles") or [], target_lang_name=target_lang_name
+                )
                 summary = _sanitize_text_for_manga_font(str(p_obj.get("summary") or "").strip())
                 results[p_idx] = (bubbles, summary)
             if any(b or s for b, s in results):
                 return results
 
-    if expected_pages == 1 and isinstance(parsed, dict) and "bubbles" in parsed:
-        bubbles = _normalize_and_validate_bubbles(parsed.get("bubbles") or [])
-        summary = _sanitize_text_for_manga_font(str(parsed.get("summary") or "").strip())
-        return [(bubbles, summary)]
+        if expected_pages == 1 and isinstance(parsed, dict) and "bubbles" in parsed:
+            bubbles = _normalize_and_validate_bubbles(
+                parsed.get("bubbles") or [], target_lang_name=target_lang_name
+            )
+            summary = _sanitize_text_for_manga_font(str(parsed.get("summary") or "").strip())
+            return [(bubbles, summary)]
 
     if expected_pages == 1:
-        b, s = _parse_manga_bubbles_json(raw_text)
+        b, s = _parse_manga_bubbles_json(raw_text, target_lang_name=target_lang_name)
         return [(b, s)]
 
     return [([], "") for _ in range(expected_pages)]
 
 
-def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
+def _parse_manga_bubbles_json(
+    raw_text: str,
+    target_lang_name: str = "",
+) -> tuple[list[dict], str]:
     if not raw_text:
         return [], ""
     cleaned = re.sub(r"<think>[\s\S]*?</think>", "", raw_text).strip()
@@ -1371,7 +1422,9 @@ def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
 
     try:
         parsed = json.loads(target)
-        bubbles = _normalize_and_validate_bubbles(parsed.get("bubbles") or [])
+        bubbles = _normalize_and_validate_bubbles(
+            parsed.get("bubbles") or [], target_lang_name=target_lang_name
+        )
         summary = _sanitize_text_for_manga_font(str(parsed.get("summary") or "").strip())
         if bubbles:
             return bubbles, summary
@@ -1383,7 +1436,9 @@ def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
         repaired = re.sub(r'(["\d\]}])\s*\n(\s*["{])', r"\1,\n\2", repaired)
         repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
         parsed = json.loads(repaired)
-        bubbles = _normalize_and_validate_bubbles(parsed.get("bubbles") or [])
+        bubbles = _normalize_and_validate_bubbles(
+            parsed.get("bubbles") or [], target_lang_name=target_lang_name
+        )
         summary = _sanitize_text_for_manga_font(str(parsed.get("summary") or "").strip())
         if bubbles:
             return bubbles, summary
@@ -1428,7 +1483,9 @@ def _parse_manga_bubbles_json(raw_text: str) -> tuple[list[dict], str]:
             "box_2d": norm_box,
         })
 
-    valid_extracted = _normalize_and_validate_bubbles(extracted_bubbles)
+    valid_extracted = _normalize_and_validate_bubbles(
+        extracted_bubbles, target_lang_name=target_lang_name
+    )
     return valid_extracted, summary
 
 
@@ -1464,6 +1521,7 @@ async def _invoke_manga_batch_single_model(
     per_call_timeout: float,
     wall_start: float,
     max_wall_budget: float,
+    target_lang_name: str = "",
     total_cv: int = 0,
     notify_fn=None,
 ) -> tuple[list[tuple[list[dict], str]] | None, list[tuple[list[dict], str]] | None]:
@@ -1558,7 +1616,9 @@ async def _invoke_manga_batch_single_model(
                 p.get("text", "") for p in resp_parts
                 if p.get("text") and not p.get("thought", False)
             ).strip()
-            batch_results = _parse_manga_pages_batch_json(raw_json_str, num_pages)
+            batch_results = _parse_manga_pages_batch_json(
+                raw_json_str, num_pages, target_lang_name=target_lang_name
+            )
             total_b = sum(len(b) for b, _ in batch_results)
             total_anchored = sum(
                 1 for b_list, _ in batch_results for b in b_list
@@ -1632,6 +1692,17 @@ async def _invoke_manga_batch_single_model(
     return None, text_only_fb
 
 
+def _build_english_preservation_prompt_rule(target_lang_name: str) -> str:
+    if target_lang_name.lower() == "english":
+        return ""
+    return (
+        " - PRESERVE EXISTING ENGLISH TEXT: If a badge contains ONLY English/Latin text, numbers, or Latin units "
+        "(e.g. `Character Profile`, `Kairi Yui`, `170cm`) with NO Japanese/East Asian text, set `\"should_translate\": false`, "
+        "`\"source_text\": \"<exact English text>\"`, `\"translated_text\": \"\"` so the original crisp English typography stays untouched on the image! "
+        "If a single badge mixes Japanese + English (e.g. `浬 結衣 Kairi Yui`), translate ONLY the Japanese part and keep the English part verbatim with a clean space.\n"
+    )
+
+
 async def extract_and_translate_manga_pages_batch(
     pages_input: list[tuple[bytes | str, str]],
     target_lang_name: str,
@@ -1641,9 +1712,9 @@ async def extract_and_translate_manga_pages_batch(
 ) -> tuple[list[tuple[list[dict], str]], list[list[dict]], bool]:
     """
     Set-of-Mark (SoM) CV-Anchored Multi-Page Manga Batch Pipeline:
-    1) Streams each page from `/tmp` (or raw `bytes`) 1-at-a-time to detect enclosed speech bubbles
-       (white, pastel/colored, corner-clipped, and dark) via vectorized OpenCV+NumPy and stamps
-       high-contrast BLACK/YELLOW badges without keeping raw page buffers in RAM.
+    1) Streams each page from `/tmp` (or raw `bytes`) 1-at-a-time to detect enclosed speech bubbles,
+       colored UI section banners, pastel table row labels, and dark/light text blocks via vectorized
+       OpenCV+NumPy and stamps high-contrast RED/WHITE/BLACK badges without keeping raw page buffers in RAM.
     2) Calls `MangaBatch` across:
        `gemini-3.5-flash-lite` -> `gemini-3.1-flash-lite` -> (newer >3.5 `flash-lite`)
        -> `gemma-4-31b-it` -> `gemma-4-26b-a4b-it`
@@ -1711,52 +1782,53 @@ async def extract_and_translate_manga_pages_batch(
         f"\nSeries / Post Context & Character Roster (use accurate names & terms):\n{series_context_hint[:1400]}\n"
         if series_context_hint else ""
     )
+    en_preserve_rule = _build_english_preservation_prompt_rule(target_lang_name)
 
     manga_batch_instruction = f"""
 You are a professional Manga, Manhwa, and Comic Localizer.
-You are given {num_pages} sequential manga page image(s) (labeled PAGE 1 to PAGE {num_pages}).
-Every enclosed speech bubble AND rectangular narration/caption box has ALREADY been outlined in RED with a high-contrast RED/WHITE/BLACK NUMBERED BADGE (`1`, `2`, `3`, ...) at its top-right rim!
+You are given {num_pages} sequential manga / character-profile page image(s) (labeled PAGE 1 to PAGE {num_pages}).
+Every enclosed speech bubble, rectangular narration/caption box, colored section banner, and table label has ALREADY been outlined in RED with a high-contrast RED/WHITE/BLACK NUMBERED BADGE (`1`, `2`, `3`, ...) at its top-right rim!
 {context_block}
 Analyze all {num_pages} page(s) in sequence so character names, titles/ranks, pronouns, and ongoing story stay consistent across every page,
-and translate EVERY SINGLE speech bubble and narration/caption box on EVERY page into natural, idiomatic {target_lang_name}.
+and translate EVERY SINGLE Japanese speech bubble, narration/caption box, section banner, table header, and expression label on EVERY page into natural, idiomatic {target_lang_name}.
 
 CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
 1. MANDATORY 1-TO-1 NUMBERED BADGE CHECKLIST (`bubble_id`):
  - Each page header lists the exact numbered badge IDs present on that page (`[1, 2, ..., K]`).
  - You MUST inspect and output an entry for EVERY SINGLE badge ID `1..K` on that page — NEVER skip a badge ID, NEVER merge two separate badges into one entry, and NEVER put text from a DIFFERENT bubble into another bubble's badge ID!
- - Double-check which exact RED/WHITE NUMBERED badge touches the bubble or narration box whose Japanese text you are reading before assigning `"bubble_id"`.
- - MANDATORY: Translate BOTH spoken speech bubbles AND EVERY rectangular white/colored narration/caption box (คำบรรยาย)! If badge `k` contains ANY Japanese sentence, dialogue, monologue, or narration caption: set `"bubble_id": k`, `"should_translate": true`, `"box_2d": null`, transcribe ONLY the exact `"source_text"` visually INSIDE badge `k`, and write its natural {target_lang_name} `"translated_text"`.
- - CRITICAL ANTI-DUPLICATE RULE: If badge `k` outlines a character face, body, clothing, hand, background art, or pure SFX with NO dialogue text visually inside badge `k`, you MUST set `"should_translate": false`, `"source_text": ""`, `"translated_text": ""` — NEVER copy or duplicate dialogue from a neighboring bubble onto an empty face/body badge! (Conversely, NEVER set `"should_translate": false` on a real narration/caption box.)
+ - Double-check which exact RED/WHITE NUMBERED badge touches the bubble, banner, table label, or caption whose Japanese text you are reading before assigning `"bubble_id"`.
+ - MANDATORY: Translate spoken speech bubbles, rectangular narration/caption boxes, AND EVERY badged Japanese section banner, table row header, and expression/detail label (e.g. `基本情報`, `年齢`, `身長`, `誕生日`, `所属`, `表情差分`, `通常`, `嬉`, `怒`, `哀`, `楽`, `照`, `能力`, `固有武器`, `必殺技`, `弱点・制約`, `武器・装備`, `デカい`)! Keep compact banner/table/expression labels concise (1-3 short words) so they fit cleanly inside the pill.
+{en_preserve_rule} - CRITICAL ANTI-DUPLICATE RULE: If badge `k` outlines a character face, body, clothing, hand, background art, or pure SFX with NO dialogue/label text visually inside badge `k`, you MUST set `"should_translate": false`, `"source_text": ""`, `"translated_text": ""` — NEVER copy or duplicate text from a neighboring bubble onto an empty face/body badge!
 2. UNMARKED / BORDERLESS DIALOGUE (`bubble_id: null`):
- - ALSO scan every panel for real spoken dialogue or monologue written WITHOUT a numbered badge around it.
- - For each unmarked dialogue or narration box, add a SEPARATE entry with `"bubble_id": null`, `"should_translate": true`, transcribe `"source_text"`, and provide `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY that Japanese text in its OWN panel — NEVER over faces, hands, or artwork!).
- - NEVER merge unbadged dialogue from another panel into an earlier panel's badge!
+ - ALSO scan every panel for real Japanese dialogue, narration, or profile text written WITHOUT a numbered badge around it.
+ - For each unmarked Japanese text block, add a SEPARATE entry with `"bubble_id": null`, `"should_translate": true`, transcribe `"source_text"`, and provide `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY that Japanese text in its OWN panel — NEVER over faces, hands, or artwork!).
+ - NEVER merge unbadged text from another panel into an earlier panel's badge!
  - NEVER output floating handwritten SFX (e.g. ドーン, トスッ, ポスン, ムチッ, ぐっ, カチャッ, ガチャ, ぎゅっ, にま, べた, もじっ) as `box_2d`.
 3. Accurate Speaker Attribution, Names & Visual Gender:
  - Identify the actual character speaking each bubble visually (follow the tail; never copy one character's name onto every bubble).
  - Keep character names, titles/ranks, and faction names consistent across all pages using accurate Japanese phonetics.
  - Match pronouns and politeness particles strictly to each speaker's visual gender and setting: in Thai, visually female characters (including female subordinates, guards, and attendants) must use female/neutral endings (`ค่ะ`, `คะ`, `นะคะ`, `นะ`, `ล่ะ`, `สิ`) — NEVER use male `ครับ`/`ผม` unless the speaker is clearly drawn as male!
- - PURE TARGET LANGUAGE & FONT-SAFE OUTPUT: Write EVERY `translated_text` and `summary` purely in natural, correctly spelled {target_lang_name} using ONLY standard {target_lang_name} script and ASCII punctuation (`...`, `~`, `-`, `'`, `!`, `?`) — no emojis, no heart/music symbols, and no mixed English/romanized syllables inside Thai (e.g. render `えへへ` as `เอะเฮะ`, `…っ!!` as `...อ๊ะ!!`, `コイツ` as `ไอ้หมอนี่`).
+ - PURE TARGET LANGUAGE & FONT-SAFE OUTPUT: Write EVERY `translated_text` and `summary` purely in natural, correctly spelled {target_lang_name} using ONLY standard {target_lang_name} script and ASCII punctuation (`...`, `~`, `-`, `"`, `'`, `!`, `?`) — convert Japanese brackets `「」『』` into standard `"..."` quotes, with no emojis or heart/music symbols, and no mixed romanized syllables for Japanese interjections inside Thai (e.g. render `えへへ` as `เอะเฮะ`, `…っ!!` as `...อ๊ะ!!`, `コイツ` as `ไอ้หมอนี่`).
  - When translating to English, preserve Japanese honorifics attached directly with a hyphen and NO space (`-san`, `-kun`, `-chan`, `-sama`, `-sensei`, `-senpai`).
 4. Return ONLY valid JSON matching this exact structure for all {num_pages} page(s) (write `summary` in {target_lang_name}):
 {{
- "pages": [
- {{
- "page_index": 1,
- "summary": "Brief 1-sentence scene context for Page 1 in {target_lang_name}",
- "bubbles": [
- {{
- "id": 1,
- "bubble_id": 1,
- "should_translate": true,
- "speaker_or_note": "Actual speaker name / Narration",
- "source_text": "Original Japanese text inside badge 1",
- "box_2d": null,
- "translated_text": "Natural {target_lang_name} translation"
- }}
- ]
- }}
- ]
+  "pages": [
+    {{
+      "page_index": 1,
+      "summary": "Brief 1-sentence scene context for Page 1 in {target_lang_name}",
+      "bubbles": [
+        {{
+          "id": 1,
+          "bubble_id": 1,
+          "should_translate": true,
+          "speaker_or_note": "Actual speaker name / Section Banner / Narration",
+          "source_text": "Original Japanese text inside badge 1",
+          "box_2d": null,
+          "translated_text": "Natural {target_lang_name} translation"
+        }}
+      ]
+    }}
+  ]
 }}
 """.strip()
 
@@ -1767,7 +1839,7 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
         for idx, (b64_img, fname, cv_cnt) in enumerate(b64_pages, 1):
             if cv_cnt > 0:
                 badge_ids_str = ", ".join(str(i) for i in range(1, cv_cnt + 1))
-                badge_note = f"NUMBERED BADGES ON THIS PAGE: [{badge_ids_str}] (account for EVERY badge ID strictly inside its own red outline; add bubble_id=null for any unbadged dialogue in other panels)"
+                badge_note = f"NUMBERED BADGES ON THIS PAGE: [{badge_ids_str}] (account for EVERY badge ID strictly inside its own red outline; add bubble_id=null for any unbadged Japanese dialogue/text in other panels)"
             else:
                 badge_note = "no numbered badges (use bubble_id=null + box_2d for any dialogue)"
             parts.append({"text": f"=== PAGE {idx} ({fname} | {badge_note}) ==="})
@@ -1801,6 +1873,7 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
                 _invoke_manga_batch_single_model(
                     m1_id, m1_gemma, parts, req_id, num_pages, batch_dim,
                     per_call_timeout, wall_start, max_wall_budget,
+                    target_lang_name=target_lang_name,
                     total_cv=total_cv, notify_fn=_notify,
                 )
             )
@@ -1825,6 +1898,7 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
                     _invoke_manga_batch_single_model(
                         m2_id, m2_gemma, parts, req_id, num_pages, batch_dim,
                         per_call_timeout, wall_start, max_wall_budget,
+                        target_lang_name=target_lang_name,
                         total_cv=total_cv, notify_fn=_notify,
                     )
                 )
@@ -1864,6 +1938,7 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
             res_m, fb_m = await _invoke_manga_batch_single_model(
                 model_id, is_gemma, parts, req_id, num_pages, batch_dim,
                 per_call_timeout, wall_start, max_wall_budget,
+                target_lang_name=target_lang_name,
                 total_cv=total_cv, notify_fn=_notify,
             )
             if res_m is not None:
@@ -1886,6 +1961,7 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
                 f"(timeout={int(or_timeout)}s, dim={batch_dim}px)"
             )
             or_t0 = time.monotonic()
+
             async def _on_or_hb_tick(m_id: str, el: float):
                 await _notify(
                     f"🌐 **2/3** กำลังแปลผ่าน OpenRouter (`{el:.0f}s`)..."
@@ -1918,7 +1994,9 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
 
             if raw_or_json:
                 or_elapsed = time.monotonic() - or_t0
-                or_results = _parse_manga_pages_batch_json(raw_or_json, num_pages)
+                or_results = _parse_manga_pages_batch_json(
+                    raw_or_json, num_pages, target_lang_name=target_lang_name
+                )
                 total_b = sum(len(b) for b, _ in or_results)
                 total_anchored = sum(
                     1 for b_list, _ in or_results for b in b_list
@@ -1985,37 +2063,39 @@ async def extract_and_translate_manga_bubbles(
     else:
         badge_note = "no numbered badges (use bubble_id=null + box_2d)"
 
+    en_preserve_rule = _build_english_preservation_prompt_rule(target_lang_name)
+
     manga_system_instruction = f"""
 You are a professional Manga, Manhwa, and Comic Localizer.
 This page has {badge_note}.
 {context_block}
-Translate EVERY SINGLE speech bubble and narration/caption box on this page into natural, idiomatic {target_lang_name}.
+Translate EVERY SINGLE Japanese speech bubble, narration/caption box, section banner, table header, and expression label on this page into natural, idiomatic {target_lang_name}.
 
 CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
 1. MANDATORY 1-TO-1 NUMBERED BADGE CHECKLIST (`bubble_id`):
  - Output an entry for EVERY SINGLE badge ID listed above — NEVER skip a badge ID, NEVER merge two separate badges, and NEVER put text from a different bubble into another bubble's badge ID!
- - MANDATORY: Translate BOTH spoken speech bubbles AND EVERY rectangular narration/caption box (คำบรรยาย)! If badge `k` contains ANY Japanese dialogue, monologue, or narration caption: set `"bubble_id": k`, `"should_translate": true`, `"box_2d": null`, exact `"source_text"` inside ONLY badge `k`, and its natural {target_lang_name} `"translated_text"`.
- - CRITICAL ANTI-DUPLICATE RULE: If badge `k` outlines a character face, body, clothing, hand, background art, or pure SFX with NO dialogue text inside it, set `"should_translate": false`, `"source_text": ""`, `"translated_text": ""` — NEVER copy dialogue from a nearby bubble onto an empty face/body badge! (Never skip a real narration/caption box.)
+ - MANDATORY: Translate spoken speech bubbles, rectangular narration/caption boxes, AND EVERY badged Japanese section banner, table row header, and expression/detail label (e.g. `基本情報`, `年齢`, `身長`, `誕生日`, `所属`, `表情差分`, `通常`, `嬉`, `怒`, `哀`, `楽`, `照`, `能力`, `固有武器`, `必殺技`, `弱点・制約`, `武器・装備`, `デカい`)! Keep compact banner/table/expression labels concise (1-3 short words) so they fit cleanly inside the pill.
+{en_preserve_rule} - CRITICAL ANTI-DUPLICATE RULE: If badge `k` outlines a character face, body, clothing, hand, background art, or pure SFX with NO dialogue/label text inside it, set `"should_translate": false`, `"source_text": ""`, `"translated_text": ""` — NEVER copy text from a nearby bubble onto an empty face/body badge!
 2. UNMARKED / BORDERLESS DIALOGUE (`bubble_id: null`):
- - For real spoken dialogue/narration WITHOUT a numbered badge (e.g. vertical text on open white panels), output a SEPARATE entry with `"bubble_id": null`, `"should_translate": true`, `"source_text"`, and `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY the Japanese text in its own panel).
+ - For real Japanese dialogue, narration, or profile text WITHOUT a numbered badge (e.g. vertical text on open white panels), output a SEPARATE entry with `"bubble_id": null`, `"should_translate": true`, `"source_text"`, and `"box_2d": [ymin, xmin, ymax, xmax]` (4 INTEGERS in `0..1000` tightly enclosing ONLY the Japanese text in its own panel).
  - NEVER concatenate or repeat text that already belongs to numbered badges into an extra `bubble_id: null` summary entry, and NEVER shift a banner/title onto an adjacent paragraph's badge ID.
 3. Accurate Speaker Attribution, Names & Visual Gender:
  - Identify the actual speaker visually; keep character names and franchise-specific terms consistent with the Series / Post Context using accurate Japanese phonetics (e.g. `あおい` -> `อาโออิ`, `せな` -> `เซนะ`) or Romaji — NEVER translate Japanese proper names literally; match Thai/English tone to visual gender (never use male Thai `ครับ`/`ผม` for female characters/guards).
- - PURE TARGET LANGUAGE & FONT-SAFE OUTPUT: Write EVERY `translated_text` and `summary` purely in natural, correctly spelled {target_lang_name} using ONLY standard {target_lang_name} script and ASCII punctuation (`...`, `~`, `-`, `'`, `!`, `?`) — no emojis, no heart/music symbols, and no mixed English/romanized syllables inside Thai (e.g. render `えへへ` as `เอะเฮะ`, `…っ!!` as `...อ๊ะ!!`, `コイツ` as `ไอ้หมอนี่`).
+ - PURE TARGET LANGUAGE & FONT-SAFE OUTPUT: Write EVERY `translated_text` and `summary` purely in natural, correctly spelled {target_lang_name} using ONLY standard {target_lang_name} script and ASCII punctuation (`...`, `~`, `-`, `"`, `'`, `!`, `?`) — convert Japanese brackets `「」『』` into standard `"..."` quotes, with no emojis or heart/music symbols, and no mixed romanized syllables for Japanese interjections inside Thai (e.g. render `えへへ` as `เอะเฮะ`, `…っ!!` as `...อ๊ะ!!`, `コイツ` as `ไอ้หมอนี่`).
 4. Return ONLY valid JSON matching this exact structure (write `summary` in {target_lang_name}):
 {{
- "summary": "Brief 1-sentence scene context in {target_lang_name}",
- "bubbles": [
- {{
- "id": 1,
- "bubble_id": 1,
- "should_translate": true,
- "speaker_or_note": "Actual speaker name / Narration",
- "source_text": "Original Japanese text inside badge 1",
- "box_2d": null,
- "translated_text": "Natural {target_lang_name} translation"
- }}
- ]
+  "summary": "Brief 1-sentence scene context in {target_lang_name}",
+  "bubbles": [
+    {{
+      "id": 1,
+      "bubble_id": 1,
+      "should_translate": true,
+      "speaker_or_note": "Actual speaker name / Section Banner / Narration",
+      "source_text": "Original Japanese text inside badge 1",
+      "box_2d": null,
+      "translated_text": "Natural {target_lang_name} translation"
+    }}
+  ]
 }}
 """.strip()
 
@@ -2111,7 +2191,9 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
                 raw_json_str = "".join(
                     p.get("text", "") for p in parts if p.get("text") and not p.get("thought", False)
                 ).strip()
-                bubbles, summary = _parse_manga_bubbles_json(raw_json_str)
+                bubbles, summary = _parse_manga_bubbles_json(
+                    raw_json_str, target_lang_name=target_lang_name
+                )
                 if bubbles and _consider_candidate("Tier 1 Gemini", bubbles, summary):
                     return bubbles, summary, cv_bubbles
         except Exception as e:
@@ -2127,7 +2209,9 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
             purpose=f"MangaSingle[{req_id}]",
         )
         if gemma_content:
-            bubbles, summary = _parse_manga_bubbles_json(gemma_content)
+            bubbles, summary = _parse_manga_bubbles_json(
+                gemma_content, target_lang_name=target_lang_name
+            )
             if bubbles and _consider_candidate("Tier 2 AI Studio Gemma 4", bubbles, summary):
                 return bubbles, summary, cv_bubbles
     except Exception as e:
@@ -2149,7 +2233,9 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
                 purpose=f"MangaSingleOpenRouter[{req_id}]",
             )
             if or_content:
-                bubbles, summary = _parse_manga_bubbles_json(or_content)
+                bubbles, summary = _parse_manga_bubbles_json(
+                    or_content, target_lang_name=target_lang_name
+                )
                 if bubbles and _consider_candidate("Tier 2.5 OpenRouter Nemotron", bubbles, summary):
                     return bubbles, summary, cv_bubbles
         except Exception as e:
@@ -2164,7 +2250,9 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
             purpose=f"MangaSingleCF[{req_id}]",
         )
         if cf_content:
-            bubbles, summary = _parse_manga_bubbles_json(cf_content)
+            bubbles, summary = _parse_manga_bubbles_json(
+                cf_content, target_lang_name=target_lang_name
+            )
             if bubbles and _consider_candidate("Tier 3 Cloudflare Gemma 4", bubbles, summary):
                 return bubbles, summary, cv_bubbles
     except Exception as e:
@@ -2182,7 +2270,9 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
                 purpose=f"MangaSingle[{req_id}]",
             )
             if gq_content:
-                bubbles, summary = _parse_manga_bubbles_json(gq_content)
+                bubbles, summary = _parse_manga_bubbles_json(
+                    gq_content, target_lang_name=target_lang_name
+                )
                 if bubbles and _consider_candidate("Tier 4 Groq Qwen", bubbles, summary):
                     return bubbles, summary, cv_bubbles
         except Exception as e:
@@ -2199,7 +2289,9 @@ CRITICAL SET-OF-MARK (NUMBERED BADGE) & TRANSLATION RULES:
             timeout_sec=30,
         )
         if cfq_content:
-            bubbles, summary = _parse_manga_bubbles_json(cfq_content)
+            bubbles, summary = _parse_manga_bubbles_json(
+                cfq_content, target_lang_name=target_lang_name
+            )
             if bubbles and _consider_candidate("Tier 5 Cloudflare Qwen", bubbles, summary):
                 return bubbles, summary, cv_bubbles
     except Exception as e:
@@ -2224,7 +2316,8 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
     - `manga_semaphore` (`Semaphore(1)`) OOM guard with queue waiting notice
     - Disk-backed `/tmp` job page streaming (input & rendered output pages stay on disk, keeping
       raw 1-12p buffers out of container RAM during 20-60s Vision API waits and Stage 3 uploads)
-    - Vectorized OpenCV + NumPy CV Set-of-Mark (SoM) detection (white, pastel, corner, dark) & render masking
+    - Vectorized OpenCV + NumPy CV Set-of-Mark (SoM) detection (white, pastel, corner, dark, UI banners/labels)
+      & render masking
     - Shared `llm.py` Google AI Studio catalog & cooldowns + dynamic `15s`/`25s` `3.5-flash-lite` -> `3.1-flash-lite` hedge
     - Adaptive Stage 2 Gemma 4 text-only localization polish (auto-skips on clean <=4-bubble 1p strips;
       always-on parallel-chunked for multi-page batches & dense pages)
@@ -2500,7 +2593,7 @@ async def process_manga_translation_request(ctx_or_message, user_prompt: str):
                                 f"🎨 **3/3** กำลังใส่คำแปลลงภาพ (`{page_idx}/{num_pages}` หน้า)...",
                                 force=False,
                             )
-                            await asyncio.sleep(0.05)
+                        await asyncio.sleep(0.05)
 
                     render_elapsed = time.monotonic() - render_t0
                     api_log(

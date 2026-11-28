@@ -563,7 +563,12 @@ PLAIN_TEXT_EXTENSIONS = (".txt", ".md", ".csv", ".rst", ".env.example")
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
 AUDIO_EXTENSIONS = (".ogg", ".wav", ".mp3", ".m4a", ".flac")
 
+# Debian `fonts-tlwg-garuda-otf` installs OpenType (.otf) under `/usr/share/fonts/opentype/tlwg/`.
+# Prioritize Garuda OTF/TTF (full Thai + Latin + digits + ASCII punctuation coverage) before
+# `NotoSansThai-Bold.ttf`, which is Thai-only on Debian and renders ASCII/digits/quotes as tofu boxes [].
 FONT_CANDIDATES = (
+    "/usr/share/fonts/opentype/tlwg/Garuda-Bold.otf",
+    "/usr/share/fonts/opentype/tlwg/Garuda.otf",
     "/usr/share/fonts/truetype/tlwg/Garuda-Bold.ttf",
     "/usr/share/fonts/truetype/tlwg/Garuda.ttf",
     "/usr/share/fonts/truetype/noto/NotoSansThai-Bold.ttf",
